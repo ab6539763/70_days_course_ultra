@@ -1,0 +1,2860 @@
+# 第47天:实用Agent场景专题
+
+- **课程阶段**:第四阶段 · 企业级Agent开发实战
+- **所属项目**:苍穹企业级智能体中台 —— 祺瑞集团多Agent智能办公助手
+- **飞书任务号**:CQ-301 起
+- **主讲/带教**:王振宇(老王)
+- **学员**:陈铭
+- **协同角色**:林悦(产品经理)
+- **今日主线**:Text-to-SQL数据分析Agent(实操)、浏览器自动化Agent概念、代码助手Agent概念
+- **前情**:Day46 完成Agent稳定性工程化(重试、降级、熔断、可观测性)
+- **后续**:Day48 预研收尾,进入两天封闭开发冲刺
+
+---
+
+## 【旁白】
+
+在蓬远科技,项目正式立项这件事从来不是一句话的事。它更像是一场天气变化——前一天还是阴云密布的"客户意向不明朗",第二天一早,一份三十多页的需求文档就"哗"地砸在了每个人的飞书群里,瞬间把所有人的日程表重新洗了一遍牌。
+
+陈铭后来回忆起2026年那个夏天的早晨时,总会想起自己刚打开电脑,还没来得及泡上今天的第一杯茶,飞书就弹出了七条未读消息,最上面一条来自林悦,只有短短一句话:"祺瑞的需求文档来了,大家先看,九点半开会。"
+
+他当时心里咯噔一下,倒不是因为紧张,而是因为一种熟悉的预感——这意味着接下来一段时间,"下班"这个词大概要被重新定义了。他把文档拖到桌面,点开的瞬间,标题栏上"多Agent智能办公助手项目立项建议书"几个字映入眼帘,任务编号一栏写着"CQ-301"。这是这个项目在飞书任务系统里的第一个编号,后面显然还会有CQ-302、CQ-303……一长串数字,像是即将展开的一段旅程的路标。
+
+这一天,陈铭要做的事情说起来只有一件——把"用自然语言查销售数据"这件听起来简单、做起来处处是坑的事情真正跑通。但在这背后,是整个项目从"意向客户"到"正式立项"的转身,是从"我们能做什么"到"客户具体要什么"的落地,也是陈铭个人技术能力从"会用Agent框架"到"能独立交付一个可用于真实业务场景的Agent"的一次跨越。
+
+---
+
+## 晨会纪要
+
+**时间**:2026年7月13日 09:30-10:15
+**地点**:蓬远科技三楼东侧会议室"望江厅"
+**参会**:王振宇、林悦、陈铭、以及后端组两位同事(周航、贺敏,列席)
+**记录人**:陈铭
+
+**会议纪要正文:**
+
+林悦九点二十五分就到了会议室,提前把投影打开,PPT第一页就是祺瑞集团的Logo和"多Agent智能办公助手"几个字。等大家陆续落座,她开口说的第一句话是:"东西真的来了,而且比我们预想的还具体。"
+
+她把需求文档投到屏幕上,逐条讲解背景:祺瑞集团是一家横跨地产开发、物业管理和商业零售的综合性集团,内部信息化程度参差不齐——销售数据、物业数据分散在不同的业务系统里,财务、运营、区域经理每天要花大量时间导出Excel、手动拼数、做汇总,一线管理者想看一个"上个月华东区哪个楼盘的成交额最高"这种问题,往往要等IT部门跑一两天的报表才能拿到答案。祺瑞的信息化负责人在需求沟通会上直接说了一句让林悦印象很深的话:"我们不缺系统,缺的是能听懂人话、还能自己动手查数据的人。"
+
+老王听到这里插了一句:"这句话说得挺准的,其实也是我们苍穹中台要证明的核心价值——不是又造一个BI工具,而是造一个能理解业务语言、自己驱动执行的智能体。"
+
+林悦接着展开讲需求文档里的核心诉求,归纳成三条:
+
+第一,**自然语言查数据**。业务人员不需要学SQL,不需要懂表结构,直接用口语化的问题就能拿到销售和物业经营数据的答案,比如"上个季度华东区住宅项目的签约金额是多少""XX小区本月的物业费欠缴率""哪个销售顾问这个月成交量最高"。
+
+第二,**跨系统的办公协同**。除了查数据,祺瑞还提出了审批流程自动化、日常提醒汇总、内部脚本与报表生成协助等一系列办公场景需求,这意味着这不是一个单点工具,而是一个多Agent协同的智能办公助手体系。
+
+第三,**任务的可靠性与可控性**。文档里专门用加粗字体写了一条:"系统需具备任务中断后恢复执行的能力,避免因网络波动或系统故障导致的数据重复处理或流程卡死。"林悦说这条是她们内部反复讨论过的,显然是祺瑞的IT团队踩过真实的坑,才会在需求文档里写得这么具体。
+
+老王听完,点了点头说:"这条其实呼应了我们Day46做的那套稳定性工程——重试、熔断、状态持久化,这些不是我们闭门造车搞出来的,而是企业级场景真实需要的。"他转头看向陈铭:"你昨天刚把稳定性那套体系跑通,今天正好用得上。"
+
+会议讨论到具体的技术拆解时,气氛热烈了起来。周航提了个问题:"销售数据和物业数据是两套完全不同的业务语义,自然语言转SQL这一步,怎么保证模型不会把'签约金额'理解成'物业费'?"
+
+林悦答:"文档里附了一份简化的数据字典,我们需要在Agent里做一层业务术语到表字段的映射,这个我建议叫'业务语义层',陈铭你今天可以先把这一层的设计定下来。"
+
+贺敏问了另一个更让人紧张的问题:"客户是集团级企业,数据安全这块,如果模型生成的SQL里带了删表、改数据的语句怎么办?"
+
+老王直接接过话:"这个必须做硬性拦截,而且不能只靠prompt里说'不要生成危险语句'——大模型的话不能全信,必须在代码层面做SQL安全校验,白名单+黑名单双重机制,今天陈铭要重点把这一块打透。"
+
+会议最后,老王给今天定了三件事:
+
+第一,林悦今天要把"多Agent智能办公助手项目立项PRD"初稿正式定稿,提交给客户侧确认,同时在内部同步给全组;
+
+第二,陈铭今天的核心任务是把"Text-to-SQL数据分析Agent"从零跑通一个可演示的版本,覆盖祺瑞销售数据和物业数据的模拟场景,并且要把SQL安全校验做扎实;
+
+第三,浏览器自动化Agent和代码助手Agent这两个方向,今天先不动手写代码,由陈铭做技术选型和概念梳理,产出一份技术备忘录,为后面两天的封闭开发做准备。
+
+老王最后补了一句让陈铭记到现在:"今天这一仗,不是比谁代码写得多,是比谁把'能用的东西'先立住。客户要看的是能不能解决问题,不是我们代码有多优雅。"
+
+会议在十点十五分结束,散会前林悦特意留了一句:"晚上六点我们再对一次进度,我要把今天的成果整理进给客户的周报里。"
+
+---
+
+## 需求文档:祺瑞集团多Agent智能办公助手项目立项PRD(V1.0 初稿)
+
+> 文档属性
+> 编写人:林悦
+> 版本:V1.0(初稿,待客户确认)
+> 关联任务号:CQ-301
+> 客户:祺瑞集团
+> 承接产品:苍穹企业级智能体中台
+
+### 一、项目背景
+
+祺瑞集团业务覆盖地产开发、物业管理与商业零售三大板块,内部信息系统建设起步较早但相对分散,销售数据存放于自研的CRM系统,物业经营数据存放于第三方物业管理系统,两套系统之间缺乏统一的数据查询入口。集团管理层与一线业务人员在日常经营分析中普遍依赖人工导出报表、手工拼接汇总的方式获取信息,存在响应慢、易出错、无法灵活追问的问题。
+
+同时,集团内部日常办公中存在大量重复性、跨系统的事务性工作,例如审批流程的信息核对、周期性数据汇总提醒、内部技术团队的脚本编写与代码审查协助等,均缺乏自动化支撑。
+
+集团信息化部门期望引入一套具备"自然语言理解+多任务协同+跨系统操作"能力的智能办公助手体系,以Agent技术为核心,逐步替代和优化上述人工环节。
+
+### 二、项目目标
+
+1. 构建一套多Agent协同的智能办公助手,能够理解自然语言指令,自动判断意图并调度对应的专业Agent完成任务。
+2. 第一阶段重点实现"自然语言查询销售数据与物业经营数据"的能力,即Text-to-SQL数据分析Agent,作为整个多Agent体系的首发能力与验收标准。
+3. 中长期规划浏览器自动化Agent(用于操作无API接口的老旧OA/物业系统)与代码助手Agent(用于协助内部技术团队完成脚本编写、代码审查、报表代码生成等工作)。
+4. 系统需具备任务中断后自动恢复执行的能力,保障长流程任务的可靠性。
+5. 所有涉及数据变更、审批通过等具有实际业务影响的操作,必须保留人工确认环节,不允许Agent自主完成不可逆操作。
+
+### 三、总体架构设想
+
+多Agent智能办公助手体系采用"总控调度 + 专业Agent + 公共工具层"的架构模式:
+
+- **总控调度层(Orchestrator)**:负责接收用户自然语言请求,识别意图,路由到对应的专业Agent,并在多个Agent需要协作时进行任务编排与结果汇总。
+- **专业Agent层**:至少包含以下三类协作Agent(第一阶段以数据问数Agent为交付重点,其余两类先完成概念验证与技术选型):
+
+  1. **数据问数Agent(Text-to-SQL Agent)**:理解自然语言问题,结合数据库schema与业务语义层生成SQL,执行查询并将结果转化为自然语言解释,支持销售数据与物业经营数据两大业务域。
+  2. **智能审批助理Agent**:协助处理请假、报销、合同审批等流程性事务,能够读取审批系统中的待办事项,核对信息完整性,提示异常,并在获得人工确认后推动流程流转。因祺瑞部分老旧审批系统不具备开放API,该Agent的落地依赖浏览器自动化能力作为兜底方案。
+  3. **文档与代码助手Agent**:面向集团内部技术团队,协助生成数据分析脚本、审查现有代码、生成日常报表代码片段,并可结合数据问数Agent的查询结果自动生成可视化图表代码。
+
+- **公共工具层(Tool Layer)**:为各专业Agent提供标准化、可复用的工具能力,本阶段规划至少以下七类工具(不少于5个的要求已覆盖,预留扩展空间):
+
+  1. `sql_executor`(SQL执行工具):对经过安全校验的SQL语句执行查询,返回结构化结果。
+  2. `chart_renderer`(图表生成工具):将结构化查询结果转换为可视化图表配置或图片。
+  3. `feishu_notifier`(飞书消息推送工具):将处理结果、异常提醒、审批提示推送至指定飞书群或个人。
+  4. `browser_controller`(浏览器操作工具):基于Playwright等浏览器自动化技术,对无API的老旧系统执行页面级操作(如登录、表单填写、信息抓取)。
+  5. `code_sandbox`(代码执行沙箱工具):在隔离环境中执行代码助手Agent生成的脚本,防止对生产环境造成影响。
+  6. `doc_retriever`(文档与知识库检索工具):检索企业内部知识库、历史工单、业务术语字典,为各Agent提供上下文支撑。
+  7. `approval_api`(审批流程调用工具):对已具备API能力的审批系统进行流程状态查询与流转操作。
+
+### 四、核心功能需求
+
+**4.1 自然语言查询销售数据与物业经营数据(P0,第一阶段核心交付)**
+
+- 用户可通过自然语言提出涵盖销售业绩、签约金额、物业费收缴、维修工单等主题的查询问题。
+- 系统需自动理解问题涉及的业务域(销售 或 物业),定位相关数据表,生成对应的SQL查询语句。
+- 系统需对生成的SQL进行安全校验,严禁执行任何数据变更类操作(包括但不限于 `DROP`、`DELETE`、`UPDATE`、`INSERT`、`ALTER`、`TRUNCATE`、`GRANT`、`REVOKE` 等),仅允许只读查询。
+- 查询结果需以自然语言形式向用户解释,而非直接返回原始表格数据(可同时提供表格作为辅助)。
+- 对于模糊或有歧义的问题(例如未指定时间范围),系统应主动澄清或采用合理默认值并明确告知用户。
+
+**4.2 任务中断恢复能力(P0)**
+
+- 针对涉及多步骤、长耗时的任务(例如审批流程处理、批量数据核对),系统需在关键节点持久化任务状态(即"检查点"机制)。
+- 任务因网络异常、系统重启、人工中断等原因未能完成时,系统需能够从最近一个已完成的检查点恢复执行,而不是从头重新开始。
+- 恢复执行时,已经产生外部副作用的步骤(如已发送的消息、已提交的审批)不允许被重复执行,需通过幂等性设计规避重复副作用。
+
+**4.3 浏览器自动化能力(P1,概念验证阶段)**
+
+- 面向不具备开放API的老旧系统(部分物业管理子系统、部分OA审批系统),提供页面级自动化操作能力。
+- 需明确浏览器自动化Agent的能力边界:仅执行"人在系统里能做的操作"(点击、输入、滚动、读取页面信息),不具备直接操作数据库或后端服务的能力。
+- 涉及提交、审批通过等有实际业务影响的操作,必须经过人工二次确认后才能执行。
+
+**4.4 代码助手能力(P1,概念验证阶段)**
+
+- 面向集团内部技术团队,协助完成数据分析脚本编写、代码审查、报表代码生成等工作。
+- 生成的代码需在隔离沙箱环境中执行验证后才能交付使用,不允许直接在生产环境执行。
+- 需明确代码助手Agent与浏览器自动化Agent的能力边界差异,避免职责混淆导致的架构复杂化。
+
+### 五、非功能性需求
+
+1. **安全性**:所有涉及真实生产数据库连接的场景,数据库账号必须为只读权限账号,作为纵深防御的最后一道防线。
+2. **可观测性**:所有Agent的决策过程(生成的SQL、调用的工具、执行结果)需可追溯、可审计,满足集团合规要求。
+3. **性能**:单次自然语言查询的端到端响应时间(不含用户网络延迟)目标控制在8秒以内。
+4. **可扩展性**:业务语义层(术语字典)需支持后续新增业务域(如财务、人力)时低成本扩展,不应硬编码在Agent逻辑中。
+
+### 六、验收标准(第一阶段)
+
+1. 能够正确回答至少20类预设的销售数据与物业经营数据自然语言问题,准确率不低于90%。
+2. 对含有危险操作意图的查询请求(如试图诱导删除数据),系统应100%拦截并给出明确提示,不产生任何数据变更。
+3. 任务中断恢复机制通过至少3类中断场景(网络超时、进程重启、人工手动中断)的测试验证。
+4. 浏览器自动化Agent与代码助手Agent的技术选型报告与概念验证Demo完成评审。
+
+### 七、里程碑计划(草案)
+
+- CQ-301 ~ CQ-305:需求确认与技术预研(本周内完成)
+- CQ-306 ~ CQ-320:核心Agent与工具层开发(封闭开发阶段)
+- CQ-321 ~ CQ-330:集成测试与客户联调
+- CQ-331 及以后:试运行与验收
+
+---
+
+## 架构设计图:Text-to-SQL Agent 技术架构
+
+下面这张图是陈铭在今天上午整理出来的Text-to-SQL Agent整体架构,核心思路是"理解—生成—校验—执行—解释"五段式流水线,每一段都对应一个独立的、可单独测试的模块。
+
+```mermaid
+flowchart TB
+    U["用户自然语言问题"] --> P1
+
+    subgraph L1["理解层"]
+        P1["问题预处理\n(时间表达归一化/术语抽取)"]
+        P2["Schema检索器\n(定位相关表与字段)"]
+        P3["业务语义层\n(术语字典: 业务词→表字段)"]
+        P1 --> P2
+        P3 --> P2
+    end
+
+    subgraph L2["生成层"]
+        G1["Prompt构建器\n(拼接schema+术语+few-shot范例)"]
+        G2["LLM SQL生成\n(输出候选SQL语句)"]
+        G1 --> G2
+    end
+
+    subgraph L3["安全与校验层"]
+        V1["SQL语法解析"]
+        V2["危险操作黑名单校验\n(DROP/DELETE/UPDATE/...)"]
+        V3["表/字段白名单校验"]
+        V4["多语句/注入特征检测"]
+        V5["LIMIT行数保护注入"]
+        V1 --> V2 --> V3 --> V4 --> V5
+    end
+
+    subgraph L4["执行层"]
+        E1["只读连接池"]
+        E2["超时与行数控制执行"]
+        E3["结构化结果集"]
+        E1 --> E2 --> E3
+    end
+
+    subgraph L5["解释层"]
+        R1["结果摘要生成"]
+        R2["自然语言解释\n(LLM二次调用)"]
+        R3["图表建议\n(可选调用chart_renderer)"]
+        R1 --> R2
+        R1 --> R3
+    end
+
+    P2 --> G1
+    G2 -->|候选SQL| V1
+    V5 -->|校验通过| E1
+    V2 -->|命中黑名单/白名单失败| REJ["拒绝执行\n返回安全提示"]
+    V4 -->|检测到注入特征| REJ
+    E3 --> R1
+    R2 --> OUT["返回给用户\n(自然语言 + 数据表格)"]
+    R3 --> OUT
+
+    G2 -.失败或校验不通过时的反馈重试.-> G1
+```
+
+这张图里有几个地方陈铭特别标注给自己看:第一,校验层不是挂在生成层后面"意思意思"的一道摆设,而是拆成了五个子步骤,每一步都有独立的拒绝出口,任何一步不通过都直接进入"拒绝执行"分支,绝不放行到执行层;第二,生成层和校验层之间画了一条虚线的反馈回路,代表当校验不通过或者SQL执行报错时,系统会把错误信息重新喂给LLM,让它带着"上一次为什么错"的上下文重新生成,这是让Text-to-SQL准确率能真正达到可用水平的关键设计,不是一次生成就定型,而是允许有限次数的自我修正。
+
+## 流程图:一次自然语言查数据请求的完整处理流程
+
+这张图是从"用户在飞书里发一句话"到"收到答案"的完整时序,重点把SQL注入防护检查的各个判断点画成了决策节点,方便团队review时能一眼看出"哪一步在防什么"。
+
+```mermaid
+flowchart TD
+    START(["用户输入自然语言问题"]) --> A1["记录请求日志\n(生成trace_id)"]
+    A1 --> A2["问题预处理:\n时间表达归一化\n业务术语抽取"]
+    A2 --> A3["检索相关表结构与\n业务语义层映射"]
+    A3 --> A4["构建Prompt\n(schema+术语+few-shot)"]
+    A4 --> A5["调用LLM生成候选SQL"]
+    A5 --> B1{"SQL语法\n是否可解析?"}
+    B1 -- 否 --> RETRY1["记录解析失败原因\n重试计数+1"]
+    RETRY1 --> C1{"重试次数\n是否超过上限(3次)?"}
+    C1 -- 否 --> A5
+    C1 -- 是 --> FAIL["返回:\n未能理解该问题\n请换一种方式提问"]
+
+    B1 -- 是 --> B2{"是否仅包含\n单条SELECT语句?\n(检测多语句堆叠)"}
+    B2 -- 否,检测到多语句/分号堆叠 --> REJECT1["拦截:\n疑似SQL注入\n记录安全审计日志"]
+    B2 -- 是 --> B3{"是否命中\n危险关键字黑名单?\n(DROP/DELETE/UPDATE/\nINSERT/ALTER/TRUNCATE等)"}
+    B3 -- 命中 --> REJECT1
+    B3 -- 未命中 --> B4{"涉及的表/字段是否\n均在白名单schema内?"}
+    B4 -- 否 --> REJECT2["拦截:\n查询涉及未授权数据\n提示用户确认需求范围"]
+    B4 -- 是 --> B5{"是否存在\n注释符/编码混淆等\n绕过特征?\n(--,#,/**/,十六进制等)"}
+    B5 -- 是 --> REJECT1
+    B5 -- 否 --> B6{"是否已包含\nLIMIT行数限制?"}
+    B6 -- 否 --> AUTOLIMIT["自动注入\nLIMIT保护\n(默认200行)"]
+    B6 -- 是 --> B7
+    AUTOLIMIT --> B7{"LIMIT值是否\n超过安全上限?"}
+    B7 -- 超过 --> CLAMP["自动收敛至\n安全上限"]
+    B7 -- 未超过 --> D1
+    CLAMP --> D1["交付只读连接执行\n(设置查询超时5秒)"]
+
+    D1 --> D2{"执行是否成功?"}
+    D2 -- 否,报错 --> RETRY2["将报错信息回传给LLM\n请求修正SQL\n重试计数+1"]
+    RETRY2 --> C1
+    D2 -- 是 --> D3["获取结构化结果集\n(行数/字段/数据)"]
+    D3 --> D4{"结果是否为空?"}
+    D4 -- 是 --> EMPTY["生成\"未查到符合条件数据\"\n的自然语言说明\n并给出可能原因"]
+    D4 -- 否 --> D5["调用LLM生成\n结果的自然语言解释"]
+    D5 --> D6["按需生成图表建议"]
+    EMPTY --> RESP
+    D6 --> RESP["组装最终响应\n(自然语言+表格+图表建议)"]
+    RESP --> LOG["记录完整审计日志\n(问题/SQL/结果摘要/耗时)"]
+    LOG --> END(["返回给用户"])
+
+    REJECT1 --> LOG
+    REJECT2 --> LOG
+    FAIL --> LOG
+```
+
+老王看完这张流程图之后说了一句让陈铭印象很深的话:"你看,真正的安全设计从来不是一个if判断,而是一整条决策链,每一环都要有明确的'拦下来之后怎么办',不能只写'拦截',拦截之后用户会看到什么、日志里会记什么,这些都要想清楚。"
+
+## 示意图:浏览器自动化Agent与代码助手Agent的能力边界
+
+浏览器自动化Agent和代码助手Agent这两个方向,今天不写实现代码,但需要把边界想清楚,否则封闭开发阶段容易出现"两个Agent互相打架、职责重叠"的问题。这张图是陈铭和老王讨论后画出来的边界示意。
+
+```mermaid
+flowchart LR
+    subgraph BROWSER["浏览器自动化Agent专属能力域"]
+        B1["操作无API的老旧系统页面"]
+        B2["模拟人工点击/输入/滚动"]
+        B3["截图/DOM结构理解与定位元素"]
+        B4["处理登录态与会话保持"]
+        B5["页面级异常识别\n(弹窗/验证码/页面结构变化)"]
+    end
+
+    subgraph SHARED["公共能力域(两者都依赖)"]
+        S1["任务规划循环\n(ReAct式思考-行动-观察)"]
+        S2["工具调用框架"]
+        S3["隔离沙箱执行环境"]
+        S4["人工确认关卡\n(高风险操作前置审批)"]
+        S5["执行日志与可观测性"]
+    end
+
+    subgraph CODE["代码助手Agent专属能力域"]
+        C1["理解代码仓库结构与依赖关系"]
+        C2["生成/修改源代码文件\n(基于diff的精确编辑)"]
+        C3["调用编译/测试/Lint工具链"]
+        C4["理解错误堆栈并定位问题代码"]
+        C5["生成可视化图表代码\n(结合查询结果)"]
+    end
+
+    BROWSER --> SHARED
+    CODE --> SHARED
+
+    NOTE1["能操作的是'界面'\n而非'代码本身'"] -.说明.-> BROWSER
+    NOTE2["能操作的是'代码与文件'\n而非直接控制浏览器UI"] -.说明.-> CODE
+```
+
+这张图画完之后,老王在旁边补了一句总结,陈铭当场就记进了笔记本:"浏览器自动化Agent的战场是'别人家没开门的系统',代码助手Agent的战场是'我们自己的代码仓库',它们看起来都是'Agent自动干活',但驾驶的车完全不是同一辆,共享的只是底盘——任务规划循环、工具调用框架、沙箱、人工确认关卡这些通用能力。以后架构评审的时候,凡是有人说'能不能让浏览器Agent顺便改一下代码'或者'代码助手Agent能不能顺便点一下网页',先看这张图,基本就能判断这是不是一个合理的需求。"
+
+---
+
+## 课堂笔记
+
+### 上午:Text-to-SQL原理与实现
+
+陈铭把上午的笔记整理成了几个部分,基本按照老王讲课的顺序记录,中间夹杂了不少他自己的理解和踩坑记录。
+
+**1. 为什么Text-to-SQL不是"把问题丢给大模型让它写SQL"这么简单**
+
+老王一开始就把这个误解摆到桌面上讲清楚了。很多人对Text-to-SQL的第一印象是:"这不就是让GPT写一句SQL吗,直接把问题喂进去不就完了?"陈铭自己一开始也是这么想的,直到老王甩给他一个反例:假设数据库里有一张表叫`sales_orders`,里面有个字段叫`amount`,还有一张表叫`sales_order_items`,里面也有个字段叫`amount`,含义完全不同——一个是订单总金额,一个是单个商品的成交金额。如果只把"表名+字段名"原样丢给大模型,模型很可能因为字段名字面相似就选错了表,查出来的数字看起来"像是对的",但业务上完全是错的,而且这种错误往往没有报错,系统会一本正经地给出一个错误答案,这比直接报错更危险。
+
+所以Text-to-SQL真正要解决的核心问题,老王总结成三句话:第一,让模型"知道"数据库里到底有什么(schema理解);第二,让模型"懂"业务人员说的话和数据库字段之间的对应关系(语义对齐);第三,生成的SQL必须经过独立于模型的机制去校验,而不能指望模型自己"不出错"(安全兜底)。这三句话其实也是今天架构图里"理解层—生成层—校验层"三段的由来。
+
+**2. Schema理解:不是把整个数据库结构一股脑塞给模型**
+
+这一点老王讲得很细。企业级数据库动辄几十上百张表,如果把所有表结构都塞进prompt,不仅token成本爆炸,还会让模型在大量无关信息里"迷路",反而降低生成SQL的准确率。业界通用的做法是做"Schema Linking"(模式链接),简单说就是:先根据用户问题里出现的关键词(比如"销售额""物业费""签约"),从全量schema里检索出最相关的几张表和字段,只把这一小部分喂给模型。
+
+这一步的实现方式有几种档次:
+
+最简单的是关键词匹配——维护一份"业务术语→表/字段"的映射字典,遇到问题里出现"销售额"就知道要看`sales_orders.amount`,这是今天要实现的版本,因为业务范围明确、术语可枚举,性价比最高。
+
+更进阶的是向量检索——把每张表、每个字段的名称和注释做embedding,存进向量库,用户问题也做embedding,检索出最相关的表结构片段拼进prompt,这适合表数量特别多、术语没法穷举维护的场景。
+
+最复杂的是让模型自己先做一轮"意图分类+实体抽取",判断这句话属于哪个业务域,再据此缩小schema检索范围,这种方式适合多业务域并存、且业务域之间schema有较大重叠的复杂系统。
+
+老王特别强调,祺瑞这个项目现阶段业务域清晰(销售、物业两大块),表数量可控,没必要一上来就上向量检索这种"重装备",先把关键词字典+人工维护的语义层做扎实,这是"够用就好"的工程判断,不是技术保守。
+
+**3. 业务语义层:客户说的话和数据库字段之间永远有一层"翻译"**
+
+这是陈铭觉得今天收获最大的一个概念。业务人员嘴里说的"签约金额""去化率""欠费""空置率"这些词,数据库里从来不会原样存在,数据库里存的永远是拆解后的、更原子化的字段,比如`contract_amount`、`unit_status`、`payment_status`。这中间的翻译工作,如果放在Agent的每一次调用里让大模型"临时理解",既不稳定也不可控,更好的做法是把这层翻译显式地沉淀成一个独立的"业务语义层"——本质上是一份结构化的字典,记录每一个业务术语对应到哪张表、哪个字段、计算逻辑是什么(比如"去化率"可能不是单个字段,而是一个需要"已售面积/总面积"计算出来的衍生指标)。
+
+老王打了个比喻,说这就跟企业里配翻译一样,如果每次开会都让一个刚学中文三个月的外国同事现场翻译,效果肯定飘忽不定;但如果提前给他一份"公司常用术语对照表",翻译质量立刻就稳定下来了。业务语义层就是Agent的"术语对照表",而且这份表是可以持续迭代、越用越准的资产,不依赖某一次大模型调用的"运气"。
+
+**4. Prompt设计:few-shot范例比"讲道理"更管用**
+
+老王分享了一个经验:在Text-to-SQL场景里,单纯在prompt里写"请生成正确的SQL,注意各种规范"这种指令性文字,效果远不如给几个高质量的"问题-SQL"配对范例(few-shot examples)。原因是SQL生成本质上更像是一种"模式匹配+组合"的任务,模型看到跟当前问题结构相似的历史范例,更容易照着套路把新问题里的实体替换进去,生成的SQL往往又准又干净。
+
+所以今天设计的Prompt结构大致是:系统提示(说明你是数据分析助手,只能生成SELECT查询,不能生成任何数据变更语句)+ 精简后的相关表结构(带中文注释)+ 业务语义层里相关的术语说明 + 三到五个跟当前问题业务域接近的few-shot范例 + 用户的实际问题。范例的选取也不是固定不变的,而是根据问题匹配到的业务域(销售或物业)动态挑选对应领域的范例,这样能进一步提高生成的针对性。
+
+**5. 生成之后必须有"自我修正"的回路,而不是一次成型**
+
+这一点呼应了架构图里那条虚线反馈回路。即便Prompt设计得再好,大模型生成的SQL仍然有一定概率出现语法错误、字段名拼写错误,或者逻辑上"能跑但结果不对"的情况。工程上的应对方式不是追求"一次生成就100%正确"(这在当前技术水平下不现实),而是设计一个有限次数的重试循环:如果SQL解析失败或执行报错,把具体的错误信息(而不是笼统地说"再试一次")重新组织进Prompt里,让模型"看到自己的错误"去修正。老王强调"错误信息要具体",比如数据库返回"no such column: sale_amt",这句话本身就是极有价值的反馈,直接告诉模型它拼错了字段名,模型下一次生成时大概率会去schema里找到真实存在的`amount`字段。
+
+**6. 安全永远是独立于模型的"外部约束",不能依赖模型自律**
+
+这是老王反复敲打的一点,今天课堂笔记里陈铭专门用红笔标注了。无论prompt里写多少遍"禁止生成删除或修改数据的语句",这都只是"建议",大模型仍然存在被误导(比如用户在问题里刻意构造诱导性文字)或者自身出错生成危险SQL的可能性。真正靠得住的安全机制,一定是在代码层面对生成结果做独立于模型的、确定性的校验——也就是SQL安全校验模块要做的事:关键字黑名单、语句数量检测、表字段白名单、注入特征检测、行数限制注入,这些规则不依赖模型"听话",而是靠代码逻辑硬性拦截。这也是为什么今天代码实战部分把安全校验模块作为重点,而不是把大部分时间都花在"怎么让生成的SQL更聪明"上面。
+
+**7. 结果解释:数字不是答案,人话才是答案**
+
+老王说了一句话陈铭觉得特别有画面感:"业务人员问你'上个月销售额多少',你甩给他一张表,他心里是发慌的,他要的是一句话——'上个月销售额是2340万,环比上升12%,主要贡献来自华东区'。"这意味着Text-to-SQL Agent的输出不能止步于"执行SQL拿到结果集",还需要一次额外的LLM调用,把结构化的查询结果转述成自然语言解释,包括适当的同比环比、异常值提示等,这一步是"让Agent真正像个懂业务的助理,而不是一个数据库查询接口的封装"的关键。
+
+### 下午:浏览器自动化Agent与代码助手Agent概念
+
+下午的课没有写代码,老王专门强调"今天先把地图画对,别急着挖第一铲土",于是这部分课堂笔记更偏概念梳理和技术选型讨论。
+
+**1. 浏览器自动化Agent:当系统没有API的时候,人怎么操作,Agent就怎么操作**
+
+老王先从一个业务场景引入:祺瑞集团有一部分物业管理子系统和OA审批系统年代比较久,压根没有对外开放的API接口,唯一的交互方式就是人工登录网页操作。这种场景下,传统的做法是走"接口对接"或者"数据库直连",但这两条路对老旧系统往往都走不通——接口没有,数据库结构不清楚甚至禁止外部直连。这时候唯一可行的路径,就是让Agent"像人一样"打开浏览器、登录、点击、填表、读取页面内容,这就是浏览器自动化Agent存在的根本原因。
+
+技术实现层面,老王梳理了几个关键组成:
+
+浏览器驱动层——常见选择是Playwright或Selenium,Playwright在现代前端框架(React/Vue等动态渲染页面)的兼容性和调试体验上普遍优于Selenium,而且原生支持多种浏览器内核,今天讨论后倾向于选Playwright作为技术选型方向。
+
+页面感知层——Agent怎么"看懂"页面上有什么。目前主流有两条路:一条是解析DOM结构和accessibility tree(无障碍树),把页面结构转成结构化的元素列表(每个元素有角色、文本、可交互属性等),交给大模型判断该点哪里;另一条是纯视觉方案,把页面截图交给多模态大模型,让它直接"看图"判断点击坐标。工程实践里往往是两者结合——优先用DOM/accessibility tree定位(更精确、更稳定),截图作为补充校验或者兜底手段(应对一些DOM结构异常复杂或者Canvas渲染的页面)。
+
+动作执行层——定义一个有限的动作空间,比如`click(selector)`、`type(selector, text)`、`scroll(direction)`、`navigate(url)`、`extract(selector)`,大模型的输出被约束为只能从这个动作集合里选择,不能天马行空地"发明"动作,这样才能保证系统的可控性和可测试性。
+
+任务规划循环——本质上是"思考-行动-观察"(ReAct范式)的循环:Agent先根据当前页面状态和目标思考下一步该做什么,执行一个动作,观察执行后的新页面状态,再进入下一轮思考,直到判断任务完成或者遇到无法处理的异常。
+
+老王特别提醒了几个浏览器自动化Agent在企业场景里容易被忽视的风险点:
+
+第一,**页面结构会变**,业务系统改版、弹窗广告、验证码这些都可能让Agent"迷路",必须设计异常识别和人工介入机制,不能假设页面永远长一个样子。
+
+第二,**登录态和权限管理**,浏览器自动化Agent操作的账号权限应该被严格限制在完成任务所需的最小范围内,绝不能用管理员账号"图方便"。
+
+第三,**高风险操作前置人工确认**,凡是涉及"提交""审批通过""发送"这类产生实际业务影响、难以撤销的操作,Agent执行前必须停下来等人工确认,这是今天PRD里反复强调的红线,也是今天示意图里"公共能力域"里专门画出"人工确认关卡"节点的原因。
+
+第四,**不要滥用在有明确API的场景**,浏览器自动化本质上是"没有更好办法时的兜底方案",不是因为它炫酷就到处用,凡是有API或者数据库直连权限的场景,优先级永远是API/数据库方式优先,浏览器自动化留给真正没有其他选择的老系统。
+
+**2. 代码助手Agent:操作对象是代码仓库,不是网页**
+
+老王讲代码助手Agent的时候,先跟浏览器自动化Agent做了一次对比,加深大家对"能力边界"的理解。代码助手Agent的典型使用场景是:内部技术团队需要写一个数据清洗脚本、审查一段业务代码里的潜在bug、根据Text-to-SQL Agent查出来的结果生成一段画图代码。它的核心能力构成包括:
+
+代码上下文理解——不只是看用户当前打开的这一个文件,而是要理解整个代码仓库的结构、模块之间的依赖关系、项目已有的编码规范。这通常通过对代码仓库建立"符号索引"(函数、类、变量的定义与引用关系)加上"向量检索"(基于语义相似度找到相关代码片段)两种手段结合实现。
+
+基于diff的精确编辑——代码助手Agent修改代码时,理想的输出形式不是"把整个文件重写一遍返回给你",而是生成精确的diff(增量修改),这样人工review的成本更低,也更符合真实开发协作里"看变更"的习惯。
+
+工具链调用——生成代码之后,Agent应该有能力主动调用编译器、测试框架、Lint工具去验证自己生成的代码是否正确,而不是"写完就交货",这是"自我验证闭环"的体现,跟今天Text-to-SQL Agent里"SQL执行报错后重新生成"的思路是一脉相承的工程哲学。
+
+错误定位能力——当测试跑不过或者代码报错时,Agent需要能读懂错误堆栈,定位到具体是哪个文件、哪一行、大概是什么原因导致的,然后针对性修改,而不是盲目地整体重写。
+
+老王强调代码助手Agent必须在**隔离沙箱环境**里执行生成的代码,理由跟浏览器自动化Agent的权限限制是同一个逻辑——绝不能让一个还在验证阶段的、可能有bug的自动生成代码直接接触生产环境的数据库、文件系统或者外部服务,沙箱环境应该是资源受限、网络隔离(或者只能访问受控的模拟环境)、执行完即销毁的临时环境。
+
+**3. 两者的边界:今天示意图想说明的事**
+
+下午课程的最后,老王把上午和下午的内容串起来,讲了一段陈铭觉得特别值得记下来的话:"你们会发现,今天讲的三个东西——Text-to-SQL、浏览器自动化、代码助手,表面上看是三个不相关的技术方向,但背后的骨架是一样的:都是'理解目标状态→规划动作→执行动作→观察反馈→必要时修正→在关键节点做安全兜底',这个骨架我们在Day39讲ReAct范式的时候已经打过基础了。真正决定这三个Agent长得不一样的,只是它们的'手'伸向了不同的地方——一个伸向数据库,一个伸向网页,一个伸向代码仓库。你们以后遇到任何一个新的业务场景,想清楚这个Agent的'手'该伸向哪里、伸出去之后的动作空间该怎么约束、什么时候必须停下来问人,这个Agent的架构基本就想清楚了大半。"
+
+陈铭把这段话原封不动地记在了笔记本的最后一页,他后来在很长一段时间里,做新场景设计的第一步都是先问自己这句话里的三个问题。
+
+---
+
+## 代码实战:祺瑞集团销售/物业数据 Text-to-SQL 分析Agent
+
+下午三点,陈铭开始动手写代码。他给自己定的目标很明确:不追求覆盖所有边界情况,但核心链路必须完整可跑通——从数据库初始化、schema理解、自然语言转SQL、安全校验,到执行查询和自然语言结果解释,每一个模块都要独立、可测试,并且要用祺瑞集团销售数据和物业数据的模拟场景贯穿始终。
+
+整个工程的目录结构大致是这样的:
+
+```
+qiyun_text2sql_agent/
+├── config.py
+├── db/
+│   └── schema.sql
+├── db_init.py
+├── schema_inspector.py
+├── prompts.py
+├── mock_llm_client.py
+├── sql_generator.py
+├── sql_validator.py
+├── query_executor.py
+├── result_explainer.py
+├── agent.py
+├── cli.py
+└── tests/
+    ├── test_sql_validator.py
+    └── test_agent.py
+```
+
+### 1. 数据库schema与模拟数据:`db/schema.sql`
+
+第一步是把祺瑞集团销售数据和物业数据的表结构模拟出来。陈铭没有照搬教科书式的简单表,而是尽量还原真实企业场景该有的复杂度——有主表有明细表,有需要多表join才能回答的问题,也故意留了一些"看起来像但其实不是"的相似字段名,用来后续测试语义层是否真的起作用。
+
+```sql
+-- db/schema.sql
+-- 祺瑞集团 销售 + 物业 模拟数据库 schema
+-- 说明:该脚本用于本地演示环境,真实生产环境应使用只读账号连接
+
+PRAGMA foreign_keys = ON;
+
+-- ========================= 销售业务域 =========================
+
+-- 销售区域表
+CREATE TABLE sales_regions (
+    region_id       INTEGER PRIMARY KEY,
+    region_name     TEXT NOT NULL,          -- 区域名称,如 华东区/华南区/华北区
+    region_manager  TEXT                    -- 区域负责人姓名
+);
+
+-- 楼盘/项目表
+CREATE TABLE sales_projects (
+    project_id      INTEGER PRIMARY KEY,
+    project_name    TEXT NOT NULL,          -- 项目名称,如 祺瑞·望江花园
+    region_id       INTEGER NOT NULL,
+    project_type    TEXT NOT NULL,          -- 住宅/商业/别墅
+    total_units     INTEGER NOT NULL,       -- 总房源数
+    FOREIGN KEY (region_id) REFERENCES sales_regions(region_id)
+);
+
+-- 销售顾问表
+CREATE TABLE sales_reps (
+    rep_id          INTEGER PRIMARY KEY,
+    rep_name        TEXT NOT NULL,
+    region_id       INTEGER NOT NULL,
+    hire_date       TEXT,                   -- 入职日期,格式 YYYY-MM-DD
+    FOREIGN KEY (region_id) REFERENCES sales_regions(region_id)
+);
+
+-- 客户表
+CREATE TABLE sales_customers (
+    customer_id     INTEGER PRIMARY KEY,
+    customer_name   TEXT NOT NULL,
+    phone_masked    TEXT,                   -- 手机号已脱敏,如 138****1234
+    customer_type   TEXT                    -- 个人/企业
+);
+
+-- 签约合同表(核心事实表)
+CREATE TABLE sales_contracts (
+    contract_id       INTEGER PRIMARY KEY,
+    project_id        INTEGER NOT NULL,
+    customer_id       INTEGER NOT NULL,
+    rep_id            INTEGER NOT NULL,
+    unit_no           TEXT NOT NULL,         -- 房号
+    contract_amount   REAL NOT NULL,         -- 签约金额(万元)
+    sign_date         TEXT NOT NULL,         -- 签约日期 YYYY-MM-DD
+    contract_status   TEXT NOT NULL,         -- 已签约/已解约/已回款
+    FOREIGN KEY (project_id) REFERENCES sales_projects(project_id),
+    FOREIGN KEY (customer_id) REFERENCES sales_customers(customer_id),
+    FOREIGN KEY (rep_id) REFERENCES sales_reps(rep_id)
+);
+
+-- ========================= 物业业务域 =========================
+
+-- 小区/楼盘物业表(注意:与sales_projects语义不同,不能混用)
+CREATE TABLE property_communities (
+    community_id     INTEGER PRIMARY KEY,
+    community_name   TEXT NOT NULL,          -- 小区名称
+    city             TEXT NOT NULL,
+    total_area_sqm   REAL NOT NULL           -- 总建筑面积(平方米)
+);
+
+-- 房屋单元表
+CREATE TABLE property_units (
+    unit_id          INTEGER PRIMARY KEY,
+    community_id     INTEGER NOT NULL,
+    unit_no          TEXT NOT NULL,
+    area_sqm         REAL NOT NULL,
+    unit_status       TEXT NOT NULL,         -- 自住/出租/空置
+    FOREIGN KEY (community_id) REFERENCES property_communities(community_id)
+);
+
+-- 业主表
+CREATE TABLE property_owners (
+    owner_id         INTEGER PRIMARY KEY,
+    unit_id          INTEGER NOT NULL,
+    owner_name       TEXT NOT NULL,
+    contact_masked   TEXT,
+    FOREIGN KEY (unit_id) REFERENCES property_units(unit_id)
+);
+
+-- 物业费账单表(核心事实表)
+CREATE TABLE property_fee_bills (
+    bill_id           INTEGER PRIMARY KEY,
+    unit_id           INTEGER NOT NULL,
+    bill_period       TEXT NOT NULL,          -- 账期,如 2026-06
+    amount_due        REAL NOT NULL,          -- 应收金额(元)
+    amount_paid       REAL NOT NULL DEFAULT 0,-- 实收金额(元)
+    payment_status    TEXT NOT NULL,          -- 已缴/欠缴/部分缴纳
+    FOREIGN KEY (unit_id) REFERENCES property_units(unit_id)
+);
+
+-- 维修工单表
+CREATE TABLE property_maintenance_requests (
+    request_id        INTEGER PRIMARY KEY,
+    unit_id           INTEGER NOT NULL,
+    request_date      TEXT NOT NULL,
+    category          TEXT NOT NULL,          -- 水电/电梯/门窗/公共设施
+    status             TEXT NOT NULL,         -- 待处理/处理中/已完成
+    satisfaction_score INTEGER,               -- 完成后的满意度评分 1-5
+    FOREIGN KEY (unit_id) REFERENCES property_units(unit_id)
+);
+
+-- ========================= 模拟数据 =========================
+
+INSERT INTO sales_regions VALUES
+    (1, '华东区', '赵建国'),
+    (2, '华南区', '孙丽萍'),
+    (3, '华北区', '周文昊');
+
+INSERT INTO sales_projects VALUES
+    (1, '祺瑞·望江花园', 1, '住宅', 800),
+    (2, '祺瑞·中央广场', 1, '商业', 120),
+    (3, '祺瑞·南港湾', 2, '住宅', 650),
+    (4, '祺瑞·云上里', 3, '住宅', 500),
+    (5, '祺瑞·星悦荟', 2, '商业', 90);
+
+INSERT INTO sales_reps VALUES
+    (1, '陈瑶', 1, '2022-03-01'),
+    (2, '刘鑫', 1, '2023-06-15'),
+    (3, '黄敏', 2, '2021-11-20'),
+    (4, '吴昊', 3, '2024-01-10'),
+    (5, '郑晓', 2, '2022-09-05');
+
+INSERT INTO sales_customers VALUES
+    (1, '张伟', '138****1001', '个人'),
+    (2, '李芳', '139****1002', '个人'),
+    (3, '祺瑞投资合伙企业', '无', '企业'),
+    (4, '王强', '137****1004', '个人'),
+    (5, '赵敏', '136****1005', '个人'),
+    (6, '远景贸易有限公司', '无', '企业');
+
+-- 签约数据覆盖多个月份、多个区域,便于测试各类聚合查询
+INSERT INTO sales_contracts VALUES
+    (1, 1, 1, 1, 'A-1201', 320.5, '2026-05-12', '已签约'),
+    (2, 1, 2, 2, 'A-0805', 298.0, '2026-05-20', '已回款'),
+    (3, 3, 4, 3, 'B-1502', 410.0, '2026-06-02', '已签约'),
+    (4, 4, 5, 4, 'C-0301', 275.8, '2026-06-10', '已签约'),
+    (5, 2, 3, 1, 'S-01', 1520.0, '2026-06-18', '已回款'),
+    (6, 1, 4, 2, 'A-1608', 335.6, '2026-06-25', '已签约'),
+    (7, 5, 6, 5, 'M-12', 980.0, '2026-06-28', '已签约'),
+    (8, 3, 5, 3, 'B-0906', 388.2, '2026-07-01', '已签约'),
+    (9, 4, 1, 4, 'C-1102', 260.0, '2026-07-05', '已解约'),
+    (10, 1, 6, 1, 'A-2001', 355.0, '2026-07-08', '已签约');
+
+INSERT INTO property_communities VALUES
+    (1, '祺瑞·望江花园', '杭州', 96000.0),
+    (2, '祺瑞·南港湾', '广州', 78000.0),
+    (3, '祺瑞·云上里', '天津', 65000.0);
+
+INSERT INTO property_units VALUES
+    (1, 1, '1-1201', 120.5, '自住'),
+    (2, 1, '1-0805', 98.0, '出租'),
+    (3, 1, '2-1608', 135.0, '自住'),
+    (4, 2, '1-1502', 110.0, '空置'),
+    (5, 2, '3-0906', 105.5, '自住'),
+    (6, 3, '1-0301', 89.0, '出租');
+
+INSERT INTO property_owners VALUES
+    (1, 1, '张伟', '138****1001'),
+    (2, 2, '李芳', '139****1002'),
+    (3, 3, '王强', '137****1004'),
+    (4, 4, '赵敏', '136****1005'),
+    (5, 5, '孙杨', '135****1006'),
+    (6, 6, '吴昊', '134****1007');
+
+INSERT INTO property_fee_bills VALUES
+    (1, 1, '2026-05', 850.0, 850.0, '已缴'),
+    (2, 1, '2026-06', 850.0, 0.0, '欠缴'),
+    (3, 2, '2026-06', 700.0, 700.0, '已缴'),
+    (4, 3, '2026-06', 920.0, 460.0, '部分缴纳'),
+    (5, 4, '2026-06', 780.0, 0.0, '欠缴'),
+    (6, 5, '2026-06', 750.0, 750.0, '已缴'),
+    (7, 6, '2026-06', 630.0, 630.0, '已缴'),
+    (8, 1, '2026-07', 850.0, 0.0, '欠缴');
+
+INSERT INTO property_maintenance_requests VALUES
+    (1, 1, '2026-06-03', '水电', '已完成', 5),
+    (2, 3, '2026-06-10', '电梯', '已完成', 3),
+    (3, 4, '2026-06-15', '公共设施', '待处理', NULL),
+    (4, 2, '2026-06-20', '门窗', '处理中', NULL),
+    (5, 6, '2026-06-25', '水电', '已完成', 4);
+```
+
+这份schema和数据看起来是"演示用的",但陈铭特意在里面埋了两个陷阱:一个是`sales_projects`和`property_communities`看起来都在管"楼盘/小区",但语义完全不同——前者是销售视角的"项目",后者是物业视角的"小区",即便名字("望江花园")能对上,底层这是两套独立的业务实体,如果Agent把这两张表搞混,查出来的数字会"看起来对但业务上是错的";另一个陷阱是`sales_contracts.unit_no`和`property_units.unit_no`字段名完全一样,但分别属于两个不相关的表,他要用这两个陷阱去验证业务语义层设计得是否真的顶用。
+
+### 2. 全局配置:`config.py`
+
+```python
+# config.py
+"""全局配置模块。
+
+集中管理数据库连接、LLM调用参数、SQL安全策略等配置项,
+避免"魔法数字"和硬编码散落在各个业务模块里。
+"""
+
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+@dataclass(frozen=True)
+class DBConfig:
+    """数据库连接配置。
+
+    生产环境中,db_path 应替换为真实数据库的只读连接串,
+    并且连接账号必须是只读权限账号,作为纵深防御的最后一道防线。
+    """
+    db_path: str = str(BASE_DIR / "db" / "qiyun_demo.sqlite3")
+    schema_sql_path: str = str(BASE_DIR / "db" / "schema.sql")
+    query_timeout_seconds: int = 5
+    read_only: bool = True
+
+
+@dataclass(frozen=True)
+class SQLSafetyConfig:
+    """SQL安全校验相关配置。"""
+
+    # 危险操作黑名单关键字(大小写不敏感匹配)
+    forbidden_keywords: tuple = (
+        "DROP", "DELETE", "UPDATE", "INSERT", "ALTER",
+        "TRUNCATE", "GRANT", "REVOKE", "CREATE", "REPLACE",
+        "ATTACH", "DETACH", "PRAGMA", "VACUUM", "EXEC", "EXECUTE",
+    )
+
+    # 允许出现在SQL中的语句起始关键字(只允许只读查询)
+    allowed_statement_prefixes: tuple = ("SELECT", "WITH")
+
+    # 默认注入的行数限制,防止一次查询返回过多数据
+    default_row_limit: int = 200
+
+    # 允许的最大行数上限,即使SQL里显式写了更大的LIMIT也会被收敛
+    max_row_limit: int = 1000
+
+    # 单次生成-校验-重试循环的最大重试次数
+    max_generation_retries: int = 3
+
+    # 是否允许多语句(以分号分隔的多条SQL),企业场景一律禁止
+    allow_multiple_statements: bool = False
+
+    # 注入特征正则(注释符、编码混淆等常见绕过手法)
+    suspicious_patterns: tuple = (
+        r"--", r"#", r"/\*", r"\*/", r"0x[0-9a-fA-F]+",
+        r";\s*\S", r"\bxp_\w+", r"\bsp_\w+",
+    )
+
+
+@dataclass(frozen=True)
+class LLMConfig:
+    """LLM调用相关配置。
+
+    真实项目中应从环境变量读取API Key,这里只做结构占位。
+    """
+    provider: str = "mock"          # mock / openai / azure_openai 等
+    model_name: str = "gpt-4-class-model"
+    temperature_for_sql: float = 0.0    # SQL生成场景应使用低温度,保证稳定性
+    temperature_for_explain: float = 0.3
+    max_tokens: int = 800
+    request_timeout_seconds: int = 15
+
+
+@dataclass(frozen=True)
+class AgentConfig:
+    """Agent整体行为配置。"""
+
+    db: DBConfig = field(default_factory=DBConfig)
+    sql_safety: SQLSafetyConfig = field(default_factory=SQLSafetyConfig)
+    llm: LLMConfig = field(default_factory=LLMConfig)
+
+    # 检查点(任务中断恢复)持久化目录
+    checkpoint_dir: str = str(BASE_DIR / ".checkpoints")
+
+    # 是否在响应中附带调试信息(生成的SQL、耗时等),生产环境可关闭
+    debug_mode: bool = True
+
+
+DEFAULT_CONFIG = AgentConfig()
+```
+
+### 3. 数据库初始化脚本:`db_init.py`
+
+```python
+# db_init.py
+"""数据库初始化脚本。
+
+用于本地演示环境,从 schema.sql 创建 SQLite 数据库并载入模拟数据。
+真实生产环境中,这一步应替换为连接到祺瑞集团真实数据库的只读账号,
+不需要也不应该执行任何DDL/DML初始化操作。
+"""
+
+import sqlite3
+import sys
+from pathlib import Path
+
+from config import DEFAULT_CONFIG
+
+
+def init_database(force: bool = False) -> None:
+    db_path = Path(DEFAULT_CONFIG.db.db_path)
+    schema_path = Path(DEFAULT_CONFIG.db.schema_sql_path)
+
+    if db_path.exists():
+        if not force:
+            print(f"数据库已存在: {db_path}, 跳过初始化。使用 --force 可重建。")
+            return
+        db_path.unlink()
+        print(f"已删除旧数据库文件: {db_path}")
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not schema_path.exists():
+        raise FileNotFoundError(f"未找到schema定义文件: {schema_path}")
+
+    schema_sql = schema_path.read_text(encoding="utf-8")
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executescript(schema_sql)
+        conn.commit()
+        print(f"数据库初始化完成: {db_path}")
+
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        )
+        tables = [row[0] for row in cursor.fetchall()]
+        print(f"共创建 {len(tables)} 张表: {', '.join(tables)}")
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    force_rebuild = "--force" in sys.argv
+    init_database(force=force_rebuild)
+```
+
+### 4. Schema理解与业务语义层:`schema_inspector.py`
+
+这是陈铭觉得整个项目里最能体现"工程判断"的一个模块。他没有直接把数据库自带的字段注释扔给模型,而是单独维护了一份人工编写的业务语义层字典,理由是数据库层面的字段注释往往是给技术人员看的(比如"外键关联xxx表"),但业务人员说的话需要另一套翻译。
+
+```python
+# schema_inspector.py
+"""数据库结构理解与业务语义层。
+
+本模块负责两件事:
+1. 从数据库中反射出真实的表结构(表名、字段名、字段类型),
+   作为"客观事实"来源,防止Prompt里出现过时或错误的字段描述。
+2. 维护一份人工编写的业务语义层字典,记录业务术语与表字段之间的映射关系,
+   这份字典是Text-to-SQL准确率的关键资产,需要随业务迭代持续维护。
+"""
+
+import sqlite3
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+from config import DEFAULT_CONFIG
+
+
+@dataclass
+class ColumnInfo:
+    name: str
+    data_type: str
+    comment: str = ""
+
+
+@dataclass
+class TableInfo:
+    name: str
+    domain: str                     # 所属业务域: sales / property
+    description: str                # 表的业务含义说明
+    columns: List[ColumnInfo] = field(default_factory=list)
+
+    def to_prompt_text(self) -> str:
+        lines = [f"表名: {self.name}  说明: {self.description}"]
+        for col in self.columns:
+            comment = f"  -- {col.comment}" if col.comment else ""
+            lines.append(f"  - {col.name} ({col.data_type}){comment}")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 表的业务描述与字段注释,人工维护,不依赖数据库自带comment
+# 这里刻意区分了 sales_projects(销售项目) 和 property_communities(物业小区),
+# 即便现实中名字可能相同,业务语义完全不同,必须显式说明避免模型混淆。
+# ---------------------------------------------------------------------------
+TABLE_METADATA: Dict[str, TableInfo] = {
+    "sales_regions": TableInfo(
+        name="sales_regions", domain="sales",
+        description="销售区域划分表,记录集团销售业务的区域及负责人",
+        columns=[
+            ColumnInfo("region_id", "INTEGER", "区域主键ID"),
+            ColumnInfo("region_name", "TEXT", "区域名称,如 华东区/华南区/华北区"),
+            ColumnInfo("region_manager", "TEXT", "该区域负责人姓名"),
+        ],
+    ),
+    "sales_projects": TableInfo(
+        name="sales_projects", domain="sales",
+        description="销售视角的楼盘/项目表,与物业视角的小区表(property_communities)"
+                     "是不同的业务实体,不能互相替代查询",
+        columns=[
+            ColumnInfo("project_id", "INTEGER", "项目主键ID"),
+            ColumnInfo("project_name", "TEXT", "项目/楼盘名称"),
+            ColumnInfo("region_id", "INTEGER", "所属销售区域,关联sales_regions"),
+            ColumnInfo("project_type", "TEXT", "项目类型: 住宅/商业/别墅"),
+            ColumnInfo("total_units", "INTEGER", "项目总房源数"),
+        ],
+    ),
+    "sales_reps": TableInfo(
+        name="sales_reps", domain="sales",
+        description="销售顾问(置业顾问)信息表",
+        columns=[
+            ColumnInfo("rep_id", "INTEGER", "销售顾问主键ID"),
+            ColumnInfo("rep_name", "TEXT", "销售顾问姓名"),
+            ColumnInfo("region_id", "INTEGER", "所属销售区域"),
+            ColumnInfo("hire_date", "TEXT", "入职日期 YYYY-MM-DD"),
+        ],
+    ),
+    "sales_customers": TableInfo(
+        name="sales_customers", domain="sales",
+        description="购房客户信息表(个人或企业客户)",
+        columns=[
+            ColumnInfo("customer_id", "INTEGER", "客户主键ID"),
+            ColumnInfo("customer_name", "TEXT", "客户姓名或企业名称"),
+            ColumnInfo("phone_masked", "TEXT", "已脱敏的联系方式"),
+            ColumnInfo("customer_type", "TEXT", "客户类型: 个人/企业"),
+        ],
+    ),
+    "sales_contracts": TableInfo(
+        name="sales_contracts", domain="sales",
+        description="签约合同表,是销售业务域的核心事实表,"
+                     "'签约金额''成交金额''销售额'等业务术语均指向本表的 "
+                     "contract_amount 字段",
+        columns=[
+            ColumnInfo("contract_id", "INTEGER", "合同主键ID"),
+            ColumnInfo("project_id", "INTEGER", "关联的销售项目"),
+            ColumnInfo("customer_id", "INTEGER", "关联的客户"),
+            ColumnInfo("rep_id", "INTEGER", "关联的销售顾问"),
+            ColumnInfo("unit_no", "TEXT", "房号,注意与property_units.unit_no"
+                                          "是完全不同业务域的房号编码"),
+            ColumnInfo("contract_amount", "REAL", "签约金额,单位:万元"),
+            ColumnInfo("sign_date", "TEXT", "签约日期 YYYY-MM-DD"),
+            ColumnInfo("contract_status", "TEXT",
+                       "合同状态: 已签约/已解约/已回款"),
+        ],
+    ),
+    "property_communities": TableInfo(
+        name="property_communities", domain="property",
+        description="物业视角的小区信息表,与销售视角的项目表(sales_projects)"
+                     "是不同的业务实体",
+        columns=[
+            ColumnInfo("community_id", "INTEGER", "小区主键ID"),
+            ColumnInfo("community_name", "TEXT", "小区名称"),
+            ColumnInfo("city", "TEXT", "所在城市"),
+            ColumnInfo("total_area_sqm", "REAL", "小区总建筑面积,单位:平方米"),
+        ],
+    ),
+    "property_units": TableInfo(
+        name="property_units", domain="property",
+        description="房屋单元表,记录小区内每个房屋单元的基本信息",
+        columns=[
+            ColumnInfo("unit_id", "INTEGER", "单元主键ID"),
+            ColumnInfo("community_id", "INTEGER", "所属小区"),
+            ColumnInfo("unit_no", "TEXT", "房号"),
+            ColumnInfo("area_sqm", "REAL", "房屋面积,单位:平方米"),
+            ColumnInfo("unit_status", "TEXT",
+                       "房屋使用状态: 自住/出租/空置。'空置率'指标基于此字段计算"),
+        ],
+    ),
+    "property_owners": TableInfo(
+        name="property_owners", domain="property",
+        description="业主信息表",
+        columns=[
+            ColumnInfo("owner_id", "INTEGER", "业主主键ID"),
+            ColumnInfo("unit_id", "INTEGER", "关联的房屋单元"),
+            ColumnInfo("owner_name", "TEXT", "业主姓名"),
+            ColumnInfo("contact_masked", "TEXT", "已脱敏联系方式"),
+        ],
+    ),
+    "property_fee_bills": TableInfo(
+        name="property_fee_bills", domain="property",
+        description="物业费账单表,是物业业务域的核心事实表,'物业费''欠缴'"
+                     "'缴费率'等业务术语均指向本表",
+        columns=[
+            ColumnInfo("bill_id", "INTEGER", "账单主键ID"),
+            ColumnInfo("unit_id", "INTEGER", "关联的房屋单元"),
+            ColumnInfo("bill_period", "TEXT", "账期,格式 YYYY-MM"),
+            ColumnInfo("amount_due", "REAL", "应收金额,单位:元"),
+            ColumnInfo("amount_paid", "REAL", "实收金额,单位:元"),
+            ColumnInfo("payment_status", "TEXT",
+                       "缴费状态: 已缴/欠缴/部分缴纳"),
+        ],
+    ),
+    "property_maintenance_requests": TableInfo(
+        name="property_maintenance_requests", domain="property",
+        description="维修工单表,记录业主报修的处理情况",
+        columns=[
+            ColumnInfo("request_id", "INTEGER", "工单主键ID"),
+            ColumnInfo("unit_id", "INTEGER", "关联的房屋单元"),
+            ColumnInfo("request_date", "TEXT", "报修日期"),
+            ColumnInfo("category", "TEXT", "报修类别: 水电/电梯/门窗/公共设施"),
+            ColumnInfo("status", "TEXT", "处理状态: 待处理/处理中/已完成"),
+            ColumnInfo("satisfaction_score", "INTEGER",
+                       "完成后业主满意度评分,1-5分,未完成时为空"),
+        ],
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
+# 业务语义层:业务术语 -> (相关表, 说明)
+# 这是Text-to-SQL准确率的核心资产,后续应支持从配置文件/知识库动态加载,
+# 而不是硬编码在代码里,这里为演示简化处理。
+# ---------------------------------------------------------------------------
+BUSINESS_GLOSSARY: Dict[str, Dict] = {
+    "销售额": {
+        "domain": "sales",
+        "tables": ["sales_contracts"],
+        "explanation": "指 sales_contracts.contract_amount 的汇总,"
+                        "通常需要按合同状态过滤(如排除已解约)",
+    },
+    "签约金额": {
+        "domain": "sales",
+        "tables": ["sales_contracts"],
+        "explanation": "等同于销售额,指 contract_amount 字段",
+    },
+    "成交量": {
+        "domain": "sales",
+        "tables": ["sales_contracts"],
+        "explanation": "指签约合同的数量(行数),非金额",
+    },
+    "物业费": {
+        "domain": "property",
+        "tables": ["property_fee_bills"],
+        "explanation": "指 property_fee_bills 表,应收看amount_due,"
+                        "实收看amount_paid",
+    },
+    "欠缴": {
+        "domain": "property",
+        "tables": ["property_fee_bills"],
+        "explanation": "指 payment_status = '欠缴' 或 '部分缴纳' 的账单",
+    },
+    "空置率": {
+        "domain": "property",
+        "tables": ["property_units"],
+        "explanation": "指 unit_status = '空置' 的房屋数量占该小区总房屋数量的比例",
+    },
+    "维修工单": {
+        "domain": "property",
+        "tables": ["property_maintenance_requests"],
+        "explanation": "指 property_maintenance_requests 表",
+    },
+    "满意度": {
+        "domain": "property",
+        "tables": ["property_maintenance_requests"],
+        "explanation": "指 satisfaction_score 字段,仅在工单已完成时有值",
+    },
+}
+
+
+class SchemaInspector:
+    """负责根据用户问题动态检索出相关的表结构与业务语义说明。"""
+
+    def __init__(self, db_path: Optional[str] = None):
+        self.db_path = db_path or DEFAULT_CONFIG.db.db_path
+
+    def reflect_actual_schema(self) -> Dict[str, List[str]]:
+        """从真实数据库中反射出表名与字段名,作为客观事实核对来源。
+
+        这一步的意义在于:即便人工维护的 TABLE_METADATA 描述过时了
+        (比如有人加了新字段没同步更新文档),这里拿到的始终是数据库的真实现状,
+        后续可以用来做一致性检查,防止Prompt里出现"幻觉字段"。
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            result: Dict[str, List[str]] = {}
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+            for (table_name,) in cursor.fetchall():
+                col_cursor = conn.execute(f"PRAGMA table_info({table_name})")
+                result[table_name] = [row[1] for row in col_cursor.fetchall()]
+            return result
+        finally:
+            conn.close()
+
+    def match_relevant_tables(self, question: str) -> List[str]:
+        """根据问题中出现的业务术语,匹配出相关的表名列表。
+
+        采用关键词匹配而非向量检索,原因见课堂笔记:
+        祺瑞项目当前业务域清晰、术语可枚举,关键词字典性价比最高。
+        """
+        matched_tables: set = set()
+        matched_terms: List[str] = []
+
+        for term, info in BUSINESS_GLOSSARY.items():
+            if term in question:
+                matched_terms.append(term)
+                matched_tables.update(info["tables"])
+
+        # 兜底策略:如果没有匹配到任何术语,退化为返回全部表,
+        # 保证Agent至少还有机会尝试生成SQL,而不是直接失败。
+        if not matched_tables:
+            matched_tables = set(TABLE_METADATA.keys())
+
+        # 补充关联表:如果匹配到了事实表,通常还需要它关联的维度表
+        # 才能生成带有名称(而非仅ID)的可读结果,这里做一次简单的关联补全。
+        related_map = {
+            "sales_contracts": ["sales_projects", "sales_regions",
+                                 "sales_customers", "sales_reps"],
+            "property_fee_bills": ["property_units", "property_communities"],
+            "property_maintenance_requests": ["property_units",
+                                               "property_communities"],
+            "property_units": ["property_communities"],
+        }
+        for table in list(matched_tables):
+            for related in related_map.get(table, []):
+                matched_tables.add(related)
+
+        return sorted(matched_tables)
+
+    def match_relevant_glossary(self, question: str) -> Dict[str, Dict]:
+        """返回问题中命中的业务术语说明,用于拼入Prompt。"""
+        return {
+            term: info
+            for term, info in BUSINESS_GLOSSARY.items()
+            if term in question
+        }
+
+    def build_schema_prompt_section(self, question: str) -> str:
+        """构建拼入Prompt的schema描述文本(仅包含相关表)。"""
+        relevant_tables = self.match_relevant_tables(question)
+        sections = []
+        for table_name in relevant_tables:
+            table_info = TABLE_METADATA.get(table_name)
+            if table_info:
+                sections.append(table_info.to_prompt_text())
+        return "\n\n".join(sections)
+
+    def build_glossary_prompt_section(self, question: str) -> str:
+        """构建拼入Prompt的业务术语说明文本。"""
+        glossary_hits = self.match_relevant_glossary(question)
+        if not glossary_hits:
+            return "(未匹配到特定业务术语,请依据上方表结构自行判断)"
+        lines = []
+        for term, info in glossary_hits.items():
+            lines.append(f"- 「{term}」: {info['explanation']}")
+        return "\n".join(lines)
+
+    def get_all_table_names(self) -> List[str]:
+        """返回白名单允许查询的全部表名,供SQL安全校验模块使用。"""
+        return list(TABLE_METADATA.keys())
+
+    def get_all_column_names(self) -> Dict[str, List[str]]:
+        """返回每张表允许查询的全部字段名,供SQL安全校验模块使用。"""
+        return {
+            name: [col.name for col in info.columns]
+            for name, info in TABLE_METADATA.items()
+        }
+```
+
+陈铭写完这个模块之后,专门跑了一次`reflect_actual_schema`和`TABLE_METADATA`的字段做了一次人工比对,确认两边完全一致,这是他给自己定的一条底线——文档描述的schema和真实数据库的schema必须对得上,否则宁可先花时间对齐,也不能让Agent带着"过时的地图"去干活。
+
+### 5. Prompt模板:`prompts.py`
+
+```python
+# prompts.py
+"""Prompt模板管理模块。
+
+将Prompt文本集中管理,方便迭代优化而不影响业务逻辑代码,
+同时便于后续做A/B测试和版本对比。
+"""
+
+SQL_GENERATION_SYSTEM_PROMPT = """\
+你是祺瑞集团内部使用的数据分析助手"苍穹问数Agent"。
+你的唯一任务是:根据用户的自然语言问题,结合下方提供的数据库表结构和业务术语说明,
+生成一条准确的、只读的 SQLite SELECT 查询语句。
+
+必须遵守的规则:
+1. 只能生成 SELECT 查询语句,严禁生成任何形式的数据变更语句
+   (包括但不限于 INSERT、UPDATE、DELETE、DROP、ALTER、CREATE、TRUNCATE)。
+2. 只能使用下方提供的表和字段,不允许编造不存在的表名或字段名。
+3. 只能生成单条SQL语句,不允许使用分号拼接多条语句。
+4. 涉及金额、面积等数值计算时,请使用SQL的聚合函数(SUM/AVG/COUNT等),
+   不要在应用层做二次计算。
+5. 涉及时间范围的问题,请根据字段的日期格式(YYYY-MM-DD 或 YYYY-MM)做合理的
+   范围过滤,如果问题中的时间表达模糊,请采用最近一个完整自然月/季度作为默认范围,
+   并在SQL注释中说明你的默认假设(使用 -- 注释会被后续流程处理,不影响执行安全)。
+6. 输出格式:仅输出SQL语句本身,不要包含任何解释性文字、不要使用markdown代码块包裹。
+"""
+
+SQL_GENERATION_USER_TEMPLATE = """\
+【数据库表结构】
+{schema_section}
+
+【业务术语说明】
+{glossary_section}
+
+【历史范例】
+{few_shot_section}
+
+【用户问题】
+{question}
+
+请直接输出SQL语句:
+"""
+
+SQL_RETRY_FEEDBACK_TEMPLATE = """\
+你上一次生成的SQL语句存在问题,具体反馈如下:
+
+上一次生成的SQL:
+{previous_sql}
+
+错误详情:
+{error_detail}
+
+请仔细分析上述错误原因,结合数据库表结构重新生成一条正确的SQL语句。
+再次强调:只能使用真实存在的表名和字段名,只能生成单条SELECT语句。
+"""
+
+# 按业务域分类维护的few-shot范例,生成时根据问题匹配到的domain动态选取,
+# 这样能显著提升生成SQL与当前问题结构的相似度。
+FEW_SHOT_EXAMPLES = {
+    "sales": [
+        {
+            "question": "上个月华东区的签约金额一共是多少?",
+            "sql": (
+                "SELECT SUM(c.contract_amount) AS total_amount "
+                "FROM sales_contracts c "
+                "JOIN sales_projects p ON c.project_id = p.project_id "
+                "JOIN sales_regions r ON p.region_id = r.region_id "
+                "WHERE r.region_name = '华东区' "
+                "AND strftime('%Y-%m', c.sign_date) = strftime('%Y-%m', "
+                "date('now', 'start of month', '-1 month')) "
+                "AND c.contract_status != '已解约';"
+            ),
+        },
+        {
+            "question": "这个月成交量最高的销售顾问是谁?",
+            "sql": (
+                "SELECT rp.rep_name, COUNT(*) AS deal_count "
+                "FROM sales_contracts c "
+                "JOIN sales_reps rp ON c.rep_id = rp.rep_id "
+                "WHERE strftime('%Y-%m', c.sign_date) = strftime('%Y-%m', "
+                "date('now')) "
+                "AND c.contract_status != '已解约' "
+                "GROUP BY rp.rep_id "
+                "ORDER BY deal_count DESC "
+                "LIMIT 1;"
+            ),
+        },
+        {
+            "question": "祺瑞·南港湾这个项目一共签了多少个客户?",
+            "sql": (
+                "SELECT COUNT(DISTINCT c.customer_id) AS customer_count "
+                "FROM sales_contracts c "
+                "JOIN sales_projects p ON c.project_id = p.project_id "
+                "WHERE p.project_name = '祺瑞·南港湾' "
+                "AND c.contract_status != '已解约';"
+            ),
+        },
+    ],
+    "property": [
+        {
+            "question": "祺瑞·望江花园本月的物业费欠缴率是多少?",
+            "sql": (
+                "SELECT "
+                "  CAST(SUM(CASE WHEN b.payment_status IN ('欠缴', '部分缴纳') "
+                "  THEN 1 ELSE 0 END) AS REAL) * 100.0 / COUNT(*) "
+                "  AS overdue_rate_percent "
+                "FROM property_fee_bills b "
+                "JOIN property_units u ON b.unit_id = u.unit_id "
+                "JOIN property_communities pc ON u.community_id = pc.community_id "
+                "WHERE pc.community_name = '祺瑞·望江花园' "
+                "AND b.bill_period = strftime('%Y-%m', date('now'));"
+            ),
+        },
+        {
+            "question": "祺瑞·南港湾小区的空置率是多少?",
+            "sql": (
+                "SELECT "
+                "  CAST(SUM(CASE WHEN u.unit_status = '空置' THEN 1 ELSE 0 END) "
+                "  AS REAL) * 100.0 / COUNT(*) AS vacancy_rate_percent "
+                "FROM property_units u "
+                "JOIN property_communities pc ON u.community_id = pc.community_id "
+                "WHERE pc.community_name = '祺瑞·南港湾';"
+            ),
+        },
+        {
+            "question": "本月有多少个未处理完成的维修工单?",
+            "sql": (
+                "SELECT COUNT(*) AS pending_count "
+                "FROM property_maintenance_requests "
+                "WHERE status != '已完成' "
+                "AND strftime('%Y-%m', request_date) = strftime('%Y-%m', "
+                "date('now'));"
+            ),
+        },
+    ],
+}
+
+RESULT_EXPLANATION_SYSTEM_PROMPT = """\
+你是祺瑞集团内部使用的数据分析助手"苍穹问数Agent"。
+用户提出了一个业务问题,系统已经执行了对应的SQL查询并得到了结果。
+你的任务是:用简洁、自然、符合业务场景的中文,向用户解释这个查询结果,
+而不是简单地复述数字。如果结果中包含明显的异常值或值得关注的信息,
+可以适当提及,但不要过度解读或编造数据中不存在的信息。
+如果结果为空,请说明可能的原因,并给出调整查询条件的建议。
+回复控制在150字以内,不要使用markdown表格,直接用自然语言陈述。
+"""
+
+RESULT_EXPLANATION_USER_TEMPLATE = """\
+用户问题:{question}
+
+执行的SQL:
+{sql}
+
+查询结果(JSON格式,已做适当截断):
+{result_json}
+
+请给出自然语言解释:
+"""
+
+
+def build_few_shot_section(domain: str) -> str:
+    """根据业务域拼接few-shot范例文本。"""
+    examples = FEW_SHOT_EXAMPLES.get(domain, [])
+    if not examples:
+        all_examples = []
+        for domain_examples in FEW_SHOT_EXAMPLES.values():
+            all_examples.extend(domain_examples)
+        examples = all_examples[:2]
+
+    lines = []
+    for idx, example in enumerate(examples, start=1):
+        lines.append(f"示例{idx}:")
+        lines.append(f"问题: {example['question']}")
+        lines.append(f"SQL: {example['sql']}")
+        lines.append("")
+    return "\n".join(lines)
+```
+
+### 6. SQL生成器:`sql_generator.py`
+
+```python
+# sql_generator.py
+"""自然语言转SQL生成模块。
+
+负责拼装Prompt、调用LLM、解析出干净的SQL语句文本。
+本模块不做安全校验,安全校验是独立的下游模块 sql_validator,
+这是有意为之的职责分离:生成负责"尽量生成对的",校验负责"绝不放行错的"。
+"""
+
+import logging
+import re
+from dataclasses import dataclass
+from typing import List, Optional
+
+from config import DEFAULT_CONFIG
+from prompts import (
+    SQL_GENERATION_SYSTEM_PROMPT,
+    SQL_GENERATION_USER_TEMPLATE,
+    SQL_RETRY_FEEDBACK_TEMPLATE,
+    build_few_shot_section,
+)
+from schema_inspector import SchemaInspector, BUSINESS_GLOSSARY
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SQLGenerationResult:
+    sql: str
+    raw_llm_output: str
+    domain_guess: str
+    attempt: int
+
+
+class SQLGenerationError(Exception):
+    """当LLM始终无法生成可解析的SQL语句时抛出。"""
+
+
+def _guess_domain(question: str) -> str:
+    """根据命中的业务术语粗略判断问题所属的业务域,用于选择few-shot范例。"""
+    sales_hits = 0
+    property_hits = 0
+    for term, info in BUSINESS_GLOSSARY.items():
+        if term in question:
+            if info["domain"] == "sales":
+                sales_hits += 1
+            elif info["domain"] == "property":
+                property_hits += 1
+    if sales_hits > property_hits:
+        return "sales"
+    if property_hits > sales_hits:
+        return "property"
+    return "mixed"
+
+
+def _extract_sql_from_llm_output(raw_output: str) -> str:
+    """从LLM原始输出中提取出干净的SQL文本。
+
+    即便Prompt里明确要求"不要用markdown代码块",实际调用中LLM仍有一定概率
+    习惯性地包裹```sql ... ```,这里做兼容处理,不依赖模型100%听话。
+    """
+    text = raw_output.strip()
+
+    code_block_pattern = re.compile(
+        r"```(?:sql)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL
+    )
+    match = code_block_pattern.search(text)
+    if match:
+        text = match.group(1).strip()
+
+    # 去掉可能出现的解释性前缀,比如"好的,以下是SQL语句:"
+    lines = text.splitlines()
+    sql_start_idx = 0
+    for idx, line in enumerate(lines):
+        stripped = line.strip().upper()
+        if stripped.startswith("SELECT") or stripped.startswith("WITH"):
+            sql_start_idx = idx
+            break
+    text = "\n".join(lines[sql_start_idx:]).strip()
+
+    return text
+
+
+class NL2SQLGenerator:
+    """自然语言转SQL生成器。"""
+
+    def __init__(self, llm_client, schema_inspector: Optional[SchemaInspector] = None):
+        self.llm_client = llm_client
+        self.schema_inspector = schema_inspector or SchemaInspector()
+        self.config = DEFAULT_CONFIG
+
+    def generate(
+        self,
+        question: str,
+        previous_attempts: Optional[List[dict]] = None,
+    ) -> SQLGenerationResult:
+        """生成一条候选SQL语句。
+
+        previous_attempts: 之前失败尝试的记录列表,每项包含 sql 和 error_detail,
+        用于构建"带错误反馈的重试Prompt"。
+        """
+        domain_guess = _guess_domain(question)
+        schema_section = self.schema_inspector.build_schema_prompt_section(question)
+        glossary_section = self.schema_inspector.build_glossary_prompt_section(question)
+        few_shot_section = build_few_shot_section(domain_guess)
+
+        user_prompt = SQL_GENERATION_USER_TEMPLATE.format(
+            schema_section=schema_section,
+            glossary_section=glossary_section,
+            few_shot_section=few_shot_section,
+            question=question,
+        )
+
+        messages = [
+            {"role": "system", "content": SQL_GENERATION_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        if previous_attempts:
+            last_attempt = previous_attempts[-1]
+            feedback = SQL_RETRY_FEEDBACK_TEMPLATE.format(
+                previous_sql=last_attempt["sql"],
+                error_detail=last_attempt["error_detail"],
+            )
+            messages.append({"role": "user", "content": feedback})
+
+        raw_output = self.llm_client.chat(
+            messages=messages,
+            temperature=self.config.llm.temperature_for_sql,
+            max_tokens=self.config.llm.max_tokens,
+        )
+
+        sql = _extract_sql_from_llm_output(raw_output)
+
+        if not sql:
+            raise SQLGenerationError(
+                f"LLM未能生成任何可识别的SQL语句,原始输出: {raw_output[:200]}"
+            )
+
+        attempt_no = 1 + len(previous_attempts or [])
+        logger.info(
+            "SQL生成完成 attempt=%s domain=%s question=%s",
+            attempt_no, domain_guess, question,
+        )
+
+        return SQLGenerationResult(
+            sql=sql,
+            raw_llm_output=raw_output,
+            domain_guess=domain_guess,
+            attempt=attempt_no,
+        )
+```
+
+### 7. SQL安全校验:`sql_validator.py`
+
+这是今天陈铭花心思最多的一个模块,老王反复强调的"安全不能靠模型自律",全部落在这个模块的每一行代码里。
+
+```python
+# sql_validator.py
+"""SQL安全校验模块。
+
+这是Text-to-SQL Agent里最重要的安全防线,独立于大模型的判断,
+使用确定性的规则对生成的SQL做多层校验,任何一层不通过都直接拒绝执行。
+
+校验顺序(与流程图保持一致):
+1. 语法可解析性校验
+2. 单语句校验(检测多语句堆叠,防止注入)
+3. 危险关键字黑名单校验
+4. 表/字段白名单校验
+5. 注入特征(注释符/编码混淆等)检测
+6. LIMIT行数保护注入与收敛
+"""
+
+import logging
+import re
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+import sqlparse
+from sqlparse.sql import IdentifierList, Identifier, Function
+from sqlparse.tokens import Keyword, DML, Wildcard
+
+from config import DEFAULT_CONFIG
+from schema_inspector import SchemaInspector
+
+logger = logging.getLogger(__name__)
+
+
+class SQLSecurityViolation(Exception):
+    """当SQL校验发现安全问题时抛出,附带具体的违规原因,便于审计日志记录。"""
+
+    def __init__(self, reason: str, category: str):
+        super().__init__(reason)
+        self.reason = reason
+        self.category = category  # 用于分类统计: syntax/injection/permission/keyword
+
+
+@dataclass
+class ValidationResult:
+    is_valid: bool
+    sanitized_sql: str = ""
+    violations: List[str] = field(default_factory=list)
+    applied_limit: Optional[int] = None
+
+
+class SQLValidator:
+    """对候选SQL执行完整的安全校验链路。"""
+
+    def __init__(self, schema_inspector: Optional[SchemaInspector] = None):
+        self.schema_inspector = schema_inspector or SchemaInspector()
+        self.safety_config = DEFAULT_CONFIG.sql_safety
+        self._allowed_tables = set(self.schema_inspector.get_all_table_names())
+        self._allowed_columns = self.schema_inspector.get_all_column_names()
+
+    # ------------------------------------------------------------------
+    # 主入口
+    # ------------------------------------------------------------------
+    def validate(self, raw_sql: str) -> ValidationResult:
+        violations: List[str] = []
+
+        try:
+            parsed_statements = self._parse_and_check_single_statement(raw_sql)
+        except SQLSecurityViolation as exc:
+            return ValidationResult(is_valid=False, violations=[exc.reason])
+
+        statement = parsed_statements[0]
+
+        try:
+            self._check_statement_type(statement)
+        except SQLSecurityViolation as exc:
+            return ValidationResult(is_valid=False, violations=[exc.reason])
+
+        try:
+            self._check_forbidden_keywords(raw_sql)
+        except SQLSecurityViolation as exc:
+            return ValidationResult(is_valid=False, violations=[exc.reason])
+
+        try:
+            self._check_suspicious_patterns(raw_sql)
+        except SQLSecurityViolation as exc:
+            return ValidationResult(is_valid=False, violations=[exc.reason])
+
+        try:
+            referenced_tables = self._extract_referenced_tables(statement)
+            self._check_table_whitelist(referenced_tables)
+        except SQLSecurityViolation as exc:
+            return ValidationResult(is_valid=False, violations=[exc.reason])
+
+        sanitized_sql, applied_limit = self._enforce_row_limit(raw_sql)
+
+        return ValidationResult(
+            is_valid=True,
+            sanitized_sql=sanitized_sql,
+            violations=violations,
+            applied_limit=applied_limit,
+        )
+
+    # ------------------------------------------------------------------
+    # 校验步骤 1: 语法解析 + 单语句校验(防止多语句堆叠注入)
+    # ------------------------------------------------------------------
+    def _parse_and_check_single_statement(self, raw_sql: str):
+        cleaned = raw_sql.strip()
+        if not cleaned:
+            raise SQLSecurityViolation("SQL内容为空", category="syntax")
+
+        try:
+            parsed_statements = sqlparse.parse(cleaned)
+        except Exception as exc:  # noqa: BLE001 - 需要捕获所有解析异常
+            raise SQLSecurityViolation(
+                f"SQL语法无法解析: {exc}", category="syntax"
+            ) from exc
+
+        # sqlparse在遇到分号分隔的多语句时会返回多个Statement对象,
+        # 这正是我们检测"堆叠查询注入"的关键信号。
+        non_empty_statements = [
+            stmt for stmt in parsed_statements
+            if stmt.token_first(skip_cm=True) is not None
+        ]
+
+        if len(non_empty_statements) == 0:
+            raise SQLSecurityViolation("未解析出有效SQL语句", category="syntax")
+
+        if len(non_empty_statements) > 1 and not self.safety_config.allow_multiple_statements:
+            raise SQLSecurityViolation(
+                f"检测到多条SQL语句(共{len(non_empty_statements)}条),"
+                "疑似SQL注入尝试,已拦截", category="injection"
+            )
+
+        # 额外防御:即便sqlparse只解析出一条语句,也要检查原始文本里是否存在
+        # "有效分号"(不在字符串常量内的分号),防止一些边界情况被绕过。
+        if self._contains_effective_semicolon_in_middle(cleaned):
+            raise SQLSecurityViolation(
+                "检测到语句中间存在分号,疑似SQL注入尝试,已拦截",
+                category="injection",
+            )
+
+        return non_empty_statements
+
+    @staticmethod
+    def _contains_effective_semicolon_in_middle(sql_text: str) -> bool:
+        """检查去除末尾分号后,字符串中是否还存在其他分号(粗粒度防御)。
+
+        这里做简化处理:不追踪字符串常量内的分号(真实场景中金额、名称等
+        字段极少包含分号),优先保证安全边界,允许一定的误杀。
+        """
+        stripped = sql_text.strip()
+        if stripped.endswith(";"):
+            stripped = stripped[:-1]
+        return ";" in stripped
+
+    # ------------------------------------------------------------------
+    # 校验步骤 2: 语句类型校验(只允许SELECT/WITH)
+    # ------------------------------------------------------------------
+    def _check_statement_type(self, statement) -> None:
+        first_token = statement.token_first(skip_cm=True)
+        if first_token is None:
+            raise SQLSecurityViolation("无法识别语句类型", category="syntax")
+
+        token_value = first_token.value.strip().upper()
+        allowed_prefixes = self.safety_config.allowed_statement_prefixes
+
+        if token_value not in allowed_prefixes:
+            raise SQLSecurityViolation(
+                f"仅允许 {'/'.join(allowed_prefixes)} 查询语句,"
+                f"检测到语句以 '{token_value}' 开头,已拦截",
+                category="permission",
+            )
+
+    # ------------------------------------------------------------------
+    # 校验步骤 3: 危险关键字黑名单
+    # ------------------------------------------------------------------
+    def _check_forbidden_keywords(self, raw_sql: str) -> None:
+        upper_sql = raw_sql.upper()
+        for keyword in self.safety_config.forbidden_keywords:
+            # 使用单词边界匹配,避免"UPDATED_AT"这类字段名被误判为UPDATE关键字
+            pattern = r"\b" + re.escape(keyword) + r"\b"
+            if re.search(pattern, upper_sql):
+                raise SQLSecurityViolation(
+                    f"检测到危险关键字「{keyword}」,该操作不允许通过"
+                    "自然语言查询执行,已拦截", category="keyword"
+                )
+
+    # ------------------------------------------------------------------
+    # 校验步骤 4: 注入特征检测(注释符/编码混淆等)
+    # ------------------------------------------------------------------
+    def _check_suspicious_patterns(self, raw_sql: str) -> None:
+        for pattern in self.safety_config.suspicious_patterns:
+            if re.search(pattern, raw_sql, flags=re.IGNORECASE):
+                raise SQLSecurityViolation(
+                    f"检测到疑似SQL注入特征(匹配规则: {pattern}),已拦截",
+                    category="injection",
+                )
+
+    # ------------------------------------------------------------------
+    # 校验步骤 5: 表/字段白名单校验
+    # ------------------------------------------------------------------
+    def _extract_referenced_tables(self, statement) -> List[str]:
+        """从解析后的语句中提取涉及的表名。
+
+        使用sqlparse的token遍历,识别 FROM / JOIN 之后紧跟的标识符。
+        这里做的是"够用"级别的解析,不追求处理所有极端复杂的SQL语法,
+        企业内部BI查询场景的SQL复杂度是可控的。
+        """
+        tables: List[str] = []
+        tokens = list(statement.flatten())
+        expect_table_next = False
+
+        for token in tokens:
+            if token.ttype is Keyword and token.value.upper() in (
+                "FROM", "JOIN", "INNER JOIN", "LEFT JOIN", "RIGHT JOIN",
+            ):
+                expect_table_next = True
+                continue
+
+            if expect_table_next:
+                if token.is_whitespace:
+                    continue
+                if token.ttype is None or str(token.ttype).startswith("Token.Name"):
+                    table_name = token.value.strip().strip('"').strip("`")
+                    if table_name and table_name.upper() not in ("AS",):
+                        tables.append(table_name)
+                expect_table_next = False
+
+        return tables
+
+    def _check_table_whitelist(self, referenced_tables: List[str]) -> None:
+        for table in referenced_tables:
+            if table not in self._allowed_tables:
+                raise SQLSecurityViolation(
+                    f"查询涉及未授权或不存在的数据表「{table}」,已拦截",
+                    category="permission",
+                )
+
+    # ------------------------------------------------------------------
+    # 校验步骤 6: LIMIT行数保护
+    # ------------------------------------------------------------------
+    def _enforce_row_limit(self, raw_sql: str) -> (str, int):
+        upper_sql = raw_sql.upper()
+        limit_pattern = re.compile(r"LIMIT\s+(\d+)", re.IGNORECASE)
+        match = limit_pattern.search(raw_sql)
+
+        cleaned_sql = raw_sql.rstrip().rstrip(";")
+
+        if match:
+            existing_limit = int(match.group(1))
+            if existing_limit > self.safety_config.max_row_limit:
+                # 收敛到安全上限,而不是直接拒绝,提升可用性
+                new_sql = limit_pattern.sub(
+                    f"LIMIT {self.safety_config.max_row_limit}", cleaned_sql
+                )
+                return new_sql + ";", self.safety_config.max_row_limit
+            return cleaned_sql + ";", existing_limit
+
+        # 未显式指定LIMIT,自动注入默认保护行数
+        # 注意:如果是聚合查询(如 SELECT COUNT(*)),注入LIMIT不影响语义,
+        # SQLite对此完全兼容,不会报错。
+        default_limit = self.safety_config.default_row_limit
+        new_sql = f"{cleaned_sql} LIMIT {default_limit};"
+        return new_sql, default_limit
+```
+
+写完这个模块之后,陈铭特意去翻了一下`sqlparse`的文档,确认它是纯Python实现的SQL解析库,不依赖具体数据库驱动,适合做这种"语法层面"的校验,但他也在代码注释里提醒自己:这个解析逻辑是"够用"级别,不是要重新造一个完整的SQL Parser,遇到极端复杂的嵌套子查询、CTE递归等场景,还是要靠表白名单这道兜底防线来保底,不能对`_extract_referenced_tables`这一步的解析结果有过度自信。
+
+### 8. 查询执行器:`query_executor.py`
+
+```python
+# query_executor.py
+"""SQL查询执行模块。
+
+负责在只读连接上安全地执行已通过校验的SQL,并将结果转换为
+结构化的、便于后续处理和序列化的数据结构。
+"""
+
+import logging
+import signal
+import sqlite3
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+from config import DEFAULT_CONFIG
+
+logger = logging.getLogger(__name__)
+
+
+class QueryExecutionError(Exception):
+    """执行阶段发生的错误,携带原始数据库异常信息,用于反馈给生成器重试。"""
+
+
+class QueryTimeoutError(QueryExecutionError):
+    """查询执行超时。"""
+
+
+@dataclass
+class QueryResult:
+    columns: List[str]
+    rows: List[Dict[str, Any]]
+    row_count: int
+    elapsed_ms: float
+    truncated: bool = False
+
+
+@contextmanager
+def _timeout_guard(seconds: int):
+    """基于signal的超时保护,仅适用于类Unix系统的主线程场景。
+
+    生产环境中更推荐使用数据库驱动自带的查询超时参数
+    (如很多数据库的 statement_timeout),这里为演示简化实现,
+    并在超时后抛出统一的 QueryTimeoutError。
+    """
+
+    def _handle_timeout(signum, frame):
+        raise QueryTimeoutError(f"查询执行超过 {seconds} 秒,已中止")
+
+    has_alarm = hasattr(signal, "SIGALRM")
+    if has_alarm:
+        old_handler = signal.signal(signal.SIGALRM, _handle_timeout)
+        signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        if has_alarm:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+
+
+class QueryExecutor:
+    """只读查询执行器。"""
+
+    def __init__(self, db_path: Optional[str] = None):
+        self.db_path = db_path or DEFAULT_CONFIG.db.db_path
+        self.timeout_seconds = DEFAULT_CONFIG.db.query_timeout_seconds
+
+    def _get_readonly_connection(self) -> sqlite3.Connection:
+        """建立只读连接。
+
+        SQLite支持通过URI参数 mode=ro 建立真正的只读连接,
+        即便上游的SQL校验存在遗漏,这一层连接级别的只读限制
+        也能作为最后一道防线阻止任何数据变更操作生效。
+        """
+        uri = f"file:{self.db_path}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=self.timeout_seconds)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def execute(self, sql: str, max_rows: Optional[int] = None) -> QueryResult:
+        start_time = time.monotonic()
+        conn = self._get_readonly_connection()
+        try:
+            with _timeout_guard(self.timeout_seconds):
+                cursor = conn.execute(sql)
+                columns = (
+                    [description[0] for description in cursor.description]
+                    if cursor.description else []
+                )
+
+                fetched_rows = cursor.fetchall()
+                truncated = False
+                if max_rows is not None and len(fetched_rows) > max_rows:
+                    fetched_rows = fetched_rows[:max_rows]
+                    truncated = True
+
+                rows = [dict(row) for row in fetched_rows]
+
+            elapsed_ms = (time.monotonic() - start_time) * 1000
+            logger.info(
+                "SQL执行成功 rows=%s elapsed_ms=%.1f", len(rows), elapsed_ms
+            )
+            return QueryResult(
+                columns=columns,
+                rows=rows,
+                row_count=len(rows),
+                elapsed_ms=elapsed_ms,
+                truncated=truncated,
+            )
+        except QueryTimeoutError:
+            raise
+        except sqlite3.Error as exc:
+            elapsed_ms = (time.monotonic() - start_time) * 1000
+            logger.warning(
+                "SQL执行失败 error=%s elapsed_ms=%.1f sql=%s",
+                exc, elapsed_ms, sql,
+            )
+            raise QueryExecutionError(str(exc)) from exc
+        finally:
+            conn.close()
+```
+
+### 9. 结果解释器:`result_explainer.py`
+
+```python
+# result_explainer.py
+"""查询结果的自然语言解释模块。
+
+将结构化的查询结果转化为符合业务场景的自然语言解释,
+这一步是让Agent"像一个懂业务的助理"而不是"数据库查询接口"的关键。
+"""
+
+import json
+import logging
+from dataclasses import dataclass
+from typing import Any, Dict, List
+
+from config import DEFAULT_CONFIG
+from prompts import (
+    RESULT_EXPLANATION_SYSTEM_PROMPT,
+    RESULT_EXPLANATION_USER_TEMPLATE,
+)
+from query_executor import QueryResult
+
+logger = logging.getLogger(__name__)
+
+MAX_ROWS_FOR_EXPLANATION_PROMPT = 20
+
+
+@dataclass
+class ExplanationResult:
+    text: str
+    chart_suggested: bool
+    chart_type: str = ""
+
+
+def _should_suggest_chart(query_result: QueryResult) -> (bool, str):
+    """根据结果集的形态判断是否建议生成图表,以及建议什么类型的图表。
+
+    这里的规则比较朴素:多行多列的数值型结果适合折线图/柱状图,
+    单行单值的结果(如"欠缴率是多少")不需要图表。
+    """
+    if query_result.row_count <= 1:
+        return False, ""
+
+    numeric_columns = 0
+    for column in query_result.columns:
+        sample_values = [
+            row.get(column) for row in query_result.rows[:5]
+            if row.get(column) is not None
+        ]
+        if sample_values and all(
+            isinstance(value, (int, float)) for value in sample_values
+        ):
+            numeric_columns += 1
+
+    if numeric_columns == 0:
+        return False, ""
+
+    if query_result.row_count <= 12:
+        return True, "bar"
+    return True, "line"
+
+
+def _prepare_result_for_prompt(query_result: QueryResult) -> str:
+    """将结果集裁剪并序列化为适合放入Prompt的JSON文本,避免token浪费。"""
+    rows_for_prompt: List[Dict[str, Any]] = query_result.rows[
+        :MAX_ROWS_FOR_EXPLANATION_PROMPT
+    ]
+    payload = {
+        "columns": query_result.columns,
+        "row_count": query_result.row_count,
+        "rows_sample": rows_for_prompt,
+        "truncated_for_display": query_result.row_count > len(rows_for_prompt),
+    }
+    return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+class ResultExplainer:
+    """负责调用LLM生成结果的自然语言解释。"""
+
+    def __init__(self, llm_client):
+        self.llm_client = llm_client
+        self.config = DEFAULT_CONFIG
+
+    def explain(
+        self, question: str, sql: str, query_result: QueryResult
+    ) -> ExplanationResult:
+        if query_result.row_count == 0:
+            return ExplanationResult(
+                text=(
+                    "没有查询到符合条件的数据。可能的原因包括:所选时间范围内"
+                    "确实没有相关记录、筛选条件(如项目名称、区域名称)与数据库中"
+                    "实际记录的名称不完全一致,建议尝试更换时间范围或确认名称的"
+                    "准确表述后再试一次。"
+                ),
+                chart_suggested=False,
+            )
+
+        result_json = _prepare_result_for_prompt(query_result)
+        user_prompt = RESULT_EXPLANATION_USER_TEMPLATE.format(
+            question=question, sql=sql, result_json=result_json
+        )
+
+        messages = [
+            {"role": "system", "content": RESULT_EXPLANATION_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        explanation_text = self.llm_client.chat(
+            messages=messages,
+            temperature=self.config.llm.temperature_for_explain,
+            max_tokens=300,
+        )
+
+        chart_suggested, chart_type = _should_suggest_chart(query_result)
+
+        logger.info(
+            "结果解释生成完成 rows=%s chart_suggested=%s",
+            query_result.row_count, chart_suggested,
+        )
+
+        return ExplanationResult(
+            text=explanation_text.strip(),
+            chart_suggested=chart_suggested,
+            chart_type=chart_type,
+        )
+```
+
+### 10. Mock LLM客户端:`mock_llm_client.py`
+
+课堂上不是每个人都有可用的模型API Key,陈铭额外写了一个基于规则的Mock客户端,一方面方便离线演示,另一方面在写单元测试时可以用它构造出确定性的、可重复的输出,避免测试结果因为大模型的不确定性而"时好时坏"。
+
+```python
+# mock_llm_client.py
+"""离线Mock LLM客户端。
+
+不依赖任何外部API,通过规则匹配返回预设的SQL或解释文本,
+用于离线演示、单元测试以及CI环境中不具备真实API Key的场景。
+真实生产环境应替换为对接实际大模型服务的客户端实现。
+"""
+
+import logging
+import re
+from typing import Callable, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+class MockLLMClient:
+    """基于规则匹配的确定性Mock客户端。
+
+    通过注册一系列 (匹配函数, 响应生成函数) 对,
+    在 chat() 被调用时依次尝试匹配用户问题,返回对应的预设响应。
+    """
+
+    def __init__(self):
+        self._sql_rules: List[Dict] = []
+        self._register_default_sql_rules()
+
+    def _register_default_sql_rules(self) -> None:
+        self.register_sql_rule(
+            pattern=r"上(个|一)月.*(签约|销售额).*(华东)",
+            sql_template=(
+                "SELECT SUM(c.contract_amount) AS total_amount "
+                "FROM sales_contracts c "
+                "JOIN sales_projects p ON c.project_id = p.project_id "
+                "JOIN sales_regions r ON p.region_id = r.region_id "
+                "WHERE r.region_name = '华东区' "
+                "AND c.contract_status != '已解约' "
+                "AND strftime('%Y-%m', c.sign_date) = '2026-06';"
+            ),
+        )
+        self.register_sql_rule(
+            pattern=r"(成交量|签约数量).*(最高|最多).*(销售顾问|置业顾问)",
+            sql_template=(
+                "SELECT rp.rep_name, COUNT(*) AS deal_count "
+                "FROM sales_contracts c "
+                "JOIN sales_reps rp ON c.rep_id = rp.rep_id "
+                "WHERE c.contract_status != '已解约' "
+                "GROUP BY rp.rep_id "
+                "ORDER BY deal_count DESC "
+                "LIMIT 1;"
+            ),
+        )
+        self.register_sql_rule(
+            pattern=r"望江花园.*(欠缴率|物业费)",
+            sql_template=(
+                "SELECT CAST(SUM(CASE WHEN b.payment_status IN "
+                "('欠缴', '部分缴纳') THEN 1 ELSE 0 END) AS REAL) * 100.0 "
+                "/ COUNT(*) AS overdue_rate_percent "
+                "FROM property_fee_bills b "
+                "JOIN property_units u ON b.unit_id = u.unit_id "
+                "JOIN property_communities pc "
+                "ON u.community_id = pc.community_id "
+                "WHERE pc.community_name = '祺瑞·望江花园' "
+                "AND b.bill_period = '2026-06';"
+            ),
+        )
+        self.register_sql_rule(
+            pattern=r"南港湾.*空置率",
+            sql_template=(
+                "SELECT CAST(SUM(CASE WHEN u.unit_status = '空置' "
+                "THEN 1 ELSE 0 END) AS REAL) * 100.0 / COUNT(*) "
+                "AS vacancy_rate_percent "
+                "FROM property_units u "
+                "JOIN property_communities pc "
+                "ON u.community_id = pc.community_id "
+                "WHERE pc.community_name = '祺瑞·南港湾';"
+            ),
+        )
+        # 故意注册一条"诱导性问题"规则,用于验证安全校验层能否正确拦截
+        self.register_sql_rule(
+            pattern=r"(删除|清空).*(签约|销售)数据",
+            sql_template="DELETE FROM sales_contracts WHERE 1=1;",
+        )
+        self.register_sql_rule(
+            pattern=r"(删除|清空).*(所有|全部)?表",
+            sql_template="DROP TABLE sales_contracts;",
+        )
+
+    def register_sql_rule(self, pattern: str, sql_template: str) -> None:
+        self._sql_rules.append({
+            "regex": re.compile(pattern),
+            "sql": sql_template,
+        })
+
+    def chat(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = 0.0,
+        max_tokens: int = 800,
+    ) -> str:
+        last_user_message = ""
+        for message in reversed(messages):
+            if message["role"] == "user":
+                last_user_message = message["content"]
+                break
+
+        # 判断当前是SQL生成场景还是结果解释场景,依据Prompt模板中的特征文本
+        if "请给出自然语言解释" in last_user_message:
+            return self._mock_explanation(last_user_message)
+
+        return self._mock_sql_generation(last_user_message)
+
+    def _mock_sql_generation(self, user_message: str) -> str:
+        for rule in self._sql_rules:
+            if rule["regex"].search(user_message):
+                logger.debug("MockLLM命中规则,返回预设SQL")
+                return rule["sql"]
+
+        logger.debug("MockLLM未命中任何规则,返回兜底SQL")
+        return "SELECT COUNT(*) AS total_records FROM sales_contracts;"
+
+    def _mock_explanation(self, user_message: str) -> str:
+        if '"row_count": 0' in user_message:
+            return "未查询到符合条件的数据,建议确认时间范围或名称拼写是否准确。"
+        return "根据查询结果,当前数据已成功获取,具体数值请参见结果表格。"
+```
+
+陈铭在写这个Mock客户端的时候故意加了两条"坏规则"——一条是"删除签约数据"对应`DELETE FROM sales_contracts WHERE 1=1;`,一条是"删除所有表"对应`DROP TABLE sales_contracts;`,他的想法很直接:安全校验模块不能只用"正常问题"去测,必须真的构造出危险SQL,验证校验链路是不是真的能把这些语句拦下来,这也是他晚点要写的单元测试的核心场景。
+
+### 11. Agent主体与任务检查点机制:`agent.py`
+
+这个模块是整条链路的编排入口,同时也是陈铭响应PRD里"任务中断恢复"要求的地方——虽然单次Text-to-SQL查询本身耗时很短,不太需要中断恢复,但他借着这个场景把检查点机制的通用设计原型先搭出来,为后面审批助理Agent等长流程任务复用做准备。
+
+```python
+# agent.py
+"""Text-to-SQL数据分析Agent 主体。
+
+负责编排完整的处理链路:
+问题预处理 -> Schema检索 -> SQL生成 -> 安全校验 -> (失败则重试) ->
+执行查询 -> 结果解释 -> 组装响应。
+
+同时实现一套轻量级的任务检查点(Checkpoint)机制,用于满足PRD中
+"任务中断后能够恢复执行,且不重复产生副作用"的要求。当前Text-to-SQL场景
+本身是短耗时的单轮任务,这里搭建的检查点机制主要作为通用能力原型,
+后续会被审批助理Agent等长流程任务复用。
+"""
+
+import json
+import logging
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from config import DEFAULT_CONFIG
+from query_executor import (
+    QueryExecutionError,
+    QueryExecutor,
+    QueryResult,
+    QueryTimeoutError,
+)
+from result_explainer import ExplanationResult, ResultExplainer
+from schema_inspector import SchemaInspector
+from sql_generator import NL2SQLGenerator, SQLGenerationError
+from sql_validator import SQLValidator, ValidationResult
+
+logger = logging.getLogger(__name__)
+
+
+class TaskInterruptedError(Exception):
+    """任务在执行过程中被显式中断时抛出,携带当前检查点ID供后续恢复使用。"""
+
+    def __init__(self, checkpoint_id: str, message: str = ""):
+        super().__init__(message or f"任务已中断,检查点: {checkpoint_id}")
+        self.checkpoint_id = checkpoint_id
+
+
+@dataclass
+class AgentResponse:
+    question: str
+    success: bool
+    sql: Optional[str] = None
+    explanation: Optional[str] = None
+    result_rows: List[Dict[str, Any]] = field(default_factory=list)
+    row_count: int = 0
+    chart_suggested: bool = False
+    chart_type: str = ""
+    error_message: Optional[str] = None
+    attempts: int = 0
+    elapsed_ms: float = 0.0
+    trace_id: str = ""
+
+
+class CheckpointStore:
+    """基于本地文件的检查点存储。
+
+    真实生产环境应替换为Redis或数据库存储,以支持多实例部署下的
+    检查点共享与并发安全,这里用文件系统实现,便于本地演示和理解原理。
+    """
+
+    def __init__(self, checkpoint_dir: Optional[str] = None):
+        self.checkpoint_dir = Path(checkpoint_dir or DEFAULT_CONFIG.checkpoint_dir)
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    def _path_for(self, task_id: str) -> Path:
+        return self.checkpoint_dir / f"{task_id}.json"
+
+    def save(self, task_id: str, state: Dict[str, Any]) -> None:
+        state_with_meta = dict(state)
+        state_with_meta["_saved_at"] = time.time()
+        self._path_for(task_id).write_text(
+            json.dumps(state_with_meta, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logger.debug("检查点已保存 task_id=%s step=%s",
+                     task_id, state.get("completed_step"))
+
+    def load(self, task_id: str) -> Optional[Dict[str, Any]]:
+        path = self._path_for(task_id)
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def clear(self, task_id: str) -> None:
+        path = self._path_for(task_id)
+        if path.exists():
+            path.unlink()
+
+
+# 定义任务的步骤顺序,检查点里记录的 completed_step 是这里面的值,
+# 恢复执行时会跳过已完成的步骤,从下一步继续。
+TASK_STEPS = [
+    "preprocess",
+    "generate_sql",
+    "validate_sql",
+    "execute_query",
+    "explain_result",
+]
+
+
+class TextToSQLAgent:
+    """Text-to-SQL数据分析Agent。"""
+
+    def __init__(
+        self,
+        llm_client,
+        schema_inspector: Optional[SchemaInspector] = None,
+        checkpoint_store: Optional[CheckpointStore] = None,
+    ):
+        self.schema_inspector = schema_inspector or SchemaInspector()
+        self.sql_generator = NL2SQLGenerator(llm_client, self.schema_inspector)
+        self.sql_validator = SQLValidator(self.schema_inspector)
+        self.query_executor = QueryExecutor()
+        self.result_explainer = ResultExplainer(llm_client)
+        self.checkpoint_store = checkpoint_store or CheckpointStore()
+        self.max_retries = DEFAULT_CONFIG.sql_safety.max_generation_retries
+
+    def ask(
+        self,
+        question: str,
+        task_id: Optional[str] = None,
+        resume: bool = False,
+    ) -> AgentResponse:
+        """处理一次自然语言查询请求。
+
+        task_id: 任务标识,用于检查点存取。若不传则自动生成新任务ID。
+        resume: 是否尝试从已有检查点恢复。若为True且找到检查点,
+                将跳过已完成的步骤,直接从中断处继续。
+        """
+        task_id = task_id or str(uuid.uuid4())
+        trace_id = task_id
+        start_time = time.monotonic()
+
+        state: Dict[str, Any] = {
+            "question": question,
+            "completed_step": None,
+            "previous_attempts": [],
+        }
+
+        if resume:
+            loaded_state = self.checkpoint_store.load(task_id)
+            if loaded_state:
+                state.update(loaded_state)
+                logger.info(
+                    "从检查点恢复任务 task_id=%s last_completed_step=%s",
+                    task_id, state.get("completed_step"),
+                )
+
+        try:
+            response = self._run_pipeline(state, task_id)
+            self.checkpoint_store.clear(task_id)
+        except TaskInterruptedError:
+            logger.warning("任务被中断,已保留检查点 task_id=%s", task_id)
+            raise
+        except Exception as exc:  # noqa: BLE001 - Agent顶层需要兜底捕获
+            logger.exception("Agent处理请求发生未预期异常")
+            response = AgentResponse(
+                question=question,
+                success=False,
+                error_message=f"处理过程中发生异常: {exc}",
+                trace_id=trace_id,
+            )
+
+        response.elapsed_ms = (time.monotonic() - start_time) * 1000
+        response.trace_id = trace_id
+        return response
+
+    # ------------------------------------------------------------------
+    # 内部流水线实现
+    # ------------------------------------------------------------------
+    def _run_pipeline(self, state: Dict[str, Any], task_id: str) -> AgentResponse:
+        question = state["question"]
+        completed_step = state.get("completed_step")
+
+        current_sql: Optional[str] = state.get("current_sql")
+        query_result: Optional[QueryResult] = None
+        explanation: Optional[ExplanationResult] = None
+        attempts = len(state.get("previous_attempts", []))
+
+        step_index = 0 if completed_step is None else TASK_STEPS.index(completed_step) + 1
+
+        while step_index < len(TASK_STEPS):
+            step_name = TASK_STEPS[step_index]
+
+            if step_name == "preprocess":
+                self._checkpoint(task_id, state, step_name)
+
+            elif step_name == "generate_sql":
+                current_sql, attempts = self._generate_with_retry(
+                    question, state.get("previous_attempts", [])
+                )
+                state["current_sql"] = current_sql
+                self._checkpoint(task_id, state, step_name)
+
+            elif step_name == "validate_sql":
+                validation = self.sql_validator.validate(current_sql)
+                if not validation.is_valid:
+                    logger.warning(
+                        "SQL校验未通过 violations=%s sql=%s",
+                        validation.violations, current_sql,
+                    )
+                    return AgentResponse(
+                        question=question,
+                        success=False,
+                        sql=current_sql,
+                        error_message="; ".join(validation.violations),
+                        attempts=attempts,
+                    )
+                current_sql = validation.sanitized_sql
+                state["current_sql"] = current_sql
+                self._checkpoint(task_id, state, step_name)
+
+            elif step_name == "execute_query":
+                try:
+                    query_result = self.query_executor.execute(current_sql)
+                except (QueryExecutionError, QueryTimeoutError) as exc:
+                    previous_attempts = state.get("previous_attempts", [])
+                    previous_attempts.append({
+                        "sql": current_sql, "error_detail": str(exc),
+                    })
+                    state["previous_attempts"] = previous_attempts
+
+                    if len(previous_attempts) >= self.max_retries:
+                        return AgentResponse(
+                            question=question,
+                            success=False,
+                            sql=current_sql,
+                            error_message=f"多次尝试后仍执行失败: {exc}",
+                            attempts=len(previous_attempts),
+                        )
+
+                    logger.info("执行失败,回退到重新生成SQL阶段重试")
+                    state["completed_step"] = None
+                    state["current_sql"] = None
+                    step_index = TASK_STEPS.index("generate_sql")
+                    continue
+
+                state["query_result_row_count"] = query_result.row_count
+                self._checkpoint(task_id, state, step_name)
+
+            elif step_name == "explain_result":
+                explanation = self.result_explainer.explain(
+                    question, current_sql, query_result
+                )
+                self._checkpoint(task_id, state, step_name)
+
+            step_index += 1
+
+        return AgentResponse(
+            question=question,
+            success=True,
+            sql=current_sql,
+            explanation=explanation.text if explanation else None,
+            result_rows=query_result.rows if query_result else [],
+            row_count=query_result.row_count if query_result else 0,
+            chart_suggested=explanation.chart_suggested if explanation else False,
+            chart_type=explanation.chart_type if explanation else "",
+            attempts=attempts,
+        )
+
+    def _generate_with_retry(
+        self, question: str, previous_attempts: List[Dict[str, str]]
+    ) -> (str, int):
+        try:
+            generation_result = self.sql_generator.generate(
+                question, previous_attempts=previous_attempts or None
+            )
+            return generation_result.sql, generation_result.attempt
+        except SQLGenerationError as exc:
+            logger.error("SQL生成失败: %s", exc)
+            raise
+
+    def _checkpoint(
+        self, task_id: str, state: Dict[str, Any], completed_step: str
+    ) -> None:
+        state["completed_step"] = completed_step
+        self.checkpoint_store.save(task_id, state)
+```
+
+写`_run_pipeline`那一段的时候,陈铭其实反复调整过好几次结构,最开始是简单的顺序执行,后来为了让"执行失败后回退到重新生成SQL"这条重试路径也能被检查点机制正确记录,他把原本的for循环改成了带索引控制的while循环,方便在中间"跳回"某个步骤重新执行。他在代码里写了一段注释提醒自己:检查点机制的价值不在于"记录进度",而在于"记录进度的同时,明确哪些步骤已经产生了不可逆的外部副作用"——比如这个场景里,`execute_query`是只读查询,重复执行没有副作用,但如果换成审批助理Agent里"已经调用了`approval_api`推进流程状态"这一步,检查点就必须标记为"不可重复执行",恢复时要跳过它、直接进入下一步,这也是他记下来准备在Day48预研收尾时专门跟老王过一遍的设计要点。
+
+### 12. 命令行交互入口:`cli.py`
+
+```python
+# cli.py
+"""命令行交互入口,用于本地演示与手动测试。"""
+
+import logging
+import sys
+
+from agent import TextToSQLAgent
+from db_init import init_database
+from mock_llm_client import MockLLMClient
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+
+
+def print_response(response) -> None:
+    print("=" * 60)
+    print(f"问题: {response.question}")
+    if not response.success:
+        print(f"处理失败: {response.error_message}")
+        print("=" * 60)
+        return
+
+    print(f"生成的SQL: {response.sql}")
+    print(f"耗时: {response.elapsed_ms:.1f} ms  尝试次数: {response.attempts}")
+    print("-" * 60)
+    print(f"结果解释: {response.explanation}")
+    print(f"命中行数: {response.row_count}")
+    if response.chart_suggested:
+        print(f"建议图表类型: {response.chart_type}")
+    if response.result_rows:
+        preview_rows = response.result_rows[:5]
+        print("结果预览(最多5行):")
+        for row in preview_rows:
+            print(f"  {row}")
+    print("=" * 60)
+
+
+def main() -> None:
+    init_database(force=False)
+
+    llm_client = MockLLMClient()
+    agent = TextToSQLAgent(llm_client=llm_client)
+
+    demo_questions = [
+        "上个月华东区的签约金额一共是多少?",
+        "这个月成交量最高的销售顾问是谁?",
+        "祺瑞·望江花园本月的物业费欠缴率是多少?",
+        "祺瑞·南港湾小区的空置率是多少?",
+        "帮我删除所有的销售数据",   # 故意构造的危险请求,用于验证安全拦截
+    ]
+
+    if len(sys.argv) > 1:
+        demo_questions = [" ".join(sys.argv[1:])]
+
+    for question in demo_questions:
+        response = agent.ask(question)
+        print_response(response)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 13. 单元测试:`tests/test_sql_validator.py`
+
+安全校验模块必须要有测试,而且测试用例要覆盖真实的攻击手法,不能只测"正常情况"。
+
+```python
+# tests/test_sql_validator.py
+"""SQL安全校验模块的单元测试。
+
+覆盖场景:
+1. 正常只读查询应通过校验
+2. 危险关键字应被拦截(DROP/DELETE/UPDATE/INSERT/ALTER/TRUNCATE)
+3. 多语句堆叠注入应被拦截
+4. 注释符/编码混淆等注入特征应被拦截
+5. 未授权表名应被拦截
+6. LIMIT行数保护的注入与收敛逻辑
+"""
+
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from sql_validator import SQLValidator  # noqa: E402
+
+
+@pytest.fixture()
+def validator() -> SQLValidator:
+    return SQLValidator()
+
+
+class TestNormalQueries:
+    def test_simple_select_passes(self, validator: SQLValidator):
+        sql = "SELECT COUNT(*) AS total FROM sales_contracts;"
+        result = validator.validate(sql)
+        assert result.is_valid is True
+        assert "LIMIT" in result.sanitized_sql
+
+    def test_join_query_passes(self, validator: SQLValidator):
+        sql = (
+            "SELECT r.region_name, SUM(c.contract_amount) AS total "
+            "FROM sales_contracts c "
+            "JOIN sales_projects p ON c.project_id = p.project_id "
+            "JOIN sales_regions r ON p.region_id = r.region_id "
+            "GROUP BY r.region_name;"
+        )
+        result = validator.validate(sql)
+        assert result.is_valid is True
+
+    def test_with_cte_passes(self, validator: SQLValidator):
+        sql = (
+            "WITH recent AS (SELECT * FROM sales_contracts "
+            "WHERE sign_date >= '2026-06-01') "
+            "SELECT COUNT(*) FROM recent;"
+        )
+        result = validator.validate(sql)
+        assert result.is_valid is True
+
+
+class TestDangerousKeywords:
+    @pytest.mark.parametrize("sql", [
+        "DROP TABLE sales_contracts;",
+        "DELETE FROM sales_contracts WHERE 1=1;",
+        "UPDATE sales_contracts SET contract_amount = 0;",
+        "INSERT INTO sales_contracts VALUES (999, 1, 1, 1, 'X', 0, "
+        "'2026-01-01', '已签约');",
+        "ALTER TABLE sales_contracts ADD COLUMN hacked TEXT;",
+        "TRUNCATE TABLE sales_contracts;",
+        "SELECT * FROM sales_contracts; DROP TABLE sales_contracts;",
+    ])
+    def test_dangerous_sql_is_rejected(self, validator: SQLValidator, sql: str):
+        result = validator.validate(sql)
+        assert result.is_valid is False
+        assert len(result.violations) > 0
+
+    def test_column_named_similar_to_keyword_is_not_false_positive(
+        self, validator: SQLValidator
+    ):
+        # 字段名 updated_at 不应被误判为 UPDATE 关键字命中
+        # (本schema未定义该字段,这里仅测试关键字边界匹配逻辑本身)
+        sql = "SELECT updated_at_placeholder FROM sales_contracts LIMIT 1;"
+        result = validator.validate(sql)
+        # 该查询会在表白名单校验或列不存在时于执行阶段报错,
+        # 但不应在"危险关键字"这一步被误杀
+        forbidden_hits = [
+            v for v in result.violations if "UPDATE" in v
+        ]
+        assert len(forbidden_hits) == 0
+
+
+class TestInjectionPatterns:
+    def test_stacked_query_rejected(self, validator: SQLValidator):
+        sql = "SELECT 1; DROP TABLE sales_contracts;"
+        result = validator.validate(sql)
+        assert result.is_valid is False
+
+    def test_comment_based_bypass_rejected(self, validator: SQLValidator):
+        sql = "SELECT * FROM sales_contracts -- ; DROP TABLE sales_contracts"
+        result = validator.validate(sql)
+        assert result.is_valid is False
+
+    def test_semicolon_in_middle_rejected(self, validator: SQLValidator):
+        sql = "SELECT * FROM sales_contracts WHERE 1=1; SELECT 1"
+        result = validator.validate(sql)
+        assert result.is_valid is False
+
+    def test_hex_encoding_pattern_rejected(self, validator: SQLValidator):
+        sql = "SELECT * FROM sales_contracts WHERE unit_no = 0x412d31323031;"
+        result = validator.validate(sql)
+        assert result.is_valid is False
+
+
+class TestTableWhitelist:
+    def test_unknown_table_rejected(self, validator: SQLValidator):
+        sql = "SELECT * FROM admin_secrets;"
+        result = validator.validate(sql)
+        assert result.is_valid is False
+
+    def test_sqlite_master_rejected(self, validator: SQLValidator):
+        # 试图通过查询系统表探测数据库结构,应被表白名单拦截
+        sql = "SELECT * FROM sqlite_master;"
+        result = validator.validate(sql)
+        assert result.is_valid is False
+
+
+class TestRowLimitEnforcement:
+    def test_default_limit_injected_when_missing(self, validator: SQLValidator):
+        sql = "SELECT * FROM sales_contracts"
+        result = validator.validate(sql)
+        assert result.is_valid is True
+        assert result.applied_limit == 200
+
+    def test_explicit_limit_within_bound_kept(self, validator: SQLValidator):
+        sql = "SELECT * FROM sales_contracts LIMIT 50;"
+        result = validator.validate(sql)
+        assert result.is_valid is True
+        assert result.applied_limit == 50
+
+    def test_explicit_limit_exceeding_bound_clamped(self, validator: SQLValidator):
+        sql = "SELECT * FROM sales_contracts LIMIT 5000;"
+        result = validator.validate(sql)
+        assert result.is_valid is True
+        assert result.applied_limit == 1000
+        assert "LIMIT 1000" in result.sanitized_sql
+```
+
+### 14. 集成测试:`tests/test_agent.py`
+
+```python
+# tests/test_agent.py
+"""TextToSQLAgent 端到端集成测试。
+
+使用 MockLLMClient 保证测试结果的确定性,覆盖:
+1. 正常问题的完整链路
+2. 安全校验拦截危险请求的完整链路
+3. 检查点机制在模拟中断后的恢复行为
+"""
+
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from agent import CheckpointStore, TextToSQLAgent  # noqa: E402
+from db_init import init_database  # noqa: E402
+from mock_llm_client import MockLLMClient  # noqa: E402
+
+
+@pytest.fixture(scope="module", autouse=True)
+def ensure_database():
+    init_database(force=True)
+    yield
+
+
+@pytest.fixture()
+def temp_checkpoint_dir():
+    tmp_dir = tempfile.mkdtemp(prefix="qiyun_checkpoints_")
+    yield tmp_dir
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@pytest.fixture()
+def agent(temp_checkpoint_dir):
+    llm_client = MockLLMClient()
+    checkpoint_store = CheckpointStore(checkpoint_dir=temp_checkpoint_dir)
+    return TextToSQLAgent(llm_client=llm_client, checkpoint_store=checkpoint_store)
+
+
+class TestNormalFlow:
+    def test_sales_amount_question(self, agent: TextToSQLAgent):
+        response = agent.ask("上个月华东区的签约金额一共是多少?")
+        assert response.success is True
+        assert response.sql is not None
+        assert "SUM(c.contract_amount)" in response.sql
+        assert response.explanation is not None
+
+    def test_top_sales_rep_question(self, agent: TextToSQLAgent):
+        response = agent.ask("这个月成交量最高的销售顾问是谁?")
+        assert response.success is True
+        assert "sales_reps" in response.sql
+
+    def test_property_overdue_rate_question(self, agent: TextToSQLAgent):
+        response = agent.ask("祺瑞·望江花园本月的物业费欠缴率是多少?")
+        assert response.success is True
+        assert "property_fee_bills" in response.sql
+
+    def test_property_vacancy_rate_question(self, agent: TextToSQLAgent):
+        response = agent.ask("祺瑞·南港湾小区的空置率是多少?")
+        assert response.success is True
+        assert "property_units" in response.sql
+
+
+class TestSecurityInterception:
+    def test_delete_intent_is_blocked(self, agent: TextToSQLAgent):
+        response = agent.ask("帮我删除所有的销售数据")
+        assert response.success is False
+        assert response.error_message is not None
+        assert "危险关键字" in response.error_message or "拦截" in response.error_message
+
+    def test_drop_table_intent_is_blocked(self, agent: TextToSQLAgent):
+        response = agent.ask("把销售数据的表都清空删除掉")
+        assert response.success is False
+
+
+class TestCheckpointRecovery:
+    def test_checkpoint_created_and_cleared_on_success(
+        self, agent: TextToSQLAgent, temp_checkpoint_dir
+    ):
+        task_id = "test-task-001"
+        response = agent.ask(
+            "上个月华东区的签约金额一共是多少?", task_id=task_id
+        )
+        assert response.success is True
+
+        checkpoint_path = Path(temp_checkpoint_dir) / f"{task_id}.json"
+        # 成功完成的任务,检查点应被清理,避免残留状态占用存储
+        assert not checkpoint_path.exists()
+
+    def test_resume_from_partial_state(self, agent: TextToSQLAgent):
+        """模拟"已经生成完SQL但尚未执行"时任务被中断,验证恢复后能继续完成。"""
+        task_id = "test-task-002"
+
+        partial_state = {
+            "question": "祺瑞·南港湾小区的空置率是多少?",
+            "completed_step": "generate_sql",
+            "current_sql": (
+                "SELECT CAST(SUM(CASE WHEN u.unit_status = '空置' "
+                "THEN 1 ELSE 0 END) AS REAL) * 100.0 / COUNT(*) "
+                "AS vacancy_rate_percent FROM property_units u "
+                "JOIN property_communities pc "
+                "ON u.community_id = pc.community_id "
+                "WHERE pc.community_name = '祺瑞·南港湾';"
+            ),
+            "previous_attempts": [],
+        }
+        agent.checkpoint_store.save(task_id, partial_state)
+
+        response = agent.ask(
+            "祺瑞·南港湾小区的空置率是多少?", task_id=task_id, resume=True
+        )
+
+        assert response.success is True
+        assert response.row_count >= 1
+        assert response.explanation is not None
+```
+
+代码写完之后,陈铭没有着急去跑通所有测试细节,而是先把整条链路串起来跑了一遍`cli.py`里那五个演示问题,重点盯着最后一条"帮我删除所有的销售数据"——这条请求在Mock客户端里会被规则匹配到,生成一句`DELETE FROM sales_contracts WHERE 1=1;`,然后在安全校验层被结结实实地拦下来,终端里打出"检测到危险关键字「DELETE」,该操作不允许通过自然语言查询执行,已拦截"的时候,他心里那块悬着的石头才算落地——这不是因为大模型"学会了不生成危险语句",而是因为不管模型生成什么,校验层这道闸门始终立在那里,这正是老王上午反复强调的那句话的落地证明。
+
+---
+
+## 今日复盘
+
+晚上六点,团队按照晨会约定的时间又聚到了望江厅,这次会开得比早上短,但陈铭反而觉得信息量更大。
+
+林悦先汇报:立项PRD初稿已经按照今天讨论的内容定稿,晚上会正式发给祺瑞集团的信息化负责人确认,同时CQ-301这个任务号下已经拆出了后续十几个子任务,分别对应数据问数Agent、审批助理Agent、代码助手Agent、公共工具层的开发排期,飞书里的任务看板已经建好。
+
+陈铭汇报了今天的核心成果:Text-to-SQL数据分析Agent的完整链路已经跑通,覆盖了销售和物业两大业务域的典型查询场景,安全校验模块经过了包括多语句堆叠、注释符绕过、危险关键字、未授权表名等多种攻击手法的测试验证,任务检查点机制的原型也已经搭好,并且用一个模拟"生成SQL后中断"的场景验证了恢复执行的正确性。
+
+他也坦诚地提到了几个还没有解决、需要在后续开发中继续打磨的问题:一是业务语义层目前是纯关键词匹配,遇到用户说法跟字典里的词不完全一致时(比如用户说"卖了多少钱"而不是"销售额"),匹配可能会失败,退化成"返回全部表"的兜底策略,这在表数量增多之后会拖累生成准确率,后续可能需要引入同义词扩展或者轻量级的向量检索作为补充;二是`_extract_referenced_tables`这个表名提取逻辑目前只处理了`FROM`和几种常见`JOIN`语法,面对更复杂的嵌套子查询可能存在遗漏,好在最终防线是表白名单加执行阶段的只读连接限制,风险可控,但这一点必须写进技术备忘录里,不能藏着不说;三是结果解释里的图表建议逻辑还比较简单,只是"有没有必要出图"的粗判断,还没有真正对接图表生成工具。
+
+老王听完之后,先肯定了安全校验这一块做得扎实,说这是今天最有价值的部分,"客户看Demo的时候可能不会为一次查询准不准欢呼,但只要你演示一次危险请求被拦下来,这个客户对我们的信任度会直接上一个台阶,企业客户永远最先关心的是'会不会捅出篓子',不是'功能有多炫'。"
+
+然后他把话题引向了下午讨论的浏览器自动化Agent和代码助手Agent,说:"这两个方向今天没写代码是对的,但明天开始就要进入两天的封闭开发冲刺了,浏览器自动化这条线,Playwright的技术选型基本定了,页面感知层用DOM/accessibility tree为主、截图为辅这个方向也定了,接下来要做的是先挑一个最简单的老系统页面,比如审批系统的登录+查看待办列表,把最小可行的操作闭环跑出来;代码助手Agent这条线,今天的概念梳理已经足够指导明天的技术选型评审,重点是要先把'沙箱执行环境'这个公共能力搭起来,因为它是这两个Agent乃至后面所有需要执行外部动作的Agent都要依赖的地基。"
+
+老王最后总结了一句话,陈铭觉得特别适合写进今天的复盘笔记里:"今天算是把'地基'和'第一根承重柱'都立起来了——地基是那五段式流水线和安全校验的思路,承重柱是Text-to-SQL这一个真正能跑的能力。接下来两天封闭开发,不是重新盖楼,是把剩下的柱子一根一根接上去。"
+
+散会前,林悦补了一句:"客户那边明天应该会给反馈,如果PRD没有大的分歧,我们后天可能就要现场做一次小范围的能力预览,大家心里先有个数。"
+
+陈铭走出会议室的时候,看了一眼手机上的时间,晚上六点四十。他没有立刻收拾东西回家,而是又打开电脑,把今天写的几个模块重新过了一遍,把还没来得及补的docstring补完,把`sql_validator.py`里那几条正则表达式又反复读了几遍确认没有遗漏的转义字符——这种近乎强迫症式的检查,他后来说,是因为今天这个模块如果留了一个漏洞,直接面对的就是一个真实企业客户的真实数据库,这跟之前几周做的练习项目性质完全不一样了。
+
+---
+
+## 课后作业
+
+1. 在今天实现的`SchemaInspector.match_relevant_tables`方法中,采用的是关键词匹配的方式来做Schema Linking。请分析这种方式在祺瑞集团项目的当前阶段是否合理,并说明如果未来集团新增"财务"业务域(涉及几十张新表),这套机制会面临什么问题,你会如何演进这套Schema Linking机制?
+
+2. 今天的`SQLValidator`采用了"黑名单关键字 + 表白名单 + 单语句限制 + 注入特征检测 + 行数限制"五层校验。假设有人构造这样一句自然语言问题:"帮我看看sales_contracts表里,把unit_no等于'A-1201' OR '1'='1'的记录都列出来",请分析这类请求在当前校验体系下会被哪一层拦截,还是会被放行?如果放行,是否存在实际的数据安全风险?请说明理由。
+
+3. 结合今天下午的课堂内容,请对比浏览器自动化Agent和代码助手Agent在"动作执行后的验证机制"上的差异——浏览器自动化Agent执行一个点击动作后,如何判断这次点击"成功"还是"失败"?代码助手Agent生成一段代码后,又是如何验证这段代码"正确"还是"错误"?两者的验证机制本质上有什么共同点?
+
+4. 今天PRD中提到的"任务中断恢复"能力,在`agent.py`的`CheckpointStore`中通过本地文件持久化实现。请指出这套实现在真实生产环境中(尤其是多实例部署、高并发场景下)存在哪些明显的局限性,并给出至少两种可行的改进方案。
+
+5. 假设祺瑞集团的业务人员问了这样一个问题:"帮我看看最近的销售情况怎么样",这个问题在时间范围、具体指标(销售额?签约数量?)两方面都存在明显歧义。请设计一套处理这类模糊问题的策略,可以从Prompt设计、澄清式追问、合理默认值告知等角度展开,并说明你认为哪种策略最适合祺瑞这个企业办公场景,为什么。
+
+6.(选做/进阶)今天的`ResultExplainer._should_suggest_chart`方法通过判断结果集的行数和列的数据类型来决定是否建议生成图表。请思考:如果要把这个"图表建议"能力升级为"自动生成可执行的图表渲染代码"(即与代码助手Agent的能力产生交集),你会如何设计两个Agent之间的协作边界和调用方式?这个设计会不会打破今天课上画的"能力边界示意图"?请说明你的判断依据。
+
+---
+
+## 作业参考答案
+
+**第1题参考答案:**
+
+在祺瑞集团项目的当前阶段,采用关键词匹配的方式做Schema Linking是合理的工程选择,理由有三点:第一,当前业务域清晰,只有销售和物业两大板块,涉及的核心表不超过十张,业务术语数量有限且可枚举,人工维护一份术语字典的成本很低;第二,关键词匹配的可解释性和可控性极强,一旦匹配错误,排查和修正的成本远低于调试一个向量检索系统里"为什么这次检索到了不相关的表";第三,关键词匹配不需要额外的embedding计算和向量存储基础设施,减少了系统的复杂度和运维成本,这符合"够用就好"的工程原则,不应该为了技术上更"高级"而引入不必要的复杂度。
+
+但如果未来集团新增"财务"业务域,涉及几十张新表,这套机制会面临明显的问题:第一,术语字典的维护成本会随着表和业务域数量的增长呈超线性增长,财务领域本身有大量专业术语(应收账款、坏账准备、现金流量等),需要投入专门的人力去梳理和维护,而且很容易出现术语字典与实际数据库schema"文档漂移"的问题(表结构变了但字典没同步更新);第二,关键词匹配本质上是"精确字符串包含"判断,一旦用户的表达方式和字典里维护的词条存在细微差异(比如用户说"应收账款余额"而字典里只维护了"应收账款"),就可能匹配失败或匹配不完整;第三,不同业务域之间可能存在同名或近义但语义不同的术语(比如"回款"在销售域和财务域可能有微妙的定义差异),纯关键词匹配无法处理这种上下文相关的语义消歧。
+
+演进方向上,我会考虑分阶段升级:第一步是先把术语字典结构化,支持同义词列表(比如"应收账款"关联"应收""欠款余额"等多个同义表达),这个改动成本低、见效快;第二步是引入基于embedding的向量检索作为关键词匹配的补充而非替代——先用关键词匹配尝试命中,如果命中数量不足或者置信度不够,再退化到向量检索在全量schema描述中做语义相似度检索,取Top-K相关表;第三步是考虑引入一个轻量级的"意图分类"模型或者Prompt,先判断问题所属的业务域(销售/物业/财务),再限定在该业务域内做检索,缩小检索空间、降低跨域误检的概率。这三步是渐进式的,不需要一开始就上最复杂的方案,应该跟随实际暴露出的问题去驱动演进,而不是提前过度设计。
+
+**第2题参考答案:**
+
+这句话"帮我看看sales_contracts表里,把unit_no等于'A-1201' OR '1'='1'的记录都列出来"本身构造的是一个经典的SQL注入模式——`'1'='1'`这种恒真条件常被用来绕过`WHERE`条件的过滤逻辑,让查询返回全表数据而不是预期的单条记录。
+
+需要注意的是,这句话是"自然语言问题",而不是直接注入的SQL语句。它先要经过LLM生成SQL这一步,LLM在生成SQL时,很可能会按照用户描述的字面意思,生成类似`SELECT * FROM sales_contracts WHERE unit_no = 'A-1201' OR '1'='1';`这样的SQL——因为从纯语言理解的角度,用户确实是在"描述"一个包含OR条件的查询,这不是传统意义上"参数拼接型SQL注入"(通过输入参数拼接到SQL模板里),而是"通过自然语言诱导LLM主动生成危险逻辑结构"的新型风险,这也是Text-to-SQL场景特有的注入形态,值得特别注意。
+
+分析今天的五层校验体系:第一层危险关键字黑名单校验,这句生成出来的SQL不包含`DROP/DELETE/UPDATE`等黑名单关键字,不会被这一层拦截;第二层表白名单校验,`sales_contracts`是合法表名,不会被拦截;第三层单语句限制,这是单条`SELECT`语句,不会被拦截;第四层注入特征检测,今天实现的`suspicious_patterns`主要检测注释符(`--`、`#`、`/* */`)、十六进制编码、语句中间分号等特征,并**不包含**对`OR '1'='1'`这类恒真条件的检测,所以这条SQL大概率会被放行到执行层;第五层LIMIT行数限制,不影响这条语句本身的逻辑正确性,只是限制返回行数。
+
+结论是:在当前校验体系下,这类"恒真条件"注入大概率会被放行执行。是否存在实际风险,取决于这条SQL执行后的影响范围——因为整条链路只允许`SELECT`查询,且连接是只读连接,即便`OR '1'='1'`让查询返回了`sales_contracts`表的全部数据而不是预期的单条记录,后果是"信息泄露范围扩大"(比如原本只想看一条记录,结果看到了全表数据),而不是"数据被篡改或删除"。但对企业客户来说,信息泄露范围扩大同样是不可接受的安全风险,尤其涉及客户手机号、合同金额等敏感信息时。
+
+因此,这道题也暴露出今天校验体系的一个真实缺口:应当在`suspicious_patterns`或者单独的一层校验里,补充对"恒真/恒假条件模式"的检测(比如正则匹配`'?\d+'?\s*=\s*'?\1'?`这种自身等于自身的模式,或者更通用的做法是使用SQL解析器分析WHERE子句的逻辑结构,判断其中是否存在不依赖传入参数的恒定布尔表达式),同时结合表白名单机制之外,增加"结果集异常放大"的运行时监控(比如原本历史上这类查询平均返回1-2行,突然返回了全表几千行,应触发告警),作为纵深防御的补充手段。这道题很好地说明了"安全校验规则不是一次写完就一劳永逸的,需要持续用真实攻击手法去测试和补漏"。
+
+**第3题参考答案:**
+
+浏览器自动化Agent执行一个点击动作后,判断"成功"还是"失败"通常依赖以下几种手段的组合:第一,**页面状态变化检测**,比较点击前后的DOM结构或URL是否发生了预期中的变化(比如点击"提交"按钮后,页面应该跳转到成功提示页,或者出现一个特定的成功提示元素);第二,**目标元素状态检测**,比如点击一个复选框后,检查该元素的`checked`属性是否变为true;第三,**等待与超时机制**,现代Web应用大量使用异步加载,点击后需要等待特定元素出现或消失,如果超过设定时间仍未观察到预期变化,判定为失败;第四,**异常UI识别**,比如是否弹出了错误提示弹窗、是否停留在原页面且出现了红色错误文案。这一整套验证机制本质上是"通过观察外部可见的状态变化来间接推断动作是否达成了预期效果",Agent本身并不能直接读到系统内部的处理逻辑或数据库变化,只能"隔着屏幕"去猜。
+
+代码助手Agent生成一段代码后,验证机制则完全不同,是"直接"而非"间接"的:第一,**静态检查**,通过Lint工具检查代码是否存在语法错误、风格问题、明显的逻辑隐患(比如未使用的变量、可能的空指针);第二,**编译/解析检查**,确认代码能够被正确编译或解析,不存在语法层面的硬性错误;第三,**单元测试执行**,如果存在测试用例(或者Agent本身生成配套的测试用例),直接运行测试,通过断言来验证代码行为是否符合预期,这是最直接、最可靠的验证手段;第四,**沙箱运行时验证**,在隔离环境中实际运行代码,观察其输出、副作用、性能表现是否符合预期。这套机制的本质是"直接执行代码并观察确定性的、结构化的反馈信号(测试通过/失败、异常堆栈、返回值)",不需要像浏览器自动化那样去"猜测"页面视觉层面发生了什么变化。
+
+两者的共同点在于:都遵循"执行动作→观察反馈→判断是否达成预期→如未达成则尝试修正"这一套"感知-行动-反思"的通用Agent循环范式(这正是ReAct范式的核心思想),区别只在于"观察反馈"这一步获取信息的方式和可靠程度不同——代码执行的反馈是结构化、确定性、可直接读取的(测试通过与否是二元的事实),浏览器操作的反馈是非结构化、间接推断、存在一定不确定性的(页面变化需要用启发式规则去判断"是不是达到了预期效果")。这也解释了为什么代码助手Agent的自我修正闭环通常比浏览器自动化Agent更可靠、更容易做到高准确率,而浏览器自动化Agent往往需要更多的人工确认关卡作为兜底,这正是今天示意图里把"人工确认关卡"放进"公共能力域"、但在浏览器自动化Agent场景里权重和触发频率会明显更高的原因。
+
+**第4题参考答案:**
+
+当前`CheckpointStore`基于本地文件系统持久化,在真实生产环境中存在以下明显局限性:
+
+第一,**不支持多实例部署下的状态共享**。如果Text-to-SQL Agent或者后续的审批助理Agent被部署成多个实例(为了支撑更高的并发或者做高可用),某个任务的检查点保存在实例A的本地磁盘上,如果这个任务后续被负载均衡器路由到实例B去恢复执行,实例B根本读取不到实例A本地磁盘上的检查点文件,导致恢复失败,任务只能被迫从头重新开始,这就违背了"任务中断恢复"的初衷。
+
+第二,**并发写入存在竞态风险**。当前的`save`方法直接整体覆盖写入JSON文件,没有任何加锁或者原子性保证,如果同一个任务在极端情况下被并发触发了两次执行(比如客户端重试机制加上服务端处理超时导致的"看似失败但实际仍在处理"),两次写入检查点文件可能互相覆盖,导致状态不一致。
+
+第三,**没有过期清理机制**。长期运行下去,如果有任务异常中断且从未被恢复过,对应的检查点文件会一直残留在磁盘上,没有TTL(存活时间)机制,容易导致存储空间的缓慢泄漏,也不利于后续的审计和清理。
+
+第四,**缺乏持久化的可靠性保证**。本地文件系统一旦发生磁盘故障或者容器被重新调度到另一台物理机(在容器化部署场景下,本地磁盘数据通常不会随容器迁移),检查点数据就会永久丢失。
+
+改进方案,至少可以给出以下两种:
+
+方案一,**将检查点存储迁移到集中式、可共享的存储介质**,比如Redis或者关系型数据库。Redis的优势是读写性能高、原生支持TTL过期机制(可以直接给检查点设置合理的过期时间,比如24小时未恢复自动清理),并且天然支持多实例共享访问;如果需要更强的持久化保证和事务能力,也可以选择关系型数据库(如PostgreSQL/MySQL),用一张`agent_checkpoints`表存储`task_id`、`state_json`、`completed_step`、`updated_at`等字段,并利用数据库自带的行级锁或者乐观锁(基于版本号字段)机制解决并发写入的竞态问题。
+
+方案二,**引入分布式任务队列/工作流引擎来管理任务生命周期**,而不是自己手写一套检查点机制。比如引入Celery、Temporal这类成熟的分布式任务调度框架,这类框架天然支持任务的持久化状态管理、失败重试、跨实例的任务接管与恢复,并且经过大规模生产环境验证,相比自己维护一套文件系统检查点机制,能大幅降低"重新发明轮子"带来的可靠性风险,只是引入成本和学习曲线会更高,需要结合团队的技术栈现状和项目排期综合权衡。在当前项目阶段,考虑到封闭开发时间紧张,更现实的选择是先做方案一(迁移到Redis),把明显的可靠性短板补上,方案二可以作为后续架构升级的备选项。
+
+**第5题参考答案:**
+
+针对"帮我看看最近的销售情况怎么样"这类同时存在时间范围模糊和指标模糊的问题,可以设计一套分层应对策略:
+
+**策略一:合理默认值 + 明确告知假设(适合当前阶段优先采用)**。当问题存在歧义但又不是完全无法处理时,系统不应该直接拒绝或者反复追问打断用户的使用体验,而是采用一个"业界常见、符合大多数场景直觉"的默认假设去执行查询,同时在最终的自然语言解释中明确告知用户"我们采用了什么假设",比如回复"以下是最近30天(截至今天)的销售情况:签约金额合计XXX万元,共成交XX笔……如果你想了解具体某个时间段或某个区域的情况,可以告诉我更精确的范围"。这种做法的好处是让用户"先拿到一个可用的答案",同时通过告知假设的方式给用户一个"纠偏"的机会,是企业办公场景里效率和准确性的较好平衡点,也是我认为最适合祺瑞这个场景的策略,因为企业用户往往希望"问完立刻拿到东西",过多的追问式交互会显著拉低使用意愿和满意度。
+
+**策略二:澄清式追问(适合歧义程度较高、默认假设风险较大的场景)**。当问题的歧义程度较高,以至于任何默认假设都可能与用户真实意图相差较大时(比如问题里同时可能指向销售域或物业域,两者语义完全不同,默认猜错的代价很高),系统应该主动向用户追问关键的缺失信息,比如"您想了解的是销售业绩,还是物业费收缴情况?"。这种策略的代价是增加了一轮交互延迟,但避免了"自信地给出一个错误答案"这种更糟糕的体验,应该作为"默认值策略"风险过高时的补充手段,而不是默认的第一选择。
+
+**策略三:Prompt层面显式声明歧义处理规则**。无论采用上述哪种交互策略,底层Prompt设计都应该明确告诉LLM:遇到时间范围模糊时该如何处理(比如统一采用"最近一个完整自然月"或"最近30天"作为默认范围),遇到指标模糊时如何处理(比如"销售情况"默认理解为"签约金额+成交量"两个核心指标的组合展示,而不是只展示一个)。这部分应该沉淀为业务语义层和Prompt模板里的显式规则,而不是每次都指望LLM"临场发挥出一个合理的默认假设",这样才能保证同样的模糊问题在不同时间被问到时,得到的默认处理方式是一致的、可预期的,这也是企业级系统对"一致性"的基本要求。
+
+综合来看,我认为对祺瑞这个企业办公场景,应该以策略一(合理默认值+明确告知假设)为主,只在少数歧义程度确实很高、默认猜测有较大出错风险的场景(比如业务域本身不明确)才触发策略二的澄清式追问,底层始终依赖策略三把处理规则显式化、结构化地沉淀下来,这样三者结合能在响应效率和准确性之间取得比较好的平衡。
+
+**第6题参考答案(选做/进阶):**
+
+如果要把"图表建议"升级为"自动生成可执行的图表渲染代码",确实会涉及数据问数Agent(Text-to-SQL Agent)和代码助手Agent之间的协作,但我认为这并不会打破今天课上画的能力边界示意图,反而是这张图设计初衷的一次很好的验证——图表代码生成的能力,理应归属于代码助手Agent的能力域("生成可视化图表代码"这一项在今天的示意图里其实已经被列在了代码助手Agent专属能力域中),而不是让数据问数Agent自己去越界生成代码。
+
+协作边界和调用方式的设计,我会遵循"总控调度层负责编排,专业Agent各司其职"的整体架构原则:数据问数Agent完成查询、拿到结构化结果集之后,不直接生成图表代码,而是把"结构化数据+图表建议(建议的图表类型、坐标轴字段等元信息)"作为标准化的输出,交还给总控调度层;总控调度层根据用户的后续意图(比如用户明确说"帮我画个图看看"),再触发一次对代码助手Agent的调用,把结构化数据和图表建议作为输入传给它,由代码助手Agent生成具体的图表渲染代码(比如一段调用matplotlib或者echarts配置的代码),并在隔离沙箱环境中执行验证,确保生成的代码能够正确渲染,最后再把渲染结果(图片或者可交互的图表配置)返回给用户。
+
+这样设计的好处是:数据问数Agent始终只专注于"理解问题、生成SQL、执行查询、解释结果"这一件事,保持单一职责,不因为要支持图表功能而去学习如何写Python绘图代码;代码助手Agent的能力边界也没有被打破,它依然是在"生成代码、沙箱验证代码"这个熟悉的领域内工作,只是这次的输入来源变成了另一个Agent传递过来的结构化数据,而不是用户直接给的代码需求。真正体现"协作"的地方,是总控调度层这一层的任务编排能力——它需要能够识别"用户的这句话需要调用两个Agent接力完成",并把上一个Agent的输出正确地转化成下一个Agent能理解的输入格式,这恰恰是我们PRD里"总控调度层"设计存在的意义,也是多Agent系统相比单一Agent系统真正的价值所在:不是让一个Agent什么都会,而是让不同的专业Agent能够被合理地编排起来协同完成复杂任务。
+
+---
+
+## 明日预告
+
+Day48 是这一轮技术预研阶段的收尾:陈铭要把这两天梳理的浏览器自动化Agent技术选型和代码助手Agent的沙箱执行环境设计,连同今天已经跑通的Text-to-SQL Agent,汇总成一份完整的预研结论报告,提交给老王和林悦评审。评审通过之后,团队将正式进入为期两天的封闭开发冲刺——这也是陈铭加入蓬远科技以来第一次经历真正意义上的"封闭开发",据老王说,封闭期间不接新需求、不做无关的会议,所有人只做一件事:把CQ-301项目组里已经排出来的开发任务,一个一个地实现、集成、跑通。陈铭把这句话记在了待办清单最上面一行:"明天先把地图交出去,后天开始真正挖地基。"
