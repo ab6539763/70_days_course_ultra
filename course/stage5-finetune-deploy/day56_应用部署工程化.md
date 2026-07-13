@@ -1,0 +1,2423 @@
+# 第56天:应用部署工程化
+
+## 一、标题元信息
+
+- **课程名称**:企业级AI应用开发实战营(70天全程)
+- **所属阶段**:第五阶段 · 模型微调与部署上线(Stage 5:Fine-tune & Deploy)
+- **日期定位**:第56天 · 周四 · 本Sprint的重大项目集成日
+- **主题**:应用部署工程化——Docker容器化与云端上线
+- **主讲导师**:王振宇(老王,蓬远科技技术合伙人、AI中台负责人)
+- **技术支持**:孙昊(蓬远科技运维工程师,负责御风金融私有化部署项目的基础设施)
+- **学员视角**:陈铭(蓬远科技AI应用工程师,苍穹企业级智能体中台项目组成员)
+- **关联项目**:苍穹企业级智能体中台 · 御风金融私有化部署专项
+- **前置知识依赖**:FastAPI服务开发(第45~50天)、向量数据库应用与知识库构建(第51~53天)、模型微调与LoRA适配(第54天)、vLLM推理服务接入(第55天)
+- **今日课时安排**:上午3小时理论与实操(Docker基础),下午3.5小时理论与实操(Docker Compose编排、云服务器部署上线),晚间1小时答疑与作业布置
+- **今日产出物**:一套完整容器化的"苍穹知识库问答系统",包含FastAPI后端、前端界面、PostgreSQL数据库、向量数据库、vLLM推理服务五个容器,通过Docker Compose统一编排,并部署到云服务器实现公网可访问
+- **本日关键词**:镜像、容器、Dockerfile、多阶段构建、Docker Compose、服务编排、健康检查、反向代理、环境变量管理、云服务器部署、CI/CD
+
+---
+
+## 二、【旁白】
+
+清晨七点五十,蓬远科技的办公室还没到点,茶水间的咖啡机已经响了两轮。陈铭到得比平时早,昨天晚上他把vLLM推理服务接进苍穹平台之后,整个人还处在一种"终于跑起来了"的兴奋劲儿里——尽管这份兴奋在深夜十一点被王振宇一句"跑起来和能上线,是两件事"给按下去了一半。
+
+今天不太一样。会议室的白板上,孙昊已经提前画好了一张草图,五个方框,几条箭头,写着"御风金融·私有化部署"几个字,旁边画了个大大的问号。孙昊是那种平时话不多、但一开口全是干货的人,运维出身,在他手里,"能跑"和"能稳定跑三年"之间隔着的东西,远比陈铭想象的要多。
+
+陈铭这段时间习惯了在本地开发机上跑代码——`python main.py`,一切正常,页面能访问,接口能调通,心里就踏实。可今天他要面对一个新的现实:御风金融的机房里没有他的开发环境,没有他电脑里装的那一堆Python库版本,没有他本地那份"改了忘记提交"的`.env`文件。要把一套系统原封不动地搬到别人的机器上,还要保证向量库、数据库、推理服务这几个各自"性格迥异"的组件能在同一个环境里和睦相处——这件事,今天必须做完,而且是通过Docker来做。
+
+老王在晨会上说了一句让陈铭记到现在的话:"你写的代码是你的手艺,但客户买的不是你的手艺,买的是能持续运转的服务。今天开始,你要学会把手艺装进一个可以到处搬、到处跑、还不会走样的箱子里。"
+
+这个箱子,就是容器。
+
+---
+
+## 三、晨会纪要
+
+**时间**:2026年X月X日(星期四) 09:00-09:35
+**地点**:蓬远科技三楼小会议室
+**参会人**:王振宇(主持)、孙昊、陈铭、以及项目组另外两名同学(林薇、赵天成,负责前端与测试)
+**会议主题**:御风金融私有化部署项目——容器化启动会
+
+---
+
+**王振宇**:大家坐吧,今天不聊模型效果,不聊prompt,聊点"土"的东西——怎么把咱们做出来的东西,交到客户手里,还能一直稳定跑着。昨天陈铭把vLLM服务接进来了,苍穹平台的核心链路算是打通了:前端提问,后端接单,向量库检索,vLLM推理,最后把答案吐出来。链路通了是第一步,但客户要的不是"我们机房里能跑",客户要的是"他们机房里能跑,而且换人维护也能跑,出了问题重启一下也能跑"。孙昊,你先说说御风金融那边最新的情况。
+
+**孙昊**:嗯,昨天晚上和御风金融的IT那边又对了一次。他们的态度很明确——金融行业监管卡得死,数据不能出他们的机房,所以这次是**私有化部署**,不是SaaS模式那种我们托管、他们访问的方式。他们会给我们一批物理机或者虚拟机资源,具体配置我等会儿念需求文档里的清单。核心问题是:我们现在的代码,是一堆散落的Python脚本、一个前端项目、还有本地起的几个服务进程,这套东西直接扔到客户机房是没法用的——环境不一致、依赖版本不一致、启动顺序不对都会出问题。之前我们给别的客户做过一次"裸机部署",光是排查Python版本冲突就花了三天,这次不能再这样了。
+
+**王振宇**:所以这次咱们要求更高,标准动作是**全面容器化**。陈铭,你知道为什么我们非要用Docker,而不是继续手动装环境吗?
+
+**陈铭**:我理解主要是环境一致性的问题?本地能跑,换台机器可能因为Python版本、系统库版本不一样就跑不起来了。
+
+**王振宇**:对,这是最直接的一层。但还有更深的一层——**交付的边界感**。以前我们交付的是"一份代码加一份安装文档",客户那边的运维人员要照着文档一步步装环境,装错一步,后面全乱。现在我们交付的是"一个镜像加一份启动命令",客户那边不需要理解我们代码里装了哪些依赖、用了哪个数据库驱动版本,他只需要执行`docker compose up`,这套系统就能起来。这不是省事儿,这是把复杂度封装起来、把责任边界画清楚。出了问题,如果是镜像内部的问题,是我们的责任;如果是他机器资源不够,是他的责任。边界一清楚,合作才能长久,尤其像御风金融这种金融客户,后续可能还要走软件验收、安全审计这些流程,容器化交付是行业里默认的规范动作。
+
+**孙昊**:补充一点,金融客户对"离线可交付"的要求也很高。他们的机房大概率是不能连外网的,或者连外网要走审批。如果我们用容器打包,可以把镜像导出成`tar`包,拷进去直接`docker load`,不依赖任何在线仓库。这个我们后面部署脚本里要覆盖到。
+
+**林薇**:振宇,前端这边也要单独打镜像吗?我们现在开发环境是用`npm run dev`起的。
+
+**王振宇**:对,前端也要容器化,而且前端容器和后端容器职责要分清楚——前端容器负责把静态资源build出来,交给Nginx去serve,不应该在生产环境里还跑着`npm run dev`那种带热更新的开发服务器,那玩意儿性能差、还不稳定。孙昊今天会带你们过一下前端Dockerfile怎么写多阶段构建。
+
+**赵天成**:那测试这块,我这两天主要跟哪块对齐?
+
+**王振宇**:你先把现有的接口测试用例整理一下,等容器化跑起来之后,我们要在容器环境里把这些测试跑一遍,确认容器里的服务行为跟本地开发环境一致。这个叫"环境等价性验证",容器化最容易踩的坑就是"本地好好的,进了容器就不行了",八成是环境变量没传对,或者端口没映射对,或者是文件路径写死了本机路径。
+
+**陈铭**:那今天的整体节奏是怎样的?
+
+**王振宇**:上午孙昊带你们从头过一遍Docker基础——镜像是什么、容器是什么、Dockerfile怎么写,不是照本宣科念概念,是直接上手,把咱们知识库项目的后端先单独装进一个容器里跑起来。下午进阶到Docker Compose,把后端、前端、PostgreSQL、向量数据库、vLLM服务五个容器编排在一起,一条命令全部拉起来。最后争取今天把这套东西部署到一台云服务器上,做到公网能访问——哪怕是先挂一个临时域名,或者直接用IP加端口访问,今天必须看到"从我们的开发机搬到云上,还能正常用"这个结果。
+
+**孙昊**:我这边已经申请好一台云服务器用作今天的实操环境,4核8G,后面部署环节大家直接上手操作,不是我演示、你们看。
+
+**王振宇**:最后说一句重的话。咱们之前做的都是"让AI能用",今天开始要做"让AI能用得起、用得稳、用得放心"。这是从做demo到做产品之间,真正的分水岭。行,散会,上午孙昊主讲,我随时插话。
+
+---
+
+会议结束后,孙昊在白板上补了一句话,底下画了个圈:"能在你电脑上跑,不算数;能在客户机房里跑三个月不用你管,才算数。"
+
+陈铭把这句话拍照存进了手机备忘录,标题写的是"今天的靴子"。
+
+---
+
+## 四、需求文档:御风金融私有化部署环境技术要求
+
+> 文档编号:PY-DEPLOY-2026-011
+> 文档版本:V1.0
+> 提出方:御风金融科技部
+> 承接方:蓬远科技(苍穹企业级智能体中台项目组)
+> 密级:内部
+> 编写人:孙昊(整理自客户需求沟通纪要)
+> 审核人:王振宇
+
+### 4.1 项目背景
+
+御风金融是一家全国性的金融服务机构,业务涵盖财富管理、信贷风控、合规审计等多个板块。由于监管要求(《商业银行互联网贷款管理暂行办法》相关合规条款、金融数据安全相关规定),御风金融明确要求本次智能体中台项目采用**私有化部署**方式,所有数据处理、模型推理、知识检索均须在御风金融自有机房内完成,不允许任何客户数据出域,不允许调用任何公网大模型API接口。
+
+本项目为苍穹企业级智能体中台在御风金融场景下的落地实施,一期范围聚焦于"内部知识库智能问答系统",覆盖御风金融内部合规制度、产品知识、操作手册等文档的检索与问答能力,后续二期将扩展至信贷风控辅助决策场景(暂不在本次部署范围内)。
+
+### 4.2 部署模式要求
+
+1. **私有化独立部署**:整套系统(应用服务、数据库、向量库、模型推理服务)全部部署在御风金融自有机房的服务器/虚拟机上,蓬远科技不保留任何形式的远程持续访问权限,交付验收完成后仅通过预约方式进行运维支持。
+2. **离线可交付**:御风金融机房网络策略为默认禁止出网,仅允许通过审批的白名单IP段访问特定内部系统。因此交付物必须支持"离线安装"——即所有Docker镜像、依赖包均需提前打包为文件形式(如`.tar`镜像包),现场通过`docker load`方式导入,不依赖运行时联网拉取。
+3. **容器化交付**:所有应用组件必须以Docker容器形式交付,禁止以"裸机安装脚本"方式交付,理由如下:
+   - 便于版本管控与回滚,出现问题可以直接切回上一个镜像版本;
+   - 便于环境一致性核验,开发、测试、生产三套环境行为一致;
+   - 便于后续的安全扫描与合规审计(容器镜像可以进行漏洞扫描、镜像签名等操作,符合金融行业对软件供应链安全的要求);
+   - 便于故障隔离,单个组件异常不会波及其他组件的进程空间。
+4. **编排要求**:考虑到御风金融首期部署规模不大(单节点即可满足并发量要求),暂不引入Kubernetes集群方案,采用**Docker Compose**进行多容器编排管理,后续视业务量增长评估是否升级为K8s方案(此项已与御风金融IT负责人明确达成一致,写入会议纪要)。
+
+### 4.3 硬件与基础环境要求
+
+| 项目 | 要求 |
+|---|---|
+| 服务器数量 | 首期1台生产服务器 + 1台备用/测试服务器 |
+| CPU | 不低于16核 |
+| 内存 | 不低于64GB(需承载向量库索引与推理服务缓存) |
+| GPU | 至少1张显存不低于24GB的GPU卡(用于vLLM推理服务,首期采用7B量级模型) |
+| 磁盘 | 系统盘不低于100GB(SSD),数据盘不低于500GB(用于存放向量库数据、PostgreSQL数据、模型权重文件与日志) |
+| 操作系统 | CentOS 7.9 / Ubuntu 22.04 LTS(以御风金融机房现有标准镜像为准,经沟通确认为Ubuntu 22.04 LTS) |
+| Docker版本 | Docker Engine 24.x 及以上,Docker Compose V2(内置于Docker CLI的`docker compose`子命令) |
+| 网络 | 内网可访问,不要求公网直接暴露;需预留一个内部域名或固定内网IP供其他系统调用;需配置Nginx反向代理统一入口 |
+| GPU驱动 | NVIDIA驱动版本不低于535,需配套安装`nvidia-container-toolkit`以支持容器内GPU调用 |
+
+### 4.4 功能性需求
+
+1. **知识库问答服务**:支持御风金融内部文档(制度类PDF、Word、Excel等格式)的批量导入、切分、向量化,并支持自然语言问答检索,回答需附带原文引用来源。
+2. **多角色权限控制**:不同部门(合规部、风控部、财富管理部)访问的知识库范围需要隔离,需支持基于角色的访问控制(RBAC)。
+3. **对话历史留存**:所有问答记录需要落库留存,保留期不低于180天,满足金融行业审计追溯要求。
+4. **模型推理本地化**:所有大模型推理均通过本地部署的vLLM推理服务完成,不允许调用任何外部API,推理服务需支持并发请求排队与限流。
+5. **管理后台**:提供基础的系统管理页面,支持文档管理、用户管理、对话记录查询等功能。
+
+### 4.5 非功能性需求
+
+1. **可用性**:核心问答服务可用性不低于99.5%(按月计),单点故障(如某个容器异常退出)应能自动重启恢复,不应导致整个系统瘫痪。
+2. **性能**:知识检索响应时间(不含大模型生成时间)不超过500毫秒;大模型首字返回时间(TTFT)不超过2秒;支持至少20个并发用户同时使用。
+3. **数据安全**:
+   - 所有数据库连接需使用密码认证,密码不允许硬编码在代码或镜像中,须通过环境变量或密钥管理方式注入;
+   - 数据库数据需要定期备份,备份文件需加密存储;
+   - 容器间网络通信需要做到最小暴露原则,数据库、向量库等组件不应直接暴露端口给外部网络,仅允许应用服务容器访问。
+4. **可维护性**:
+   - 提供清晰的部署文档与运维手册;
+   - 提供一键部署脚本,支持首次部署、更新升级、回滚三种场景;
+   - 各容器需配置健康检查(healthcheck),异常状态可被监控系统及时发现;
+   - 日志需要统一收集,支持按服务、按时间检索。
+5. **可扩展性**:架构设计需为后续引入Kubernetes、引入多GPU分布式推理预留扩展空间,不应有强绑定单机部署的设计缺陷(例如避免容器间通过`localhost`硬编码通信,应统一使用Docker Compose的服务名进行网络寻址)。
+
+### 4.6 验收标准
+
+1. 在指定的生产服务器上,通过部署脚本一次性拉起全部容器,系统在10分钟内达到可用状态。
+2. 模拟机房断网环境下(仅允许内网通信),完成从零开始的完整部署,验证离线交付能力。
+3. 关闭任意一个非核心容器(如向量库容器)并观察系统降级表现是否符合预期(应给出明确的错误提示而非无响应或崩溃)。
+4. 手动触发一次容器重启(`docker compose restart`),验证数据不丢失、服务可在预期时间内恢复。
+5. 提交完整技术文档,包含架构图、部署手册、环境变量清单、常见问题排查手册。
+6. 通过御风金融科技部指定的安全评估流程(镜像漏洞扫描报告、端口暴露清单核查)。
+
+### 4.7 项目里程碑(容器化相关部分)
+
+- **T+0(本次任务,第56天)**:完成核心组件的Dockerfile编写与本地容器化验证,完成Docker Compose全栈编排,完成云服务器(测试环境)部署验证。
+- **T+1(第57天)**:安全合规专项收官,针对御风金融合规诉求进行专项review,包括镜像安全扫描、端口暴露审查、数据加密方案确认。
+- **T+2**:现场部署演练(模拟离线环境)。
+- **T+3**:正式在御风金融机房完成生产环境部署与验收。
+
+---
+
+孙昊念完这份需求文档,把最后一页翻过去,补了一句:"这份文档看着长,其实就落在两件事上——**别让客户操心环境**,**别让客户的数据出域**。今天咱们做的所有技术动作,都是为了兑现这两句话。"
+
+## 五、架构设计图:苍穹平台容器化部署架构
+
+```mermaid
+graph TB
+    subgraph Client["客户端层"]
+        Browser["浏览器 / 内部系统调用方"]
+    end
+
+    subgraph EdgeLayer["接入层(单台生产服务器)"]
+        Nginx["Nginx 反向代理容器<br/>nginx:1.25-alpine<br/>统一入口 · 80/443端口"]
+    end
+
+    subgraph AppLayer["应用服务层"]
+        Frontend["前端容器 frontend<br/>Nginx + 静态资源<br/>Vue/React 构建产物"]
+        Backend["后端容器 backend<br/>FastAPI + Uvicorn<br/>多阶段构建 Python镜像"]
+    end
+
+    subgraph AILayer["AI推理层"]
+        VLLM["vLLM推理服务容器 vllm-server<br/>本地化大模型推理<br/>OpenAI兼容接口 · GPU直通"]
+    end
+
+    subgraph DataLayer["数据存储层"]
+        Postgres["PostgreSQL容器 postgres<br/>业务数据 · 用户 · 对话历史"]
+        VectorDB["向量数据库容器 milvus/chroma<br/>知识库向量索引"]
+        Redis["Redis容器 redis<br/>会话缓存 · 限流计数"]
+    end
+
+    subgraph VolumeLayer["持久化存储卷"]
+        V1["pg_data 数据卷"]
+        V2["vector_data 数据卷"]
+        V3["model_weights 模型权重卷"]
+        V4["app_logs 日志卷"]
+    end
+
+    Browser -->|"HTTPS 443"| Nginx
+    Nginx -->|"/ 静态资源转发"| Frontend
+    Nginx -->|"/api/* 反向代理"| Backend
+
+    Backend -->|"检索请求"| VectorDB
+    Backend -->|"读写业务数据"| Postgres
+    Backend -->|"会话缓存/限流"| Redis
+    Backend -->|"OpenAI兼容API调用"| VLLM
+
+    Postgres --- V1
+    VectorDB --- V2
+    VLLM --- V3
+    Backend --- V4
+
+    classDef edge fill:#FFE0B2,stroke:#E65100,stroke-width:2px
+    classDef app fill:#BBDEFB,stroke:#0D47A1,stroke-width:2px
+    classDef ai fill:#C8E6C9,stroke:#1B5E20,stroke-width:2px
+    classDef data fill:#F8BBD0,stroke:#880E4F,stroke-width:2px
+    classDef vol fill:#E0E0E0,stroke:#424242,stroke-width:1px,stroke-dasharray: 4 3
+
+    class Nginx edge
+    class Frontend,Backend app
+    class VLLM ai
+    class Postgres,VectorDB,Redis data
+    class V1,V2,V3,V4 vol
+```
+
+**架构要点说明**(孙昊在白板上讲解时的原话整理):
+
+这张图的关键不是画了几个方框,是方框之间的"箭头方向"和"边界"。第一,所有对外的入口只有一个——Nginx容器的443端口,这是安全设计里的"单一暴露面"原则,数据库、向量库、Redis这些容器全部不映射端口到主机,只在Docker内部网络里被后端服务访问,外部完全摸不到,这一条直接满足了需求文档里"最小暴露原则"的要求。第二,前端容器和后端容器是解耦的,前端出了问题不影响后端接口,后端出了问题前端页面至少还能显示,只是接口报错,这种解耦对于后面做故障排查特别有用。第三,持久化存储卷单独画出来,是要提醒大家:容器是"随时可以扔掉重建"的,但数据卷不能扔,数据卷才是这套系统真正值钱的部分,数据库数据、向量索引、模型权重全部要落在数据卷上,容器重启、镜像升级都不能影响这些数据。
+
+## 六、流程图:从代码到镜像构建到容器运行到云服务器部署上线的完整CI/CD流程
+
+```mermaid
+flowchart TD
+    A["开发者本地编码<br/>陈铭在开发机上修改代码"] --> B["本地测试<br/>pytest 单元测试 + 手动接口验证"]
+    B --> C{"测试通过?"}
+    C -->|"否"| A
+    C -->|"是"| D["git commit / git push<br/>推送到 Git 仓库"]
+
+    D --> E["CI流水线触发<br/>GitHub Actions / GitLab CI"]
+    E --> F["代码检查阶段<br/>lint · 类型检查 · 安全扫描"]
+    F --> G{"检查通过?"}
+    G -->|"否"| H["通知开发者<br/>阻断流水线"]
+    H --> A
+    G -->|"是"| I["镜像构建阶段<br/>docker build 多阶段构建"]
+
+    I --> J["构建后端镜像<br/>backend:tag"]
+    I --> K["构建前端镜像<br/>frontend:tag"]
+
+    J --> L["镜像扫描<br/>trivy / grype 漏洞扫描"]
+    K --> L
+
+    L --> M{"存在高危漏洞?"}
+    M -->|"是"| H
+    M -->|"否"| N["推送镜像到镜像仓库<br/>私有Registry / Harbor"]
+
+    N --> O{"部署目标环境"}
+    O -->|"在线联网环境"| P["docker compose pull<br/>从仓库拉取最新镜像"]
+    O -->|"离线隔离环境<br/>如御风金融机房"| Q["docker save 导出镜像包<br/>拷贝介质带入机房<br/>docker load 导入"]
+
+    P --> R["docker compose up -d<br/>启动/更新全部容器"]
+    Q --> R
+
+    R --> S["健康检查等待<br/>healthcheck 全部通过"]
+    S --> T{"健康检查通过?"}
+    T -->|"否"| U["自动回滚<br/>docker compose down<br/>切回上一版本镜像"]
+    U --> H
+    T -->|"是"| V["Nginx反向代理接管流量<br/>灰度/全量切流"]
+
+    V --> W["云服务器/机房服务器<br/>公网或内网可访问"]
+    W --> X["监控与日志采集<br/>持续观察运行状态"]
+    X --> Y["运维值守<br/>孙昊团队日常巡检"]
+
+    classDef dev fill:#BBDEFB,stroke:#0D47A1,stroke-width:2px
+    classDef ci fill:#FFF9C4,stroke:#F57F17,stroke-width:2px
+    classDef build fill:#C8E6C9,stroke:#1B5E20,stroke-width:2px
+    classDef deploy fill:#FFCCBC,stroke:#BF360C,stroke-width:2px
+    classDef ops fill:#D1C4E9,stroke:#4527A0,stroke-width:2px
+
+    class A,B,D dev
+    class E,F,G,L,M ci
+    class I,J,K,N build
+    class O,P,Q,R,S,T,U,V deploy
+    class W,X,Y ops
+```
+
+**流程图讲解要点**:这条流程线看起来长,但陈铭他们今天要亲手跑通的,是中间从"镜像构建"到"部署上线"这一段。老王特意强调,左边的CI流水线部分(代码检查、自动化测试、自动扫描)属于"工程成熟度"的进阶内容,今天先手动走一遍构建和部署的核心步骤,把Dockerfile和docker-compose.yml写扎实,后面几天会补上自动化流水线的部分。而右边关于"离线隔离环境"的分支,是专门为御风金融这种私有化部署场景准备的——`docker save`和`docker load`这一对命令,今天下午会亲自演练,这是私有化交付里绕不开的一个动作。
+
+## 七、示意图:Docker镜像分层构建示意
+
+```mermaid
+flowchart TB
+    subgraph Layers["镜像分层结构(自底向上叠加,每一层都是只读的)"]
+        direction TB
+        L1["第1层:Base Image 基础镜像<br/>python:3.11-slim<br/>操作系统基础库 + Python运行时"]
+        L2["第2层:系统依赖层<br/>apt-get install<br/>编译工具 · libpq-dev · curl等"]
+        L3["第3层:Python依赖层<br/>COPY requirements.txt<br/>pip install -r requirements.txt"]
+        L4["第4层:应用代码层<br/>COPY . /app<br/>项目源代码"]
+        L5["第5层:运行配置层<br/>ENV / EXPOSE / ENTRYPOINT<br/>启动命令与元数据"]
+
+        L1 --> L2 --> L3 --> L4 --> L5
+    end
+
+    subgraph Cache["构建缓存机制"]
+        C1["未变更层:命中缓存<br/>直接复用,秒级完成"]
+        C2["变更层及其之后所有层:缓存失效<br/>需要重新构建"]
+    end
+
+    L5 -.->|"最终生成"| Image["可运行镜像<br/>backend:v1.2.0"]
+    Image -->|"docker run"| Container["运行中的容器实例<br/>可读写层 Container Layer"]
+
+    L1 -.镜像不变通常不重建.-> C1
+    L4 -.代码经常改动.-> C2
+
+    classDef base fill:#E1F5FE,stroke:#01579B,stroke-width:2px
+    classDef sys fill:#FFF3E0,stroke:#E65100,stroke-width:2px
+    classDef dep fill:#F1F8E9,stroke:#33691E,stroke-width:2px
+    classDef code fill:#FCE4EC,stroke:#880E4F,stroke-width:2px
+    classDef conf fill:#EDE7F6,stroke:#4527A0,stroke-width:2px
+    classDef img fill:#FFECB3,stroke:#FF6F00,stroke-width:3px
+    classDef run fill:#C8E6C9,stroke:#1B5E20,stroke-width:2px
+
+    class L1 base
+    class L2 sys
+    class L3 dep
+    class L4 code
+    class L5 conf
+    class Image img
+    class Container run
+```
+
+**示意图讲解要点**:这张图是孙昊上午课重点讲的内容——"为什么Dockerfile里COPY代码要放在最后一步,而不是一上来就把整个项目全拷进去"。答案就在这张图里:Docker构建镜像是分层叠加的,每一层都会被缓存,只要某一层的内容(以及它对应的指令)没有变化,Docker再次构建时会直接复用缓存,不用重新执行。如果把变化频率最高的代码层放在最前面,那么每次改一行代码,后面所有层(包括耗时的依赖安装)都要重新跑一遍,构建速度会慢得让人无法忍受。反过来,把基础镜像、系统依赖、Python依赖这些不常变的东西放在前面,代码放在最后,那么日常开发时改代码、重新构建,基本上几秒钟就能出结果,因为前面几层全部命中缓存。
+
+## 八、课堂笔记
+
+### 上午场:Docker基础(镜像 / 容器 / Dockerfile编写)
+
+孙昊上课不太爱用PPT,他直接打开一台干净的云服务器,从零开始敲命令,让陈铭他们跟着做。这段笔记是陈铭课后整理的,尽量还原了课堂上讲的逐字逐句。
+
+**1. 为什么需要容器,虚拟机不行吗?**
+
+孙昊先抛了一个问题:"你们之前用没用过虚拟机?VMware,VirtualBox那种。"陈铭说用过,装过Windows虚拟机跑一些老软件。孙昊接着说,虚拟机是"硬件级别的隔离"——每台虚拟机里都跑着一个完整的操作系统内核,占用资源大,启动慢,一台虚拟机动辄几个GB甚至几十个GB,启动要几十秒到几分钟。而容器是"进程级别的隔离",容器里没有独立的操作系统内核,所有容器共享宿主机的Linux内核,容器只是把应用程序需要的文件系统、依赖库、环境变量打包在一起,用Linux的namespace和cgroup机制做隔离。这样一来,容器镜像可以做到几十MB到几百MB,容器启动是秒级的,同一台机器上可以轻松跑几十个容器。
+
+老王补了一句更直白的比喻:"虚拟机是给你盖了一整栋新房子,容器是在同一栋房子里用隔断墙隔出了单独的房间。房间之间互不干扰,但地基、水电这些基础设施是共用的,所以效率高得多。"
+
+**2. 镜像(Image)和容器(Container)的关系**
+
+这是新手最容易搞混的两个概念,孙昊用了一个很直观的比喻:镜像就像是一个"类"(class),容器就像是这个类实例化出来的"对象"(instance)。镜像是静态的、只读的模板,里面打包了运行一个应用所需要的一切——操作系统基础文件、依赖库、代码、配置。容器则是镜像运行起来之后的实例,是一个动态的、可读写的进程,你可以基于同一个镜像启动多个容器,它们互相独立,各自有自己的运行状态,但都共享同一份镜像里的只读内容。
+
+命令层面的对应关系也很清晰:
+
+- `docker build`:根据Dockerfile构建出一个镜像。
+- `docker run`:基于一个镜像,创建并启动一个容器。
+- `docker images`:查看本机有哪些镜像(相当于"类库")。
+- `docker ps`:查看当前正在运行的容器(相当于"正在运行的对象实例")。
+- `docker ps -a`:查看包括已停止的所有容器。
+
+陈铭在这里问了个问题:"如果我从同一个镜像启动了三个容器,它们之间的数据是完全隔离的吗?"孙昊回答:"默认是完全隔离的,每个容器都有自己独立的可读写层,你在容器A里创建的文件,容器B里是看不到的。除非你显式地做了数据卷挂载或者网络互通配置,让它们之间产生联系,这个下午讲Compose的时候会细讲。"
+
+**3. Dockerfile的核心指令**
+
+孙昊现场敲了一个最简单的Dockerfile,一行一行讲解每个指令的含义,陈铭记录如下:
+
+- `FROM`:指定基础镜像,是Dockerfile的第一行(除了极少数场景),决定了你的镜像"从哪个地基开始盖"。常见的基础镜像有`python:3.11-slim`(裁剪过的Python官方镜像,体积小)、`node:20-alpine`(基于Alpine Linux的Node镜像,体积极小但兼容性稍弱)、`ubuntu:22.04`(完整的Ubuntu系统镜像,体积较大但兼容性好)。孙昊特别提醒,选基础镜像要在"体积"和"兼容性"之间权衡,像`alpine`系列镜像因为用的是musl libc而不是glibc,有些Python的C扩展库(比如某些科学计算库)在alpine上编译会遇到麻烦,生产环境如果对稳定性要求高,选`slim`版本通常是更稳妥的中间地带。
+- `WORKDIR`:设置容器内的工作目录,后续的相对路径操作都基于这个目录。相当于在容器里先`cd`到某个目录,而且如果目录不存在会自动创建。
+- `COPY` / `ADD`:把宿主机上的文件拷贝进镜像。`COPY`是最推荐的方式,单纯的文件拷贝;`ADD`功能更多(支持自动解压tar包、支持URL下载),但因为行为不够可预测,团队规范里一般约定优先用`COPY`,除非确实需要`ADD`的特殊能力。
+- `RUN`:在构建镜像的过程中执行命令,常用于安装依赖。每一个`RUN`指令都会生成一个新的镜像层,所以有经验的写法会把多个相关的命令用`&&`拼接在一个`RUN`里,减少层数,同时记得清理安装过程中产生的缓存文件(比如`apt-get clean`),避免镜像臃肿。
+- `ENV`:设置环境变量,这个变量在构建阶段和容器运行阶段都生效,是环境变量管理里非常关键的一个指令。
+- `ARG`:构建阶段的变量,只在`docker build`过程中生效,容器运行起来之后就消失了,常用于传递构建参数(比如指定安装某个版本的依赖)。
+- `EXPOSE`:声明容器会监听哪个端口,这只是一个"声明性"的元数据,并不会真正做端口映射,实际的端口映射要在`docker run -p`或者Compose文件里配置。
+- `CMD`:指定容器启动时默认执行的命令,如果`docker run`时指定了其他命令会覆盖`CMD`。
+- `ENTRYPOINT`:也是指定启动命令,但和`CMD`不同的是,`ENTRYPOINT`不容易被覆盖,通常用于固定容器的"主要行为",搭配`CMD`来传递默认参数,这样使用者可以通过`docker run image 参数`的方式灵活替换参数部分,但主命令是锁定的。
+- `VOLUME`:声明一个数据卷挂载点,提示这个目录的数据需要持久化,不应该跟着容器的生命周期一起被删除。
+- `USER`:指定容器内进程运行时使用的用户,默认情况下容器进程是以`root`身份运行的,这在生产环境是个安全隐患,孙昊特别强调,做正式交付的镜像一定要创建一个非root用户来运行应用进程,这是很多安全评估会重点检查的一项。
+- `HEALTHCHECK`:定义容器的健康检查命令,Docker会周期性执行这个命令来判断容器是否处于健康状态,这个指令对编排层面(Compose判断依赖是否就绪)非常关键。
+
+**4. 镜像分层与构建缓存**
+
+这一部分对应上面的示意图。孙昊现场演示了一个反面案例:把`COPY . .`放在`RUN pip install`之前,然后改了一行代码重新构建,发现`pip install`那一层缓存失效,重新跑了一遍,花了将近两分钟;把顺序调整过来,先`COPY requirements.txt`单独装依赖,再`COPY`剩余代码,同样改一行代码重新构建,只用了三秒钟。这个对比给陈铭留下了很深的印象——写Dockerfile不是随便堆指令,顺序本身就是一种设计。
+
+孙昊总结了一个经验法则:**变化频率越低的内容,越应该放在Dockerfile的前面**。基础镜像几乎不变,放最前面;系统依赖和第三方库依赖变化频率中等,放中间;业务代码变化最频繁,放最后。
+
+**5. .dockerignore文件**
+
+陈铭发现孙昊在项目根目录下建了一个`.dockerignore`文件,内容和`.gitignore`有点像,但作用不同——`.dockerignore`控制的是`docker build`执行`COPY . .`这类指令时,哪些文件不应该被拷进构建上下文。孙昊解释,如果不配置这个文件,`node_modules`、`.git`、本地虚拟环境、日志文件这些体积庞大又完全没必要放进镜像的东西,都会被一股脑儿拷进去,不但让镜像体积暴涨,还会拖慢每次构建时"发送构建上下文"这一步的速度(Docker构建的第一步是把当前目录打包发给Docker daemon,这个过程如果目录里塞满了垂圾文件会很慢)。
+
+**6. 多阶段构建(Multi-stage Build)**
+
+这是上午课的重点,也是下午写后端Dockerfile的核心技术。孙昊讲了一个场景:如果用Python写后端,构建过程中可能需要装一些编译工具(比如某些库需要`gcc`编译C扩展),但这些编译工具在应用运行阶段完全用不上,如果全部打进最终镜像,会让镜像体积白白增加几百MB,还扩大了安全攻击面(装的东西越多,潜在的漏洞就越多)。
+
+多阶段构建的思路是:Dockerfile里可以写多个`FROM`,每一个`FROM`开启一个新的构建阶段,前面阶段可以像正常流程一样装各种编译工具、跑各种构建命令,但最终阶段只从前面阶段里"拷贝"需要的产物(比如编译好的可执行文件、装好的依赖包),不拷贝那些只在构建过程中需要的工具链。这样最终生成的镜像只包含运行时真正需要的东西,又干净又小。
+
+前端项目是多阶段构建最典型的应用场景——第一阶段用完整的Node镜像执行`npm install`和`npm run build`,生成一堆静态文件(HTML/CSS/JS);第二阶段换成一个极简的Nginx镜像,只把第一阶段生成的静态文件拷进去。最终镜像里根本不需要Node.js运行时,只需要Nginx,镜像体积能从几百MB压缩到几十MB。
+
+**7. 常见坑点(孙昊现场吐槽的几个"血泪经验")**
+
+- 忘记指定`.dockerignore`,把整个`node_modules`打进构建上下文,构建慢得要死。
+- 在Dockerfile里写死了本机的绝对路径(比如`/Users/xxx/project`),换台机器构建直接失败。
+- 用`latest`标签的基础镜像,今天构建能用,过几周基础镜像更新了内容变了,构建行为不一致,生产环境的镜像应该锁定具体版本号,比如`python:3.11.9-slim`而不是`python:3.11-slim`,更严格地说甚至要锁定到具体的镜像digest。
+- 容器内进程用`root`用户运行,安全评估直接被打回。
+- 把敏感信息(数据库密码、API密钥)直接写进Dockerfile的`ENV`指令里,这些信息会被永久固化在镜像层里,`docker history`一查就能看到,这是绝对不能犯的错误,敏感信息必须通过运行时环境变量或者密钥管理服务注入,绝不能写进镜像。
+
+### 下午场:Docker Compose编排 + 云服务器部署上线
+
+午饭后陈铭他们回到工位,发现王振宇已经在群里发了下午的任务清单:上午把后端单独装进容器跑通了,下午要把整个系统——前端、后端、数据库、向量库、推理服务——全部编排起来,一条命令拉起,还要真正部署到云服务器上让公网能访问。
+
+**1. 为什么需要Docker Compose**
+
+上午大家用`docker run`命令手动启动了后端容器,孙昊问了一句:"如果我现在要同时启动后端、前端、数据库、向量库、推理服务五个容器,每个容器又要配置端口映射、环境变量、数据卷挂载、还要保证启动顺序(比如数据库要先起来,后端才能连上),你们打算敲几行`docker run`命令?"
+
+陈铭粗略算了一下,每个`docker run`命令加上各种参数,少说也要五六行,五个容器就是三十行密密麻麻的命令,而且顺序还容易搞错,重启一次整套系统简直是体力活。
+
+孙昊说,这正是Docker Compose存在的意义——用一份YAML文件,把"要启动哪些容器、每个容器用什么镜像、需要什么配置、容器之间怎么联网、数据怎么持久化"全部声明清楚,然后一条`docker compose up`命令,把整套系统一次性拉起来。这种方式叫"声明式编排"——你只需要描述"我想要的最终状态是什么样",不需要一步步告诉Docker怎么做,Compose引擎会自己去对比当前状态和期望状态,做出相应的动作。
+
+**2. Compose文件的核心概念**
+
+- **services(服务)**:Compose文件里最核心的部分,每一个service对应一个(或多个)容器,定义了这个服务用什么镜像(或者用哪个Dockerfile构建)、暴露什么端口、挂载什么数据卷、依赖哪些其他服务等等。
+- **networks(网络)**:Compose默认会给每个项目创建一个专属的桌面网络,同一个网络里的容器可以通过**服务名**直接互相访问,比如后端容器要连数据库,不需要知道数据库容器的IP地址,直接用`postgres`这个服务名当作主机名去连接就行,Docker内置的DNS会自动解析。这一点解决了容器IP地址不固定的问题(容器每次重启IP可能会变,但服务名是固定的)。
+- **volumes(数据卷)**:声明持久化存储,分为具名卷(named volume,由Docker管理存储位置)和绑定挂载(bind mount,直接映射宿主机某个目录)。数据库、向量库这类需要持久化数据的服务,一定要挂载数据卷,否则容器被删除,数据就跟着一起没了。
+- **depends_on**:声明服务之间的启动依赖顺序,比如后端服务要`depends_on`数据库服务,Compose会保证先启动数据库容器再启动后端容器。但要特别注意,`depends_on`默认只保证"启动顺序",不保证"服务真正就绪"——数据库容器启动了不代表数据库已经初始化完毕可以接受连接了,这中间可能有几秒的差距。要解决这个问题,需要结合`healthcheck`和`condition: service_healthy`一起使用,这也是孙昊今天下午重点强调的一个细节,很多团队踩过这个坑,表现出来的现象就是"每次冷启动第一次请求都会报数据库连接失败,过几秒重试就好了"。
+- **环境变量与`.env`文件**:Compose支持在项目根目录放一个`.env`文件,文件里定义的变量可以在`docker-compose.yml`里通过`${变量名}`的方式引用,这是环境变量管理的核心机制,今天下午的代码实战会详细展开。
+
+**3. 健康检查(healthcheck)的重要性**
+
+孙昊讲了一个真实的案例:之前给另一个客户交付的系统,数据库容器和后端容器几乎同时启动,后端容器里的应用在启动阶段就尝试连接数据库执行初始化,结果因为数据库还没完全准备好接受连接,后端直接报错退出,容器就跟着退出了。虽然Docker配置了自动重启策略,后端容器重启后数据库已经准备好了,所以第二次能连上,但从外部看,系统"启动之后前几十秒会报错",这在生产环境是不能接受的现象。
+
+解决方案就是给每个服务配置`healthcheck`,比如数据库容器的健康检查可以是执行一次简单的查询命令,后端容器的健康检查可以是访问自己的`/health`接口。然后在依赖这个服务的其他服务里,用`depends_on`的`condition: service_healthy`写法,明确要求"必须等到数据库健康检查通过,才能启动后端容器",这样就能从根本上避免"启动时序竞争"的问题。
+
+**4. 云服务器部署上线的完整流程**
+
+下午课的后半段,孙昊带着大家真正在一台云服务器上从零开始部署。整体步骤如下(这是课堂上边操作边讲的流程,陈铭记录得比较细):
+
+**第一步,选择云服务器与初始化。** 孙昊解释,选云服务器要考虑的因素包括:地域(尽量选择离目标用户近的地域,降低网络延迟)、实例规格(CPU/内存/是否需要GPU,今天的实操环境用的是不带GPU的普通实例,GPU相关的vLLM部署留在明天专项处理)、操作系统镜像(统一用Ubuntu 22.04 LTS,和御风金融机房环境保持一致,减少后续排查环境差异的成本)、存储(系统盘和数据盘要分开,数据盘专门挂载给容器的数据卷使用,方便后续扩容和备份)。
+
+**第二步,基础环境准备。** 新买的云服务器是一张白纸,需要先完成:更新系统软件包、安装Docker Engine和Docker Compose插件、配置防火墙规则(云服务器通常还有一层"安全组"的概念,需要在云平台控制台单独放开需要暴露的端口,比如80和443)、创建部署专用的普通用户(不建议一直用root操作)、配置SSH密钥登录(禁用密码登录,提升安全性)。
+
+**第三步,安装Docker。** 孙昊强调不要用系统自带的旧版本Docker包(比如Ubuntu的`docker.io`软件包,版本往往落后很多),要用Docker官方提供的安装脚本或者官方源来安装最新稳定版。安装完之后,一定要把部署用户加入`docker`用户组,否则每次执行docker命令都要加`sudo`,很麻烦而且容易出安全问题(把普通用户加入docker组本身也有一定的权限提升风险,这一点孙昊也提到了,在真正的生产环境里,更严格的做法是通过专门的CI/CD账号或者受控的sudo规则来执行部署操作,而不是让开发人员的个人账号拥有docker权限)。
+
+**第四步,把代码和构建产物传到服务器。** 有两种主流方式:一种是直接在服务器上`git clone`代码仓库,然后在服务器本地执行`docker build`;另一种是在本地或者CI环境里构建好镜像,推送到镜像仓库,服务器上只需要`docker pull`拉取镜像。对于御风金融这种离线环境,还有第三种方式——本地构建好镜像后用`docker save`导出成tar文件,通过安全的介质(比如加密U盘,走安全审批流程)带入机房,再用`docker load`导入。今天的实操环境是联网环境,所以选择第一种方式,直接在云服务器上clone代码构建。
+
+**第五步,配置环境变量与密钥。** 在服务器上创建`.env`文件,填入生产环境专用的数据库密码、密钥等敏感信息,这个文件绝对不能提交到Git仓库,要在`.gitignore`里明确排除,同时要设置合理的文件权限(比如`chmod 600 .env`,只允许文件所有者读写)。
+
+**第六步,执行部署脚本,拉起全部容器。** 运行`docker compose up -d`,加上`-d`参数表示在后台运行(detached模式),不会一直占用当前终端会话。
+
+**第七步,验证服务状态。** 用`docker compose ps`查看所有容器的运行状态和健康检查结果,用`docker compose logs -f 服务名`查看某个服务的实时日志,排查启动异常。
+
+**第八步,配置反向代理与域名(或直接用IP访问)。** 今天的实操环境暂时没有正式域名,先直接用"服务器公网IP + 端口"的方式验证访问,后续正式上线时会配置域名解析和HTTPS证书(比如用Let's Encrypt的免费证书,通过`certbot`自动续期)。
+
+**第九步,设置开机自启与容器重启策略。** 在Compose文件里给每个服务配置`restart: always`或者`restart: unless-stopped`策略,保证服务器重启或者容器意外退出后能自动恢复,不需要人工介入。
+
+**5. 部署完成后的验证清单**
+
+孙昊要求大家部署完成后,必须按照一份checklist逐项验证,不能只看"页面能打开"就算完事:
+
+- 前端页面能否正常访问,静态资源(图片、样式)加载是否正常;
+- 后端接口能否正常响应,包括正常请求和异常请求(比如传错参数)的处理是否符合预期;
+- 数据库连接是否正常,数据写入和读取是否正确;
+- 向量库检索功能是否正常,能否正确返回相关文档片段;
+- 大模型推理接口是否正常,响应内容是否合理;
+- 各容器的资源占用情况(CPU、内存)是否在合理范围,有没有异常飙升;
+- 容器日志里有没有隐藏的报错或者警告信息(有些服务即使表面上功能正常,日志里也可能藏着一些将来会爆发的隐患);
+- 重启服务器模拟一次故障恢复,验证所有容器能否自动重新拉起并恢复正常服务。
+
+陈铭在验证过程中真的发现了一个问题——向量库容器的健康检查配置有误,健康检查命令写的端口和实际监听端口不一致,导致Compose一直认为这个服务"不健康",尽管功能上其实是正常工作的。这个问题排查了将近二十分钟,最后是孙昊提醒他去看Compose对该服务健康检查的详细状态才发现的。这个小插曲让陈铭真切体会到,健康检查这种"看起来是配置项"的东西,配错了同样会造成实实在在的问题排查成本。
+
+---
+
+## 九、代码实战
+
+今天的代码实战,目标是把"苍穹知识库问答系统"完整容器化,并编排部署到云服务器。整体项目结构如下:
+
+```
+cangqiong-knowledge-base/
+├── backend/                     # FastAPI 后端服务
+│   ├── app/
+│   │   ├── main.py
+│   │   ├── config.py
+│   │   ├── database.py
+│   │   ├── models.py
+│   │   ├── schemas.py
+│   │   ├── routers/
+│   │   │   ├── __init__.py
+│   │   │   ├── chat.py
+│   │   │   ├── documents.py
+│   │   │   └── health.py
+│   │   ├── services/
+│   │   │   ├── __init__.py
+│   │   │   ├── vector_service.py
+│   │   │   ├── llm_service.py
+│   │   │   └── rag_service.py
+│   │   └── utils/
+│   │       └── logger.py
+│   ├── requirements.txt
+│   ├── Dockerfile
+│   ├── .dockerignore
+│   └── docker-entrypoint.sh
+├── frontend/                     # 前端项目
+│   ├── src/
+│   ├── package.json
+│   ├── Dockerfile
+│   ├── .dockerignore
+│   └── nginx.frontend.conf
+├── nginx/                        # 反向代理配置
+│   ├── nginx.conf
+│   └── conf.d/
+│       └── cangqiong.conf
+├── scripts/                      # 部署与运维脚本
+│   ├── deploy.sh
+│   ├── rollback.sh
+│   ├── wait-for-it.sh
+│   ├── backup.sh
+│   ├── restore.sh
+│   └── health-check-all.sh
+├── docker-compose.yml
+├── docker-compose.prod.yml
+├── .env.example
+├── .gitignore
+└── Makefile
+```
+
+接下来逐一实现每一部分。
+
+### 9.1 后端Dockerfile(多阶段构建)
+
+```dockerfile
+# ==============================================================================
+# 苍穹企业级智能体中台 - 后端服务 Dockerfile
+# 采用多阶段构建:builder阶段负责安装依赖与编译,runtime阶段只保留运行时必需内容
+# 维护者:陈铭 / 孙昊  项目:御风金融私有化部署专项
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 阶段一:builder —— 负责编译依赖、安装Python包
+# ------------------------------------------------------------------------------
+FROM python:3.11.9-slim AS builder
+
+# 声明构建期变量,用于控制pip源、是否启用测试等,默认使用官方源
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG BUILD_ENV=production
+
+LABEL stage="builder"
+LABEL maintainer="cangqiong-team@pengyuan.tech"
+
+# 避免生成 .pyc 文件、避免输出缓冲,方便日志实时查看
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /build
+
+# 安装编译依赖:某些Python库(如psycopg2、部分向量计算库)需要C扩展编译环境
+# 使用 --no-install-recommends 减少不必要的软件包,控制层体积
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        gcc \
+        g++ \
+        libpq-dev \
+        curl \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+# 先只拷贝依赖清单文件,充分利用Docker层缓存机制
+# 只要 requirements.txt 内容不变,下面这一层在重新构建时会直接命中缓存
+COPY requirements.txt .
+
+# 使用虚拟环境隔离依赖,方便后面整体拷贝到运行阶段
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+RUN pip install --upgrade pip setuptools wheel \
+    && pip install -i ${PIP_INDEX_URL} --no-cache-dir -r requirements.txt
+
+# ------------------------------------------------------------------------------
+# 阶段二:runtime —— 最终运行镜像,只保留必需的运行时文件
+# ------------------------------------------------------------------------------
+FROM python:3.11.9-slim AS runtime
+
+LABEL stage="runtime"
+LABEL maintainer="cangqiong-team@pengyuan.tech"
+LABEL description="苍穹企业级智能体中台 - 后端服务运行镜像"
+LABEL version="1.0.0"
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    APP_HOME=/app \
+    TZ=Asia/Shanghai
+
+# 运行阶段只需要极少量的系统库,不需要编译工具链
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libpq5 \
+        curl \
+        tzdata \
+    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone \
+    && rm -rf /var/lib/apt/lists/*
+
+# 创建非root用户运行应用进程,避免容器内以root身份运行造成的安全隐患
+RUN groupadd --gid 1000 appgroup \
+    && useradd --uid 1000 --gid appgroup --shell /bin/bash --create-home appuser
+
+# 从builder阶段拷贝已经装好依赖的虚拟环境,不需要重新安装,也不带编译工具链
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+WORKDIR ${APP_HOME}
+
+# 拷贝应用代码(变化最频繁的内容放在最后,最大化利用缓存)
+COPY --chown=appuser:appgroup ./app ${APP_HOME}/app
+COPY --chown=appuser:appgroup ./docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
+    && mkdir -p ${APP_HOME}/logs ${APP_HOME}/uploads \
+    && chown -R appuser:appgroup ${APP_HOME}/logs ${APP_HOME}/uploads
+
+# 切换到非root用户
+USER appuser
+
+EXPOSE 8000
+
+# 健康检查:定期访问健康检查接口,判断容器是否处于健康状态
+# interval: 检查间隔  timeout: 单次检查超时时间  retries: 连续失败次数达到阈值判定为unhealthy
+# start-period: 容器启动后的宽限期,宽限期内的失败不计入retries
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:8000/api/health || exit 1
+
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+```
+
+### 9.2 前端Dockerfile(多阶段构建)
+
+```dockerfile
+# ==============================================================================
+# 苍穹企业级智能体中台 - 前端服务 Dockerfile
+# 阶段一使用完整Node环境完成依赖安装与构建
+# 阶段二使用极简Nginx镜像仅承载静态构建产物,大幅缩小镜像体积
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 阶段一:builder —— 安装依赖并执行前端构建
+# ------------------------------------------------------------------------------
+FROM node:20.14.0-alpine AS builder
+
+LABEL stage="builder"
+
+WORKDIR /build
+
+# 单独拷贝依赖清单文件,充分利用构建缓存
+COPY package.json package-lock.json ./
+
+# 使用 npm ci 而不是 npm install:严格按照 lock 文件安装,保证依赖版本完全一致
+# --prefer-offline 优先使用本地缓存,加快构建速度
+RUN npm ci --prefer-offline --no-audit --no-fund
+
+# 拷贝其余源代码
+COPY . .
+
+# 构建期注入的环境变量,比如API基础地址,通过 ARG 传入,允许在不同环境使用不同配置构建
+ARG VITE_API_BASE_URL=/api
+ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
+
+RUN npm run build
+
+# ------------------------------------------------------------------------------
+# 阶段二:runtime —— 使用Nginx承载静态资源
+# ------------------------------------------------------------------------------
+FROM nginx:1.25.4-alpine AS runtime
+
+LABEL stage="runtime"
+LABEL description="苍穹企业级智能体中台 - 前端静态资源服务"
+
+# 移除Nginx默认配置,替换为项目定制配置
+RUN rm -f /etc/nginx/conf.d/default.conf
+
+COPY nginx.frontend.conf /etc/nginx/conf.d/default.conf
+
+# 只拷贝构建产物(通常是 dist 目录),不携带任何Node.js运行时或源代码
+COPY --from=builder /build/dist /usr/share/nginx/html
+
+# 非root用户运行Nginx(nginx:alpine镜像自带一个非特权用户nginx,这里做显式声明)
+RUN chown -R nginx:nginx /usr/share/nginx/html \
+    && chown -R nginx:nginx /var/cache/nginx \
+    && touch /var/run/nginx.pid \
+    && chown nginx:nginx /var/run/nginx.pid
+
+USER nginx
+
+EXPOSE 80
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:80/ || exit 1
+
+CMD ["nginx", "-g", "daemon off;"]
+```
+
+前端容器内部的Nginx配置(`nginx.frontend.conf`,负责单页应用路由回退与静态资源缓存策略):
+
+```nginx
+server {
+    listen 80;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # gzip压缩,减少静态资源传输体积
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript;
+    gzip_min_length 1024;
+    gzip_comp_level 6;
+
+    # 静态资源长缓存,文件名带哈希值,内容变化时文件名也会变,可以放心长缓存
+    location ~* \.(js|css|png|jpg|jpeg|gif|svg|woff|woff2|ttf|eot|ico)$ {
+        expires 30d;
+        add_header Cache-Control "public, no-transform";
+        access_log off;
+    }
+
+    # 单页应用路由回退:任何前端路由路径找不到对应文件时,统一回退到index.html
+    # 由前端路由(如vue-router / react-router)接管后续渲染
+    location / {
+        try_files $uri $uri/ /index.html;
+        add_header Cache-Control "no-cache";
+    }
+
+    # 健康检查探测端点,避免被access log污染
+    location = /healthz {
+        access_log off;
+        return 200 "ok\n";
+        add_header Content-Type text/plain;
+    }
+
+    error_page 500 502 503 504 /50x.html;
+    location = /50x.html {
+        root /usr/share/nginx/html;
+    }
+}
+```
+
+### 9.3 docker-compose.yml 全栈编排(整合后端/前端/PostgreSQL/向量数据库/vLLM推理服务)
+
+```yaml
+# ==============================================================================
+# 苍穹企业级智能体中台 - 全栈容器编排配置
+# 服务组成:Nginx反向代理 · 前端 · 后端 · PostgreSQL · Chroma向量数据库 · Redis缓存 · vLLM推理服务
+# 适用范围:开发/测试环境通用基线配置,生产环境叠加 docker-compose.prod.yml 覆盖
+# ==============================================================================
+
+version: "3.9"
+
+# ------------------------------------------------------------------------------
+# 网络定义:划分前端网络与后端网络,实现最小暴露原则
+# frontend-net:仅Nginx与前端/后端服务可访问,面向外部流量入口
+# backend-net:仅后端与各数据存储/推理服务可访问,不对外暴露
+# ------------------------------------------------------------------------------
+networks:
+  frontend-net:
+    driver: bridge
+  backend-net:
+    driver: bridge
+    internal: false   # 生产环境覆盖配置中会设为 true,彻底隔绝出网能力
+
+# ------------------------------------------------------------------------------
+# 数据卷定义:所有需要持久化的数据全部落在具名卷上,与容器生命周期解耦
+# ------------------------------------------------------------------------------
+volumes:
+  pg_data:
+    driver: local
+  vector_data:
+    driver: local
+  redis_data:
+    driver: local
+  model_weights:
+    driver: local
+  app_logs:
+    driver: local
+  nginx_logs:
+    driver: local
+
+services:
+
+  # ----------------------------------------------------------------------------
+  # Nginx 反向代理:统一入口,承担静态资源转发与API反向代理
+  # ----------------------------------------------------------------------------
+  nginx:
+    image: nginx:1.25.4-alpine
+    container_name: cangqiong-nginx
+    restart: unless-stopped
+    ports:
+      - "${NGINX_HTTP_PORT:-80}:80"
+      - "${NGINX_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+      - nginx_logs:/var/log/nginx
+    networks:
+      - frontend-net
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:80/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ----------------------------------------------------------------------------
+  # 前端服务:构建产物由 Nginx 承载
+  # ----------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
+    image: cangqiong/frontend:${IMAGE_TAG:-latest}
+    container_name: cangqiong-frontend
+    restart: unless-stopped
+    expose:
+      - "80"
+    networks:
+      - frontend-net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:80/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ----------------------------------------------------------------------------
+  # 后端服务:FastAPI 应用主体
+  # ----------------------------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        BUILD_ENV: ${BUILD_ENV:-production}
+    image: cangqiong/backend:${IMAGE_TAG:-latest}
+    container_name: cangqiong-backend
+    restart: unless-stopped
+    expose:
+      - "8000"
+    environment:
+      - APP_ENV=${APP_ENV:-production}
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - REDIS_URL=redis://redis:6379/0
+      - VECTOR_DB_HOST=chroma
+      - VECTOR_DB_PORT=8001
+      - VLLM_BASE_URL=http://vllm-server:8100/v1
+      - VLLM_MODEL_NAME=${VLLM_MODEL_NAME:-qwen2.5-7b-instruct}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - MAX_UPLOAD_SIZE_MB=${MAX_UPLOAD_SIZE_MB:-50}
+      - CONVERSATION_RETENTION_DAYS=${CONVERSATION_RETENTION_DAYS:-180}
+    volumes:
+      - app_logs:/app/logs
+      - ./backend/uploads:/app/uploads
+    networks:
+      - frontend-net
+      - backend-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      chroma:
+        condition: service_healthy
+      vllm-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 4G
+        reservations:
+          cpus: "1"
+          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
+
+  # ----------------------------------------------------------------------------
+  # PostgreSQL:业务数据、用户、对话历史留存
+  # ----------------------------------------------------------------------------
+  postgres:
+    image: postgres:16.3-alpine
+    container_name: cangqiong-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./backend/sql/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - backend-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "30m"
+        max-file: "5"
+
+  # ----------------------------------------------------------------------------
+  # Redis:会话缓存、限流计数器、任务队列辅助
+  # ----------------------------------------------------------------------------
+  redis:
+    image: redis:7.2-alpine
+    container_name: cangqiong-redis
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ----------------------------------------------------------------------------
+  # Chroma 向量数据库:知识库文档向量索引与检索
+  # 说明:考虑首期部署规模,选用轻量级的Chroma;若后续数据规模增长,可平滑迁移至Milvus集群方案
+  # ----------------------------------------------------------------------------
+  chroma:
+    image: chromadb/chroma:0.5.3
+    container_name: cangqiong-chroma
+    restart: unless-stopped
+    environment:
+      - IS_PERSISTENT=TRUE
+      - PERSIST_DIRECTORY=/chroma/chroma_data
+      - ANONYMIZED_TELEMETRY=FALSE
+      - CHROMA_SERVER_AUTH_CREDENTIALS=${CHROMA_AUTH_TOKEN}
+      - CHROMA_SERVER_AUTH_PROVIDER=chromadb.auth.token_authn.TokenAuthenticationServerProvider
+    volumes:
+      - vector_data:/chroma/chroma_data
+    networks:
+      - backend-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "30m"
+        max-file: "5"
+
+  # ----------------------------------------------------------------------------
+  # vLLM 推理服务:本地化大模型推理,提供OpenAI兼容接口
+  # 说明:承接第55天接入成果,此处以容器化方式统一纳入编排体系
+  # ----------------------------------------------------------------------------
+  vllm-server:
+    image: vllm/vllm-openai:v0.5.4
+    container_name: cangqiong-vllm
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${GPU_DEVICE_IDS:-0}
+      - HF_HOME=/models/.cache
+    volumes:
+      - model_weights:/models
+    command: >
+      --model /models/${VLLM_MODEL_NAME:-qwen2.5-7b-instruct}
+      --served-model-name ${VLLM_MODEL_NAME:-qwen2.5-7b-instruct}
+      --host 0.0.0.0
+      --port 8100
+      --gpu-memory-utilization 0.85
+      --max-model-len 8192
+      --max-num-seqs 32
+      --dtype bfloat16
+    networks:
+      - backend-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8100/health"]
+      interval: 20s
+      timeout: 10s
+      retries: 6
+      start_period: 120s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: ["gpu"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
+```
+
+生产环境覆盖配置(`docker-compose.prod.yml`,与基础配置叠加使用,启动命令为`docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d`):
+
+```yaml
+# ==============================================================================
+# 生产环境覆盖配置
+# 使用方式: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+# 主要变化:关闭调试端口暴露、加强资源限制、启用backend-net内部隔离、调整日志与重启策略
+# ==============================================================================
+
+version: "3.9"
+
+networks:
+  backend-net:
+    internal: true    # 生产环境彻底关闭backend-net的出网能力,数据库/向量库/推理服务无法主动访问外网
+
+services:
+
+  nginx:
+    restart: always
+    volumes:
+      - ./nginx/nginx.prod.conf:/etc/nginx/nginx.conf:ro
+    logging:
+      options:
+        max-size: "50m"
+        max-file: "10"
+
+  frontend:
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+
+  backend:
+    restart: always
+    environment:
+      - APP_ENV=production
+      - LOG_LEVEL=WARNING
+    deploy:
+      resources:
+        limits:
+          cpus: "6"
+          memory: 6G
+        reservations:
+          cpus: "2"
+          memory: 2G
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 5
+        window: 120s
+
+  postgres:
+    restart: always
+    ports: []          # 生产环境不映射数据库端口到主机,彻底不暴露
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 8G
+
+  redis:
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+
+  chroma:
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 8G
+
+  vllm-server:
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 32G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: ["gpu"]
+```
+
+### 9.4 环境变量管理:`.env`文件与docker-compose的整合
+
+```bash
+# ==============================================================================
+# .env.example —— 环境变量配置模板
+# 使用说明:复制本文件为 .env,并填入真实的敏感信息,.env 文件不应提交到Git仓库
+# 命名规范:全部使用大写字母加下划线,保持与 docker-compose.yml 引用一致
+# ==============================================================================
+
+# ---------------- 应用基础配置 ----------------
+APP_ENV=production
+BUILD_ENV=production
+IMAGE_TAG=v1.0.0
+LOG_LEVEL=INFO
+
+# ---------------- 前端构建配置 ----------------
+VITE_API_BASE_URL=/api
+
+# ---------------- Nginx 端口配置 ----------------
+NGINX_HTTP_PORT=80
+NGINX_HTTPS_PORT=443
+
+# ---------------- PostgreSQL 配置 ----------------
+# 生产环境请使用强随机密码,建议不少于20位,包含大小写字母、数字与特殊字符
+POSTGRES_USER=cangqiong_admin
+POSTGRES_PASSWORD=CHANGE_ME_STRONG_PASSWORD_HERE
+POSTGRES_DB=cangqiong_kb
+
+# ---------------- Redis 配置 ----------------
+REDIS_PASSWORD=CHANGE_ME_REDIS_PASSWORD_HERE
+
+# ---------------- 向量数据库配置 ----------------
+CHROMA_AUTH_TOKEN=CHANGE_ME_CHROMA_TOKEN_HERE
+
+# ---------------- vLLM 推理服务配置 ----------------
+VLLM_MODEL_NAME=qwen2.5-7b-instruct
+GPU_DEVICE_IDS=0
+
+# ---------------- 安全密钥配置 ----------------
+# JWT签名密钥,用于用户身份鉴权,务必使用高强度随机字符串,可用 openssl rand -hex 32 生成
+JWT_SECRET_KEY=CHANGE_ME_JWT_SECRET_HERE
+
+# ---------------- 业务配置 ----------------
+MAX_UPLOAD_SIZE_MB=50
+CONVERSATION_RETENTION_DAYS=180
+```
+
+后端配置读取模块(`backend/app/config.py`,展示环境变量如何在应用代码里被消费,与Compose文件形成闭环):
+
+```python
+"""
+苍穹企业级智能体中台 - 后端配置模块
+统一从环境变量读取配置,不在代码中硬编码任何敏感信息或环境相关参数
+所有变量均由 docker-compose.yml 的 environment 字段注入,
+最终来源于 .env 文件,实现"配置与代码分离"的十二要素应用(12-Factor App)原则
+"""
+
+import os
+from functools import lru_cache
+from typing import Optional
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """应用运行时配置,继承自 pydantic-settings,自动从环境变量加载并做类型校验"""
+
+    model_config = SettingsConfigDict(env_file=None, case_sensitive=True, extra="ignore")
+
+    # 应用基础信息
+    app_name: str = "苍穹企业级智能体中台"
+    app_env: str = os.getenv("APP_ENV", "development")
+    log_level: str = os.getenv("LOG_LEVEL", "INFO")
+
+    # 数据库配置
+    database_url: str = os.getenv(
+        "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/cangqiong_kb"
+    )
+    database_pool_size: int = int(os.getenv("DATABASE_POOL_SIZE", "10"))
+    database_max_overflow: int = int(os.getenv("DATABASE_MAX_OVERFLOW", "20"))
+
+    # Redis 配置
+    redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+    # 向量数据库配置
+    vector_db_host: str = os.getenv("VECTOR_DB_HOST", "localhost")
+    vector_db_port: int = int(os.getenv("VECTOR_DB_PORT", "8001"))
+    chroma_auth_token: Optional[str] = os.getenv("CHROMA_AUTH_TOKEN")
+
+    # vLLM 推理服务配置
+    vllm_base_url: str = os.getenv("VLLM_BASE_URL", "http://localhost:8100/v1")
+    vllm_model_name: str = os.getenv("VLLM_MODEL_NAME", "qwen2.5-7b-instruct")
+    vllm_request_timeout: int = int(os.getenv("VLLM_REQUEST_TIMEOUT", "60"))
+
+    # 安全配置
+    jwt_secret_key: str = os.getenv("JWT_SECRET_KEY", "")
+    jwt_algorithm: str = "HS256"
+    jwt_expire_minutes: int = int(os.getenv("JWT_EXPIRE_MINUTES", "480"))
+
+    # 业务配置
+    max_upload_size_mb: int = int(os.getenv("MAX_UPLOAD_SIZE_MB", "50"))
+    conversation_retention_days: int = int(os.getenv("CONVERSATION_RETENTION_DAYS", "180"))
+
+    def validate_production_secrets(self) -> None:
+        """生产环境启动前的强制校验,防止关键密钥缺失或使用默认弱值直接上线"""
+        if self.app_env == "production":
+            if not self.jwt_secret_key or len(self.jwt_secret_key) < 32:
+                raise RuntimeError(
+                    "生产环境下 JWT_SECRET_KEY 未配置或强度不足(需不少于32位),"
+                    "请检查 .env 文件配置,禁止使用弱密钥上线"
+                )
+            if "CHANGE_ME" in self.database_url:
+                raise RuntimeError("检测到数据库连接串仍为默认占位值,请在 .env 中配置真实密码")
+
+
+@lru_cache
+def get_settings() -> Settings:
+    """使用lru_cache确保配置对象在应用生命周期内只被构建一次,避免重复解析环境变量"""
+    settings = Settings()
+    settings.validate_production_secrets()
+    return settings
+```
+
+### 9.5 Nginx反向代理配置(主入口)
+
+```nginx
+# ==============================================================================
+# nginx/nginx.conf —— 主配置文件
+# ==============================================================================
+
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log warn;
+pid /var/run/nginx.pid;
+
+events {
+    worker_connections 2048;
+    use epoll;
+    multi_accept on;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    log_format main_json escape=json
+        '{'
+        '"time":"$time_iso8601",'
+        '"remote_addr":"$remote_addr",'
+        '"request_method":"$request_method",'
+        '"request_uri":"$request_uri",'
+        '"status":"$status",'
+        '"body_bytes_sent":"$body_bytes_sent",'
+        '"request_time":"$request_time",'
+        '"upstream_response_time":"$upstream_response_time",'
+        '"http_user_agent":"$http_user_agent",'
+        '"http_x_forwarded_for":"$http_x_forwarded_for"'
+        '}';
+
+    access_log /var/log/nginx/access.log main_json;
+
+    sendfile        on;
+    tcp_nopush      on;
+    tcp_nodelay     on;
+    keepalive_timeout 65;
+    client_max_body_size 60m;
+
+    # 隐藏版本号,减少信息泄露面
+    server_tokens off;
+
+    # 限流配置:防止接口被恶意刷量,zone定义在http块,具体应用在server块内
+    limit_req_zone $binary_remote_addr zone=api_limit:10m rate=10r/s;
+    limit_conn_zone $binary_remote_addr zone=conn_limit:10m;
+
+    gzip on;
+    gzip_types text/plain application/json application/javascript text/css;
+    gzip_min_length 1024;
+
+    include /etc/nginx/conf.d/*.conf;
+}
+```
+
+反向代理站点配置(`nginx/conf.d/cangqiong.conf`):
+
+```nginx
+# ==============================================================================
+# nginx/conf.d/cangqiong.conf —— 苍穹知识库系统站点配置
+# 统一入口:80端口http自动跳转https,443端口承接实际流量
+# 路由规则:/ 转发给前端容器,/api/* 转发给后端容器,做统一反向代理
+# ==============================================================================
+
+upstream backend_upstream {
+    server backend:8000 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+}
+
+upstream frontend_upstream {
+    server frontend:80 max_fails=3 fail_timeout=30s;
+    keepalive 16;
+}
+
+# HTTP 全部跳转 HTTPS(正式域名接入后启用,今日实操环境暂以IP直连80端口验证)
+server {
+    listen 80;
+    server_name _;
+
+    location /healthz {
+        access_log off;
+        return 200 "ok\n";
+    }
+
+    location / {
+        # 若尚未配置证书,可临时注释下面这行,直接走http访问,仅用于内部验证阶段
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    server_name kb.yufengfinance-internal.com;  # 实际域名以御风金融内部DNS解析结果为准
+
+    ssl_certificate     /etc/nginx/certs/fullchain.pem;
+    ssl_certificate_key /etc/nginx/certs/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    client_max_body_size 60m;
+
+    # 后端API转发
+    location /api/ {
+        limit_req zone=api_limit burst=20 nodelay;
+        limit_conn conn_limit 20;
+
+        proxy_pass http://backend_upstream/;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # 大模型生成接口耗时较长,适当放宽超时时间,支持流式响应场景
+        proxy_read_timeout 180s;
+        proxy_send_timeout 180s;
+        proxy_connect_timeout 10s;
+        proxy_buffering off;   # 流式接口(SSE)必须关闭缓冲,否则前端收不到实时流式输出
+    }
+
+    # 健康检查探测端点单独放行,不计入限流
+    location /api/health {
+        proxy_pass http://backend_upstream/api/health;
+        access_log off;
+    }
+
+    # 前端静态资源与页面路由
+    location / {
+        proxy_pass http://frontend_upstream/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    error_page 502 503 504 /50x_custom.html;
+    location = /50x_custom.html {
+        root /usr/share/nginx/html;
+        internal;
+    }
+}
+```
+
+### 9.6 部署脚本
+
+```bash
+#!/usr/bin/env bash
+# ==============================================================================
+# scripts/deploy.sh —— 苍穹知识库系统一键部署脚本
+# 支持场景:首次部署 / 更新升级 / 指定版本部署
+# 使用方式:
+#   ./deploy.sh init            首次部署,包含环境初始化检查
+#   ./deploy.sh update          更新升级,拉取最新代码并重新构建
+#   ./deploy.sh update v1.2.0   更新到指定标签版本
+# ==============================================================================
+
+set -euo pipefail  # 任意命令失败立即退出,禁止使用未定义变量,管道中任意环节失败也视为整体失败
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOG_FILE="${PROJECT_ROOT}/logs/deploy_$(date +%Y%m%d_%H%M%S).log"
+COMPOSE_FILES="-f docker-compose.yml -f docker-compose.prod.yml"
+ENV_FILE="${PROJECT_ROOT}/.env"
+REQUIRED_DISK_SPACE_GB=20
+REQUIRED_MEMORY_GB=32
+
+mkdir -p "${PROJECT_ROOT}/logs"
+
+# ------------------------------------------------------------------------------
+# 日志输出函数,同时输出到终端与日志文件,并带上时间戳与级别标识
+# ------------------------------------------------------------------------------
+log_info()  { echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO]  $*" | tee -a "${LOG_FILE}"; }
+log_warn()  { echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN]  $*" | tee -a "${LOG_FILE}"; }
+log_error() { echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $*" | tee -a "${LOG_FILE}" >&2; }
+
+trap 'log_error "部署脚本在第 ${LINENO} 行异常退出,请检查日志: ${LOG_FILE}"' ERR
+
+# ------------------------------------------------------------------------------
+# 环境预检:确保部署前置条件全部满足,避免部署到一半才发现资源不够
+# ------------------------------------------------------------------------------
+pre_check() {
+    log_info "开始环境预检..."
+
+    if ! command -v docker &> /dev/null; then
+        log_error "未检测到 Docker,请先安装 Docker Engine"
+        exit 1
+    fi
+
+    if ! docker compose version &> /dev/null; then
+        log_error "未检测到 Docker Compose V2 插件,请确认 docker compose 子命令可用"
+        exit 1
+    fi
+
+    if [[ ! -f "${ENV_FILE}" ]]; then
+        log_error ".env 文件不存在,请复制 .env.example 为 .env 并填写真实配置后重试"
+        exit 1
+    fi
+
+    # 检查是否存在未替换的默认占位密码,防止误用示例配置直接上线
+    if grep -q "CHANGE_ME" "${ENV_FILE}"; then
+        log_error ".env 文件中检测到未替换的默认占位值(CHANGE_ME),请检查后重试"
+        exit 1
+    fi
+
+    local available_disk_gb
+    available_disk_gb=$(df -BG "${PROJECT_ROOT}" | awk 'NR==2 {gsub("G","",$4); print $4}')
+    if (( available_disk_gb < REQUIRED_DISK_SPACE_GB )); then
+        log_warn "当前可用磁盘空间为 ${available_disk_gb}GB,低于建议值 ${REQUIRED_DISK_SPACE_GB}GB,请留意磁盘占用"
+    fi
+
+    local total_mem_gb
+    total_mem_gb=$(free -g | awk '/^Mem:/{print $2}')
+    if (( total_mem_gb < REQUIRED_MEMORY_GB )); then
+        log_warn "当前系统内存为 ${total_mem_gb}GB,低于建议值 ${REQUIRED_MEMORY_GB}GB,vLLM推理服务可能出现资源紧张"
+    fi
+
+    if ! command -v nvidia-smi &> /dev/null; then
+        log_warn "未检测到 nvidia-smi,若需运行vLLM推理服务容器,请确认GPU驱动与nvidia-container-toolkit已正确安装"
+    fi
+
+    log_info "环境预检完成"
+}
+
+# ------------------------------------------------------------------------------
+# 备份当前运行状态,便于失败后回滚
+# ------------------------------------------------------------------------------
+backup_current_state() {
+    log_info "备份当前镜像标签信息用于回滚..."
+    docker compose ${COMPOSE_FILES} images --format json > "${PROJECT_ROOT}/logs/pre_deploy_images_$(date +%Y%m%d_%H%M%S).json" 2>/dev/null || true
+    bash "${PROJECT_ROOT}/scripts/backup.sh" || log_warn "数据库备份步骤出现异常,请人工确认备份文件是否正常生成"
+}
+
+# ------------------------------------------------------------------------------
+# 拉取代码更新(仅在联网环境下执行,离线环境应通过介质导入镜像后跳过此步骤)
+# ------------------------------------------------------------------------------
+pull_latest_code() {
+    local target_tag="${1:-}"
+    log_info "拉取最新代码..."
+    cd "${PROJECT_ROOT}"
+    git fetch --all --tags
+
+    if [[ -n "${target_tag}" ]]; then
+        log_info "切换到指定版本标签: ${target_tag}"
+        git checkout "tags/${target_tag}"
+    else
+        git pull origin main
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# 构建镜像
+# ------------------------------------------------------------------------------
+build_images() {
+    log_info "开始构建镜像..."
+    cd "${PROJECT_ROOT}"
+    docker compose ${COMPOSE_FILES} build --pull --no-cache backend frontend
+    log_info "镜像构建完成"
+}
+
+# ------------------------------------------------------------------------------
+# 启动/更新服务
+# ------------------------------------------------------------------------------
+start_services() {
+    log_info "启动/更新容器服务..."
+    cd "${PROJECT_ROOT}"
+    docker compose ${COMPOSE_FILES} up -d --remove-orphans
+    log_info "容器服务已提交启动请求"
+}
+
+# ------------------------------------------------------------------------------
+# 等待健康检查通过
+# ------------------------------------------------------------------------------
+wait_for_health() {
+    log_info "等待各服务健康检查通过(最长等待5分钟)..."
+    local max_wait=300
+    local elapsed=0
+    local interval=10
+
+    while (( elapsed < max_wait )); do
+        local unhealthy_count
+        unhealthy_count=$(docker compose ${COMPOSE_FILES} ps --format json \
+            | grep -o '"Health":"[a-z]*"' \
+            | grep -v '"Health":"healthy"' \
+            | grep -c '"Health"' || true)
+
+        if [[ "${unhealthy_count}" == "0" ]]; then
+            log_info "所有服务健康检查均已通过"
+            return 0
+        fi
+
+        log_info "仍有 ${unhealthy_count} 个服务未通过健康检查,${interval}秒后重试... (已等待${elapsed}秒)"
+        sleep "${interval}"
+        elapsed=$((elapsed + interval))
+    done
+
+    log_error "等待超时,部分服务健康检查未通过,请执行 docker compose ps 查看详情"
+    return 1
+}
+
+# ------------------------------------------------------------------------------
+# 回滚逻辑:健康检查失败时自动触发
+# ------------------------------------------------------------------------------
+rollback() {
+    log_error "检测到部署异常,开始执行自动回滚..."
+    bash "${PROJECT_ROOT}/scripts/rollback.sh"
+    log_error "回滚完成,请检查日志排查根因: ${LOG_FILE}"
+    exit 1
+}
+
+# ------------------------------------------------------------------------------
+# 部署后验证
+# ------------------------------------------------------------------------------
+post_deploy_verify() {
+    log_info "执行部署后验证脚本..."
+    bash "${PROJECT_ROOT}/scripts/health-check-all.sh" || rollback
+    log_info "部署后验证全部通过"
+}
+
+# ------------------------------------------------------------------------------
+# 主流程调度
+# ------------------------------------------------------------------------------
+main() {
+    local action="${1:-update}"
+    local target_tag="${2:-}"
+
+    log_info "=========================================="
+    log_info "苍穹知识库系统部署脚本启动,动作: ${action}"
+    log_info "=========================================="
+
+    pre_check
+
+    case "${action}" in
+        init)
+            log_info "首次部署模式"
+            build_images
+            start_services
+            wait_for_health || rollback
+            post_deploy_verify
+            ;;
+        update)
+            backup_current_state
+            pull_latest_code "${target_tag}"
+            build_images
+            start_services
+            wait_for_health || rollback
+            post_deploy_verify
+            ;;
+        *)
+            log_error "未知的部署动作: ${action},支持的动作为 init / update"
+            exit 1
+            ;;
+    esac
+
+    log_info "部署流程全部完成,系统已上线"
+    docker compose ${COMPOSE_FILES} ps
+}
+
+main "$@"
+```
+
+回滚脚本:
+
+```bash
+#!/usr/bin/env bash
+# ==============================================================================
+# scripts/rollback.sh —— 快速回滚脚本
+# 场景:新版本部署后健康检查失败,或上线后发现严重问题,需要立即恢复上一稳定版本
+# ==============================================================================
+
+set -euo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+COMPOSE_FILES="-f docker-compose.yml -f docker-compose.prod.yml"
+LATEST_BACKUP_TAG_FILE="${PROJECT_ROOT}/.last_stable_tag"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+cd "${PROJECT_ROOT}"
+
+if [[ ! -f "${LATEST_BACKUP_TAG_FILE}" ]]; then
+    log "未找到上一稳定版本标签记录文件(${LATEST_BACKUP_TAG_FILE}),无法自动回滚"
+    log "请手动执行: git log --oneline 查看历史提交,并使用 git checkout <commit> 后重新部署"
+    exit 1
+fi
+
+STABLE_TAG=$(cat "${LATEST_BACKUP_TAG_FILE}")
+log "检测到上一稳定版本标签: ${STABLE_TAG}"
+log "开始回滚..."
+
+docker compose ${COMPOSE_FILES} down --remove-orphans
+
+git checkout "${STABLE_TAG}"
+
+docker compose ${COMPOSE_FILES} up -d --remove-orphans
+
+log "等待15秒后检查服务状态..."
+sleep 15
+
+docker compose ${COMPOSE_FILES} ps
+
+log "回滚操作完成,请人工二次确认系统状态是否恢复正常"
+```
+
+### 9.7 辅助脚本
+
+等待依赖服务就绪脚本(用于某些不便于直接使用healthcheck condition的场景,作为补充手段):
+
+```bash
+#!/usr/bin/env bash
+# ==============================================================================
+# scripts/wait-for-it.sh —— 等待指定主机端口可连接后再继续执行后续命令
+# 用法: ./wait-for-it.sh host:port -t 60 -- 后续要执行的命令
+# 该脚本常用于容器entrypoint中,在应用主进程启动前确保依赖服务的端口已经打开
+# ==============================================================================
+
+set -e
+
+WAITFORIT_cmdname=${0##*/}
+
+echoerr() { if [[ $WAITFORIT_QUIET -ne 1 ]]; then echo "$@" 1>&2; fi }
+
+usage() {
+    cat << USAGE >&2
+用法:
+    $WAITFORIT_cmdname host:port [-t timeout] [-- command args]
+选项:
+    -q | --quiet                   静默模式,不打印等待过程日志
+    -t TIMEOUT | --timeout=TIMEOUT 超时时间,单位秒,默认15秒,设为0表示不限制超时
+    -- COMMAND ARGS                等待成功后要执行的命令
+USAGE
+    exit 1
+}
+
+wait_for() {
+    if [[ $WAITFORIT_TIMEOUT -gt 0 ]]; then
+        echoerr "$WAITFORIT_cmdname: 正在等待 $WAITFORIT_HOST:$WAITFORIT_PORT 就绪,超时时间 $WAITFORIT_TIMEOUT 秒"
+    else
+        echoerr "$WAITFORIT_cmdname: 正在等待 $WAITFORIT_HOST:$WAITFORIT_PORT 就绪,不限时"
+    fi
+
+    WAITFORIT_start_ts=$(date +%s)
+    while :
+    do
+        if [[ $WAITFORIT_ISBUSY -eq 1 ]]; then
+            nc -z "$WAITFORIT_HOST" "$WAITFORIT_PORT"
+            WAITFORIT_result=$?
+        else
+            (echo > "/dev/tcp/$WAITFORIT_HOST/$WAITFORIT_PORT") >/dev/null 2>&1
+            WAITFORIT_result=$?
+        fi
+        if [[ $WAITFORIT_result -eq 0 ]]; then
+            WAITFORIT_end_ts=$(date +%s)
+            echoerr "$WAITFORIT_cmdname: $WAITFORIT_HOST:$WAITFORIT_PORT 在 $((WAITFORIT_end_ts - WAITFORIT_start_ts)) 秒后就绪"
+            break
+        fi
+        sleep 1
+    done
+    return 0
+}
+
+wait_for_wrapper() {
+    if [[ $WAITFORIT_QUIET -eq 1 ]]; then
+        timeout "$WAITFORIT_TIMEOUT" "$0" --quiet --child --host="$WAITFORIT_HOST" --port="$WAITFORIT_PORT" --timeout="$WAITFORIT_TIMEOUT" &
+    else
+        timeout "$WAITFORIT_TIMEOUT" "$0" --child --host="$WAITFORIT_HOST" --port="$WAITFORIT_PORT" --timeout="$WAITFORIT_TIMEOUT" &
+    fi
+    WAITFORIT_PID=$!
+    trap "kill -INT -$WAITFORIT_PID" INT
+    wait $WAITFORIT_PID
+    WAITFORIT_RESULT=$?
+    if [[ $WAITFORIT_RESULT -ne 0 ]]; then
+        echoerr "$WAITFORIT_cmdname: 等待 $WAITFORIT_HOST:$WAITFORIT_PORT 超时"
+    fi
+    return $WAITFORIT_RESULT
+}
+
+WAITFORIT_TIMEOUT=15
+WAITFORIT_QUIET=0
+WAITFORIT_ISBUSY=0
+
+if command -v nc &> /dev/null; then WAITFORIT_ISBUSY=1; fi
+
+while [[ $# -gt 0 ]]
+do
+    case "$1" in
+        *:* )
+        WAITFORIT_HOST=$(printf "%s\n" "$1"| cut -d : -f 1)
+        WAITFORIT_PORT=$(printf "%s\n" "$1"| cut -d : -f 2)
+        shift 1
+        ;;
+        -q | --quiet)
+        WAITFORIT_QUIET=1
+        shift 1
+        ;;
+        -t)
+        WAITFORIT_TIMEOUT="$2"
+        shift 2
+        ;;
+        --timeout=*)
+        WAITFORIT_TIMEOUT="${1#*=}"
+        shift 1
+        ;;
+        --)
+        shift
+        WAITFORIT_CLI=("$@")
+        break
+        ;;
+        --help)
+        usage
+        ;;
+        *)
+        echoerr "未知参数: $1"
+        usage
+        ;;
+    esac
+done
+
+if [[ -z "$WAITFORIT_HOST" || -z "$WAITFORIT_PORT" ]]; then
+    echoerr "错误: 必须提供 host:port 参数"
+    usage
+fi
+
+wait_for_wrapper
+
+if [[ ${#WAITFORIT_CLI[@]} -gt 0 ]]; then
+    exec "${WAITFORIT_CLI[@]}"
+fi
+```
+
+后端容器入口脚本(`backend/docker-entrypoint.sh`):
+
+```bash
+#!/usr/bin/env bash
+# ==============================================================================
+# backend/docker-entrypoint.sh —— 后端容器启动入口
+# 职责:等待依赖服务就绪 -> 执行数据库迁移 -> 启动应用主进程
+# ==============================================================================
+
+set -euo pipefail
+
+echo "[entrypoint] 苍穹后端服务启动流程开始..."
+
+DB_HOST=$(python -c "import os,urllib.parse as u; print(u.urlparse(os.environ['DATABASE_URL']).hostname)")
+DB_PORT=$(python -c "import os,urllib.parse as u; print(u.urlparse(os.environ['DATABASE_URL']).port or 5432)")
+
+echo "[entrypoint] 等待数据库 ${DB_HOST}:${DB_PORT} 就绪..."
+/usr/local/bin/wait-for-it.sh "${DB_HOST}:${DB_PORT}" -t 60 -- echo "[entrypoint] 数据库端口已就绪"
+
+echo "[entrypoint] 执行数据库迁移(alembic upgrade head)..."
+alembic upgrade head
+
+echo "[entrypoint] 数据库迁移完成,启动应用主进程..."
+exec "$@"
+```
+
+数据库备份脚本:
+
+```bash
+#!/usr/bin/env bash
+# ==============================================================================
+# scripts/backup.sh —— PostgreSQL数据库定时备份脚本
+# 建议通过 crontab 每日凌晨执行一次,备份文件加密后存放于独立备份目录
+# ==============================================================================
+
+set -euo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${PROJECT_ROOT}/.env"
+
+BACKUP_DIR="${PROJECT_ROOT}/backups"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+BACKUP_FILE="${BACKUP_DIR}/pg_backup_${TIMESTAMP}.sql.gz"
+ENCRYPTED_FILE="${BACKUP_FILE}.enc"
+RETENTION_DAYS=30
+
+mkdir -p "${BACKUP_DIR}"
+
+echo "[backup] 开始备份数据库 ${POSTGRES_DB}..."
+
+docker compose exec -T postgres pg_dump -U "${POSTGRES_USER}" "${POSTGRES_DB}" | gzip > "${BACKUP_FILE}"
+
+echo "[backup] 数据库导出完成: ${BACKUP_FILE}"
+
+# 使用对称加密对备份文件加密存储,满足金融行业数据安全要求
+if [[ -n "${BACKUP_ENCRYPTION_KEY:-}" ]]; then
+    openssl enc -aes-256-cbc -salt -pbkdf2 -in "${BACKUP_FILE}" -out "${ENCRYPTED_FILE}" -k "${BACKUP_ENCRYPTION_KEY}"
+    rm -f "${BACKUP_FILE}"
+    echo "[backup] 备份文件已加密: ${ENCRYPTED_FILE}"
+else
+    echo "[backup] 警告: 未配置 BACKUP_ENCRYPTION_KEY,备份文件未加密,生产环境请务必配置加密密钥"
+fi
+
+echo "[backup] 清理 ${RETENTION_DAYS} 天前的旧备份文件..."
+find "${BACKUP_DIR}" -name "pg_backup_*" -mtime "+${RETENTION_DAYS}" -delete
+
+echo "[backup] 备份任务完成"
+```
+
+数据库恢复脚本:
+
+```bash
+#!/usr/bin/env bash
+# ==============================================================================
+# scripts/restore.sh —— 从备份文件恢复PostgreSQL数据库
+# 用法: ./restore.sh /path/to/pg_backup_xxx.sql.gz.enc
+# 高危操作:执行前会二次确认,并覆盖当前数据库内容,请谨慎使用
+# ==============================================================================
+
+set -euo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${PROJECT_ROOT}/.env"
+
+BACKUP_FILE_ENC="${1:?请指定要恢复的加密备份文件路径}"
+TMP_DECRYPTED="/tmp/restore_$(date +%s).sql.gz"
+
+echo "警告: 该操作会覆盖当前数据库 ${POSTGRES_DB} 的全部数据!"
+read -rp "请输入 YES 以确认继续: " CONFIRM
+if [[ "${CONFIRM}" != "YES" ]]; then
+    echo "已取消恢复操作"
+    exit 0
+fi
+
+echo "[restore] 解密备份文件..."
+openssl enc -d -aes-256-cbc -pbkdf2 -in "${BACKUP_FILE_ENC}" -out "${TMP_DECRYPTED}" -k "${BACKUP_ENCRYPTION_KEY}"
+
+echo "[restore] 开始恢复数据库..."
+gunzip -c "${TMP_DECRYPTED}" | docker compose exec -T postgres psql -U "${POSTGRES_USER}" -d "${POSTGRES_DB}"
+
+rm -f "${TMP_DECRYPTED}"
+
+echo "[restore] 数据库恢复完成,请验证数据完整性"
+```
+
+全服务健康检查脚本:
+
+```bash
+#!/usr/bin/env bash
+# ==============================================================================
+# scripts/health-check-all.sh —— 部署后全链路健康检查
+# 逐一验证 Nginx / 前端 / 后端 / 数据库 / 向量库 / Redis / vLLM 是否均正常工作
+# ==============================================================================
+
+set -uo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${PROJECT_ROOT}"
+
+FAIL_COUNT=0
+
+check() {
+    local name="$1"
+    local cmd="$2"
+    echo -n "检查 ${name} ... "
+    if eval "${cmd}" &> /dev/null; then
+        echo "通过"
+    else
+        echo "失败"
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+    fi
+}
+
+check "Nginx反向代理"     "curl -sf http://localhost/healthz"
+check "前端服务"          "docker compose exec -T frontend wget -q -O- http://localhost:80/healthz"
+check "后端服务健康接口"   "curl -sf http://localhost/api/health"
+check "PostgreSQL连接"    "docker compose exec -T postgres pg_isready -U \${POSTGRES_USER}"
+check "Redis连接"         "docker compose exec -T redis redis-cli -a \${REDIS_PASSWORD} ping"
+check "向量数据库心跳"     "docker compose exec -T chroma curl -sf http://localhost:8000/api/v1/heartbeat"
+check "vLLM推理服务"       "docker compose exec -T vllm-server curl -sf http://localhost:8100/health"
+
+echo "------------------------------------------------------"
+if [[ ${FAIL_COUNT} -eq 0 ]]; then
+    echo "全部检查项通过,系统状态正常"
+    exit 0
+else
+    echo "共 ${FAIL_COUNT} 项检查失败,请检查对应服务日志"
+    exit 1
+fi
+```
+
+### 9.8 后端应用主体代码(关键片段)
+
+FastAPI应用入口(`backend/app/main.py`):
+
+```python
+"""
+苍穹企业级智能体中台 - FastAPI 应用主入口
+容器化改造要点:
+1. 启动时读取由环境变量注入的配置,不在代码中硬编码任何环境相关信息
+2. 提供 /api/health 健康检查接口,供 Docker healthcheck 及 Nginx 探活使用
+3. 应用生命周期钩子中完成数据库连接池、向量库客户端、推理服务客户端的初始化与释放
+"""
+
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from app.config import get_settings
+from app.database import init_db_pool, close_db_pool
+from app.routers import chat, documents, health
+from app.services.vector_service import VectorService
+from app.services.llm_service import LLMService
+from app.utils.logger import setup_logging
+
+settings = get_settings()
+setup_logging(settings.log_level)
+logger = logging.getLogger("cangqiong.main")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理:启动阶段建立各下游服务连接,关闭阶段优雅释放资源"""
+    logger.info("苍穹后端服务启动中,当前环境: %s", settings.app_env)
+
+    await init_db_pool(settings.database_url, settings.database_pool_size)
+    logger.info("数据库连接池初始化完成")
+
+    app.state.vector_service = VectorService(
+        host=settings.vector_db_host,
+        port=settings.vector_db_port,
+        auth_token=settings.chroma_auth_token,
+    )
+    await app.state.vector_service.connect()
+    logger.info("向量数据库客户端连接完成")
+
+    app.state.llm_service = LLMService(
+        base_url=settings.vllm_base_url,
+        model_name=settings.vllm_model_name,
+        timeout=settings.vllm_request_timeout,
+    )
+    logger.info("vLLM推理服务客户端初始化完成,目标地址: %s", settings.vllm_base_url)
+
+    logger.info("苍穹后端服务启动完成,进入就绪状态")
+    yield
+
+    logger.info("苍穹后端服务开始优雅关闭...")
+    await close_db_pool()
+    await app.state.vector_service.close()
+    logger.info("资源释放完成,服务关闭")
+
+
+app = FastAPI(
+    title="苍穹企业级智能体中台 - 知识库问答服务",
+    description="御风金融私有化部署专项 · 后端服务",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if settings.app_env != "production" else [],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    """记录每一次请求的基本信息,便于容器化部署后统一日志检索"""
+    response = await call_next(request)
+    logger.info(
+        "%s %s -> %s",
+        request.method,
+        request.url.path,
+        response.status_code,
+    )
+    return response
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.exception("未捕获异常: %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"code": 50000, "message": "服务器内部错误,请联系管理员", "detail": None},
+    )
+
+
+app.include_router(health.router, prefix="/api", tags=["健康检查"])
+app.include_router(chat.router, prefix="/api/chat", tags=["问答对话"])
+app.include_router(documents.router, prefix="/api/documents", tags=["文档管理"])
+```
+
+健康检查接口(`backend/app/routers/health.py`):
+
+```python
+"""
+健康检查路由
+供 Docker HEALTHCHECK 指令、Nginx 反代探活、以及 Compose 的 service_healthy 条件依赖使用
+设计原则:健康检查接口本身要足够"轻",不应该在这个接口里做重量级的下游依赖检测,
+否则一旦下游依赖抖动,会直接导致本服务被误判为不健康,引发连锁的容器重启风暴
+"""
+
+import time
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
+
+router = APIRouter()
+
+_start_time = time.time()
+
+
+@router.get("/health")
+async def health_check():
+    """基础健康检查:仅确认应用进程本身处于运行状态,响应速度要求在毫秒级"""
+    return {
+        "status": "ok",
+        "service": "cangqiong-backend",
+        "uptime_seconds": round(time.time() - _start_time, 2),
+    }
+
+
+@router.get("/health/deep")
+async def deep_health_check(request: Request):
+    """深度健康检查:逐一检测各下游依赖连通性,用于运维人员主动排查问题,不建议作为容器healthcheck使用"""
+    results = {}
+
+    try:
+        vector_service = request.app.state.vector_service
+        results["vector_db"] = await vector_service.ping()
+    except Exception as exc:  # noqa: BLE001
+        results["vector_db"] = f"error: {exc}"
+
+    overall_status = "ok" if all(v == "ok" or v is True for v in results.values()) else "degraded"
+
+    return JSONResponse(
+        status_code=200 if overall_status == "ok" else 503,
+        content={"status": overall_status, "dependencies": results},
+    )
+```
+
+### 9.9 CI/CD流水线配置(与流程图对应,今日先手动演练核心步骤,流水线配置留档备用)
+
+```yaml
+# ==============================================================================
+# .github/workflows/deploy.yml —— GitHub Actions 持续集成/持续部署流水线
+# 说明:本配置对应流程图中的自动化环节,当前阶段先以人工方式走通核心步骤,
+#      本文件作为下一阶段自动化改造的基线留档
+# ==============================================================================
+
+name: 苍穹知识库系统构建与部署
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: registry.pengyuan.tech
+  IMAGE_NAMESPACE: cangqiong
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装Python依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          pip install ruff pytest
+
+      - name: 代码静态检查
+        run: ruff check backend/app
+
+      - name: 运行单元测试
+        run: pytest backend/tests -v
+
+  build-and-scan:
+    needs: lint-and-test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 构建后端镜像
+        run: |
+          docker build -t ${REGISTRY}/${IMAGE_NAMESPACE}/backend:${{ github.sha }} \
+            -f backend/Dockerfile backend
+
+      - name: 构建前端镜像
+        run: |
+          docker build -t ${REGISTRY}/${IMAGE_NAMESPACE}/frontend:${{ github.sha }} \
+            -f frontend/Dockerfile frontend
+
+      - name: 镜像漏洞扫描
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/backend:${{ github.sha }}"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+
+      - name: 登录私有镜像仓库
+        run: echo "${{ secrets.REGISTRY_PASSWORD }}" | docker login ${REGISTRY} -u "${{ secrets.REGISTRY_USER }}" --password-stdin
+
+      - name: 推送镜像
+        run: |
+          docker push ${REGISTRY}/${IMAGE_NAMESPACE}/backend:${{ github.sha }}
+          docker push ${REGISTRY}/${IMAGE_NAMESPACE}/frontend:${{ github.sha }}
+
+  deploy-staging:
+    needs: build-and-scan
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 通过SSH连接测试服务器执行部署脚本
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_SSH_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          script: |
+            cd /opt/cangqiong-knowledge-base
+            export IMAGE_TAG=${{ github.sha }}
+            ./scripts/deploy.sh update
+```
+
+Makefile(整合常用操作,降低团队协作的命令记忆成本):
+
+```makefile
+# ==============================================================================
+# Makefile —— 苍穹知识库系统常用操作快捷命令集
+# ==============================================================================
+
+.PHONY: build up down restart logs ps clean backup deploy-init deploy-update
+
+build:
+	docker compose -f docker-compose.yml -f docker-compose.prod.yml build
+
+up:
+	docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+down:
+	docker compose -f docker-compose.yml -f docker-compose.prod.yml down
+
+restart:
+	docker compose -f docker-compose.yml -f docker-compose.prod.yml restart
+
+logs:
+	docker compose -f docker-compose.yml -f docker-compose.prod.yml logs -f --tail=200
+
+ps:
+	docker compose -f docker-compose.yml -f docker-compose.prod.yml ps
+
+clean:
+	docker compose -f docker-compose.yml -f docker-compose.prod.yml down -v --remove-orphans
+	docker system prune -f
+
+backup:
+	bash scripts/backup.sh
+
+deploy-init:
+	bash scripts/deploy.sh init
+
+deploy-update:
+	bash scripts/deploy.sh update
+```
+
+---
+
+代码写完之后,陈铭把整套服务在本地开发机上先跑了一遍,五个容器全部拉起来,`docker compose ps`里五行状态清清楚楚显示"healthy"。他又跟着孙昊,把这套东西原样搬到那台4核8G的测试云服务器上,跑了一次`git clone`加`./scripts/deploy.sh init`,大概等了七分钟(主要时间花在镜像构建和vLLM拉取模型权重上),浏览器里输入服务器公网IP,页面弹出来了——虽然只是一个简陋的知识库问答界面,没有正式域名,没有HTTPS证书,但那一刻陈铭确实有点激动:这是他第一次亲手把一套系统从自己的电脑,搬到了一台完全陌生的、素未谋面的服务器上,还真的跑起来了。
+
+孙昊在旁边看着,说了句:"感觉怎么样?"
+
+陈铭说:"跟本地跑起来的感觉完全不一样,好像真的是在做一个能给别人用的东西了。"
+
+孙昊笑了笑:"这才是第一步。你现在部署到的是咱们自己的测试服务器,联网、没有安全组限制、没有审计要求。等真到了御风金融的机房,断网环境、安全组只放特定端口、每一个操作都要留痕——那才是真正的考验。明天开始就是安全合规专题,你今天搭的这套容器化架子,得经得起过一遍安全审查。"
+
+## 十、今日复盘
+
+晚上七点,陈铭对着白天记的一堆笔记,试着把今天学到的东西理出一个逻辑主线。
+
+第一层收获,是对"交付"这个词有了新的理解。以前写代码,交付的终点是"功能实现、测试通过",今天之后,陈铭意识到交付的终点其实是"客户能够独立地、稳定地把这套东西跑起来"。这中间隔着环境差异、依赖冲突、启动顺序、权限配置、网络策略等一大堆此前从未认真考虑过的东西。Docker解决的核心问题,是把"运行环境"本身变成了可以版本化、可以打包、可以搬运的一份"资产",而不再是散落在每个人电脑里、每台服务器上、只能靠文档和经验去复现的一堆临时状态。
+
+第二层收获,是对镜像分层和构建缓存机制的理解。孙昊那个"改一行代码,构建时间从两分钟变成三秒"的对比实验,让陈铭真正理解了为什么Dockerfile的指令顺序不是随便写的——每一层都是有代价的,顺序安排本质上是在对"变化频率"和"缓存收益"做权衡。这个思路后来陈铭发现不只用在Dockerfile上,写代码模块划分的时候,把稳定不变的底层抽象和经常变动的业务逻辑分开,也是同一种思维方式的延伸。
+
+第三层收获,是多阶段构建体现出来的"精简交付物"的意识。builder阶段可以随便装各种编译工具、跑各种中间产物,但最终交付给用户(或者说交付给生产环境)的东西,应该只包含运行时真正需要的部分。这跟老王常说的"边界感"是同一回事——不该暴露的东西,不管是编译工具链,还是内部实现细节,都不应该出现在最终的交付物里,一是体积和效率的问题,二是安全攻击面的问题。
+
+第四层收获,是Docker Compose带来的"声明式思维"。以前陈铭写部署脚本,习惯性地想"先做什么、再做什么、然后做什么",是一种命令式的思路。Compose文件教会他换一种思路:先描述"我想要的最终状态",让编排引擎自己去决定怎么达成这个状态。这跟他之前学FastAPI时"声明路由、声明数据模型"的思路其实是相通的,只是应用到了基础设施层面。
+
+第五层收获,也是印象最深的一个教训,是健康检查(healthcheck)看似是个小配置项,实际上是编排系统能否正确判断"服务是否真正可用"的关键依据。今天下午陈铭亲自踩了一个健康检查端口配错的坑,排查了将近二十分钟才发现问题所在。这件事让他意识到,容器化不只是"把代码打包进箱子",还包括"如何让系统知道箱子里的东西到底是好是坏"——这后半句,恰恰是最容易被新手忽略、却在生产环境里最要命的部分。
+
+第六层收获,是关于云服务器部署的一整套流程认知——从选型、初始化、装Docker、传代码、配环境变量、拉容器、配反代、验证、设自启,每一步看起来简单,串起来却是一套完整的工程动作序列,任何一步疏漏(比如忘记配置防火墙安全组、忘记设置容器重启策略)都可能在未来某个时刻变成生产事故。孙昊反复强调的"验证清单"思维——不能只看"页面能打开就算完事",要系统性地过一遍所有组件的状态——这是今天最实用的一条工作方法论。
+
+最后,陈铭还记下了老王那句"能在你电脑上跑不算数,能在客户机房里跑三个月不用你管才算数"。这句话背后,其实是把陈铭从"我能实现功能"的开发者思维,往"我能对结果负责"的工程师思维上推了一步。这可能才是今天这一整天,真正想教给他的东西——技术动作是Docker和Compose,但底层的能力升级,是责任边界的扩展。
+
+深夜十一点,陈铭又想起孙昊白板上那个问号——御风金融的私有化部署,今天只是搭起了骨架,明天开始的安全合规专题,才是真正要往这个骨架里填肉的地方。他把电脑合上之前,又checkout了一遍今天写的docker-compose.yml,数了数,五个服务,三张网络策略考量,心里想,这大概就是"工程化"这个词,第一次对他变得具体起来的时刻。
+
+## 十一、课后作业
+
+**第1题(基础概念题)**
+请用自己的语言解释镜像(Image)和容器(Container)的区别,并举一个生活中的比喻(不能直接使用课堂上"类与实例"或"房子与房间"的比喻,请自己想一个新的类比)。
+
+**第2题(Dockerfile编写题)**
+现有一个Node.js的Express后端项目,目录结构为:`src/`(源代码)、`package.json`、`package-lock.json`。请为该项目编写一份采用多阶段构建的Dockerfile,要求:第一阶段安装依赖并处理任何需要的构建步骤;第二阶段只保留运行时必需内容;最终运行阶段必须以非root用户身份运行;必须包含健康检查指令。
+
+**第3题(排错分析题)**
+你的同事在部署时遇到这样的现象:执行`docker compose up -d`之后,`docker compose ps`显示后端容器状态为"Restarting",反复重启,查看日志显示"could not connect to server: Connection refused, is the server running on host postgres and accepting TCP/IP connections?"。请分析可能的原因(至少列出3种可能性),并说明如何逐一排查确认。
+
+**第4题(Compose编排设计题)**
+假设你所在项目除了当前的PostgreSQL、向量数据库、vLLM推理服务之外,还需要新增一个"Celery异步任务worker"容器,用于处理文档批量导入解析这种耗时较长的任务,worker需要访问同一个PostgreSQL数据库和Redis(作为任务队列的broker)。请写出这个新增service在docker-compose.yml中的完整定义片段,需要包含正确的`depends_on`、健康检查依赖关系与网络配置。
+
+**第5题(生产环境安全设计题)**
+结合今天需求文档里御风金融"最小暴露原则"的要求,请指出本文代码实战部分的docker-compose.yml与docker-compose.prod.yml中,体现了哪些具体的安全设计考量?（至少列举4项，并说明每一项分别防范的是什么风险）
+
+**第6题(实践拓展题,选做)**
+请尝试将本文的`chroma`向量数据库服务替换为Milvus,并思考:如果知识库数据规模从当前的几万条文档片段增长到千万级别,Docker Compose单机编排方案会遇到哪些瓶颈?你认为下一步应该往什么方向演进(可以只给出思路,不需要写出完整配置)?
+
+**第7题(思考题)**
+王振宇说"你写的代码是你的手艺,但客户买的不是你的手艺,买的是能持续运转的服务"。结合今天学到的容器化知识,谈谈你对这句话的理解,字数不少于200字。
+
+## 十二、作业参考答案
+
+**第1题参考答案**
+
+镜像和容器的关系,可以类比成"菜谱"和"做出来的菜"。菜谱(镜像)是一份固定的、写好的说明书,里面记录了所需的食材清单和制作步骤,菜谱本身不会变化,你可以照着同一份菜谱做出很多份菜。容器则是照着菜谱实际做出来的一盘菜——同一份菜谱,厨师A做一份,厨师B做一份,两盘菜是完全独立的两份实体,你吃掉了一盘不会影响另一盘,而且做菜的过程中厨师可能会有细微的临场调整(容器运行时的可读写层),但菜谱本身(镜像本身)始终不变、不会被做菜的过程所修改。如果你想复原出跟第一盘完全一样的菜,重新照着同一份菜谱再做一份就行,这就是镜像"可重复构建同样的运行环境"这一特性的直观体现。
+
+**第2题参考答案**
+
+```dockerfile
+# ---------- 阶段一:builder ----------
+FROM node:20.14.0-alpine AS builder
+
+WORKDIR /build
+
+COPY package.json package-lock.json ./
+RUN npm ci --prefer-offline --no-audit --no-fund
+
+COPY src ./src
+
+# 如果项目使用TypeScript等需要编译的语言,这里执行构建命令,例如: RUN npm run build
+# 假设本例为纯JavaScript项目,无需额外构建步骤
+
+# ---------- 阶段二:runtime ----------
+FROM node:20.14.0-alpine AS runtime
+
+ENV NODE_ENV=production
+
+RUN addgroup -g 1000 appgroup && adduser -D -u 1000 -G appgroup appuser
+
+WORKDIR /app
+
+COPY --from=builder /build/package.json /build/package-lock.json ./
+RUN npm ci --omit=dev --prefer-offline --no-audit --no-fund && npm cache clean --force
+
+COPY --from=builder --chown=appuser:appgroup /build/src ./src
+
+USER appuser
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=15s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1
+
+CMD ["node", "src/index.js"]
+```
+
+要点说明:builder阶段负责装依赖(包括开发依赖,因为可能需要用到某些构建工具),runtime阶段重新用`npm ci --omit=dev`只装生产依赖,避免把开发工具打进最终镜像;通过`addgroup`/`adduser`创建非root用户并用`USER`指令切换;`HEALTHCHECK`假设项目提供了`/health`接口,如果没有需要先在Express项目里补上这个路由。
+
+**第3题参考答案**
+
+可能的原因至少包括以下几种:
+
+1. **启动时序问题**:后端容器启动时,PostgreSQL容器可能还没有完成初始化(尤其是首次启动需要初始化数据目录时耗时更长),此时后端尝试连接会被拒绝。排查方法:查看`postgres`容器的日志(`docker compose logs postgres`),确认其是否已经打印出"database system is ready to accept connections"这样的启动完成日志,对比后端容器尝试连接的时间点。
+
+2. **网络配置问题**:后端容器和postgres容器没有被放在同一个Docker网络里,导致后端无法通过服务名`postgres`解析到对应容器的地址。排查方法:执行`docker network inspect <网络名>`查看两个容器是否都在同一个网络的成员列表里;也可以进入后端容器执行`ping postgres`或者`nslookup postgres`测试DNS解析是否正常。
+
+3. **环境变量配置错误**:`DATABASE_URL`里的主机名写错了(比如写成了`localhost`而不是服务名`postgres`,这是新手最常见的错误——在容器里`localhost`指的是容器自己,不是宿主机也不是别的容器),或者端口号、用户名、密码配置不匹配。排查方法:进入后端容器执行`env | grep DATABASE_URL`查看实际生效的环境变量值是否正确。
+
+4. **`depends_on`未正确配置健康检查条件**:如果`depends_on`只写了服务名而没有加`condition: service_healthy`,Compose只会保证容器"已经启动"的顺序,不保证postgres真正"可以接受连接"。解决方法:给postgres配置`healthcheck`(如`pg_isready`命令),并在后端服务的`depends_on`里使用`condition: service_healthy`。
+
+**第4题参考答案**
+
+```yaml
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: cangqiong/backend:${IMAGE_TAG:-latest}
+    container_name: cangqiong-celery-worker
+    restart: unless-stopped
+    command: ["celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=4"]
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - app_logs:/app/logs
+      - ./backend/uploads:/app/uploads
+    networks:
+      - backend-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.tasks.celery_app inspect ping -d celery@$$HOSTNAME || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
+```
+
+要点说明:worker复用后端的镜像(因为业务逻辑代码是共用的),只是通过覆盖`command`来启动Celery worker进程而不是uvicorn;因为只需要处理任务、不需要对外提供接口,所以不需要挂在`frontend-net`上,只需要`backend-net`;`depends_on`同样要用`condition: service_healthy`确保数据库和Redis都真正就绪之后才启动worker,避免worker启动瞬间因为broker连不上而报错退出。
+
+**第5题参考答案**
+
+至少可以列举以下4项安全设计考量:
+
+1. **网络分层与最小暴露**:通过`frontend-net`和`backend-net`两张独立网络划分职责,数据库、Redis、向量库、vLLM推理服务全部只挂载在`backend-net`上,不与外部网络直接相通,只有Nginx和前端挂在`frontend-net`。防范的风险是:即使外部攻击者能访问到应用层,也无法直接触达数据库等核心数据存储组件,减少了攻击面。
+
+2. **生产环境`internal: true`彻底隔绝出网能力**:`docker-compose.prod.yml`里给`backend-net`加上了`internal: true`,使该网络内的容器完全无法主动访问外部网络。防范的风险是:即使某个容器被攻破,攻击者也无法利用该容器向外发起数据外传或者下载恶意程序,这对满足"数据不能出域"的合规要求尤其关键。
+
+3. **不映射数据库端口到主机**:生产环境覆盖配置中,`postgres`服务的`ports`被清空为`[]`,意味着数据库端口完全不会暴露到宿主机的网络接口上,只能通过Docker内部网络被后端服务访问。防范的风险是:防止外部直接通过IP加端口的方式暴力破解或扫描数据库服务。
+
+4. **非root用户运行容器进程**:后端、前端Dockerfile中都创建了专门的非特权用户来运行应用进程,不使用默认的root身份。防范的风险是:一旦应用进程存在漏洞被攻击者利用获得代码执行能力,由于进程本身权限受限,能造成的破坏范围(比如修改系统文件、逃逸容器）远小于以root身份运行的情况。
+
+5.（可额外补充)**敏感信息通过环境变量注入而非硬编码**:所有密码、密钥都通过`.env`文件与Compose的`environment`字段注入,不写入Dockerfile或代码仓库。防范的风险是:防止敏感信息随镜像分发或随代码提交而泄露,降低了密钥泄露的可能性。
+
+6.（可额外补充)**限流与连接数限制**:Nginx配置中的`limit_req_zone`和`limit_conn_zone`对API接口做了限流保护。防范的风险是:防止恶意刷量或者异常流量打垮后端服务,属于基础的抗DoS措施。
+
+**第6题参考答案**
+
+替换为Milvus的思路是:Milvus相较Chroma是一套更重的分布式向量数据库系统,通常还需要配套etcd(元数据存储)和MinIO(对象存储,用于存放实际的向量数据文件)两个额外组件,在docker-compose.yml中需要新增`etcd`和`minio`两个service,并让`milvus-standalone`(或分布式的多组件形式)依赖它们健康检查通过后再启动,同时后端服务对向量库的调用方式需要从Chroma SDK切换为pymilvus SDK,检索接口的调用形式也会有相应变化。
+
+关于千万级数据规模下Docker Compose单机方案的瓶颈,可以从这几个角度思考:第一,单机的CPU、内存、磁盘IO会成为瓶颈,向量检索本身是计算密集型操作,数据量上去之后单机很难同时承载写入、索引构建与查询请求;第二,单机意味着单点故障,一旦这台服务器宕机,整个知识库服务就会完全不可用,这与"高可用"的要求相悖;第三,Docker Compose本身没有跨主机的调度能力,无法把负载分散到多台机器上;第四,备份、扩容、滚动升级这些运维操作在单机方案下往往需要有一定的停机时间,不像分布式集群可以做到无缝滚动更新。
+
+演进方向大致是:当数据规模与并发量真正超过单机承载能力时,应该考虑迁移到Kubernetes集群方案,把各个组件(尤其是向量数据库这类有状态服务)按照官方提供的Helm Chart或Operator方式部署成真正的分布式集群,同时引入独立的对象存储、独立的监控告警体系(如Prometheus+Grafana)、以及自动扩缩容策略。不过这个演进不是一步到位的,今天需求文档里也明确提到"首期单节点即可满足要求,后续视业务量增长评估是否升级为K8s方案",这是一种务实的工程决策——不过早引入不必要的复杂度,但架构设计上要为未来的扩展预留空间(比如不要在代码里写死单机的localhost地址,统一走服务发现或者环境变量配置的方式)。
+
+**第7题参考答案示例**（供参考,学员作答不要求与此完全一致)
+
+这句话让我理解到,写代码只是价值链条上的一环,而不是终点。客户真正需要的,是一个能够长期、稳定、安全地为他们业务提供支撑的系统,这个系统需要在没有原开发者在场的情况下,依然能够正常运转、能够被别人维护、能够在出问题的时候被定位和恢复。今天学的Docker容器化,本质上就是把"手艺"转变成"可交付、可复制、可维护的产品"的一种工程手段——通过镜像固化环境,通过Compose声明编排关系,通过健康检查让系统具备自我感知的能力,通过环境变量分离让配置与代码解耦,这些动作看起来都是技术细节,但背后的目标是一致的,就是让这套系统脱离"只有我自己能维护"的状态,变成一个真正意义上的、可以交给别人的产品。这也是从"写出一个能跑的demo"到"交付一个能负责的产品"之间,最关键的一层能力转变。
+
+## 十三、明日预告
+
+明天是周五,也是本周Sprint的收官日——**安全合规专题**。老王在群里已经放了话:"今天把箭做好了,明天要学怎么把箭射准,而且射的位置必须是御风金融的靶心。"
+
+具体来说,第57天会直接对接御风金融的合规诉求,围绕这几个方向展开:容器镜像的安全扫描(用今天流程图里提到的漏洞扫描工具,真正跑一遍,看看今天写的镜像里到底藏着哪些已知漏洞的依赖包);端口暴露与网络策略的安全审查(把今天的docker-compose.yml和docker-compose.prod.yml拿出来,按照金融行业的安全基线逐条对照);敏感数据的加密方案(数据库层面的透明加密、备份文件加密、传输层的HTTPS全链路加密);访问审计与日志留存策略(满足需求文档里"对话记录保留不低于180天"这一条,还要考虑操作日志、登录日志的合规留存要求);以及一份完整的安全合规自评报告,作为提交给御风金融科技部走安全评估流程的正式材料。
+
+孙昊补了一句:"你们今天搭的这套架子,明天要经得起挑。别觉得今天的活儿干完了就轻松了,明天可能比今天还费脑子——今天是搭骨架,明天是拿着放大镜看骨架上有没有裂缝。"
+
+陈铭把这句话也记进了备忘录。这周的节奏,从周一的vLLM推理接入,到周三、周四的容器化与部署上线,一路走到今天,他能感觉到整套系统正在从"能跑的原型"慢慢长成"能交付的产品"的样子。而明天,则是要让这套产品经得起金融行业最挑剔的那一道审视。
