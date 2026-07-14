@@ -1775,6 +1775,1056 @@ if __name__ == "__main__":
 
 这段量化代码里有个细节团队讨论了挺久:`load_calibration_dataset` 函数在抽样的时候特意用了"均匀间隔抽样"而不是直接取前 N 条,是因为业务测试集本身是按子类顺序排列的(先是信贷审批、再是风控指标、再是合规条款……),如果直接取前 256 条,校准数据可能全部集中在信贷审批这一个子类上,量化出来的模型对这个子类的适配性会更好,但对合规条款这类靠后的子类可能适配性不足,均匀间隔抽样能让校准数据覆盖到测试集里所有的子类分布,这也是林薇在代码评审时提出来的一个改进点。
 
+### 五、merge_scale 多档位快速筛选脚本
+
+晚上团队决定尝试调整 LoRA 融合系数来缓解遗忘问题之后,陈铭意识到如果每试一个 merge_scale 取值都要手动跑一遍"合并 + 抽检评估"的完整流程,效率会很低,而且容易因为操作步骤繁琐引入人为失误(比如忘记清理上一档的模型缓存、评估时不小心用错了测试集)。于是他把"多档位合并 + 抽检评估 + 自动推荐最优档位"这套流程写成了一个独立脚本,晚上跑 merge_scale=0.6 这一档抽检结果用的正是这个脚本的早期版本,收工前他又补充完善了一版,加入了完整的推荐逻辑和报告输出。
+
+```python
+# merge_scale_sweep.py
+# merge_scale多档位快速筛选脚本
+# 用途:自动化尝试多个merge_scale取值,分别合并、跑抽检评估,
+#       综合业务能力保留度与通用能力遗忘风险,推荐最优的merge_scale取值
+
+import os
+import json
+import logging
+import argparse
+import random
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("merge_scale_sweep")
+
+# 抽检模式下,业务测试集和通用测试集分别只抽取多少条,用于快速筛选阶段。
+# 抽检结果只用来快速缩小候选范围,最终选定的档位仍需在main流程之外单独跑一次全量评估确认。
+QUICK_CHECK_BUSINESS_SAMPLE_SIZE = 50
+QUICK_CHECK_GENERAL_FOCUS_SUBCATS = ["逻辑推理", "语言理解表达", "多轮对话"]
+
+# 业务能力允许的最大下降幅度(绝对百分点),超过这个幅度的档位即使遗忘风险很低也不推荐,
+# 因为business能力大幅下降意味着这次微调的核心业务价值被过度稀释了。
+MAX_ACCEPTABLE_BUSINESS_DROP_PP = 8.0
+
+# 通用能力遗忘风险等级的可接受范围,"轻微遗忘"和"中度遗忘"都算可接受,"严重遗忘"不可接受。
+ACCEPTABLE_RISK_LEVELS = {"无下降或有提升", "轻微遗忘", "中度遗忘"}
+
+
+@dataclass
+class SweepCandidateResult:
+    merge_scale: float
+    business_pass_rate: float
+    business_drop_pp: float
+    general_focus_pass_rate: float
+    general_focus_risk_level: str
+    recommended: bool
+    rejection_reason: str = ""
+
+
+def quick_merge_and_eval(
+    merge_scale: float,
+    base_model_path: str,
+    adapter_path: str,
+    business_testset_path: str,
+    general_testset_path: str,
+    tmp_output_root: str,
+    baseline_business_pass_rate: float,
+    baseline_general_focus_pass_rate: float,
+) -> SweepCandidateResult:
+    """
+    针对单个merge_scale取值,执行"合并->抽检评估"流程,返回该档位的结果。
+
+    注意:为了让本文件可以独立阅读、聚焦筛选逻辑本身,这里对合并与评估的具体实现做了
+    轻量级封装调用(实际项目中直接复用前面merge_lora.py和eval_compare.py里的函数),
+    重点展示"多档位对比 + 推荐逻辑"这部分的工程设计。
+    """
+    from merge_lora import merge_lora_weights, self_check_merged_model
+    from eval_compare import (
+        load_test_cases, ModelRunner, Scorer, aggregate_scores,
+    )
+
+    scale_tag = str(merge_scale).replace(".", "p")
+    output_path = os.path.join(tmp_output_root, f"merged_scale_{scale_tag}")
+
+    logger.info(f"===== 开始处理 merge_scale={merge_scale} =====")
+    merge_lora_weights(
+        base_model_path=base_model_path,
+        adapter_path=adapter_path,
+        output_path=output_path,
+        merge_scale=merge_scale,
+    )
+    passed = self_check_merged_model(output_path)
+    if not passed:
+        return SweepCandidateResult(
+            merge_scale=merge_scale, business_pass_rate=0.0, business_drop_pp=100.0,
+            general_focus_pass_rate=0.0, general_focus_risk_level="合并自检失败",
+            recommended=False, rejection_reason="合并后自检未通过,模型输出异常,直接排除该档位",
+        )
+
+    business_cases = load_test_cases(business_testset_path)
+    general_cases = load_test_cases(general_testset_path)
+    focus_cases = [c for c in general_cases if c.subcategory in QUICK_CHECK_GENERAL_FOCUS_SUBCATS]
+
+    random.seed(20240611)
+    if len(business_cases) > QUICK_CHECK_BUSINESS_SAMPLE_SIZE:
+        business_cases = random.sample(business_cases, QUICK_CHECK_BUSINESS_SAMPLE_SIZE)
+
+    runner = ModelRunner(model_path=output_path, adapter_path=None)
+    scorer = Scorer()
+
+    business_results = [scorer.score(c, runner.generate(c.question).answer) for c in business_cases]
+    focus_results = [scorer.score(c, runner.generate(c.question).answer) for c in focus_cases]
+    runner.unload()
+
+    business_summary = aggregate_scores(business_results)
+    focus_summary = aggregate_scores(focus_results)
+
+    business_pass_rate = business_summary["overall"]["pass_rate"]
+    general_focus_pass_rate = focus_summary["overall"]["pass_rate"]
+
+    business_drop_pp = round((baseline_business_pass_rate - business_pass_rate) * 100, 2)
+
+    rel_delta = (
+        (baseline_general_focus_pass_rate - general_focus_pass_rate) / baseline_general_focus_pass_rate * 100
+        if baseline_general_focus_pass_rate > 0 else 0.0
+    )
+    if rel_delta <= 0:
+        risk_level = "无下降或有提升"
+    elif rel_delta < 3.0:
+        risk_level = "轻微遗忘"
+    elif rel_delta < 8.0:
+        risk_level = "中度遗忘"
+    else:
+        risk_level = "严重遗忘"
+
+    recommended = True
+    rejection_reason = ""
+    if business_drop_pp > MAX_ACCEPTABLE_BUSINESS_DROP_PP:
+        recommended = False
+        rejection_reason = f"业务能力下降{business_drop_pp}个百分点,超过允许上限{MAX_ACCEPTABLE_BUSINESS_DROP_PP}个百分点"
+    elif risk_level not in ACCEPTABLE_RISK_LEVELS:
+        recommended = False
+        rejection_reason = f"重点关注维度遗忘风险等级为「{risk_level}」,未达到可接受标准"
+
+    return SweepCandidateResult(
+        merge_scale=merge_scale,
+        business_pass_rate=round(business_pass_rate, 4),
+        business_drop_pp=business_drop_pp,
+        general_focus_pass_rate=round(general_focus_pass_rate, 4),
+        general_focus_risk_level=risk_level,
+        recommended=recommended,
+        rejection_reason=rejection_reason,
+    )
+
+
+def pick_best_candidate(candidates: List[SweepCandidateResult]) -> Optional[SweepCandidateResult]:
+    """
+    从所有"可接受"的候选档位中,挑选业务能力保留最好(下降幅度最小)的一档作为推荐结果。
+    如果所有档位都不满足"可接受"条件,返回None,提示团队需要考虑重新训练这条路径。
+    """
+    acceptable = [c for c in candidates if c.recommended]
+    if not acceptable:
+        return None
+    # 在所有可接受的档位中,优先选业务能力下降最小的(即merge_scale尽量贴近1.0、业务价值保留最多的档位)
+    return min(acceptable, key=lambda c: c.business_drop_pp)
+
+
+def print_sweep_report(candidates: List[SweepCandidateResult], best: Optional[SweepCandidateResult]) -> None:
+    print("\n========== merge_scale 多档位筛选结果 ==========")
+    print(f"{'merge_scale':<12}{'业务通过率':>10}{'业务下降pp':>12}{'重点维度通过率':>16}{'遗忘风险':>10}{'是否推荐':>10}")
+    for c in candidates:
+        print(
+            f"{c.merge_scale:<12}{c.business_pass_rate:>10.2%}{c.business_drop_pp:>12.2f}"
+            f"{c.general_focus_pass_rate:>16.2%}{c.general_focus_risk_level:>10}"
+            f"{'是' if c.recommended else '否':>10}"
+        )
+        if not c.recommended and c.rejection_reason:
+            print(f"    [排除原因] {c.rejection_reason}")
+
+    print("\n最终推荐:")
+    if best:
+        print(
+            f"  推荐 merge_scale={best.merge_scale},"
+            f"业务能力下降{best.business_drop_pp}个百分点,重点维度遗忘风险为「{best.general_focus_risk_level}」"
+        )
+        print("  [提醒] 本结果基于抽检数据得出,正式采用前必须对该档位跑一次全量评估(业务集+通用集全量)确认。")
+    else:
+        print("  未找到满足条件的merge_scale档位,建议启动Plan B:调整训练数据配比、降低学习率/epoch后重新训练。")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="merge_scale多档位快速筛选脚本")
+    parser.add_argument("--base_model_path", required=True)
+    parser.add_argument("--adapter_path", required=True)
+    parser.add_argument("--business_testset", required=True)
+    parser.add_argument("--general_testset", required=True)
+    parser.add_argument("--tmp_output_root", default="./tmp_merge_sweep")
+    parser.add_argument("--scales", type=float, nargs="+", default=[1.0, 0.8, 0.6, 0.5])
+    parser.add_argument("--baseline_business_pass_rate", type=float, required=True,
+                         help="基座模型在业务测试集上的通过率,来自eval_compare.py的评估结果")
+    parser.add_argument("--baseline_general_focus_pass_rate", type=float, required=True,
+                         help="基座模型在重点关注通用维度上的通过率")
+    args = parser.parse_args()
+
+    os.makedirs(args.tmp_output_root, exist_ok=True)
+
+    candidates = []
+    for scale in args.scales:
+        result = quick_merge_and_eval(
+            merge_scale=scale,
+            base_model_path=args.base_model_path,
+            adapter_path=args.adapter_path,
+            business_testset_path=args.business_testset,
+            general_testset_path=args.general_testset,
+            tmp_output_root=args.tmp_output_root,
+            baseline_business_pass_rate=args.baseline_business_pass_rate,
+            baseline_general_focus_pass_rate=args.baseline_general_focus_pass_rate,
+        )
+        candidates.append(result)
+
+    best = pick_best_candidate(candidates)
+    print_sweep_report(candidates, best)
+
+    report_path = os.path.join(args.tmp_output_root, "sweep_report.json")
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "candidates": [c.__dict__ for c in candidates],
+                "recommended": best.__dict__ if best else None,
+            },
+            f, ensure_ascii=False, indent=2,
+        )
+    logger.info(f"筛选报告已保存: {report_path}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+这个脚本里 `pick_best_candidate` 函数的选择逻辑,陈铭最初设计的时候是"选遗忘风险最低的那一档",后来在跟老王讨论的时候被指出这个逻辑本末倒置了——如果一味追求遗忘风险最低,merge_scale会被拉向0(几乎不合并LoRA增量),那模型基本等价于没做微调,遗忘风险确实是最低的,但业务能力的提升也几乎归零,失去了做这次微调的意义。所以最终的逻辑调整为:先筛掉不满足"业务下降不超过阈值"和"重点维度遗忘风险可接受"这两个硬条件的档位,再在剩下满足条件的候选里,选业务能力保留最多(也就是merge_scale尽量贴近1.0)的一档,这样才能在满足风险底线的前提下,尽量保留这次微调本应带来的业务价值。
+
+### 六、多轮对话连贯性自动化评分工具
+
+张浩当晚手动测试发现的"模型在多轮对话中忽略上下文、跑偏到风控话题"这个问题,给了陈铭一个新的想法——课后作业第5题里设计的那套"上下文指代理解、话题连续性、回答质量"三维度评分标准,不应该只是一道作业题的参考答案,而应该真正落地成一个可以复用的自动化评分工具,这样以后每次模型迭代,都能快速跑一遍多轮对话连贯性检测,而不必依赖张浩再花时间手动一条条去试。他把这个工具也补充进了当天的代码交付物里。
+
+```python
+# multi_turn_coherence_scorer.py
+# 多轮对话连贯性自动化评分工具
+# 用途:针对多轮对话测试用例,自动化评估模型的上下文指代理解、话题连续性、回答质量,
+#       用于检测微调模型是否存在张浩实测发现的"多轮对话跑偏"问题
+
+import json
+import re
+import logging
+import argparse
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("multi_turn_coherence")
+
+# 三个评分维度的权重,与课后作业第5题参考答案中的设计保持一致
+DIMENSION_WEIGHTS = {
+    "context_reference": 0.4,   # 上下文指代理解
+    "topic_continuity": 0.35,   # 话题连续性
+    "answer_quality": 0.25,     # 回答质量本身
+}
+
+COHERENCE_RISK_THRESHOLD = 0.6  # 综合得分低于此阈值,判定为存在连贯性风险
+
+
+@dataclass
+class DialogueTurn:
+    """一轮对话,包含用户提问和该轮问题设计的考察意图说明"""
+    turn_index: int
+    user_question: str
+    intent_note: str = ""   # 例如:"考察是否理解'刚才翻译的那句话'的指代"
+
+
+@dataclass
+class MultiTurnCase:
+    case_id: str
+    turns: List[DialogueTurn]
+    topic_description: str = ""   # 整段对话应该围绕的主题,例如"翻译并转换为商务邮件语气"
+
+
+@dataclass
+class TurnScoreDetail:
+    turn_index: int
+    context_reference_score: float
+    topic_continuity_score: float
+    answer_quality_score: float
+    weighted_score: float
+    judge_rationale: str = ""
+
+
+@dataclass
+class CaseCoherenceResult:
+    case_id: str
+    turn_scores: List[TurnScoreDetail]
+    overall_score: float
+    has_coherence_risk: bool
+    weakest_turn_index: Optional[int] = None
+
+
+def load_multi_turn_cases(path: str) -> List[MultiTurnCase]:
+    """从jsonl文件加载多轮对话测试用例,每行一个case,包含turns数组"""
+    cases = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            turns = [
+                DialogueTurn(
+                    turn_index=t["turn_index"],
+                    user_question=t["user_question"],
+                    intent_note=t.get("intent_note", ""),
+                )
+                for t in obj["turns"]
+            ]
+            cases.append(MultiTurnCase(
+                case_id=obj.get("case_id", f"mt_case_{line_no}"),
+                turns=turns,
+                topic_description=obj.get("topic_description", ""),
+            ))
+    logger.info(f"共加载多轮对话测试用例 {len(cases)} 条")
+    return cases
+
+
+class MultiTurnCoherenceScorer:
+    """
+    多轮对话连贯性评分器。
+
+    工作方式:依次把每一轮问题喂给被测模型(保留完整对话历史),
+    拿到每一轮的回答之后,再用一个评委模型(judge_runner)结合"截至当前轮次的完整对话历史"
+    对刚产出的这一轮回答按三个维度打分,这样评委在打分时能看到完整上下文,
+    才有能力判断模型是否"理解了指代关系"和"延续了话题"。
+    """
+
+    def __init__(self, target_runner, judge_runner, system_prompt: str = ""):
+        self.target_runner = target_runner
+        self.judge_runner = judge_runner
+        self.system_prompt = system_prompt
+
+    def run_case(self, case: MultiTurnCase) -> CaseCoherenceResult:
+        conversation_history: List[Dict[str, str]] = []
+        if self.system_prompt:
+            conversation_history.append({"role": "system", "content": self.system_prompt})
+
+        turn_scores = []
+        for turn in case.turns:
+            conversation_history.append({"role": "user", "content": turn.user_question})
+            answer = self._generate_with_history(conversation_history)
+            conversation_history.append({"role": "assistant", "content": answer})
+
+            score_detail = self._judge_turn(case, turn, conversation_history, answer)
+            turn_scores.append(score_detail)
+
+        overall_score = self._aggregate_case_score(turn_scores)
+        weakest = min(turn_scores, key=lambda s: s.weighted_score) if turn_scores else None
+
+        return CaseCoherenceResult(
+            case_id=case.case_id,
+            turn_scores=turn_scores,
+            overall_score=overall_score,
+            has_coherence_risk=overall_score < COHERENCE_RISK_THRESHOLD,
+            weakest_turn_index=weakest.turn_index if weakest else None,
+        )
+
+    def _generate_with_history(self, conversation_history: List[Dict[str, str]]) -> str:
+        """调用被测模型,基于完整历史生成本轮回答。此处对底层generate接口做统一封装,
+        实际项目中直接复用eval_compare.py里ModelRunner支持多轮消息列表的推理逻辑。"""
+        prompt = self.target_runner.tokenizer.apply_chat_template(
+            conversation_history, tokenize=False, add_generation_prompt=True
+        )
+        inputs = self.target_runner.tokenizer(prompt, return_tensors="pt").to(self.target_runner.device)
+        import torch
+        with torch.no_grad():
+            output_ids = self.target_runner.model.generate(
+                **inputs, max_new_tokens=self.target_runner.max_new_tokens,
+                do_sample=False, pad_token_id=self.target_runner.tokenizer.pad_token_id,
+            )
+        generated = output_ids[0][inputs["input_ids"].shape[1]:]
+        return self.target_runner.tokenizer.decode(generated, skip_special_tokens=True).strip()
+
+    def _judge_turn(
+        self, case: MultiTurnCase, turn: DialogueTurn,
+        conversation_history: List[Dict[str, str]], answer: str,
+    ) -> TurnScoreDetail:
+        history_text = "\n".join(
+            f"{'用户' if m['role'] == 'user' else '助手'}: {m['content']}"
+            for m in conversation_history if m["role"] != "system"
+        )
+        judge_prompt = f"""你是一名严格的多轮对话质量评审员,请阅读以下完整对话历史(最后一条是待评估的助手回答),
+按照三个维度分别打分(每个维度0到1之间的小数):
+
+对话主题背景: {case.topic_description if case.topic_description else "(未提供,请根据对话内容自行判断)"}
+本轮考察意图: {turn.intent_note if turn.intent_note else "(未特别说明)"}
+
+完整对话历史:
+{history_text}
+
+请按以下格式输出三个维度的分数和简要理由,严格遵守格式,每项占一行:
+上下文指代理解: 0.xx
+话题连续性: 0.xx
+回答质量: 0.xx
+理由: 一句话说明打分依据
+"""
+        judge_output = self.judge_runner.generate(judge_prompt).answer
+        scores = self._parse_judge_scores(judge_output)
+
+        weighted = (
+            scores["context_reference"] * DIMENSION_WEIGHTS["context_reference"]
+            + scores["topic_continuity"] * DIMENSION_WEIGHTS["topic_continuity"]
+            + scores["answer_quality"] * DIMENSION_WEIGHTS["answer_quality"]
+        )
+
+        return TurnScoreDetail(
+            turn_index=turn.turn_index,
+            context_reference_score=scores["context_reference"],
+            topic_continuity_score=scores["topic_continuity"],
+            answer_quality_score=scores["answer_quality"],
+            weighted_score=round(weighted, 4),
+            judge_rationale=judge_output.strip(),
+        )
+
+    @staticmethod
+    def _parse_judge_scores(judge_text: str) -> Dict[str, float]:
+        patterns = {
+            "context_reference": r"上下文指代理解[:：]\s*([0-1](?:\.\d+)?)",
+            "topic_continuity": r"话题连续性[:：]\s*([0-1](?:\.\d+)?)",
+            "answer_quality": r"回答质量[:：]\s*([0-1](?:\.\d+)?)",
+        }
+        scores = {}
+        for key, pattern in patterns.items():
+            match = re.search(pattern, judge_text)
+            if match:
+                scores[key] = max(0.0, min(1.0, float(match.group(1))))
+            else:
+                logger.warning(f"未能解析出维度[{key}]的分数,默认记为0.5,需人工复核")
+                scores[key] = 0.5
+        return scores
+
+    @staticmethod
+    def _aggregate_case_score(turn_scores: List[TurnScoreDetail]) -> float:
+        if not turn_scores:
+            return 0.0
+        # 越靠后的轮次权重略高,因为后面的轮次更依赖前面轮次积累的上下文,出问题往往更能反映真实的连贯性缺陷
+        total_weight, total_score = 0.0, 0.0
+        for i, ts in enumerate(turn_scores):
+            turn_weight = 1.0 + i * 0.15
+            total_score += ts.weighted_score * turn_weight
+            total_weight += turn_weight
+        return round(total_score / total_weight, 4) if total_weight else 0.0
+
+
+def print_coherence_report(results: List[CaseCoherenceResult]) -> None:
+    print("\n========== 多轮对话连贯性评估报告 ==========")
+    risky_count = 0
+    for r in results:
+        flag = "⚠ 存在连贯性风险" if r.has_coherence_risk else "正常"
+        if r.has_coherence_risk:
+            risky_count += 1
+        print(f"[{r.case_id}] 综合得分: {r.overall_score:.4f} | {flag}"
+              f"{f' | 最薄弱轮次: 第{r.weakest_turn_index}轮' if r.has_coherence_risk else ''}")
+        for ts in r.turn_scores:
+            print(
+                f"    第{ts.turn_index}轮: 指代理解={ts.context_reference_score:.2f} "
+                f"话题连续={ts.topic_continuity_score:.2f} 回答质量={ts.answer_quality_score:.2f} "
+                f"综合={ts.weighted_score:.2f}"
+            )
+    total = len(results)
+    risk_rate = risky_count / total if total else 0.0
+    print(f"\n总用例数: {total},存在连贯性风险: {risky_count} 条,风险占比: {risk_rate:.2%}")
+    if risk_rate > 0.2:
+        print("[结论] 多轮对话连贯性风险占比超过20%,建议将该问题纳入merge_scale调整或重新训练的优先处理范围。")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="多轮对话连贯性自动化评分工具")
+    parser.add_argument("--target_model_path", required=True)
+    parser.add_argument("--judge_model_path", required=True)
+    parser.add_argument("--testcases_path", required=True, help="多轮对话测试用例jsonl路径")
+    parser.add_argument("--output_report", default="./eval_outputs/multi_turn_coherence_report.json")
+    parser.add_argument("--system_prompt", default="你是御风金融的智能风控助手,请专业、准确地回答用户问题。")
+    args = parser.parse_args()
+
+    from eval_compare import ModelRunner
+
+    target_runner = ModelRunner(model_path=args.target_model_path, max_new_tokens=300, temperature=0.0)
+    judge_runner = ModelRunner(model_path=args.judge_model_path, max_new_tokens=200, temperature=0.0)
+
+    scorer = MultiTurnCoherenceScorer(target_runner, judge_runner, system_prompt=args.system_prompt)
+    cases = load_multi_turn_cases(args.testcases_path)
+
+    results = [scorer.run_case(c) for c in cases]
+    print_coherence_report(results)
+
+    with open(args.output_report, "w", encoding="utf-8") as f:
+        json.dump([r.__dict__ if not isinstance(r.turn_scores, list) else {
+            **r.__dict__, "turn_scores": [ts.__dict__ for ts in r.turn_scores],
+        } for r in results], f, ensure_ascii=False, indent=2, default=lambda o: o.__dict__)
+
+    target_runner.unload()
+    judge_runner.unload()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+这个工具设计上有个关键点:`_judge_turn` 方法在构造评委提示词的时候,把"截至当前轮次的完整对话历史"整段传给评委,而不是只传"当前这一轮的问题和回答",这是因为要判断"话题连续性"和"上下文指代理解"这两个维度,评委本身必须先看到完整的历史脈络,否则评委自己都不知道"刚才翻译的那句话"指的是什么,根本无法做出准确判断。这一点是陈铭在第一版实现里漏掉的——他最初的版本只把当前轮的问答传给评委,结果测出来的分数普遍偏高,后来才意识到评委压根没看到上下文,只是在"就地评估"这一轮回答本身写得好不好,跟连贯性这个考察目标完全脱节,修正之后重新跑出来的结果才真正反映出张浩手动测试发现的那个问题。
+
+### 七、量化效果多维对比套件
+
+上午和下午定下来的技术路线是 GPTQ 和 AWQ 各跑一遍做横向对比,但张浩提了个问题:"只对比 4bit 一个位宽够吗?万一 4bit 精度损失就已经超预期了,是不是应该同时看看 8bit 的表现,再决定最终用哪个方案?"这个问题让团队意识到,之前设计的 `quantize_export.py` 虽然支持配置 bits 和 group_size 参数,但每次只能跑一组配置,如果要系统性地对比多组参数组合,还是需要手动改参数、重复跑好几遍,效率不高也容易漏掉某个组合。陈铭决定把"多维度量化对比"也升级成一个自动化套件。
+
+```python
+# quantization_comparison_suite.py
+# 量化效果多维对比套件
+# 用途:批量尝试多组(方法×位宽×group_size)量化配置组合,
+#       统一跑精度评估(业务测试集抽样)+性能基准测试(显存/速度),产出综合对比报告与推荐结论
+
+import os
+import json
+import logging
+import argparse
+import itertools
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional, Tuple
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("quant_comparison_suite")
+
+# 精度损失允许的上限(相对于FP16全量模型的业务准确率,绝对百分点下降),
+# 这是需求文档验收标准里明确写的"控制在业务测试集准确率下降不超过2个百分点"这条硬指标
+MAX_ACCEPTABLE_ACCURACY_DROP_PP = 2.0
+
+
+@dataclass
+class QuantConfigCandidate:
+    method: str          # "gptq" 或 "awq"
+    bits: int
+    group_size: int
+
+    @property
+    def label(self) -> str:
+        return f"{self.method}_{self.bits}bit_g{self.group_size}"
+
+
+@dataclass
+class QuantComparisonResult:
+    config: QuantConfigCandidate
+    accuracy_drop_pp: float
+    peak_memory_mb: float
+    memory_reduction_pct: float
+    tokens_per_second: float
+    speed_change_pct: float
+    quantize_time_s: float
+    meets_accuracy_requirement: bool
+    overall_recommendation_score: float = 0.0
+
+
+def build_candidate_grid(
+    methods: List[str], bits_options: List[int], group_size_options: List[int],
+) -> List[QuantConfigCandidate]:
+    """构造所有(方法, 位宽, group_size)的组合网格。注意GGUF不在本套件的网格搜索范围内,
+    GGUF更适合作为CPU/边缘部署场景的独立评估路径(见前面quantize_export.py中的export_to_gguf函数)。"""
+    candidates = []
+    for method, bits, group_size in itertools.product(methods, bits_options, group_size_options):
+        candidates.append(QuantConfigCandidate(method=method, bits=bits, group_size=group_size))
+    logger.info(f"共构造 {len(candidates)} 组量化配置候选,将逐一量化并评测")
+    return candidates
+
+
+def quantize_one_candidate(
+    candidate: QuantConfigCandidate,
+    merged_model_path: str,
+    calibration_texts: List[str],
+    output_root: str,
+) -> str:
+    """针对单个候选配置执行量化,返回量化后模型的输出路径"""
+    from quantize_export import quantize_with_gptq, quantize_with_awq
+    import time
+
+    output_path = os.path.join(output_root, candidate.label)
+    start = time.time()
+
+    if candidate.method == "gptq":
+        quantize_with_gptq(
+            model_path=merged_model_path, output_path=output_path,
+            calibration_texts=calibration_texts, bits=candidate.bits, group_size=candidate.group_size,
+        )
+    elif candidate.method == "awq":
+        quantize_with_awq(
+            model_path=merged_model_path, output_path=output_path,
+            calibration_texts=calibration_texts, bits=candidate.bits, group_size=candidate.group_size,
+        )
+    else:
+        raise ValueError(f"不支持的量化方法: {candidate.method}")
+
+    elapsed = time.time() - start
+    logger.info(f"[{candidate.label}] 量化完成,耗时 {elapsed:.1f} 秒")
+    return output_path
+
+
+def evaluate_accuracy_drop(
+    quantized_model_path: str,
+    fp16_business_pass_rate: float,
+    business_testset_sample_path: str,
+) -> float:
+    """
+    在抽样的业务测试集上评估量化模型的准确率,并计算相对FP16全量模型的绝对下降百分点。
+    这里复用eval_compare.py里的ModelRunner和Scorer,聚焦精度对比,不重复实现推理逻辑。
+    """
+    from eval_compare import load_test_cases, ModelRunner, Scorer, aggregate_scores
+
+    cases = load_test_cases(business_testset_sample_path)
+    runner = ModelRunner(model_path=quantized_model_path, adapter_path=None)
+    scorer = Scorer()
+
+    results = [scorer.score(c, runner.generate(c.question).answer) for c in cases]
+    summary = aggregate_scores(results)
+    runner.unload()
+
+    quantized_pass_rate = summary["overall"]["pass_rate"]
+    drop_pp = round((fp16_business_pass_rate - quantized_pass_rate) * 100, 2)
+    return drop_pp
+
+
+def run_full_comparison(
+    candidates: List[QuantConfigCandidate],
+    merged_model_path: str,
+    calibration_texts: List[str],
+    business_testset_sample_path: str,
+    benchmark_questions: List[str],
+    fp16_business_pass_rate: float,
+    output_root: str,
+) -> List[QuantComparisonResult]:
+    from quantize_export import benchmark_model
+
+    logger.info("先对FP16全量模型跑一次基准测试,作为对比基线...")
+    fp16_bench = benchmark_model(merged_model_path, benchmark_questions, is_quantized=False)
+
+    results = []
+    for candidate in candidates:
+        try:
+            import time
+            start = time.time()
+            quantized_path = quantize_one_candidate(candidate, merged_model_path, calibration_texts, output_root)
+            quantize_time = time.time() - start
+
+            accuracy_drop_pp = evaluate_accuracy_drop(
+                quantized_path, fp16_business_pass_rate, business_testset_sample_path
+            )
+            bench = benchmark_model(quantized_path, benchmark_questions, is_quantized=True)
+
+            memory_reduction_pct = round(
+                (1 - bench["peak_memory_mb"] / fp16_bench["peak_memory_mb"]) * 100, 1
+            ) if fp16_bench["peak_memory_mb"] else 0.0
+            speed_change_pct = round(
+                (bench["tokens_per_second"] / fp16_bench["tokens_per_second"] - 1) * 100, 1
+            ) if fp16_bench["tokens_per_second"] else 0.0
+
+            result = QuantComparisonResult(
+                config=candidate,
+                accuracy_drop_pp=accuracy_drop_pp,
+                peak_memory_mb=bench["peak_memory_mb"],
+                memory_reduction_pct=memory_reduction_pct,
+                tokens_per_second=bench["tokens_per_second"],
+                speed_change_pct=speed_change_pct,
+                quantize_time_s=round(quantize_time, 1),
+                meets_accuracy_requirement=accuracy_drop_pp <= MAX_ACCEPTABLE_ACCURACY_DROP_PP,
+            )
+            results.append(result)
+        except Exception as e:
+            logger.error(f"[{candidate.label}] 量化或评测过程出现异常: {e},跳过该配置")
+            continue
+
+    _compute_recommendation_scores(results)
+    return results
+
+
+def _compute_recommendation_scores(results: List[QuantComparisonResult]) -> None:
+    """
+    综合推荐评分计算逻辑:在满足精度要求的候选中,按"显存节省幅度"和"速度提升幅度"
+    做归一化加权(各占50%权重),分数越高越推荐。不满足精度要求的候选评分直接置为-1,
+    保证它们永远不会被推荐,即使显存/速度表现很好。
+    """
+    qualified = [r for r in results if r.meets_accuracy_requirement]
+    if not qualified:
+        for r in results:
+            r.overall_recommendation_score = -1.0
+        return
+
+    max_mem_reduction = max(r.memory_reduction_pct for r in qualified) or 1.0
+    max_speed_change = max(r.speed_change_pct for r in qualified) or 1.0
+
+    for r in results:
+        if not r.meets_accuracy_requirement:
+            r.overall_recommendation_score = -1.0
+            continue
+        mem_score = r.memory_reduction_pct / max_mem_reduction if max_mem_reduction > 0 else 0.0
+        speed_score = r.speed_change_pct / max_speed_change if max_speed_change > 0 else 0.0
+        r.overall_recommendation_score = round(mem_score * 0.5 + speed_score * 0.5, 4)
+
+
+def print_comparison_report(results: List[QuantComparisonResult]) -> None:
+    print("\n========== 量化配置多维对比报告 ==========")
+    header = f"{'配置':<20}{'精度下降pp':>10}{'显存节省%':>10}{'速度变化%':>10}{'量化耗时s':>10}{'达标':>6}{'推荐分':>8}"
+    print(header)
+    sorted_results = sorted(results, key=lambda r: r.overall_recommendation_score, reverse=True)
+    for r in sorted_results:
+        print(
+            f"{r.config.label:<20}{r.accuracy_drop_pp:>10.2f}{r.memory_reduction_pct:>10.1f}"
+            f"{r.speed_change_pct:>10.1f}{r.quantize_time_s:>10.1f}"
+            f"{'是' if r.meets_accuracy_requirement else '否':>6}{r.overall_recommendation_score:>8.4f}"
+        )
+
+    best = sorted_results[0] if sorted_results and sorted_results[0].overall_recommendation_score >= 0 else None
+    print("\n最终推荐:")
+    if best:
+        print(
+            f"  推荐配置: {best.config.label},精度下降{best.accuracy_drop_pp}个百分点(达标),"
+            f"显存节省{best.memory_reduction_pct}%,速度变化{best.speed_change_pct}%"
+        )
+    else:
+        print("  所有候选配置均未满足精度要求(下降超过2个百分点),建议:"
+              "1) 检查校准数据是否覆盖业务分布;2) 尝试更保守的group_size(如64);"
+              "3) 优先考虑8bit而非4bit量化。")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="量化效果多维对比套件")
+    parser.add_argument("--merged_model_path", required=True)
+    parser.add_argument("--calibration_data_path", required=True)
+    parser.add_argument("--business_testset_sample", required=True, help="用于精度对比的业务测试集抽样jsonl")
+    parser.add_argument("--benchmark_questions_path", required=True)
+    parser.add_argument("--fp16_business_pass_rate", type=float, required=True)
+    parser.add_argument("--methods", nargs="+", default=["gptq", "awq"])
+    parser.add_argument("--bits_options", type=int, nargs="+", default=[4, 8])
+    parser.add_argument("--group_size_options", type=int, nargs="+", default=[64, 128])
+    parser.add_argument("--output_root", default="./quant_outputs/comparison_suite")
+    parser.add_argument("--output_report", default="./quant_outputs/comparison_suite_report.json")
+    args = parser.parse_args()
+
+    from quantize_export import load_calibration_dataset
+
+    calibration_texts = load_calibration_dataset(args.calibration_data_path)
+    with open(args.benchmark_questions_path, "r", encoding="utf-8") as f:
+        benchmark_questions = [json.loads(line)["question"] for line in f if line.strip()]
+
+    candidates = build_candidate_grid(args.methods, args.bits_options, args.group_size_options)
+    results = run_full_comparison(
+        candidates=candidates,
+        merged_model_path=args.merged_model_path,
+        calibration_texts=calibration_texts,
+        business_testset_sample_path=args.business_testset_sample,
+        benchmark_questions=benchmark_questions,
+        fp16_business_pass_rate=args.fp16_business_pass_rate,
+        output_root=args.output_root,
+    )
+
+    print_comparison_report(results)
+
+    os.makedirs(os.path.dirname(args.output_report), exist_ok=True)
+    with open(args.output_report, "w", encoding="utf-8") as f:
+        json.dump(
+            [{**r.__dict__, "config": r.config.__dict__} for r in results],
+            f, ensure_ascii=False, indent=2,
+        )
+    logger.info(f"多维对比报告已保存: {args.output_report}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+`_compute_recommendation_scores` 这个函数里,团队特意把"精度是否达标"设计成一个硬性门槛,凡是精度下降超过2个百分点的配置,推荐评分直接设为-1,不管它显存节省多猛、速度提升多快,都不会被选中。这是因为张浩在讨论这个逻辑的时候提了一句很实在的话:"如果为了省显存把业务准确率都搞掉了,那还谈什么给客户交付价值,这个口子必须卡死,不能靠加权柔性处理。"这跟需求文档里"验收标准"这一节写的硬性指标是完全对应的,代码里的门槛逻辑就是把文档里的验收要求真正落到了实处,而不是停留在文档层面的一句话。
+
+### 八、评估-合并-量化端到端自动化流水线
+
+复盘会议最后,苏晴提的那个"能不能把整套流程固化成自动化流水线"的问题,让老王在收工前又把陈铭留了几分钟。老王的意思是,今天写的四个独立脚本(对比评估、遗忘检测)加上晚上新补的三个脚本(merge_scale筛选、多轮对话连贯性、量化对比套件),已经是一整条流水线的全部核心模块了,只是散落成了七个独立可执行的脚本,团队每次用还要记住先跑哪个、再跑哪个、把上一步的输出路径填到下一步的参数里,这个"人工编排"的环节本身就有出错的空间。陈铭当晚趁着思路清楚,把这条流水线的编排逻辑也写了出来,虽然还很初级,但已经能一键跑通从评估到量化的完整链路。
+
+```python
+# run_full_pipeline.py
+# 评估-合并-量化端到端自动化流水线
+# 用途:串联对比评估、遗忘检测、merge_scale筛选、权重合并、量化对比这几个独立脚本,
+#       一次性跑完从"训练产出LoRA adapter"到"产出可部署量化模型"的完整链路,
+#       自动决策每一步是否需要人工介入(比如遗忘风险过高时中止流水线并提示)
+
+import os
+import json
+import logging
+import argparse
+import sys
+from dataclasses import dataclass, asdict
+from typing import Optional, Dict, Any
+from datetime import datetime, timezone
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("full_pipeline")
+
+
+class PipelineHaltException(Exception):
+    """流水线在某个阶段判断需要人工介入时,主动中止并抛出此异常,而不是继续往下跑产出一个有问题的模型。"""
+    def __init__(self, stage: str, reason: str):
+        self.stage = stage
+        self.reason = reason
+        super().__init__(f"流水线在阶段[{stage}]中止: {reason}")
+
+
+@dataclass
+class PipelineContext:
+    """贯穿整条流水线的上下文对象,记录每个阶段产出的关键结果,供后续阶段使用与最终汇总报告引用。"""
+    base_model_path: str
+    adapter_path: str
+    business_testset: str
+    general_testset: str
+    output_root: str
+    business_testset_sample: str = ""
+    benchmark_questions_path: str = ""
+    calibration_data_path: str = ""
+
+    base_summary: Optional[Dict[str, Any]] = None
+    ft_summary: Optional[Dict[str, Any]] = None
+    forgetting_report: Optional[Dict[str, Any]] = None
+    sweep_report: Optional[Dict[str, Any]] = None
+    selected_merge_scale: Optional[float] = None
+    merged_model_path: str = ""
+    quant_comparison_report: Optional[Dict[str, Any]] = None
+    selected_quant_config: Optional[str] = None
+
+    stage_log: list = None
+
+    def __post_init__(self):
+        if self.stage_log is None:
+            self.stage_log = []
+
+    def log_stage(self, stage: str, status: str, note: str = "") -> None:
+        self.stage_log.append({
+            "stage": stage, "status": status, "note": note,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+
+def stage_1_eval_compare(ctx: PipelineContext) -> None:
+    """阶段一:微调前后对比评估,产出基座模型和微调模型的summary"""
+    logger.info("===== 阶段一: 微调前后对比评估 =====")
+    from eval_compare import (
+        load_test_cases, ModelRunner, Scorer, run_full_eval,
+    )
+
+    business_cases = load_test_cases(ctx.business_testset)
+    general_cases = load_test_cases(ctx.general_testset)
+    all_cases = business_cases + general_cases
+
+    scorer = Scorer()
+    eval_output_dir = os.path.join(ctx.output_root, "eval_outputs")
+
+    base_runner = ModelRunner(model_path=ctx.base_model_path, adapter_path=None)
+    ctx.base_summary = run_full_eval("base_model", base_runner, scorer, all_cases, "", eval_output_dir)
+    base_runner.unload()
+
+    ft_runner = ModelRunner(model_path=ctx.base_model_path, adapter_path=ctx.adapter_path)
+    ctx.ft_summary = run_full_eval("finetuned_model", ft_runner, scorer, all_cases, "", eval_output_dir)
+    ft_runner.unload()
+
+    ctx.log_stage("eval_compare", "completed",
+                  f"业务通过率 基座={ctx.base_summary['business']['pass_rate']:.2%} "
+                  f"微调={ctx.ft_summary['business']['pass_rate']:.2%}")
+
+
+def stage_2_forgetting_check(ctx: PipelineContext) -> None:
+    """阶段二:过拟合/灾难性遗忘检测,若判定为严重遗忘,直接中止流水线,提示需要人工决策"""
+    logger.info("===== 阶段二: 过拟合/灾难性遗忘检测 =====")
+    from catastrophic_forgetting_check import (
+        analyze_dimensions, compute_weighted_risk_score, determine_overall_risk, generate_recommendation,
+    )
+
+    dimension_results = analyze_dimensions(ctx.base_summary, ctx.ft_summary, category="general")
+    weighted_score = compute_weighted_risk_score(dimension_results)
+    overall_risk = determine_overall_risk(weighted_score)
+    recommendations = generate_recommendation(overall_risk, dimension_results)
+
+    ctx.forgetting_report = {
+        "dimension_results": [dr.__dict__ for dr in dimension_results],
+        "weighted_risk_score": weighted_score,
+        "overall_risk_level": overall_risk,
+        "recommendations": recommendations,
+    }
+
+    ctx.log_stage("forgetting_check", "completed", f"综合遗忘风险等级: {overall_risk}")
+
+    if overall_risk == "严重遗忘":
+        logger.warning(
+            f"检测到「严重遗忘」风险(加权评分{weighted_score}),"
+            f"流水线不会自动继续向下执行合并与量化,需要人工决策是否尝试merge_scale调整或直接重新训练。"
+        )
+        # 注意:这里不是直接抛异常终止整个流水线,而是允许调用方通过--force_continue参数
+        # 显式选择"我知道有严重遗忘风险,但仍要继续尝试merge_scale调整"这条路径,
+        # 这个设计是为了避免流水线过于死板,同时又保留了强制的风险提示,不让问题被静默忽略。
+
+
+def stage_3_merge_scale_sweep(ctx: PipelineContext, scales: list, force_continue: bool) -> None:
+    """阶段三:merge_scale多档位筛选,选出满足业务/遗忘双重约束的最优档位"""
+    logger.info("===== 阶段三: merge_scale多档位筛选 =====")
+
+    if ctx.forgetting_report and ctx.forgetting_report["overall_risk_level"] == "严重遗忘" and not force_continue:
+        raise PipelineHaltException(
+            stage="merge_scale_sweep",
+            reason="上一阶段检测到严重遗忘风险,且未指定--force_continue,流水线主动中止,等待人工决策。",
+        )
+
+    from merge_scale_sweep import quick_merge_and_eval, pick_best_candidate
+
+    baseline_business = ctx.base_summary["business"]["pass_rate"]
+    baseline_general_focus = ctx.base_summary["general"]["pass_rate"]
+
+    candidates = []
+    for scale in scales:
+        result = quick_merge_and_eval(
+            merge_scale=scale,
+            base_model_path=ctx.base_model_path,
+            adapter_path=ctx.adapter_path,
+            business_testset_path=ctx.business_testset,
+            general_testset_path=ctx.general_testset,
+            tmp_output_root=os.path.join(ctx.output_root, "merge_sweep"),
+            baseline_business_pass_rate=baseline_business,
+            baseline_general_focus_pass_rate=baseline_general_focus,
+        )
+        candidates.append(result)
+
+    best = pick_best_candidate(candidates)
+    ctx.sweep_report = {"candidates": [c.__dict__ for c in candidates], "recommended": best.__dict__ if best else None}
+
+    if best is None:
+        raise PipelineHaltException(
+            stage="merge_scale_sweep",
+            reason="所有merge_scale候选档位均无法同时满足业务能力保留与遗忘风险要求,建议启动重新训练Plan B。",
+        )
+
+    ctx.selected_merge_scale = best.merge_scale
+    ctx.log_stage("merge_scale_sweep", "completed", f"选定merge_scale={best.merge_scale}")
+
+
+def stage_4_final_merge(ctx: PipelineContext) -> None:
+    """阶段四:使用筛选出的最优merge_scale,执行正式的权重合并并自检"""
+    logger.info(f"===== 阶段四: 使用merge_scale={ctx.selected_merge_scale}执行正式权重合并 =====")
+    from merge_lora import merge_lora_weights, self_check_merged_model
+
+    ctx.merged_model_path = os.path.join(ctx.output_root, "final_merged_model")
+    merge_lora_weights(
+        base_model_path=ctx.base_model_path, adapter_path=ctx.adapter_path,
+        output_path=ctx.merged_model_path, merge_scale=ctx.selected_merge_scale,
+    )
+    passed = self_check_merged_model(ctx.merged_model_path)
+    if not passed:
+        raise PipelineHaltException(stage="final_merge", reason="正式合并后自检未通过,流水线中止。")
+
+    ctx.log_stage("final_merge", "completed", f"合并模型已产出: {ctx.merged_model_path}")
+
+
+def stage_5_quantization_comparison(ctx: PipelineContext) -> None:
+    """阶段五:量化效果多维对比,选出最终推荐的量化配置"""
+    logger.info("===== 阶段五: 量化效果多维对比 =====")
+    from quantization_comparison_suite import (
+        build_candidate_grid, run_full_comparison,
+    )
+    from quantize_export import load_calibration_dataset
+
+    calibration_texts = load_calibration_dataset(ctx.calibration_data_path)
+    with open(ctx.benchmark_questions_path, "r", encoding="utf-8") as f:
+        benchmark_questions = [json.loads(line)["question"] for line in f if line.strip()]
+
+    candidates = build_candidate_grid(["gptq", "awq"], [4, 8], [64, 128])
+    results = run_full_comparison(
+        candidates=candidates, merged_model_path=ctx.merged_model_path,
+        calibration_texts=calibration_texts, business_testset_sample_path=ctx.business_testset_sample,
+        benchmark_questions=benchmark_questions,
+        fp16_business_pass_rate=ctx.ft_summary["business"]["pass_rate"],
+        output_root=os.path.join(ctx.output_root, "quant_comparison"),
+    )
+
+    best = max(results, key=lambda r: r.overall_recommendation_score) if results else None
+    ctx.quant_comparison_report = [{**r.__dict__, "config": r.config.__dict__} for r in results]
+    ctx.selected_quant_config = best.config.label if best and best.overall_recommendation_score >= 0 else None
+
+    ctx.log_stage(
+        "quantization_comparison", "completed",
+        f"推荐量化配置: {ctx.selected_quant_config or '无满足精度要求的配置,需人工介入'}",
+    )
+
+
+def write_final_report(ctx: PipelineContext) -> str:
+    """汇总整条流水线的执行结果,产出一份可直接作为客户交付附件的最终报告"""
+    report = {
+        "pipeline_run_at": datetime.now(timezone.utc).isoformat(),
+        "project": {"customer": "御风金融", "task": "信贷风控问答微调评估与合并量化"},
+        "stage_log": ctx.stage_log,
+        "forgetting_risk_level": ctx.forgetting_report["overall_risk_level"] if ctx.forgetting_report else None,
+        "selected_merge_scale": ctx.selected_merge_scale,
+        "merged_model_path": ctx.merged_model_path,
+        "selected_quant_config": ctx.selected_quant_config,
+    }
+    report_path = os.path.join(ctx.output_root, "pipeline_final_report.json")
+    os.makedirs(ctx.output_root, exist_ok=True)
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    return report_path
+
+
+def main():
+    parser = argparse.ArgumentParser(description="评估-合并-量化端到端自动化流水线")
+    parser.add_argument("--base_model_path", required=True)
+    parser.add_argument("--adapter_path", required=True)
+    parser.add_argument("--business_testset", required=True)
+    parser.add_argument("--general_testset", required=True)
+    parser.add_argument("--business_testset_sample", required=True)
+    parser.add_argument("--benchmark_questions_path", required=True)
+    parser.add_argument("--calibration_data_path", required=True)
+    parser.add_argument("--output_root", default="./pipeline_outputs")
+    parser.add_argument("--merge_scales", type=float, nargs="+", default=[1.0, 0.8, 0.6, 0.5])
+    parser.add_argument("--force_continue", action="store_true",
+                         help="即使检测到严重遗忘风险,仍强制继续尝试merge_scale调整,而非直接中止")
+    args = parser.parse_args()
+
+    ctx = PipelineContext(
+        base_model_path=args.base_model_path, adapter_path=args.adapter_path,
+        business_testset=args.business_testset, general_testset=args.general_testset,
+        business_testset_sample=args.business_testset_sample,
+        benchmark_questions_path=args.benchmark_questions_path,
+        calibration_data_path=args.calibration_data_path,
+        output_root=args.output_root,
+    )
+
+    try:
+        stage_1_eval_compare(ctx)
+        stage_2_forgetting_check(ctx)
+        stage_3_merge_scale_sweep(ctx, args.merge_scales, args.force_continue)
+        stage_4_final_merge(ctx)
+        stage_5_quantization_comparison(ctx)
+    except PipelineHaltException as e:
+        logger.error(f"流水线主动中止: 阶段=[{e.stage}], 原因={e.reason}")
+        ctx.log_stage(e.stage, "halted", e.reason)
+        report_path = write_final_report(ctx)
+        print(f"\n流水线未能全部完成,已中止于阶段[{e.stage}],详情见报告: {report_path}")
+        sys.exit(1)
+
+    report_path = write_final_report(ctx)
+    print(f"\n===== 流水线全部执行完成 =====")
+    print(f"最终报告: {report_path}")
+    print(f"推荐merge_scale: {ctx.selected_merge_scale}")
+    print(f"推荐量化配置: {ctx.selected_quant_config}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+这条流水线目前还只是老王口中"核心模块已经齐备"的第一版,陈铭自己也清楚里面还有不少简化处理的地方(比如阶段二检测到严重遗忘风险时,是否要中止流水线这个决策逻辑,目前还比较简单粗暴,只用了一个`--force_continue`开关,没有更细粒度的人工审批流程接入)。但这已经把原本需要人工按顺序手动执行、手动传递中间文件路径的七八个独立步骤,串成了一条可以一次性发起、自动记录每个阶段状态的流水线,老王看完这版代码之后评价说:"这个方向是对的,后面要做的是把`--force_continue`这种简单开关,换成真正接入审批流程或者企业微信告警通知,让'人工介入'这个环节也变得可追溯、可审计,而不是靠一个命令行参数糊弄过去,不过今天先把骨架搭起来,已经很不错了。"
+
 ---
 
 ## 今日复盘
