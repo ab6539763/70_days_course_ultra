@@ -1417,6 +1417,1238 @@ print("全部5个检查点均已通过,Day1基础知识点掌握情况良好。"
 print("=" * 50)
 ```
 
+晚自习结束前,陈铭还没打算收工。他翻了翻自己下午写的几个文件,觉得"变量和类型"这块知识点自己练得还不够扎实,又对着白天报错案例集意犹未尽,于是又主动加练了几个文件——这也是老王后来在群里表扬他的部分内容:"今天布置的任务大家都完成了,但陈铭这几个自己加练的文件,已经有点'企业级代码'的意识了,值得你们几个都看一看。"
+
+### 文件8:`variables_and_types_extended_practice.py` —— 变量与数据类型加练(边界情况篇)
+
+```python
+"""
+文件名:variables_and_types_extended_practice.py
+作者:陈铭
+说明:
+    白天的练习场(variables_and_types_playground.py)覆盖了int/float/str/bool
+    四种类型的"标准用法",晚自习陈铭又琢磨了一圈,专门补充了一批"边界情况"——
+    比如特别大的数字、科学计数法、负数的取整、字符串里的转义字符、
+    多重类型转换链路等等。老王看到后说:"这才是真正在'练手感',
+    不是背下来知识点就算完事,是要在各种奇怪的输入面前都不慌。"
+
+    本文件严格限定在Day1已学知识点范围内:变量、int/float/str/bool、
+    type()、类型转换函数、print()的多种用法、基本算术运算符。
+    不使用if/for/函数/列表/字典等后续课程内容。
+"""
+
+print("=" * 60)
+print("变量与数据类型加练 —— 边界情况篇")
+print("=" * 60)
+
+# ============================================================
+# 第一部分:整数的边界情况
+# ============================================================
+print("\n【第一部分:整数边界情况】")
+
+# Python的整数理论上没有位数上限(不像很多语言的int有固定字节数限制),
+# 这是Python这门语言一个很"友好"的特点,新手很容易忽略这一点。
+huge_number = 987654321987654321987654321
+print("一个超级大的整数:", huge_number)
+print("它的类型依然是:", type(huge_number))
+
+# 负数的整数运算演示
+negative_score = -18
+positive_score = 25
+score_sum = negative_score + positive_score
+print("负数与正数相加:", negative_score, "+", positive_score, "=", score_sum)
+
+# 整数的除法有两种:普通除法(/)结果永远是float;整除(//)结果保留整数部分
+total_people = 37
+group_size = 5
+groups_float = total_people / group_size          # 普通除法,结果是float
+groups_int = total_people // group_size            # 整除,结果是int,自动向下取整
+remainder = total_people % group_size               # 取余数,常用来判断"能否整除"
+print("37人分成每组5人:")
+print("  普通除法结果(float):", groups_float, " | 类型:", type(groups_float))
+print("  整除结果(int)      :", groups_int, " | 类型:", type(groups_int))
+print("  余数              :", remainder, "人多出来")
+
+# 幂运算符 **,今天课上没有细讲,但属于基础算术运算符范畴,提前记一下
+square_of_five = 5 ** 2
+cube_of_three = 3 ** 3
+print("5的平方:", square_of_five, " | 3的立方:", cube_of_three)
+
+# ============================================================
+# 第二部分:浮点数的边界情况
+# ============================================================
+print("\n【第二部分:浮点数边界情况】")
+
+# 科学计数法表示的浮点数,在处理极大或极小的数值时非常有用
+avogadro_like_number = 6.02e23          # 表示6.02乘以10的23次方
+tiny_number = 1.5e-8                     # 表示1.5乘以10的负8次方
+print("科学计数法表示的极大数:", avogadro_like_number)
+print("科学计数法表示的极小数:", tiny_number)
+print("它们的类型都是:", type(avogadro_like_number), type(tiny_number))
+
+# 浮点数的四舍五入:round()函数,第二个参数指定保留的小数位数
+raw_average = 88.66666666666667
+rounded_two = round(raw_average, 2)
+rounded_zero = round(raw_average)          # 不传第二个参数时,四舍五入到整数,但返回类型仍可能是int
+print("原始平均分:", raw_average)
+print("保留两位小数:", rounded_two)
+print("四舍五入到整数:", rounded_zero, " | 类型:", type(rounded_zero))
+
+# round()的一个"反直觉"细节:Python使用的是"银行家舍入法"(四舍六入五取偶),
+# 这和我们中学学的"四舍五入"在正好是.5的情况下可能不一样,提前打个预防针
+print("round(2.5) 的结果是:", round(2.5), "  (不是想象中的3,这是Python的舍入规则)")
+print("round(3.5) 的结果是:", round(3.5), "  (这里恰好是4,同样的规则,不同的结果)")
+
+# 浮点数的绝对值,用abs()函数
+temperature_change = -6.4
+print("温度变化的绝对值:", abs(temperature_change))
+
+# ============================================================
+# 第三部分:字符串的边界情况与转义字符
+# ============================================================
+print("\n【第三部分:字符串边界情况】")
+
+# 空字符串,合法但要注意它在bool()转换中会被判定为False
+empty_str = ""
+print("空字符串:'" + empty_str + "'  | 长度:", len(empty_str), " | bool值:", bool(empty_str))
+
+# 只包含空格的字符串,长度不为0,和"空字符串"是两个不同的概念,新手容易混淆
+space_only_str = "   "
+print("只有空格的字符串长度:", len(space_only_str), " | bool值:", bool(space_only_str))
+
+# 转义字符:反斜杠加特定字母,表示一些无法直接打印的特殊字符
+newline_demo = "第一行\n第二行"          # \n表示换行
+tab_demo = "姓名\t年龄\t身高"              # \t表示横向缩进(制表符)
+quote_demo = "老王说:\"能跑不代表对。\""   # \"表示在双引号字符串内部插入一个双引号
+backslash_demo = "文件路径示例:C:\\Users\\chenming"   # \\表示一个真正的反斜杠字符
+print("换行演示:\n" + newline_demo)
+print("制表符演示:\n" + tab_demo)
+print("引号转义演示:", quote_demo)
+print("反斜杠转义演示:", backslash_demo)
+
+# 字符串的长度,用len()函数(今天先认识,明天字符串专题会更系统地展开)
+company_name = "蓬远科技"
+print("公司名称:", company_name, " | 字数(len):", len(company_name))
+
+# 字符串乘法:用于快速生成重复的分隔线,今天上午老王演示过一次
+divider = "-" * 40
+print(divider)
+
+# 字符串加法(拼接)的多种写法对比
+first_name_part = "苍"
+last_name_part = "穹"
+full_project_name_v1 = first_name_part + last_name_part
+full_project_name_v2 = "".join([first_name_part, last_name_part])   # 提前眼熟一下join的写法,细节明天讲
+print("字符串拼接写法一(加号):", full_project_name_v1)
+print("字符串拼接写法二(join,细节明天讲):", full_project_name_v2)
+
+# ============================================================
+# 第四部分:布尔值的边界情况——哪些东西在Python里被当成"假"
+# ============================================================
+print("\n【第四部分:布尔值边界情况】")
+
+# Python里,以下几种值在bool()转换时都会被判定为False,统称为"假值"(falsy):
+# 数字0(包括0.0)、空字符串""、None(今天不展开,后面会讲)
+print("bool(0)        =", bool(0))
+print("bool(0.0)      =", bool(0.0))
+print("bool(-1)       =", bool(-1), "  (注意,负数依然是True,只有0才是False)")
+print("bool('')       =", bool(""))
+print("bool(' ')      =", bool(" "), "  (只有空格的字符串,依然算True,因为它不是真正的空字符串)")
+print("bool('False')  =", bool("False"), "  (这是一个大坑!字符串'False'本身非空,所以是True)")
+
+# 布尔值参与算术运算时,会被Python自动当成数字处理:True等价于1,False等价于0
+count_of_true_conditions = True + True + False + True
+print("True+True+False+True 的算术结果:", count_of_true_conditions, " | 类型:", type(count_of_true_conditions))
+
+# ============================================================
+# 第五部分:多重类型转换链路(把一个值在不同类型之间来回转换)
+# ============================================================
+print("\n【第五部分:多重类型转换链路】")
+
+# 从字符串到浮点数,再到整数,再到字符串,完整走一遍类型转换的链路
+original_str = "88.75"
+step1_float = float(original_str)          # 字符串 -> 浮点数
+step2_int = int(step1_float)                 # 浮点数 -> 整数(直接截断小数部分,不是四舍五入!)
+step3_str = str(step2_int)                   # 整数 -> 字符串
+print("原始字符串:", original_str, " | 类型:", type(original_str))
+print("转成浮点数后:", step1_float, " | 类型:", type(step1_float))
+print("转成整数后(注意是截断不是四舍五入):", step2_int, " | 类型:", type(step2_int))
+print("再转回字符串后:", step3_str, " | 类型:", type(step3_str))
+
+# 提醒:int()对浮点数做转换时是直接截断小数部分,不会四舍五入,这是新手常见的误区
+truncate_demo_positive = int(9.99)
+truncate_demo_negative = int(-9.99)
+print("int(9.99) 的结果是:", truncate_demo_positive, "  (截断,不是四舍五入成10)")
+print("int(-9.99) 的结果是:", truncate_demo_negative, "  (向0方向截断,不是-10)")
+
+print("\n" + "=" * 60)
+print("边界情况加练完成。老王的评语:'这些边界情况,不是为了刁难你们,")
+print("是因为客户上传的真实数据永远比课堂案例脏得多,提前眼熟没有坏处。'")
+print("=" * 60)
+```
+
+### 文件9:`personal_info_card_v4_enterprise_plus.py` —— 个人信息卡片(企业字段扩展版)
+
+```python
+"""
+文件名:personal_info_card_v4_enterprise_plus.py
+作者:陈铭
+版本:v4(在v3企业风格版基础上继续扩展的"字段更完整"版本)
+说明:
+    老王看完v3企业风格版之后,顺口提了一句:"你这版卡片,如果真的对标
+    公司未来要存进数据库的'员工档案表',字段还差不少——比如入职日期、
+    紧急联系人、工牌编号这些,企业系统里几乎每一条用户记录都会有。"
+    陈铭趁着还没睡意,把v3版本又扩展了一轮,新增了7个字段,
+    并且把"卡片"的排版做得更接近真实企业系统里"用户详情页"的样子。
+
+    本版本依然严格限定在Day1已学知识点范围内,不使用if/for/函数/
+    列表/字典,所有字段都用独立变量表示(这也是为了让陈铭自己更真切地
+    体会到:字段一多,独立变量的写法有多"笨重"——这为将来学dict、
+    学数据库表结构埋下一个很直观的心理落差,老王管这个叫"先吃点苦头,
+    后面学新工具才会真正觉得'哇,这样写省事多了'"。
+"""
+
+# ============================================================
+# 第一部分:采集基础身份信息
+# ============================================================
+full_name = input("请输入你的姓名:")
+age = int(input("请输入你的年龄:"))
+height_cm = float(input("请输入你的身高(单位:厘米):"))
+hometown = input("请输入你的籍贯(省份即可):")
+
+# ============================================================
+# 第二部分:采集企业档案常见的补充字段
+# ============================================================
+
+# 工牌编号(字符串,虽然看起来像数字,但工牌编号本质上是"标识符"而非"数量",
+# 企业系统里通常会存成字符串类型,因为标识符不需要参与加减乘除运算,
+# 而且有些工牌编号会带前缀字母,比如"PY-2024-0113"
+employee_badge_id = input("请输入你的工牌编号(例如 PY-2024-0113):")
+
+# 入职年份(整数),用于后续计算"司龄"这类衍生字段
+onboard_year = int(input("请输入你的入职年份(例如 2024):"))
+current_year = 2024              # 假设当前年份,教学用固定值,今天还没学datetime模块
+
+# 紧急联系人姓名与电话(均为字符串)
+emergency_contact_name = input("请输入紧急联系人姓名:")
+emergency_contact_phone = input("请输入紧急联系人电话:")
+
+# 是否已完成入职体检(bool,通过字符串比较转换得到)
+health_check_input = input("是否已完成入职体检?(请输入 是/否):")
+has_health_check = (health_check_input == "是")
+
+# 是否需要公司提供住宿(bool)
+housing_input = input("是否需要公司提供住宿?(请输入 是/否):")
+needs_housing = (housing_input == "是")
+
+# 期望的实习/培训津贴(浮点数,单位:元)
+expected_stipend = float(input("请输入你期望的培训期津贴(单位:元):"))
+
+# ============================================================
+# 第三部分:衍生计算(仅使用今天学过的算术运算符)
+# ============================================================
+
+years_of_service = current_year - onboard_year          # 简化版"司龄"计算
+height_m = height_cm / 100                                # 厘米转米
+annual_stipend_estimate = expected_stipend * 12            # 月度津贴转年度估算
+
+# ============================================================
+# 第四部分:格式化输出完整档案卡片
+# ============================================================
+
+print()
+print("#" * 54)
+print("#" + " 蓬远科技 · 员工档案卡(培训期模拟版)".center(52) + "#")
+print("#" * 54)
+print("基础身份信息".center(54, "-"))
+print("姓名        :{}".format(full_name))
+print("年龄        :{}岁".format(age))
+print("身高        :{}厘米(约{}米)".format(height_cm, round(height_m, 2)))
+print("籍贯        :{}".format(hometown))
+print()
+print("企业档案信息".center(54, "-"))
+print("工牌编号    :{}".format(employee_badge_id))
+print("入职年份    :{}年".format(onboard_year))
+print("培训期司龄  :约{}年(简化计算,仅作演示)".format(years_of_service))
+print("紧急联系人  :{}({})".format(emergency_contact_name, emergency_contact_phone))
+print("入职体检    :{}".format("已完成" if has_health_check else "未完成"))
+print("公司住宿需求:{}".format("需要" if needs_housing else "不需要"))
+print()
+print("薪酬预期信息".center(54, "-"))
+print("月度津贴预期:{}元".format(expected_stipend))
+print("年度津贴预估:{}元".format(annual_stipend_estimate))
+print("#" * 54)
+
+# ============================================================
+# 第五部分:字段类型完整自查(企业代码习惯:关键数据落库前的最后一道检查)
+# ============================================================
+print("\n【全字段类型自查清单】")
+print("full_name              :", type(full_name))
+print("age                    :", type(age))
+print("height_cm              :", type(height_cm))
+print("employee_badge_id      :", type(employee_badge_id))
+print("onboard_year           :", type(onboard_year))
+print("has_health_check       :", type(has_health_check))
+print("needs_housing          :", type(needs_housing))
+print("expected_stipend       :", type(expected_stipend))
+print("annual_stipend_estimate:", type(annual_stipend_estimate))
+print("\n自查完成:全部字段类型均符合设计预期,int/float/str/bool四种基础类型均已覆盖。")
+
+# 陈铭在文件末尾留了一句自己的注释,算是今晚加练的小结:
+# 字段一旦超过8个,靠一个个独立变量去管理就已经开始觉得吃力了——
+# 老王说得对,这大概就是明天以后要学列表、后面要学字典、
+# 再往后要学数据库表结构的真正动机:不是"为了显得高级",
+# 而是字段一多,笨办法真的会把人拖垂。
+```
+
+### 文件10:`input_validation_and_exception_handling_preview.py` —— 输入校验与异常处理预习加餐
+
+```python
+"""
+文件名:input_validation_and_exception_handling_preview.py
+作者:陈铭
+说明:
+    这个文件是晚自习最后陈铭"手痒"多写的一份内容,严格来说超出了
+    Day1的教学范围(try/except异常处理正式内容会在Day10系统讲解),
+    但陈铭当晚被"int('三十二')会崩溃程序"这件事刺激得不轻——他觉得
+    "一个程序,不应该因为用户随手输错一个字,就直接崩掉给用户看一脸红字"。
+    他上网查了半小时"Python怎么防止程序崩溃",大致弄懂了try/except
+    的基本用法,写了这份预习性质的代码,第二天专门去问了老王。
+
+    老王看完之后的评价原话记录在Day1晚自习笔记里:
+    "你抓的这个直觉是对的——'保护程序不崩溃'是工程师的本能反应之一。
+    你现在的写法有点糙,细节咱们Day10会系统讲,但方向完全没错,
+    这份文件我允许你留着当作Day1的'加餐记录',提醒自己当时是怎么
+    自己摸索出这个思路的。"
+
+    因此,本文件中的try/except写法仅供预习参考,请注意:
+    1. 正式的异常处理规范(具体捕获哪种异常、如何设计异常提示文案等)
+       会在Day10详细展开,这里的写法是陈铭自学后的"朴素版本"。
+    2. 本文件不代表Day1的必学内容,仅作为学有余力同学的拓展阅读。
+"""
+
+print("=" * 60)
+print("输入校验与异常处理预习加餐 —— 陈铭的自学笔记")
+print("=" * 60)
+
+# ============================================================
+# 第一部分:用try/except包裹一次可能失败的类型转换
+# ============================================================
+print("\n【第一部分:基础的try/except结构】")
+
+# 下面用一个固定字符串模拟"用户可能输错"的场景,方便脚本自动运行,不需要人工输入。
+# 在真实场景里,这个值会来自input()。
+simulated_user_input_1 = "32"          # 正常场景:用户输入了合法的数字字符串
+
+try:
+    # try块里放"可能会出错"的代码
+    age_result = int(simulated_user_input_1)
+    print("转换成功,年龄为:", age_result, " | 类型:", type(age_result))
+except ValueError:
+    # except块里放"出错之后该怎么办"的代码,而不是让程序直接崩溃退出
+    print("输入的内容无法转换成整数,请检查输入是否为合法数字。")
+
+# 再模拟一次"用户输错了"的场景
+simulated_user_input_2 = "三十二"       # 异常场景:用户输入了中文数字
+
+try:
+    age_result_2 = int(simulated_user_input_2)
+    print("转换成功,年龄为:", age_result_2)
+except ValueError:
+    print("检测到非法输入:'{}' 无法转换成整数,已进行兜底处理,程序未崩溃。".format(simulated_user_input_2))
+
+# ============================================================
+# 第二部分:同时准备多个测试样本,模拟"批量校验"的场景
+# ============================================================
+print("\n【第二部分:批量样本校验演示(仍不使用for循环,逐个手动处理)】")
+
+# 今天还没学for循环,所以这里只能"笨办法"地把每个样本单独处理一遍,
+# 陈铭在笔记里写道:"这里如果能用for循环该多省事啊",算是给自己埋了个盼头。
+sample_a = "28"
+sample_b = "abc"
+sample_c = "175.5"
+sample_d = ""
+
+try:
+    result_a = int(sample_a)
+    print("样本A '{}' 校验通过,转换结果:{}".format(sample_a, result_a))
+except ValueError:
+    print("样本A '{}' 校验失败,不是合法整数。".format(sample_a))
+
+try:
+    result_b = int(sample_b)
+    print("样本B '{}' 校验通过,转换结果:{}".format(sample_b, result_b))
+except ValueError:
+    print("样本B '{}' 校验失败,不是合法整数。".format(sample_b))
+
+try:
+    result_c = int(sample_c)
+    print("样本C '{}' 校验通过,转换结果:{}".format(sample_c, result_c))
+except ValueError:
+    # 这个样本"175.5"看起来是数字,但因为带小数点,int()同样会报错,
+    # 这是陈铭自己踩过的一个小坑,专门留在这里提醒自己
+    print("样本C '{}' 校验失败,int()无法直接转换带小数点的字符串,需要先用float()再用int()。".format(sample_c))
+
+try:
+    result_d = int(sample_d)
+    print("样本D 校验通过,转换结果:{}".format(result_d))
+except ValueError:
+    print("样本D 是空字符串,无法转换成整数,校验失败。")
+
+# ============================================================
+# 第三部分:多种异常类型的区分(TypeError vs ValueError)
+# ============================================================
+print("\n【第三部分:区分TypeError和ValueError】")
+
+# 场景1:ValueError —— 值本身不符合要求
+try:
+    bad_value = int("三十二")
+except ValueError as error_detail:
+    # as后面可以给捕获到的异常对象起一个名字,方便打印异常的具体信息
+    print("捕获到ValueError,详细信息:", error_detail)
+
+# 场景2:TypeError —— 类型本身不支持这种操作
+try:
+    # None类型和整数直接相加,会触发TypeError(今天先眼熟一下None这个概念,
+    # 它表示"什么都没有",后面Day10会更系统地讲)
+    none_value = None
+    result_type_error = none_value + 1
+except TypeError as error_detail:
+    print("捕获到TypeError,详细信息:", error_detail)
+
+# ============================================================
+# 第四部分:一个"更完整"的健壮采集流程草稿
+#           (陈铭尝试模拟真正采集用户年龄时的健壮写法)
+# ============================================================
+print("\n【第四部分:健壮的年龄采集流程草稿】")
+
+# 这里依然使用固定字符串模拟input(),第一次模拟"输错"的情况,
+# 第二次模拟"改正后重新输入"的情况——这个"重试"的完整逻辑,
+# 严格来说需要while循环才能真正自动化(那是Day6的内容),
+# 这里只是手动写两次尝试,模拟完整重试流程的雏形。
+first_attempt_input = "二十八"
+second_attempt_input = "28"
+
+age_final_result = None          # 先给一个初始值,表示"暂时还没有成功采集到"
+
+try:
+    age_final_result = int(first_attempt_input)
+    print("第一次尝试采集成功:", age_final_result)
+except ValueError:
+    print("第一次尝试采集失败:'{}' 不是合法数字,提示用户重新输入。".format(first_attempt_input))
+    try:
+        age_final_result = int(second_attempt_input)
+        print("第二次尝试采集成功:", age_final_result)
+    except ValueError:
+        print("第二次尝试依然失败,本次流程草稿只演示两次机会,实际项目会用循环持续重试。")
+
+print("最终采集结果:", age_final_result, " | 类型:", type(age_final_result))
+
+# ============================================================
+# 第五部分:finally块的初步认识——无论成功还是失败都会执行的代码
+# ============================================================
+print("\n【第五部分:finally块演示】")
+
+try:
+    demo_value = int("99")
+    print("try块执行成功,结果为:", demo_value)
+except ValueError:
+    print("try块执行失败。")
+finally:
+    # finally块里的代码,不管try块是成功还是失败,都一定会被执行,
+    # 常用来做"收尾工作",比如关闭文件、释放资源(这些概念以后会详细展开)
+    print("finally块执行:本次校验流程结束,无论结果如何都会打印这句话。")
+
+print("\n" + "=" * 60)
+print("加餐笔记小结:异常处理让程序在面对'脏输入'时,能够优雅地")
+print("给出提示并继续运行,而不是直接崩溃退出。这份认知,")
+print("会在Day10被系统化、规范化,今天先埋一颗种子。")
+print("=" * 60)
+```
+
+### 文件11:`self_check_tests_extended.py` —— 基础自检脚本(边界情况补充篇)
+
+```python
+"""
+文件名:self_check_tests_extended.py
+作者:陈铭
+说明:
+    在self_check_tests.py的基础上,补充了一批针对"边界情况"的断言检查,
+    覆盖了文件8(variables_and_types_extended_practice.py)里练习到的
+    大数字、科学计数法、负数取整、字符串转义字符、布尔值边界等场景。
+    继续沿用assert语句作为"简易自动化检查工具",不使用if/for/函数。
+"""
+
+print("开始执行Day1基础自检脚本(边界情况补充篇)...\n")
+
+# --------------------------------------------------------------------------
+# 检查点6:超大整数的类型与基本运算仍然正确
+# --------------------------------------------------------------------------
+huge_number = 10 ** 20
+assert type(huge_number) == int, "huge_number应该是int类型"
+assert huge_number == 100000000000000000000, "超大整数的计算结果不符合预期"
+print("检查点6通过:超大整数运算正常,Python的int没有固定位数上限。")
+
+# --------------------------------------------------------------------------
+# 检查点7:整除与取余的组合关系应满足数学恒等式
+# --------------------------------------------------------------------------
+dividend = 37
+divisor = 5
+quotient = dividend // divisor
+remainder = dividend % divisor
+assert quotient * divisor + remainder == dividend, "整除与取余的组合结果不满足除法恒等式"
+print("检查点7通过:37 = {}*{} + {},整除与取余的关系符合数学定义。".format(quotient, divisor, remainder))
+
+# --------------------------------------------------------------------------
+# 检查点8:round()的"截断 vs 四舍五入"边界情况
+# --------------------------------------------------------------------------
+assert int(9.99) == 9, "int()应该是截断而不是四舍五入"
+assert int(-9.99) == -9, "int()对负数同样是向0方向截断"
+assert round(9.99) == 10, "round()应该是四舍五入,与int()截断行为不同"
+print("检查点8通过:int()截断与round()四舍五入的行为差异符合预期。")
+
+# --------------------------------------------------------------------------
+# 检查点9:字符串转义字符的实际字符数量
+# --------------------------------------------------------------------------
+newline_str = "第一行\n第二行"
+assert len(newline_str) == 7, "转义字符\\n应该只占1个字符长度,不是2个(3+1+3=7)"
+tab_str = "A\tB"
+assert len(tab_str) == 3, "转义字符\\t应该只占1个字符长度"
+print("检查点9通过:转义字符\\n和\\t在字符串长度计算中都只占1个字符位。")
+
+# --------------------------------------------------------------------------
+# 检查点10:布尔值的"假值"边界情况
+# --------------------------------------------------------------------------
+assert bool(0) is False, "数字0应该被判定为False"
+assert bool(0.0) is False, "浮点数0.0应该被判定为False"
+assert bool("") is False, "空字符串应该被判定为False"
+assert bool(" ") is True, "只含空格的字符串应该被判定为True(它不是真正的空字符串)"
+assert bool("False") is True, "字符串'False'本身非空,应该被判定为True,这是一个典型陷阱"
+print("检查点10通过:布尔值的'假值'边界情况符合Python官方规则。")
+
+# --------------------------------------------------------------------------
+# 检查点11:布尔值参与算术运算时的等价数值
+# --------------------------------------------------------------------------
+sum_of_bools = True + True + False
+assert sum_of_bools == 2, "True应等价于1,False应等价于0,参与加法时结果应为2"
+assert type(sum_of_bools) == int, "布尔值相加后的结果类型应该是int"
+print("检查点11通过:布尔值在算术运算中被正确当作0和1处理。")
+
+# --------------------------------------------------------------------------
+# 检查点12:多重类型转换链路的最终结果与中间过程
+# --------------------------------------------------------------------------
+original_str = "88.75"
+step1 = float(original_str)
+step2 = int(step1)
+step3 = str(step2)
+assert step1 == 88.75, "字符串转浮点数结果不符合预期"
+assert step2 == 88, "浮点数转整数应该是截断,不是四舍五入"
+assert step3 == "88", "整数转字符串结果不符合预期"
+print("检查点12通过:多重类型转换链路(str->float->int->str)结果完全符合预期。")
+
+# --------------------------------------------------------------------------
+# 检查点13:科学计数法表示的浮点数与常规写法数值等价
+# --------------------------------------------------------------------------
+scientific_form = 1.5e2          # 等价于150.0
+regular_form = 150.0
+assert scientific_form == regular_form, "科学计数法表示的数值应该和常规写法数值相等"
+print("检查点13通过:科学计数法 1.5e2 与常规写法 150.0 数值一致。")
+
+# --------------------------------------------------------------------------
+# 汇总
+# --------------------------------------------------------------------------
+print("\n" + "=" * 60)
+print("全部8个补充检查点(检查点6-13)均已通过,边界情况理解到位。")
+print("结合self_check_tests.py的检查点1-5,Day1基础知识点共完成13项自动化验证。")
+print("=" * 60)
+```
+
+### 文件12:老王的加餐演示 —— `test_day01_basics_unittest_preview.py`(单元测试初体验,预习性质)
+
+老王在Day1晚自习查看陈铭的`input_validation_and_exception_handling_preview.py`时,顺手打开自己电脑,说:"你用assert写的这些检查点,思路已经很接近正规的'单元测试'了,我给你们提前演示一下,以后写测试大概长什么样子——这不是今天的任务,大概Day18规范化训练的时候会系统讲`unittest`和`pytest`这两个测试框架,你们今天先眼熟一下。"他现场写了下面这份文件,离开前特别说明:"这份文件里用到了`def`定义函数,这是还没正式教的内容,你们看不懂函数部分完全正常,只需要感受一下'测试用例长什么样、跑起来是什么效果'就够了。"
+
+```python
+"""
+文件名:test_day01_basics_unittest_preview.py
+作者:王振宇(老王现场演示,陈铭誊抄留存)
+说明:
+    这是一份"预习性质"的演示文件,展示Python标准库自带的unittest
+    测试框架大致长什么样子。文件中会用到def(定义函数)这个Day1还没有
+    正式教学的语法,新人现在完全不需要看懂函数内部的语法细节,
+    只需要感受两件事:
+    1. "测试用例"是把assert这种零散的检查点,组织成结构化、
+       可以被自动统一运行、统一汇报结果的代码。
+    2. 运行一份测试文件后,会得到类似"Ran 12 tests in 0.001s, OK"
+       这样的汇总报告,而不需要自己一行一行去看print()输出。
+
+    正式的单元测试写法、断言方法(assertEqual/assertTrue/assertRaises等)、
+    测试驱动开发(TDD)的理念,会在Day18《代码规范与工程化实践》
+    及后续项目阶段系统展开,这里只做最初步的"眼熟"。
+"""
+
+import unittest
+
+
+# 下面这个函数是被测试的对象,模拟"个人信息卡片程序"里最核心的
+# 一步转换逻辑:把用户输入的字符串安全地转换成整数年龄。
+# 函数的具体语法(def、参数、return)属于后续课程内容,这里先不展开讲解。
+def safe_convert_age(age_input_str):
+    """尝试把字符串转换成年龄整数,如果失败就返回None,不让程序崩溃。"""
+    try:
+        return int(age_input_str)
+    except ValueError:
+        return None
+
+
+# 下面这个函数模拟"厘米转米并保留2位小数"的逻辑
+def convert_cm_to_m(height_cm):
+    """把厘米转换成米,保留2位小数。"""
+    return round(height_cm / 100, 2)
+
+
+# 下面这个函数模拟"字符串转布尔值"的逻辑(判断输入是否为"是")
+def convert_yes_no_to_bool(answer_str):
+    """把'是'/'否'这类中文字符串,转换成标准的bool值。"""
+    return answer_str == "是"
+
+
+class TestDay01BasicConversions(unittest.TestCase):
+    """
+    这是一个"测试类",继承自unittest.TestCase。
+    类里每一个以test_开头的方法,都会被unittest框架自动识别为
+    一条独立的测试用例,自动运行并汇总结果。
+    "类"和"继承"是后续课程内容,这里不展开讲解语法细节。
+    """
+
+    def test_safe_convert_age_with_valid_input(self):
+        """测试:输入合法数字字符串时,应该正确转换成整数。"""
+        self.assertEqual(safe_convert_age("32"), 32)
+        self.assertEqual(safe_convert_age("0"), 0)
+        self.assertEqual(safe_convert_age("-5"), -5)
+
+    def test_safe_convert_age_with_invalid_input(self):
+        """测试:输入非法内容时,应该返回None而不是让程序崩溃。"""
+        self.assertIsNone(safe_convert_age("三十二"))
+        self.assertIsNone(safe_convert_age(""))
+        self.assertIsNone(safe_convert_age("abc"))
+        self.assertIsNone(safe_convert_age("32.5"))   # 带小数点的字符串,int()同样会失败
+
+    def test_convert_cm_to_m_basic_cases(self):
+        """测试:厘米转米的换算与四舍五入结果是否符合预期。"""
+        # 注意:175.5/100=1.755,但由于浮点数精度问题,round()实际结果是1.75而不是1.76,
+        # 这正好呼应了今天课上反复强调的"浮点数精度陷阱",专门保留这个真实结果作为反面教材。
+        self.assertEqual(convert_cm_to_m(175.5), 1.75)
+        self.assertEqual(convert_cm_to_m(160.0), 1.6)
+        self.assertEqual(convert_cm_to_m(0), 0.0)
+
+    def test_convert_cm_to_m_edge_cases(self):
+        """测试:极端身高数值下,换算逻辑是否依然稳定,不会报错。"""
+        self.assertEqual(convert_cm_to_m(999.99), 10.0)
+        self.assertEqual(convert_cm_to_m(1), 0.01)
+
+    def test_convert_yes_no_to_bool_true_cases(self):
+        """测试:输入'是'时,应该转换为True。"""
+        self.assertTrue(convert_yes_no_to_bool("是"))
+
+    def test_convert_yes_no_to_bool_false_cases(self):
+        """测试:输入除'是'以外的任何内容,都应该转换为False。"""
+        self.assertFalse(convert_yes_no_to_bool("否"))
+        self.assertFalse(convert_yes_no_to_bool(""))
+        self.assertFalse(convert_yes_no_to_bool("对"))
+        self.assertFalse(convert_yes_no_to_bool("Yes"))   # 大小写或语言不匹配也应该判定为False
+
+    def test_type_consistency_across_conversions(self):
+        """测试:确保三个转换函数的返回值类型符合预期,防止后续拼接时出现TypeError。"""
+        self.assertIsInstance(safe_convert_age("32"), int)
+        self.assertIsInstance(convert_cm_to_m(175.5), float)
+        self.assertIsInstance(convert_yes_no_to_bool("是"), bool)
+
+    def test_chained_scenario_like_real_card_program(self):
+        """
+        综合测试:模拟个人信息卡片程序里连续几步转换的完整链路,
+        验证多个字段一起处理时,互相之间不会产生意外的类型污染。
+        """
+        age = safe_convert_age("28")
+        height_m = convert_cm_to_m(172.3)
+        is_full_time = convert_yes_no_to_bool("是")
+
+        self.assertEqual(age, 28)
+        self.assertEqual(height_m, 1.72)
+        self.assertTrue(is_full_time)
+
+        # 验证三个字段类型互不干扰,各自保持独立的类型
+        self.assertIsInstance(age, int)
+        self.assertIsInstance(height_m, float)
+        self.assertIsInstance(is_full_time, bool)
+
+
+class TestDay01ErrorResilience(unittest.TestCase):
+    """
+    第二个测试类,专门针对"异常输入不应导致程序崩溃"这个工程要求,
+    这也是老王反复强调的"能跑不代表对,对不代表好"里,
+    "好"字背后隐含的一层意思——好的代码要能扛住脏输入。
+    """
+
+    def test_multiple_invalid_ages_do_not_crash(self):
+        """测试:一批典型的脏数据依次转换,程序应该全部安全返回None,不抛异常。"""
+        dirty_samples = ["三十二", "  ", "12.5", "-", "abc123", "一百"]
+        for sample in dirty_samples:
+            # 这里提前用了for循环遍历列表,这是Day1还没教的语法,
+            # 新人现在只需要知道:这段代码依次检查了dirty_samples里的每一个样本
+            result = safe_convert_age(sample)
+            self.assertIsNone(result, "样本'{}'应该被安全处理为None,而不是让程序崩溃".format(sample))
+
+    def test_boundary_height_values(self):
+        """测试:极端边界身高值(0、极大值)不会导致换算逻辑出现异常。"""
+        self.assertEqual(convert_cm_to_m(0), 0.0)
+        self.assertEqual(convert_cm_to_m(300), 3.0)      # 假设的极端身高,仅作数值稳定性测试
+
+
+# 下面这部分代码,让本文件既可以被unittest测试运行器识别,
+# 也可以直接用python命令单独运行,方便新人在没配置好测试框架前先看到效果。
+if __name__ == "__main__":
+    print("=" * 60)
+    print("老王的加餐演示:unittest单元测试初体验")
+    print("这份文件里的def、class、for、try/except等语法,")
+    print("Day1都还没有正式教,大家现在只需要感受测试跑起来的样子。")
+    print("=" * 60)
+    unittest.main(verbosity=2)
+```
+
+老王运行这份文件给大家看效果的时候,终端里滚出了一长串测试结果,类似下面这样(为方便记录,陈铭把关键输出誊抄了下来):
+
+```text
+test_boundary_height_values (__main__.TestDay01ErrorResilience) ... ok
+test_multiple_invalid_ages_do_not_crash (__main__.TestDay01ErrorResilience) ... ok
+test_chained_scenario_like_real_card_program (__main__.TestDay01BasicConversions) ... ok
+test_convert_cm_to_m_basic_cases (__main__.TestDay01BasicConversions) ... ok
+test_convert_cm_to_m_edge_cases (__main__.TestDay01BasicConversions) ... ok
+test_convert_yes_no_to_bool_false_cases (__main__.TestDay01BasicConversions) ... ok
+test_convert_yes_no_to_bool_true_cases (__main__.TestDay01BasicConversions) ... ok
+test_safe_convert_age_with_invalid_input (__main__.TestDay01BasicConversions) ... ok
+test_safe_convert_age_with_valid_input (__main__.TestDay01BasicConversions) ... ok
+test_type_consistency_across_conversions (__main__.TestDay01BasicConversions) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.003s
+
+OK
+```
+
+老王指着最后一行"OK"说:"这就是自动化测试最爽的地方——你不需要自己一行一行看输出对不对,框架会帮你把每一条检查点的结果汇总成一句话告诉你,`OK`就代表全部通过。以后你们写的代码越复杂,这种自动化验证的价值就越大。今天你们只需要知道这东西存在,具体怎么写,Day18见。"
+
+晚自习最后几分钟,老王又留了两个"小工具"给大家——一个是环境自检脚本,方便大家以后换新电脑、或者帮同事排查环境问题时快速定位;另一个是批量测试脚手架,用固定的数据集代替反复手动敲`input()`,方便回归验证。他说:"这两个东西严格来说也不是Day1必学内容,但都非常朴素,不涉及任何后面才教的语法,你们可以直接看懂,拿去自己用。"
+
+### 文件13:`environment_and_data_diagnostics_toolkit.py` —— 开发环境与数据类型诊断小工具
+
+```python
+"""
+文件名:environment_and_data_diagnostics_toolkit.py
+作者:王振宇(老王提供的辅助脚本,陈铭誊抄留存并加了自己的注释)
+说明:
+    这是一份"诊断小工具",分成两大块:
+    1. 环境自检——打印当前Python版本、常用内置模块是否可用,
+       帮助新人在换电脑、重装系统之后,快速确认环境是否配置正确。
+    2. 数据类型诊断——把今天学到的四种基础类型,连同它们的
+       类型转换函数、常见陷阱,汇总成一份可以直接跑出来的"体检报告"。
+
+    本文件只使用了Day1范围内的语法(变量、print、type、字符串格式化),
+    额外用到了Python标准库里的sys和platform模块(用于获取系统信息),
+    这两个模块的"用法"不需要新人现在就完全掌握,当作黑盒使用即可,
+    以后接触更多标准库模块时,会有更系统的介绍。
+"""
+
+import sys
+import platform
+
+print("#" * 60)
+print("#" + " 蓬远科技 · 开发环境诊断报告 ".center(58) + "#")
+print("#" * 60)
+
+# ============================================================
+# 第一部分:环境自检
+# ============================================================
+print("\n【第一部分:环境基础信息】")
+
+python_version = sys.version.split(" ")[0]     # 提取版本号部分,不显示编译细节
+operating_system = platform.system()             # 返回操作系统名称,例如Windows/Darwin(macOS)/Linux
+machine_arch = platform.machine()                  # 返回CPU架构信息,例如x86_64、arm64
+
+print("当前Python版本      :", python_version)
+print("当前操作系统        :", operating_system)
+print("当前CPU架构         :", machine_arch)
+
+# 简单的版本号比对(仅作字符串层面的粗略检查,严格的版本号比较逻辑更复杂,
+# 这里只是给新人一个直观的印象,不代表生产级别的版本校验写法)
+recommended_version = "3.11.6"
+print("团队推荐版本        :", recommended_version)
+version_matches = (python_version == recommended_version)
+print("当前版本是否与推荐版本完全一致:", version_matches)
+
+if_padding_line = "-" * 60
+print(if_padding_line)
+
+# ============================================================
+# 第二部分:关键内置函数快速自检
+# ============================================================
+print("\n【第二部分:关键内置函数快速自检】")
+
+# 逐一确认今天用到的几个内置函数确实存在且行为符合预期,
+# 这种"用已知输入验证已知输出"的思路,本质上就是最朴素的测试思想。
+check_print_result = "print函数正常" if True else "异常"
+check_type_result = type(123)
+check_int_result = int("100")
+check_float_result = float("3.14")
+check_str_result = str(100)
+check_bool_result = bool(1)
+check_len_result = len("蓬远科技")
+check_round_result = round(3.14159, 2)
+check_abs_result = abs(-9)
+
+print("print()        可用 | 示例输出:", check_print_result)
+print("type()         可用 | 示例输出:", check_type_result)
+print("int()          可用 | 示例输出:", check_int_result)
+print("float()        可用 | 示例输出:", check_float_result)
+print("str()          可用 | 示例输出:", check_str_result)
+print("bool()         可用 | 示例输出:", check_bool_result)
+print("len()          可用 | 示例输出:", check_len_result)
+print("round()        可用 | 示例输出:", check_round_result)
+print("abs()          可用 | 示例输出:", check_abs_result)
+
+# ============================================================
+# 第三部分:数据类型体检报告——四种基础类型的"身份证信息"汇总
+# ============================================================
+print("\n【第三部分:数据类型体检报告】")
+
+report_template = """
+类型名称   :{type_name}
+关键字     :{keyword}
+典型取值   :{example}
+type()结果 :{type_result}
+转换函数   :{convert_func}
+常见陷阱   :{pitfall}
+"""
+
+# 逐个打印四种基础类型的体检卡片(仍不使用循环,今天的知识范围内手动逐一处理)
+print(report_template.format(
+    type_name="整数",
+    keyword="int",
+    example=32,
+    type_result=type(32),
+    convert_func="int(x)",
+    pitfall="int()对浮点数是截断,不是四舍五入;int()无法直接转换带小数点的字符串",
+))
+
+print(report_template.format(
+    type_name="浮点数",
+    keyword="float",
+    example=175.5,
+    type_result=type(175.5),
+    convert_func="float(x)",
+    pitfall="浮点数运算存在精度误差,如0.1+0.2不严格等于0.3;涉及金额计算需格外小心",
+))
+
+print(report_template.format(
+    type_name="字符串",
+    keyword="str",
+    example="陈铭",
+    type_result=type("陈铭"),
+    convert_func="str(x)",
+    pitfall="input()返回值永远是str,即便用户输入的是数字,也必须显式转换后才能参与数值运算",
+))
+
+print(report_template.format(
+    type_name="布尔值",
+    keyword="bool",
+    example=True,
+    type_result=type(True),
+    convert_func="bool(x)",
+    pitfall="非空字符串'False'会被判定为True;只有真正的空字符串、数字0才是False",
+))
+
+# ============================================================
+# 第四部分:诊断结论汇总
+# ============================================================
+print("\n" + "=" * 60)
+print("诊断结论:")
+print("1. 当前Python环境版本信息已确认,详见上方报告。")
+print("2. 今天课堂用到的全部内置函数均可正常调用。")
+print("3. 四种基础数据类型的核心特性与常见陷阱已汇总记录。")
+print("本报告可作为往后每次更换设备、协助同事排查环境问题时的快速参考模板。")
+print("=" * 60)
+```
+
+### 文件14:`personal_info_card_batch_test_harness.py` —— 个人信息卡片批量测试脚手架
+
+```python
+"""
+文件名:personal_info_card_batch_test_harness.py
+作者:陈铭(参考老王演示的批量测试思路整理)
+说明:
+    每次调试个人信息卡片程序,都要重新手动输入一遍姓名、年龄、身高……
+    改一个小地方就要重新敲一遍input(),效率很低,而且很难保证每次
+    测试用的都是"同一组数据",不利于对比修改前后的效果差异。
+
+    这个文件的思路是:提前准备好几组固定的测试数据(模拟不同类型的用户),
+    用这些固定数据代替真实的input()调用,这样修改代码之后可以反复
+    快速运行、快速对比结果,而不需要每次都重新手动输入。
+    这正是"测试数据集"最朴素的雏形,以后写正规单元测试、
+    做接口测试的时候,都会用到类似的思路——准备好一批有代表性的样本,
+    覆盖"正常情况"和"边界情况",而不是每次都临时现想数据。
+
+    本文件严格限定在Day1已学知识点范围内,不使用if/for/函数/列表/字典,
+    每组测试数据都用完全独立的一套变量表示,虽然重复度较高,
+    但这恰好是老王想让陈铭亲身体会到的"痛点"——独立变量在批量场景下
+    有多笨重,为后面学列表、字典、循环这些"减负工具"埋下真实的动机。
+"""
+
+print("=" * 60)
+print("个人信息卡片程序 —— 批量测试脚手架")
+print("=" * 60)
+
+# ============================================================
+# 测试样本1:标准的全职员工画像(正常场景)
+# ============================================================
+sample1_name = "陈铭"
+sample1_age_input = "32"
+sample1_height_input = "175.5"
+sample1_employment_input = "是"
+
+sample1_age = int(sample1_age_input)
+sample1_height = float(sample1_height_input)
+sample1_is_full_time = (sample1_employment_input == "是")
+
+print("\n【测试样本1:标准全职员工画像】")
+print("姓名:{} | 年龄:{}岁 | 身高:{}厘米 | 全职:{}".format(
+    sample1_name, sample1_age, sample1_height, sample1_is_full_time
+))
+print("类型自查 -> age:{} height:{} is_full_time:{}".format(
+    type(sample1_age), type(sample1_height), type(sample1_is_full_time)
+))
+
+# ============================================================
+# 测试样本2:兼职/实习生画像(is_full_time应为False)
+# ============================================================
+sample2_name = "苏梦"
+sample2_age_input = "24"
+sample2_height_input = "162.0"
+sample2_employment_input = "否"
+
+sample2_age = int(sample2_age_input)
+sample2_height = float(sample2_height_input)
+sample2_is_full_time = (sample2_employment_input == "是")
+
+print("\n【测试样本2:兼职/实习生画像】")
+print("姓名:{} | 年龄:{}岁 | 身高:{}厘米 | 全职:{}".format(
+    sample2_name, sample2_age, sample2_height, sample2_is_full_time
+))
+print("类型自查 -> age:{} height:{} is_full_time:{}".format(
+    type(sample2_age), type(sample2_height), type(sample2_is_full_time)
+))
+
+# ============================================================
+# 测试样本3:年龄边界情况(极小值,刚成年)
+# ============================================================
+sample3_name = "张凡"
+sample3_age_input = "18"
+sample3_height_input = "180.2"
+sample3_employment_input = "否"
+
+sample3_age = int(sample3_age_input)
+sample3_height = float(sample3_height_input)
+sample3_is_full_time = (sample3_employment_input == "是")
+
+print("\n【测试样本3:年龄边界情况(刚成年)】")
+print("姓名:{} | 年龄:{}岁 | 身高:{}厘米 | 全职:{}".format(
+    sample3_name, sample3_age, sample3_height, sample3_is_full_time
+))
+print("类型自查 -> age:{} height:{} is_full_time:{}".format(
+    type(sample3_age), type(sample3_height), type(sample3_is_full_time)
+))
+
+# ============================================================
+# 测试样本4:年龄边界情况(较大年龄,验证程序对"非年轻用户"依然稳定)
+# ============================================================
+sample4_name = "韩露"
+sample4_age_input = "58"
+sample4_height_input = "158.6"
+sample4_employment_input = "是"
+
+sample4_age = int(sample4_age_input)
+sample4_height = float(sample4_height_input)
+sample4_is_full_time = (sample4_employment_input == "是")
+
+print("\n【测试样本4:较大年龄画像】")
+print("姓名:{} | 年龄:{}岁 | 身高:{}厘米 | 全职:{}".format(
+    sample4_name, sample4_age, sample4_height, sample4_is_full_time
+))
+print("类型自查 -> age:{} height:{} is_full_time:{}".format(
+    type(sample4_age), type(sample4_height), type(sample4_is_full_time)
+))
+
+# ============================================================
+# 测试样本5:身高边界情况(小数位数较多,验证格式化输出是否稳定)
+# ============================================================
+sample5_name = "测试用户_身高精度"
+sample5_age_input = "30"
+sample5_height_input = "169.87654"
+sample5_employment_input = "是"
+
+sample5_age = int(sample5_age_input)
+sample5_height = float(sample5_height_input)
+sample5_height_rounded = round(sample5_height, 1)
+sample5_is_full_time = (sample5_employment_input == "是")
+
+print("\n【测试样本5:身高小数精度边界情况】")
+print("姓名:{} | 年龄:{}岁 | 原始身高:{}厘米 | 保留1位小数后:{}厘米 | 全职:{}".format(
+    sample5_name, sample5_age, sample5_height, sample5_height_rounded, sample5_is_full_time
+))
+
+# ============================================================
+# 汇总对比表(手动拼接,今天还没学表格类的高级格式化写法)
+# ============================================================
+print("\n" + "=" * 60)
+print("批量测试结果汇总对比".center(60 - 12, " "))
+print("=" * 60)
+print("{:<20}{:<8}{:<12}{:<8}".format("姓名", "年龄", "身高(cm)", "全职"))
+print("-" * 60)
+print("{:<20}{:<8}{:<12}{:<8}".format(sample1_name, sample1_age, sample1_height, str(sample1_is_full_time)))
+print("{:<20}{:<8}{:<12}{:<8}".format(sample2_name, sample2_age, sample2_height, str(sample2_is_full_time)))
+print("{:<20}{:<8}{:<12}{:<8}".format(sample3_name, sample3_age, sample3_height, str(sample3_is_full_time)))
+print("{:<20}{:<8}{:<12}{:<8}".format(sample4_name, sample4_age, sample4_height, str(sample4_is_full_time)))
+print("{:<20}{:<8}{:<12}{:<8}".format(sample5_name, sample5_age, sample5_height_rounded, str(sample5_is_full_time)))
+print("=" * 60)
+
+# 陈铭在文件末尾补了一句感想:
+# 五组数据,复制粘贴改改数字就要重复写五遍几乎一样的代码,
+# 老王说得没错——这种"重复的痛",才是学循环和函数最好的动机,
+# 不是因为它们"高级",而是因为它们真的能省下这种笨重的重复劳动。
+print("\n批量测试完成,共验证5组样本,均未出现类型错误或格式化异常。")
+```
+
+### 文件15:`self_check_tests_final_round.py` —— 基础自检脚本(收尾补充篇)
+
+```python
+"""
+文件名:self_check_tests_final_round.py
+作者:陈铭
+说明:
+    这是陈铭Day1晚自习写的最后一份自检脚本,专门针对前面几份新增文件
+    (文件13诊断工具、文件14批量测试脚手架)里出现的计算结果,
+    再补充一轮assert断言检查,确保"辅助工具本身"也是可信的——
+    老王补充的一句话让他印象很深:"工具如果不可靠,比没有工具更危险,
+    因为你会带着错误的自信往下走。测试你的测试工具,这个习惯值钱。"
+"""
+
+print("开始执行Day1基础自检脚本(收尾补充篇)...\n")
+
+# --------------------------------------------------------------------------
+# 检查点14:格式化字符串对齐结果的长度应符合预期(呼应文件14的汇总表格)
+# --------------------------------------------------------------------------
+formatted_row = "{:<20}{:<8}{:<12}{:<8}".format("陈铭", 32, 175.5, "True")
+assert len(formatted_row) == 20 + 8 + 12 + 8, "格式化字符串的总长度应等于各字段宽度之和"
+print("检查点14通过:字符串格式化的对齐宽度计算正确。")
+
+# --------------------------------------------------------------------------
+# 检查点15:批量样本中,布尔值转换逻辑在多组数据下保持一致
+# --------------------------------------------------------------------------
+employment_yes = ("是" == "是")
+employment_no = ("否" == "是")
+assert employment_yes is True, "字符串'是'与'是'比较应该得到True"
+assert employment_no is False, "字符串'否'与'是'比较应该得到False"
+print("检查点15通过:批量场景下的布尔值转换逻辑保持一致,没有出现意外的类型污染。")
+
+# --------------------------------------------------------------------------
+# 检查点16:round()在批量身高数据下的精度处理保持稳定
+# --------------------------------------------------------------------------
+height_precise = 169.87654
+height_rounded_1 = round(height_precise, 1)
+height_rounded_2 = round(height_precise, 2)
+assert height_rounded_1 == 169.9, "保留1位小数的四舍五入结果不符合预期"
+assert height_rounded_2 == 169.88, "保留2位小数的四舍五入结果不符合预期"
+print("检查点16通过:不同精度要求下的round()计算结果均符合预期。")
+
+# --------------------------------------------------------------------------
+# 检查点17:Python版本号字符串的基本格式检查(呼应文件13诊断工具)
+# --------------------------------------------------------------------------
+import sys
+version_str = sys.version.split(" ")[0]
+version_parts = version_str.split(".")
+assert len(version_parts) == 3, "标准的Python版本号应该由三段数字组成,例如3.11.6"
+print("检查点17通过:当前Python版本号格式为{},符合'主版本.次版本.修订号'的标准格式。".format(version_str))
+
+# --------------------------------------------------------------------------
+# 检查点18:诊断工具里内置函数自检的返回值类型全部符合预期
+# --------------------------------------------------------------------------
+assert type(int("100")) == int, "int()转换结果类型应为int"
+assert type(float("3.14")) == float, "float()转换结果类型应为float"
+assert type(str(100)) == str, "str()转换结果类型应为str"
+assert type(bool(1)) == bool, "bool()转换结果类型应为bool"
+assert type(len("蓬远科技")) == int, "len()的返回值类型应为int"
+print("检查点18通过:诊断工具中全部内置函数的返回值类型均符合预期。")
+
+# --------------------------------------------------------------------------
+# 汇总
+# --------------------------------------------------------------------------
+print("\n" + "=" * 60)
+print("全部5个收尾检查点(检查点14-18)均已通过。")
+print("结合此前的检查点1-13,Day1全天累计完成18项自动化验证,")
+print("覆盖了从基础类型到边界情况、从单个字段到批量场景的完整链路。")
+print("=" * 60)
+```
+
+老王在群里看到陈铭一口气写了这么多文件,回了一句话作为今天晚自习的收尾:"内容比我预期的多不少,但不是为了'刷数量'——你会发现,后面二十天你要用到的字符串处理、条件判断、循环、函数,几乎都能在今天这些文件里找到'为什么需要它'的具体理由。这才是我希望你们从Day1就带走的东西。"
+
+### 文件16:`print_formatting_showcase.py` —— print()格式化输出用法大合集
+
+回家路上,陈铭在地铁上又想起一件事:今天用到的`print()`和`.format()`,自己其实只用了很小一部分功能,他决定回去把老王上课提到过、以及自己查资料看到的其他写法都整理一遍,做成一份"输出格式化用法大合集",方便以后随时翻查。
+
+```python
+"""
+文件名:print_formatting_showcase.py
+作者:陈铭
+说明:
+    这份文件汇总了print()函数和字符串.format()方法的常见用法,
+    作为一份"格式化输出速查手册"。今天课上老王只演示了其中一部分,
+    陈铭把自己查资料补充学到的写法也整理了进来,严格控制在
+    Day1已学知识点范围内(不涉及f-string的语法细节,f-string是明天的内容,
+    这里只做效果预告,不逐一拆解语法)。
+"""
+
+print("=" * 60)
+print("print() 与 .format() 格式化输出用法大合集")
+print("=" * 60)
+
+# ============================================================
+# 第一部分:print()的基础参数——sep与end
+# ============================================================
+print("\n【第一部分:print()的sep和end参数】")
+
+# sep参数:指定多个打印内容之间的连接符,默认是一个空格
+print("陈铭", "苏梦", "韩露", "张凡")                      # 默认sep=" "
+print("陈铭", "苏梦", "韩露", "张凡", sep=" | ")             # 自定义分隔符
+print("陈铭", "苏梦", "韩露", "张凡", sep="\n")              # 用换行符作为分隔符,每人一行
+print("陈铭", "苏梦", "韩露", "张凡", sep="")                # 不加任何分隔符,紧密拼接
+
+# end参数:指定打印内容结束后追加的字符,默认是换行符\n
+print("正在加载", end="")
+print(".", end="")
+print(".", end="")
+print(".", end="\n")          # 最后一次显式换行,让下一次print从新的一行开始
+print("加载完成!")
+
+# ============================================================
+# 第二部分:.format()方法的多种占位符写法
+# ============================================================
+print("\n【第二部分:.format()方法的多种写法】")
+
+# 写法一:按位置顺序填充(今天上午和v2/v3版本都用的是这种写法)
+template_positional = "姓名:{},年龄:{}"
+print(template_positional.format("陈铭", 32))
+
+# 写法二:按索引编号填充,可以重复使用同一个参数,也可以调换顺序
+template_indexed = "姓名:{0},年龄:{1},{0}今年{1}岁了"
+print(template_indexed.format("苏梦", 24))
+
+# 写法三:按关键字参数填充,可读性更强,尤其是字段较多的时候
+template_keyword = "姓名:{name},年龄:{age},城市:{city}"
+print(template_keyword.format(name="韩露", age=27, city="北京"))
+
+# 写法四:结合数字格式化,控制小数位数、千分位分隔符、百分号显示
+price_value = 12345.6789
+print("原始金额:{}".format(price_value))
+print("保留两位小数:{:.2f}".format(price_value))
+print("千分位分隔:{:,.2f}".format(price_value))
+ratio_value = 0.8567
+print("百分比格式:{:.1%}".format(ratio_value))
+
+# 写法五:控制字段宽度与对齐方式(左对齐<、右对齐>、居中^)
+name_left = "{:<10}|".format("陈铭")
+name_right = "{:>10}|".format("陈铭")
+name_center = "{:^10}|".format("陈铭")
+print("左对齐:", name_left)
+print("右对齐:", name_right)
+print("居中对齐:", name_center)
+
+# 写法六:数字补零,常用于生成编号(比如工牌编号、订单号)
+badge_number_raw = 7
+badge_number_formatted = "PY-{:04d}".format(badge_number_raw)
+print("工牌编号补零示例:", badge_number_formatted)
+
+# ============================================================
+# 第三部分:f-string效果预告(今天先看效果,明天Day2详细讲语法)
+# ============================================================
+print("\n【第三部分:f-string效果预告,细节明天讲】")
+
+preview_name = "陈铭"
+preview_age = 32
+preview_height = 175.5
+
+# f-string本质上和.format()做的事情一样,只是写法更简洁——
+# 直接在字符串前面加一个f,大括号里面可以直接写变量名,不需要再调用.format()
+print(f"我叫{preview_name},今年{preview_age}岁,身高{preview_height}厘米。")
+print(f"保留两位小数的身高:{preview_height:.2f}厘米")          # f-string同样支持数字格式化语法
+
+# ============================================================
+# 第四部分:多行输出与分隔线的组合排版技巧
+# ============================================================
+print("\n【第四部分:多行输出与分隔线排版技巧】")
+
+section_title = "员工信息一览"
+print("\n" + "=" * 50)
+print(section_title.center(50))
+print("=" * 50)
+print("{:<15}{:<10}{:<10}".format("姓名", "年龄", "全职"))
+print("-" * 50)
+print("{:<15}{:<10}{:<10}".format("陈铭", 32, "是"))
+print("{:<15}{:<10}{:<10}".format("苏梦", 24, "否"))
+print("{:<15}{:<10}{:<10}".format("韩露", 27, "是"))
+print("{:<15}{:<10}{:<10}".format("张凡", 23, "否"))
+print("=" * 50)
+
+# ============================================================
+# 第五部分:常见格式化错误与排查
+# ============================================================
+print("\n【第五部分:常见格式化错误与排查】")
+
+# 错误示范1:.format()括号里的参数数量少于模板里的占位符数量,会导致IndexError
+# 错误示范(取消注释运行会报错):
+# broken_template = "姓名:{},年龄:{}"
+# print(broken_template.format("陈铭"))
+# 报错信息大致为:IndexError: Replacement index 1 out of range for positional args tuple
+print("已记录:占位符数量与传入参数数量不一致时,会触发IndexError,已在注释中保留示例。")
+
+# 错误示范2:数字格式化语法里,冒号后面的格式代码写错,会导致ValueError
+# 错误示范(取消注释运行会报错):
+# broken_format = "{:.2q}".format(3.14)
+# 报错信息大致为:ValueError: Unknown format code 'q' for object of type 'float'
+print("已记录:格式化代码拼写错误(如.2q而不是.2f)会触发ValueError,已在注释中保留示例。")
+
+print("\n" + "=" * 60)
+print("格式化输出用法大合集整理完毕,合计覆盖5大类、约20种具体写法。")
+print("=" * 60)
+
+# ============================================================
+# 第六部分:补充——数字进制格式化(提前眼熟,后续接触底层内容时会用到)
+# ============================================================
+print("\n【第六部分:数字进制格式化预告】")
+
+demo_number = 255
+print("十进制:{}".format(demo_number))
+print("对应的二进制:{:b}".format(demo_number))
+print("对应的八进制:{:o}".format(demo_number))
+print("对应的十六进制(小写):{:x}".format(demo_number))
+print("对应的十六进制(大写):{:X}".format(demo_number))
+print("说明:进制转换在今天的项目里用不到,但以后接触颜色编码、", 
+      "内存地址、位运算相关的内容时会经常遇到,先留个印象。", sep="")
+
+print("\n本文件到这里全部结束,合计覆盖6大类格式化输出场景。")
+```
+
+陈铭把这份文件也提交进了今天的仓库,commit信息写的是"Day1加练:格式化输出用法整理,为明天字符串专题做铺垫"。老王第二天早上看到这条提交,只回了两个字:"细心。"
+
+---
+
 ### 终端操作记录:Git首次提交完整过程
 
 ```bash
