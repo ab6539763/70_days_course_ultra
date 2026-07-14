@@ -1619,6 +1619,1106 @@ if __name__ == "__main__":
 
 三个脚本合起来,把今天下午的实操流程串成了一条完整的链路:先用第一个脚本估算好这次训练大致需要多大的显存、该租什么规格的机器;再用第二个脚本检测租来的机器上显卡状态是否正常;最后用第三个脚本(以及配套的验证脚本)把训练所需要的整套软件环境一次性配好并验证通过。陈铭把这三个脚本都跑通之后,机器里已经装好了 transformers、peft、bitsandbytes、accelerate、datasets 这些明天就要用到的核心库,GPU 识别正常,矩阵运算测试通过,算是给 Sprint 6 开了一个扎实的头。
 
+晚上收工前,王振宇又给陈铭布置了一个"加餐"任务:显存估算脚本目前只支持课堂上预置的几个模型规格,而且只能算单卡场景,一旦客户后续要上更大规模的模型、要用多卡做分布式训练,这个脚本就不够用了;GPU 环境检测脚本目前也只是"跑一次、看一眼"的一次性工具,不能持续盯着显卡状态。这两个短板,加上"算力租用到底该租多久、多划算"这个绕不开的成本问题,构成了陈铭接下来要补齐的三块内容。
+
+### 脚本四:显存估算工具升级版 —— 支持更多模型规格与多卡分布式估算(`vram_estimator_v2.py`)
+
+陈铭把脚本一的能力做了系统性扩展:一是把预置模型规格从原来的 4 个,扩充到覆盖目前市面上主流开源模型家族的十几种规格,方便团队接到任何一个新客户的模型选型咨询时,都能直接查到参考数据,不需要现场现算;二是补上了分布式训练场景下的显存分摊估算——微软 DeepSpeed 提出的 ZeRO(Zero Redundancy Optimizer)技术有三个递进的优化阶段,分别把优化器状态、梯度、模型参数切分到多张卡上分摊存储,团队后续做大模型全量微调,大概率要用到这套技术,提前把估算逻辑打好基础,免得真正要用的时候两眼一抹黑。
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+vram_estimator_v2.py
+======================================================
+显存估算工具升级版 —— 第51天课堂配套工具(加餐)
+
+在脚本一(vram_estimator.py)的基础上做了两项核心扩展：
+
+    1. 扩充预置模型规格库：覆盖 Qwen、LLaMA、ChatGLM、Baichuan、
+       DeepSeek 等主流开源模型家族的常见参数规模，团队做技术选型
+       咨询时可以直接查表，不需要每次现场重新推导 hidden_size、
+       层数这些细节参数。
+
+    2. 新增分布式训练（DeepSpeed ZeRO）显存分摊估算：
+       - ZeRO Stage 1：仅切分优化器状态（Optimizer State Partitioning）
+       - ZeRO Stage 2：切分优化器状态 + 梯度（+ Gradient Partitioning）
+       - ZeRO Stage 3：切分优化器状态 + 梯度 + 模型参数本身
+       估算在给定卡数下，每张卡实际需要承担多少显存，
+       并给出"至少需要几张卡"的建议。
+
+    3. 新增"多卡配置规划器"：给定一个目标模型和微调方式，
+       自动扫描常见的 GPU 数量组合，给出一份可行性清单。
+
+依赖：本脚本复用脚本一中定义的部分常量与工具函数思路，
+      为了保持课堂脚本可以独立运行，这里做了自包含实现，
+      不直接 import vram_estimator.py（生产环境中建议抽取
+      公共逻辑到单独的工具模块，避免重复代码）。
+
+作者：陈铭（蓬远科技 · 苍穹项目组）
+日期：Day51（加餐）
+======================================================
+"""
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import List, Optional
+import argparse
+import math
+
+
+# ------------------------------------------------------------------
+# 基础常量（与脚本一保持一致的估算口径，便于结果互相印证）
+# ------------------------------------------------------------------
+BYTES_PER_PARAM = {
+    "fp32": 4.0,
+    "fp16": 2.0,
+    "bf16": 2.0,
+    "int8": 1.0,
+    "int4": 0.5,
+    "nf4": 0.5,
+}
+
+ADAM_OPTIMIZER_STATE_BYTES_PER_PARAM = 8.0
+MASTER_WEIGHT_COPY_BYTES_PER_PARAM = 4.0
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    """扩充版模型规格定义，覆盖主流开源模型家族"""
+    family: str            # 模型家族名称，如 Qwen / LLaMA / ChatGLM
+    display_name: str      # 展示名称
+    total_params_billion: float
+    hidden_size: int
+    num_layers: int
+
+    @property
+    def total_params(self) -> float:
+        return self.total_params_billion * 1e9
+
+
+# ------------------------------------------------------------------
+# 扩充版模型规格库：覆盖十余种主流开源模型的常见参数规模
+# 说明：这里的 hidden_size / num_layers 是各模型家族公开的
+# 典型架构配置，用于估算场景，不同版本、不同来源的模型可能
+# 存在细节差异，实际选型仍建议以模型官方 config.json 为准。
+# ------------------------------------------------------------------
+MODEL_SPEC_LIBRARY: List[ModelSpec] = [
+    ModelSpec("Qwen", "Qwen2-0.5B", 0.5, 1024, 24),
+    ModelSpec("Qwen", "Qwen2-1.5B", 1.5, 1536, 28),
+    ModelSpec("Qwen", "Qwen2-7B", 7.0, 3584, 28),
+    ModelSpec("Qwen", "Qwen2-14B（估算规格）", 14.0, 5120, 40),
+    ModelSpec("Qwen", "Qwen2-72B", 72.0, 8192, 80),
+    ModelSpec("LLaMA", "LLaMA3-8B", 8.0, 4096, 32),
+    ModelSpec("LLaMA", "LLaMA3-70B", 70.0, 8192, 80),
+    ModelSpec("LLaMA", "LLaMA2-13B", 13.0, 5120, 40),
+    ModelSpec("ChatGLM", "ChatGLM3-6B", 6.0, 4096, 28),
+    ModelSpec("Baichuan", "Baichuan2-7B", 7.0, 4096, 32),
+    ModelSpec("Baichuan", "Baichuan2-13B", 13.0, 5120, 40),
+    ModelSpec("DeepSeek", "DeepSeek-LLM-7B", 7.0, 4096, 30),
+    ModelSpec("DeepSeek", "DeepSeek-LLM-67B", 67.0, 8192, 95),
+    ModelSpec("InternLM", "InternLM2-7B", 7.0, 4096, 32),
+    ModelSpec("InternLM", "InternLM2-20B", 20.0, 6144, 48),
+    ModelSpec("Yi", "Yi-34B", 34.0, 7168, 60),
+    ModelSpec("Mixtral", "Mixtral-8x7B（MoE，稠密参数近似）", 46.7, 4096, 32),
+]
+
+
+def find_model_spec(display_name_substr: str) -> Optional[ModelSpec]:
+    """按名称模糊匹配一个模型规格，找不到返回 None"""
+    lowered = display_name_substr.lower()
+    for spec in MODEL_SPEC_LIBRARY:
+        if lowered in spec.display_name.lower():
+            return spec
+    return None
+
+
+def list_all_model_specs() -> str:
+    """打印整份模型规格库，供团队做选型时查表参考"""
+    lines = [f"{'家族':<10}{'模型':<32}{'参数量(B)':>10}{'隐藏维度':>10}{'层数':>8}"]
+    lines.append("-" * 72)
+    for spec in MODEL_SPEC_LIBRARY:
+        lines.append(
+            f"{spec.family:<10}{spec.display_name:<32}"
+            f"{spec.total_params_billion:>10.1f}{spec.hidden_size:>10}{spec.num_layers:>8}"
+        )
+    return "\n".join(lines)
+
+
+@dataclass
+class ZeROStageResult:
+    """DeepSpeed ZeRO 分布式估算结果"""
+    stage: int
+    num_gpus: int
+    per_gpu_weight_gb: float
+    per_gpu_gradient_gb: float
+    per_gpu_optimizer_gb: float
+    per_gpu_activation_gb: float
+    per_gpu_total_gb: float
+    per_gpu_total_with_margin_gb: float
+
+
+def estimate_zero_stage(
+    model: ModelSpec,
+    num_gpus: int,
+    stage: int,
+    weight_dtype: str = "bf16",
+    batch_size_per_gpu: int = 2,
+    sequence_length: int = 2048,
+    gradient_checkpointing: bool = True,
+) -> ZeROStageResult:
+    """
+    估算 DeepSpeed ZeRO 各阶段下，全量微调时每张卡实际需要承担的显存。
+
+    ZeRO 的核心思路：把原本每张卡都要完整保留一份的某些数据，
+    切分成 num_gpus 份，每张卡只保留自己负责的那一份，需要用到
+    别的卡上的数据时，通过高速通信临时取用。
+
+        Stage 0（等价于普通数据并行，无切分）：
+            每张卡都完整保留 权重 + 梯度 + 优化器状态。
+        Stage 1：优化器状态切分到 num_gpus 张卡上均摊。
+        Stage 2：优化器状态 + 梯度 均切分到 num_gpus 张卡上均摊。
+        Stage 3：优化器状态 + 梯度 + 模型参数本身 均切分。
+
+    注意：这是一个工程近似估算，真实的 DeepSpeed 运行时还涉及
+    通信缓冲区、参数聚合临时开销等因素，实际显存占用会略高于
+    本估算值，务必结合运行时的实际监控数据做校准。
+    """
+    if stage not in (0, 1, 2, 3):
+        raise ValueError("ZeRO stage 仅支持 0/1/2/3")
+
+    weight_bytes_per_param = BYTES_PER_PARAM.get(weight_dtype, 2.0)
+    total_params = model.total_params
+
+    full_weight_bytes = total_params * weight_bytes_per_param
+    full_gradient_bytes = total_params * weight_bytes_per_param
+    full_optimizer_bytes = total_params * (
+        ADAM_OPTIMIZER_STATE_BYTES_PER_PARAM + MASTER_WEIGHT_COPY_BYTES_PER_PARAM
+    )
+
+    if stage == 0:
+        per_gpu_weight = full_weight_bytes
+        per_gpu_gradient = full_gradient_bytes
+        per_gpu_optimizer = full_optimizer_bytes
+    elif stage == 1:
+        per_gpu_weight = full_weight_bytes
+        per_gpu_gradient = full_gradient_bytes
+        per_gpu_optimizer = full_optimizer_bytes / num_gpus
+    elif stage == 2:
+        per_gpu_weight = full_weight_bytes
+        per_gpu_gradient = full_gradient_bytes / num_gpus
+        per_gpu_optimizer = full_optimizer_bytes / num_gpus
+    else:  # stage == 3
+        per_gpu_weight = full_weight_bytes / num_gpus
+        per_gpu_gradient = full_gradient_bytes / num_gpus
+        per_gpu_optimizer = full_optimizer_bytes / num_gpus
+
+    activation_bytes_per_elem = BYTES_PER_PARAM.get("bf16", 2.0)
+    per_layer_activation_bytes = (
+        34 * batch_size_per_gpu * sequence_length * model.hidden_size
+        * (activation_bytes_per_elem / 2.0)
+    )
+    total_activation_bytes = per_layer_activation_bytes * model.num_layers
+    if gradient_checkpointing:
+        total_activation_bytes *= 0.15
+    # 激活值在数据并行场景下不做跨卡切分（每张卡处理自己那份数据的前向/反向）
+    per_gpu_activation_bytes = total_activation_bytes
+
+    def _gb(b: float) -> float:
+        return b / (1024 ** 3)
+
+    per_gpu_total_gb = (
+        _gb(per_gpu_weight) + _gb(per_gpu_gradient)
+        + _gb(per_gpu_optimizer) + _gb(per_gpu_activation_bytes)
+    )
+
+    return ZeROStageResult(
+        stage=stage,
+        num_gpus=num_gpus,
+        per_gpu_weight_gb=_gb(per_gpu_weight),
+        per_gpu_gradient_gb=_gb(per_gpu_gradient),
+        per_gpu_optimizer_gb=_gb(per_gpu_optimizer),
+        per_gpu_activation_gb=_gb(per_gpu_activation_bytes),
+        per_gpu_total_gb=per_gpu_total_gb,
+        per_gpu_total_with_margin_gb=per_gpu_total_gb * 1.3,
+    )
+
+
+def scan_zero_stages(
+    model: ModelSpec,
+    gpu_counts: List[int],
+    weight_dtype: str = "bf16",
+) -> List[ZeROStageResult]:
+    """对给定的一组卡数，扫描 ZeRO Stage 0~3 的每卡显存需求"""
+    results = []
+    for num_gpus in gpu_counts:
+        for stage in (0, 1, 2, 3):
+            results.append(
+                estimate_zero_stage(model, num_gpus, stage, weight_dtype=weight_dtype)
+            )
+    return results
+
+
+def print_zero_scan_report(model: ModelSpec, results: List[ZeROStageResult]) -> None:
+    print(f"\n{'=' * 78}")
+    print(f" 模型：{model.display_name}（{model.total_params_billion}B 参数）")
+    print(f" 分布式全量微调 · ZeRO 各阶段每卡显存需求扫描")
+    print(f"{'=' * 78}")
+    print(f"{'卡数':>6}{'ZeRO阶段':>10}{'每卡权重':>12}{'每卡梯度':>12}{'每卡优化器':>14}{'每卡激活值':>12}{'每卡合计+余量':>16}")
+    for r in results:
+        print(
+            f"{r.num_gpus:>6}{r.stage:>10}"
+            f"{r.per_gpu_weight_gb:>12.2f}{r.per_gpu_gradient_gb:>12.2f}"
+            f"{r.per_gpu_optimizer_gb:>14.2f}{r.per_gpu_activation_gb:>12.2f}"
+            f"{r.per_gpu_total_with_margin_gb:>16.2f}"
+        )
+    print(f"{'=' * 78}\n")
+
+
+@dataclass
+class MultiGPUPlan:
+    """多卡配置规划结果：某个卡数+ZeRO阶段组合是否可行"""
+    num_gpus: int
+    stage: int
+    gpu_model: str
+    gpu_vram_gb: int
+    per_gpu_required_gb: float
+    feasible: bool
+
+
+COMMON_GPU_VRAM_GB = {
+    "RTX 3090": 24,
+    "RTX 4090": 24,
+    "V100-32G": 32,
+    "A100-40G": 40,
+    "A800-40G": 40,
+    "A100-80G": 80,
+    "A800-80G": 80,
+    "H800-80G": 80,
+}
+
+
+def plan_multi_gpu_configurations(
+    model: ModelSpec,
+    candidate_gpu_counts: List[int] = (1, 2, 4, 8),
+    weight_dtype: str = "bf16",
+) -> List[MultiGPUPlan]:
+    """
+    扫描 [卡数 × ZeRO阶段 × GPU型号] 的组合空间，
+    找出所有"可行"的配置方案，按总成本（卡数）从低到高排序，
+    方便团队快速定位"最省钱、又能跑起来"的硬件配置。
+    """
+    plans: List[MultiGPUPlan] = []
+    for num_gpus in candidate_gpu_counts:
+        for stage in (1, 2, 3):
+            result = estimate_zero_stage(model, num_gpus, stage, weight_dtype=weight_dtype)
+            for gpu_name, vram in COMMON_GPU_VRAM_GB.items():
+                feasible = vram >= result.per_gpu_total_with_margin_gb
+                plans.append(
+                    MultiGPUPlan(
+                        num_gpus=num_gpus,
+                        stage=stage,
+                        gpu_model=gpu_name,
+                        gpu_vram_gb=vram,
+                        per_gpu_required_gb=result.per_gpu_total_with_margin_gb,
+                        feasible=feasible,
+                    )
+                )
+    # 只保留可行方案，并按"总显卡数量"排序，卡越少通常意味着采购/租用成本越低
+    feasible_plans = [p for p in plans if p.feasible]
+    feasible_plans.sort(key=lambda p: (p.num_gpus, p.gpu_vram_gb))
+    return feasible_plans
+
+
+def print_multi_gpu_plan_report(model: ModelSpec, plans: List[MultiGPUPlan], top_n: int = 10) -> None:
+    print(f"\n{'=' * 70}")
+    print(f" {model.display_name} 全量微调 · 可行多卡配置方案（按成本从低到高，前 {top_n} 条）")
+    print(f"{'=' * 70}")
+    if not plans:
+        print("  未找到任何可行方案，建议考虑使用 LoRA/QLoRA 代替全量微调，或增加卡数。")
+    for p in plans[:top_n]:
+        print(
+            f"  {p.num_gpus} × {p.gpu_model}（单卡{p.gpu_vram_gb}GB）"
+            f"  ZeRO Stage {p.stage}  单卡需求约 {p.per_gpu_required_gb:.1f}GB"
+        )
+    print(f"{'=' * 70}\n")
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="显存估算工具升级版：多模型规格 + 分布式估算")
+    parser.add_argument("--list-models", action="store_true", help="列出所有预置模型规格")
+    parser.add_argument("--model", type=str, default="Qwen2-14B", help="按名称子串匹配模型")
+    parser.add_argument("--gpus", type=int, nargs="+", default=[1, 2, 4, 8], help="要扫描的卡数列表")
+    parser.add_argument("--dtype", type=str, default="bf16", choices=list(BYTES_PER_PARAM.keys()))
+    return parser
+
+
+def main():
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    if args.list_models:
+        print(list_all_model_specs())
+        return
+
+    model = find_model_spec(args.model)
+    if model is None:
+        print(f"未找到匹配 '{args.model}' 的模型规格，可用 --list-models 查看完整列表")
+        return
+
+    zero_results = scan_zero_stages(model, args.gpus, weight_dtype=args.dtype)
+    print_zero_scan_report(model, zero_results)
+
+    plans = plan_multi_gpu_configurations(model, candidate_gpu_counts=tuple(args.gpus), weight_dtype=args.dtype)
+    print_multi_gpu_plan_report(model, plans)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+陈铭跑了一版针对"Qwen2-72B 全量微调"的扫描结果,发现即便用 8 张 80GB 的 H800 做 ZeRO Stage 3 切分,每卡显存需求依然在 60GB 上下,余量并不算宽裕;而换成 LoRA(复用脚本一的估算逻辑),同样是 72B 规模,单卡 40GB 就能跑得比较舒服。这组对比再一次印证了王振宇反复强调的判断原则——先看清楚数字,再决定要不要动用"重型武器"。
+
+### 脚本五:GPU 实时监控守护脚本(`gpu_monitor_daemon.py`)
+
+脚本二只能"看一眼当下的状态",但真实的训练任务往往要跑几个小时甚至几天,中途显存占用、温度、利用率都在持续波动,团队需要一个能长时间盯梢、自动记录历史数据、并在出现异常时主动报警的监控工具。陈铭把这个监控脚本写成了一个可以后台常驻运行的"守护进程"风格程序。
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+gpu_monitor_daemon.py
+======================================================
+GPU 实时监控守护脚本 —— 第51天课堂配套工具(加餐)
+
+用途：
+    以固定时间间隔（默认 10 秒）持续采集 GPU 状态数据，
+    包括显存占用、GPU利用率、温度、功耗，并完成三件事：
+
+    1. 持久化记录：把每一次采集结果写入本地 CSV 文件，
+       形成一份完整的训练期间硬件状态时间序列，训练结束后
+       可以用这份数据分析"整个训练过程中显存占用的峰值和
+       波动规律"，为后续同类任务的显存预留策略提供依据。
+
+    2. 异常检测与告警：当检测到显存占用持续逼近上限、
+       温度过高、或者利用率长时间接近 0（可能意味着训练
+       卡死或数据加载成为瓶颈）时，打印明显的告警信息，
+       并通过一个可插拔的告警回调（默认打印到终端，生产
+       环境可替换为发送企业微信/钉钉机器人消息）通知负责人。
+
+    3. 阶段性健康报告：每隔一段时间（默认每 5 分钟）打印
+       一份简要的健康摘要，避免负责人需要一直盯着终端刷屏
+       才能了解当前状态。
+
+使用方式：
+    python gpu_monitor_daemon.py --interval 10 --log-dir ./gpu_logs
+    # Ctrl+C 结束监控，会自动打印一份完整的运行期间统计摘要
+
+作者：陈铭（蓬远科技 · 苍穹项目组）
+日期：Day51（加餐）
+======================================================
+"""
+
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, List, Optional
+import argparse
+import csv
+import re
+import signal
+import subprocess
+import sys
+import time
+
+
+@dataclass
+class GPUSample:
+    timestamp: str
+    gpu_index: int
+    gpu_name: str
+    memory_used_mb: int
+    memory_total_mb: int
+    utilization_pct: int
+    temperature_c: int
+    power_draw_w: Optional[float]
+
+    @property
+    def memory_used_pct(self) -> float:
+        if self.memory_total_mb == 0:
+            return 0.0
+        return self.memory_used_mb / self.memory_total_mb * 100
+
+
+class AlertLevel:
+    INFO = "信息"
+    WARNING = "警告"
+    CRITICAL = "严重"
+
+
+@dataclass
+class AlertEvent:
+    timestamp: str
+    level: str
+    gpu_index: int
+    message: str
+
+
+def default_alert_callback(event: AlertEvent) -> None:
+    """默认的告警回调：打印到终端。生产环境可替换为 Webhook/IM 通知。"""
+    tag = {
+        AlertLevel.INFO: "[信息]",
+        AlertLevel.WARNING: "\033[1;33m[警告]\033[0m",
+        AlertLevel.CRITICAL: "\033[1;31m[严重]\033[0m",
+    }.get(event.level, "[未知]")
+    print(f"{tag} {event.timestamp}  GPU{event.gpu_index}  {event.message}")
+
+
+def query_gpu_samples() -> List[GPUSample]:
+    """调用 nvidia-smi 采集一次所有显卡的当前状态"""
+    fields = [
+        "index", "name", "memory.used", "memory.total",
+        "utilization.gpu", "temperature.gpu", "power.draw",
+    ]
+    cmd = ["nvidia-smi", f"--query-gpu={','.join(fields)}", "--format=csv,noheader,nounits"]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    if result.returncode != 0:
+        raise RuntimeError(f"nvidia-smi 采集失败：{result.stderr.strip()}")
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    samples = []
+    for line in result.stdout.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 7:
+            continue
+        try:
+            power_draw = float(parts[6]) if parts[6] not in ("N/A", "[Not Supported]") else None
+            samples.append(
+                GPUSample(
+                    timestamp=now,
+                    gpu_index=int(parts[0]),
+                    gpu_name=parts[1],
+                    memory_used_mb=int(float(parts[2])),
+                    memory_total_mb=int(float(parts[3])),
+                    utilization_pct=int(float(parts[4])) if parts[4] != "N/A" else 0,
+                    temperature_c=int(float(parts[5])) if parts[5] != "N/A" else 0,
+                    power_draw_w=power_draw,
+                )
+            )
+        except (ValueError, IndexError):
+            continue
+    return samples
+
+
+class GPUMonitorDaemon:
+    """
+    GPU 监控守护类，封装采集、记录、告警、报告的完整生命周期。
+
+    设计说明：
+        - 用简单的滑动窗口（最近 N 次采集）判断"利用率长时间接近0"
+          这类需要观察一段时间趋势才能下结论的异常，避免单次采样
+          的偶然波动触发误报。
+        - CSV 文件采用"追加写入"模式，即便监控进程中途重启，
+          历史数据也不会丢失，方便训练结束后统一做数据分析。
+    """
+
+    def __init__(
+        self,
+        interval_seconds: int = 10,
+        log_dir: str = "./gpu_logs",
+        memory_warning_pct: float = 85.0,
+        memory_critical_pct: float = 95.0,
+        temperature_warning_c: int = 80,
+        temperature_critical_c: int = 88,
+        idle_window_size: int = 12,       # 12 次 × 10秒 = 2分钟窗口
+        idle_utilization_threshold: int = 5,
+        report_interval_seconds: int = 300,
+        alert_callback: Optional[Callable[[AlertEvent], None]] = None,
+    ):
+        self.interval_seconds = interval_seconds
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.memory_warning_pct = memory_warning_pct
+        self.memory_critical_pct = memory_critical_pct
+        self.temperature_warning_c = temperature_warning_c
+        self.temperature_critical_c = temperature_critical_c
+        self.idle_window_size = idle_window_size
+        self.idle_utilization_threshold = idle_utilization_threshold
+        self.report_interval_seconds = report_interval_seconds
+        self.alert_callback = alert_callback or default_alert_callback
+
+        self._running = False
+        self._utilization_history: dict = {}   # gpu_index -> 最近若干次利用率的列表
+        self._all_samples: List[GPUSample] = []  # 内存中保留全部采集记录，用于结束时生成摘要
+        self._csv_path = self.log_dir / f"gpu_monitor_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        self._last_report_time = time.time()
+
+        self._init_csv()
+
+    def _init_csv(self) -> None:
+        with open(self._csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "timestamp", "gpu_index", "gpu_name",
+                "memory_used_mb", "memory_total_mb", "memory_used_pct",
+                "utilization_pct", "temperature_c", "power_draw_w",
+            ])
+
+    def _append_csv(self, samples: List[GPUSample]) -> None:
+        with open(self._csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            for s in samples:
+                writer.writerow([
+                    s.timestamp, s.gpu_index, s.gpu_name,
+                    s.memory_used_mb, s.memory_total_mb, f"{s.memory_used_pct:.1f}",
+                    s.utilization_pct, s.temperature_c,
+                    f"{s.power_draw_w:.1f}" if s.power_draw_w is not None else "",
+                ])
+
+    def _check_alerts(self, sample: GPUSample) -> None:
+        """基于单次采样值和历史窗口，判断是否需要触发告警"""
+        if sample.memory_used_pct >= self.memory_critical_pct:
+            self.alert_callback(AlertEvent(
+                sample.timestamp, AlertLevel.CRITICAL, sample.gpu_index,
+                f"显存占用已达 {sample.memory_used_pct:.1f}%，接近上限，存在 OOM 风险！",
+            ))
+        elif sample.memory_used_pct >= self.memory_warning_pct:
+            self.alert_callback(AlertEvent(
+                sample.timestamp, AlertLevel.WARNING, sample.gpu_index,
+                f"显存占用达到 {sample.memory_used_pct:.1f}%，建议关注",
+            ))
+
+        if sample.temperature_c >= self.temperature_critical_c:
+            self.alert_callback(AlertEvent(
+                sample.timestamp, AlertLevel.CRITICAL, sample.gpu_index,
+                f"温度达到 {sample.temperature_c}°C，存在过热降频甚至硬件损伤风险！",
+            ))
+        elif sample.temperature_c >= self.temperature_warning_c:
+            self.alert_callback(AlertEvent(
+                sample.timestamp, AlertLevel.WARNING, sample.gpu_index,
+                f"温度达到 {sample.temperature_c}°C，建议关注散热",
+            ))
+
+        history = self._utilization_history.setdefault(sample.gpu_index, [])
+        history.append(sample.utilization_pct)
+        if len(history) > self.idle_window_size:
+            history.pop(0)
+        if (
+            len(history) == self.idle_window_size
+            and all(u <= self.idle_utilization_threshold for u in history)
+        ):
+            self.alert_callback(AlertEvent(
+                sample.timestamp, AlertLevel.WARNING, sample.gpu_index,
+                f"最近 {self.idle_window_size * self.interval_seconds} 秒内 GPU 利用率持续低于 "
+                f"{self.idle_utilization_threshold}%，训练可能已卡死或数据加载成为瓶颈，建议检查",
+            ))
+
+    def _maybe_print_periodic_report(self) -> None:
+        now = time.time()
+        if now - self._last_report_time < self.report_interval_seconds:
+            return
+        self._last_report_time = now
+        self._print_summary(title="阶段性健康报告", recent_only_seconds=self.report_interval_seconds)
+
+    def _print_summary(self, title: str, recent_only_seconds: Optional[int] = None) -> None:
+        samples = self._all_samples
+        if recent_only_seconds is not None:
+            cutoff = time.time() - recent_only_seconds
+            samples = [s for s in samples if self._sample_epoch(s) >= cutoff]
+        if not samples:
+            return
+
+        by_gpu: dict = {}
+        for s in samples:
+            by_gpu.setdefault(s.gpu_index, []).append(s)
+
+        print(f"\n{'=' * 60}\n {title}（{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}）\n{'=' * 60}")
+        for gpu_index, gpu_samples in sorted(by_gpu.items()):
+            mem_pcts = [s.memory_used_pct for s in gpu_samples]
+            temps = [s.temperature_c for s in gpu_samples]
+            utils = [s.utilization_pct for s in gpu_samples]
+            print(
+                f"  GPU{gpu_index}（{gpu_samples[-1].gpu_name}）："
+                f"显存占用 均值{sum(mem_pcts)/len(mem_pcts):.1f}% / 峰值{max(mem_pcts):.1f}%  "
+                f"温度 均值{sum(temps)/len(temps):.1f}°C / 峰值{max(temps)}°C  "
+                f"利用率均值{sum(utils)/len(utils):.1f}%"
+            )
+        print(f"{'=' * 60}\n")
+
+    @staticmethod
+    def _sample_epoch(sample: GPUSample) -> float:
+        dt = datetime.strptime(sample.timestamp, "%Y-%m-%d %H:%M:%S")
+        return dt.timestamp()
+
+    def run_forever(self) -> None:
+        """启动监控主循环，直到收到中断信号"""
+        self._running = True
+
+        def _handle_sigint(signum, frame):
+            self._running = False
+
+        signal.signal(signal.SIGINT, _handle_sigint)
+
+        print(f"GPU 监控守护进程已启动，采集间隔 {self.interval_seconds} 秒，"
+              f"日志文件：{self._csv_path}")
+        print("按 Ctrl+C 结束监控并生成最终报告\n")
+
+        while self._running:
+            try:
+                samples = query_gpu_samples()
+            except Exception as exc:
+                print(f"[错误] 本次采集失败：{exc}", file=sys.stderr)
+                time.sleep(self.interval_seconds)
+                continue
+
+            self._append_csv(samples)
+            self._all_samples.extend(samples)
+            for sample in samples:
+                self._check_alerts(sample)
+
+            self._maybe_print_periodic_report()
+            time.sleep(self.interval_seconds)
+
+        self._print_summary(title="监控结束 · 完整运行期间统计摘要")
+        print(f"完整采集记录已保存至：{self._csv_path}")
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="GPU 实时监控守护脚本")
+    parser.add_argument("--interval", type=int, default=10, help="采集间隔（秒）")
+    parser.add_argument("--log-dir", type=str, default="./gpu_logs", help="日志文件保存目录")
+    parser.add_argument("--mem-warning", type=float, default=85.0, help="显存占用警告阈值（%）")
+    parser.add_argument("--mem-critical", type=float, default=95.0, help="显存占用严重阈值（%）")
+    parser.add_argument("--report-interval", type=int, default=300, help="阶段性报告间隔（秒）")
+    return parser
+
+
+def main():
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    daemon = GPUMonitorDaemon(
+        interval_seconds=args.interval,
+        log_dir=args.log_dir,
+        memory_warning_pct=args.mem_warning,
+        memory_critical_pct=args.mem_critical,
+        report_interval_seconds=args.report_interval,
+    )
+    daemon.run_forever()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+这个监控脚本上线后,团队约定了一条新的操作规范:以后每次正式启动一个较长的微调训练任务(预计运行超过 30 分钟),都要在训练进程之外,另开一个终端会话把这个监控守护脚本跑起来,训练结束后,把生成的 CSV 日志和训练日志一起归档,作为这次训练的"体检报告"保存下来。王振宇解释了这么做的价值:"很多显存爆掉的问题,不是一开始就爆的,是训练跑到某个特定步骤(比如某个批次里恰好有特别长的样本)才突然冲高的,没有这份持续记录的数据,你事后根本不知道问题出在哪一步,只能靠猜。"
+
+### 脚本六:显存估算工具单元测试(`test_vram_estimator_v2.py`)
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+test_vram_estimator_v2.py
+======================================================
+显存估算工具升级版 —— 单元测试
+
+覆盖点：
+    1. 模型规格库的查找功能是否正确（精确匹配、模糊匹配、找不到时返回 None）
+    2. ZeRO 各阶段的显存分摊逻辑是否符合预期
+       （Stage 0 无切分，Stage 3 应该是四种资源里省得最狠的）
+    3. 多卡配置规划器返回的方案是否真的满足"单卡显存 >= 需求"
+    4. 卡数增加时，ZeRO Stage 1/2/3 的每卡显存需求应该单调不增
+
+运行方式：
+    python -m pytest test_vram_estimator_v2.py -v
+    或者本文件也支持直接用 python 运行（内置了一个不依赖 pytest 的简易断言跑法）
+
+作者：陈铭（蓬远科技 · 苍穹项目组）
+日期：Day51（加餐）
+======================================================
+"""
+
+import sys
+
+from vram_estimator_v2 import (
+    MODEL_SPEC_LIBRARY,
+    find_model_spec,
+    estimate_zero_stage,
+    plan_multi_gpu_configurations,
+    ModelSpec,
+)
+
+
+def test_find_model_spec_exact_and_fuzzy():
+    spec = find_model_spec("Qwen2-7B")
+    assert spec is not None
+    assert spec.total_params_billion == 7.0
+
+    spec_fuzzy = find_model_spec("llama3-8b")  # 大小写不敏感的模糊匹配
+    assert spec_fuzzy is not None
+    assert spec_fuzzy.family == "LLaMA"
+
+
+def test_find_model_spec_not_found_returns_none():
+    assert find_model_spec("不存在的模型规格XYZ123") is None
+
+
+def test_model_library_no_duplicate_display_names():
+    names = [spec.display_name for spec in MODEL_SPEC_LIBRARY]
+    assert len(names) == len(set(names)), "模型规格库中存在重复的展示名称"
+
+
+def test_zero_stage0_no_partitioning():
+    """Stage 0 不做任何切分，卡数增加时每卡显存需求应保持不变"""
+    model = ModelSpec("Test", "Test-7B", 7.0, 4096, 32)
+    result_1gpu = estimate_zero_stage(model, num_gpus=1, stage=0)
+    result_4gpu = estimate_zero_stage(model, num_gpus=4, stage=0)
+    assert abs(result_1gpu.per_gpu_weight_gb - result_4gpu.per_gpu_weight_gb) < 1e-6
+    assert abs(result_1gpu.per_gpu_optimizer_gb - result_4gpu.per_gpu_optimizer_gb) < 1e-6
+
+
+def test_zero_stage_progressive_savings():
+    """
+    Stage 1 -> 2 -> 3，每卡显存需求应该逐级下降（在同样卡数下），
+    因为切分的资源范围逐级扩大。
+    """
+    model = ModelSpec("Test", "Test-7B", 7.0, 4096, 32)
+    num_gpus = 4
+
+    r1 = estimate_zero_stage(model, num_gpus=num_gpus, stage=1)
+    r2 = estimate_zero_stage(model, num_gpus=num_gpus, stage=2)
+    r3 = estimate_zero_stage(model, num_gpus=num_gpus, stage=3)
+
+    # Stage 1 只切优化器状态，权重和梯度仍是全量
+    assert r1.per_gpu_optimizer_gb < r1.per_gpu_weight_gb
+
+    # Stage 2 比 Stage 1 多切了梯度，梯度占用应该更小
+    assert r2.per_gpu_gradient_gb < r1.per_gpu_gradient_gb
+    assert abs(r2.per_gpu_optimizer_gb - r1.per_gpu_optimizer_gb) < 1e-6  # 优化器切分方式相同
+
+    # Stage 3 比 Stage 2 多切了权重本身，权重占用应该更小
+    assert r3.per_gpu_weight_gb < r2.per_gpu_weight_gb
+
+    # 综合来看，Stage 3 的每卡总需求应该是三者中最低的
+    assert r3.per_gpu_total_gb < r2.per_gpu_total_gb < r1.per_gpu_total_gb
+
+
+def test_zero_stage_more_gpus_reduces_per_gpu_memory():
+    """在同一 ZeRO Stage 下，卡数越多，每卡分摊到的显存需求应越低（对被切分的部分而言）"""
+    model = ModelSpec("Test", "Test-13B", 13.0, 5120, 40)
+
+    r_2gpu = estimate_zero_stage(model, num_gpus=2, stage=3)
+    r_8gpu = estimate_zero_stage(model, num_gpus=8, stage=3)
+
+    assert r_8gpu.per_gpu_weight_gb < r_2gpu.per_gpu_weight_gb
+    assert r_8gpu.per_gpu_optimizer_gb < r_2gpu.per_gpu_optimizer_gb
+
+
+def test_multi_gpu_plan_all_feasible_entries_actually_fit():
+    """规划器返回的每一条方案，其单卡显存需求必须真的小于等于对应GPU型号的显存容量"""
+    model = ModelSpec("Test", "Test-14B", 14.0, 5120, 40)
+    plans = plan_multi_gpu_configurations(model, candidate_gpu_counts=(2, 4, 8))
+
+    assert len(plans) > 0, "对于14B模型，预期应该能找到至少一种可行的多卡配置"
+    for plan in plans:
+        assert plan.per_gpu_required_gb <= plan.gpu_vram_gb, (
+            f"方案 {plan.num_gpus}×{plan.gpu_model} 声称可行，"
+            f"但需求 {plan.per_gpu_required_gb:.1f}GB 超过了显存容量 {plan.gpu_vram_gb}GB"
+        )
+
+
+def test_multi_gpu_plan_sorted_by_cost_ascending():
+    """规划器的结果应按卡数从少到多排序，方便优先展示最省成本的方案"""
+    model = ModelSpec("Test", "Test-14B", 14.0, 5120, 40)
+    plans = plan_multi_gpu_configurations(model, candidate_gpu_counts=(2, 4, 8))
+
+    gpu_counts = [p.num_gpus for p in plans]
+    assert gpu_counts == sorted(gpu_counts), "多卡配置方案未按卡数从低到高排序"
+
+
+def _run_all_tests_without_pytest():
+    """
+    简易测试跑法：不依赖 pytest，直接遍历当前模块里所有 test_ 开头的函数并执行。
+    方便在没有安装 pytest 的最小化环境里，也能快速验证脚本逻辑是否正确。
+    """
+    test_functions = [
+        obj for name, obj in globals().items()
+        if name.startswith("test_") and callable(obj)
+    ]
+    passed, failed = 0, 0
+    for test_func in test_functions:
+        try:
+            test_func()
+            print(f"  [通过] {test_func.__name__}")
+            passed += 1
+        except AssertionError as exc:
+            print(f"  [失败] {test_func.__name__}：{exc}")
+            failed += 1
+    print(f"\n测试完成：{passed} 通过，{failed} 失败（共 {passed + failed} 项）")
+    return failed == 0
+
+
+if __name__ == "__main__":
+    success = _run_all_tests_without_pytest()
+    sys.exit(0 if success else 1)
+```
+
+### 脚本七:算力租用成本比较计算器(`gpu_rental_cost_calculator.py`)
+
+理论和监控工具都到位了,团队还差最后一块拼图:同样能满足显存需求的几种硬件配置,到底哪一种最省钱?这个问题不能靠感觉判断,陈铭写了一个成本比较脚本,把不同算力租用渠道的价格、预计训练时长、以及"租 vs 买"的盈亏平衡点,全部量化成可以直接对比的数字。
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+gpu_rental_cost_calculator.py
+======================================================
+算力租用成本比较计算器 —— 第51天课堂配套工具(加餐)
+
+用途：
+    1. 输入若干候选的 GPU 租用方案（平台、型号、每小时单价），
+       结合预计训练时长，快速算出每个方案的总费用，并按性价比排序。
+    2. 提供"租用 vs 自购硬件"的盈亏平衡分析：给定一次性采购成本
+       和预估的月均使用时长，计算需要用多久才能收回硬件成本，
+       辅助团队判断某个客户项目是否值得建议其自建机房。
+    3. 支持多轮实验的成本预估：微调项目往往不是"训一次就完事"，
+       而是要反复调超参数、跑多组对比实验，这里提供一个"预计
+       实验轮数 × 单轮成本"的批量估算功能。
+
+作者：陈铭（蓬远科技 · 苍穹项目组）
+日期：Day51（加餐）
+======================================================
+"""
+
+from dataclasses import dataclass
+from typing import List
+import argparse
+
+
+@dataclass(frozen=True)
+class RentalOption:
+    """一个可选的算力租用方案"""
+    platform: str          # 平台名称，如 AutoDL / 魔搭 / 阿里云
+    gpu_model: str         # GPU 型号
+    gpu_count: int         # 该方案使用的卡数
+    price_per_hour_cny: float  # 每小时租用单价（人民币，含全部使用的卡）
+    vram_per_gpu_gb: int   # 单卡显存，用于结合显存估算结果判断是否满足需求
+
+
+@dataclass
+class CostEstimate:
+    option: RentalOption
+    training_hours: float
+    total_cost_cny: float
+    cost_per_hour_display: float
+
+
+def estimate_single_run_costs(
+    options: List[RentalOption],
+    training_hours: float,
+) -> List[CostEstimate]:
+    """给定一批候选方案和预计训练时长，计算每个方案的总费用"""
+    estimates = []
+    for opt in options:
+        total_cost = opt.price_per_hour_cny * training_hours
+        estimates.append(
+            CostEstimate(
+                option=opt,
+                training_hours=training_hours,
+                total_cost_cny=total_cost,
+                cost_per_hour_display=opt.price_per_hour_cny,
+            )
+        )
+    estimates.sort(key=lambda e: e.total_cost_cny)
+    return estimates
+
+
+def print_cost_comparison(estimates: List[CostEstimate]) -> None:
+    print(f"\n{'=' * 78}")
+    print(f" 算力租用方案成本对比（预计训练时长：{estimates[0].training_hours:.1f} 小时）")
+    print(f"{'=' * 78}")
+    print(f"{'平台':<10}{'GPU型号':<14}{'卡数':>6}{'单卡显存':>10}{'每小时单价':>12}{'预计总费用':>14}")
+    for e in estimates:
+        opt = e.option
+        print(
+            f"{opt.platform:<10}{opt.gpu_model:<14}{opt.gpu_count:>6}"
+            f"{opt.vram_per_gpu_gb:>9}GB{e.cost_per_hour_display:>11.2f}元"
+            f"{e.total_cost_cny:>13.2f}元"
+        )
+    cheapest = estimates[0]
+    most_expensive = estimates[-1]
+    if most_expensive.total_cost_cny > 0:
+        savings_pct = (
+            (most_expensive.total_cost_cny - cheapest.total_cost_cny)
+            / most_expensive.total_cost_cny * 100
+        )
+        print(
+            f"\n  最省钱方案：{cheapest.option.platform} {cheapest.option.gpu_model} "
+            f"（比最贵方案节省 {savings_pct:.1f}%）"
+        )
+    print(f"{'=' * 78}\n")
+
+
+@dataclass
+class BreakEvenResult:
+    hardware_purchase_cost_cny: float
+    monthly_usage_hours: float
+    cheapest_rental_hourly_rate_cny: float
+    equivalent_monthly_rental_cost_cny: float
+    break_even_months: float
+    recommendation: str
+
+
+def analyze_buy_vs_rent_break_even(
+    hardware_purchase_cost_cny: float,
+    monthly_usage_hours: float,
+    cheapest_rental_hourly_rate_cny: float,
+    additional_monthly_ops_cost_cny: float = 0.0,
+) -> BreakEvenResult:
+    """
+    盈亏平衡分析：自购硬件的一次性成本，需要用多少个月的"省下的租金"才能收回。
+
+    逻辑：
+        每月如果继续租用，需要花费 = monthly_usage_hours × cheapest_rental_hourly_rate_cny
+        每月如果自购硬件使用，只需要承担额外运维成本 additional_monthly_ops_cost_cny
+        （电费、机房、运维人力等，通常远小于租用费用，但不为零）
+        每月"省下"的钱 = 租用月费 - 自购月度运维成本
+        回本月数 = 硬件采购成本 / 每月省下的钱
+    """
+    equivalent_monthly_rental_cost = monthly_usage_hours * cheapest_rental_hourly_rate_cny
+    monthly_savings = equivalent_monthly_rental_cost - additional_monthly_ops_cost_cny
+
+    if monthly_savings <= 0:
+        return BreakEvenResult(
+            hardware_purchase_cost_cny=hardware_purchase_cost_cny,
+            monthly_usage_hours=monthly_usage_hours,
+            cheapest_rental_hourly_rate_cny=cheapest_rental_hourly_rate_cny,
+            equivalent_monthly_rental_cost_cny=equivalent_monthly_rental_cost,
+            break_even_months=float("inf"),
+            recommendation="使用时长太低，自购硬件的运维成本已经超过等效租用成本，建议继续租用，不建议自购。",
+        )
+
+    break_even_months = hardware_purchase_cost_cny / monthly_savings
+
+    if break_even_months <= 6:
+        recommendation = "回本周期较短，如果预计该硬件使用需求会持续存在，建议评估自购。"
+    elif break_even_months <= 18:
+        recommendation = "回本周期中等，需结合项目的确定性和资金状况综合判断，建议先租用观察一段时间再决策。"
+    else:
+        recommendation = "回本周期过长，硬件更新换代速度可能会让这笔投资在回本前就已经贬值，建议继续租用。"
+
+    return BreakEvenResult(
+        hardware_purchase_cost_cny=hardware_purchase_cost_cny,
+        monthly_usage_hours=monthly_usage_hours,
+        cheapest_rental_hourly_rate_cny=cheapest_rental_hourly_rate_cny,
+        equivalent_monthly_rental_cost_cny=equivalent_monthly_rental_cost,
+        break_even_months=break_even_months,
+        recommendation=recommendation,
+    )
+
+
+def print_break_even_report(result: BreakEvenResult) -> None:
+    print(f"\n{'=' * 60}")
+    print(" 自购硬件 vs 持续租用 · 盈亏平衡分析")
+    print(f"{'=' * 60}")
+    print(f"  硬件一次性采购成本        : {result.hardware_purchase_cost_cny:,.2f} 元")
+    print(f"  预计月均使用时长          : {result.monthly_usage_hours:.1f} 小时")
+    print(f"  当前最便宜的等效租用单价  : {result.cheapest_rental_hourly_rate_cny:.2f} 元/小时")
+    print(f"  等效月租用成本            : {result.equivalent_monthly_rental_cost_cny:,.2f} 元")
+    if result.break_even_months == float("inf"):
+        print(f"  回本周期                  : 无法回本")
+    else:
+        print(f"  回本周期                  : 约 {result.break_even_months:.1f} 个月")
+    print(f"  建议                      : {result.recommendation}")
+    print(f"{'=' * 60}\n")
+
+
+def estimate_multi_experiment_budget(
+    cheapest_option_hourly_rate_cny: float,
+    hours_per_run: float,
+    planned_runs: int,
+    failure_rate_buffer: float = 0.2,
+) -> dict:
+    """
+    估算多轮超参数对比实验的总预算。
+
+    failure_rate_buffer：预留一部分"失败重跑"的缓冲，微调实验中途
+    因为超参数不合理、代码 bug、显存溢出等原因中断重跑是常态，
+    预算规划时留一点缓冲比事后超支要从容得多。
+    """
+    base_total_hours = hours_per_run * planned_runs
+    buffered_total_hours = base_total_hours * (1 + failure_rate_buffer)
+    base_cost = base_total_hours * cheapest_option_hourly_rate_cny
+    buffered_cost = buffered_total_hours * cheapest_option_hourly_rate_cny
+
+    return {
+        "计划实验轮数": planned_runs,
+        "单轮预计时长(小时)": hours_per_run,
+        "基础总时长(小时)": base_total_hours,
+        "预留失败重跑缓冲后总时长(小时)": round(buffered_total_hours, 1),
+        "基础预算(元)": round(base_cost, 2),
+        "含缓冲的建议预算(元)": round(buffered_cost, 2),
+    }
+
+
+# ------------------------------------------------------------------
+# 课堂示例：假设团队要为御风金融项目跑一轮 LoRA 微调技术验证，
+# 预计需要连续训练 8 小时，比较几个候选算力方案
+# ------------------------------------------------------------------
+DEMO_OPTIONS = [
+    RentalOption("AutoDL", "RTX 4090", 1, 2.5, 24),
+    RentalOption("AutoDL", "RTX 3090", 1, 1.8, 24),
+    RentalOption("魔搭社区", "A100-40G", 1, 8.0, 40),
+    RentalOption("阿里云PAI", "A100-80G", 1, 18.0, 80),
+    RentalOption("阿里云PAI", "A10-24G", 1, 4.5, 24),
+]
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="算力租用成本比较计算器")
+    parser.add_argument("--hours", type=float, default=8.0, help="预计单轮训练时长（小时）")
+    parser.add_argument("--runs", type=int, default=1, help="计划实验轮数")
+    return parser
+
+
+def main():
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    estimates = estimate_single_run_costs(DEMO_OPTIONS, args.hours)
+    print_cost_comparison(estimates)
+
+    cheapest_rate = estimates[0].option.price_per_hour_cny
+    if args.runs > 1:
+        budget = estimate_multi_experiment_budget(
+            cheapest_option_hourly_rate_cny=cheapest_rate,
+            hours_per_run=args.hours,
+            planned_runs=args.runs,
+        )
+        print(f"\n{'=' * 50}")
+        print(f" 多轮实验预算估算（基于最省钱方案：{estimates[0].option.platform} {estimates[0].option.gpu_model}）")
+        print(f"{'=' * 50}")
+        for k, v in budget.items():
+            print(f"  {k}: {v}")
+        print(f"{'=' * 50}\n")
+
+    # 示例：假设团队考虑自购一张 RTX 4090（约 15000 元），预计每月用于内部实验的时长约 100 小时
+    break_even = analyze_buy_vs_rent_break_even(
+        hardware_purchase_cost_cny=15000.0,
+        monthly_usage_hours=100.0,
+        cheapest_rental_hourly_rate_cny=cheapest_rate,
+        additional_monthly_ops_cost_cny=200.0,  # 电费等运维成本粗估
+    )
+    print_break_even_report(break_even)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+跑完这个成本计算器,团队算出了一个挺有意思的数字:如果团队每月内部研发需要用到的 GPU 时长稳定在 100 小时左右,自购一张 RTX 4090 大约 5 个多月就能回本,之后的使用基本就是"净赚"。这个结论直接影响了王振宇后续的一个决定——团队自己出钱采购了两张消费级显卡放在办公室,作为日常做技术验证、跑课堂案例的"自留地",真正面向客户交付的正式训练任务,依然按项目预算走云端租用,两条腿走路,把成本控制在最合理的区间。
+
 ---
 
 ## 今日复盘
