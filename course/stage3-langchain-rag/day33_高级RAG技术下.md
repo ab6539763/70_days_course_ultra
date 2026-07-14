@@ -277,21 +277,21 @@ flowchart TD
 
 ```mermaid
 graph LR
-    subgraph BM25排名列表[BM25排名列表 k1=1.5 b=0.75]
+    subgraph BM25排名列表["BM25排名列表 k1=1.5 b=0.75"]
         A1["排名1: doc_C<br/>BM25分=8.9"]
         A2["排名2: doc_A<br/>BM25分=6.2"]
         A3["排名3: doc_D<br/>BM25分=4.1"]
         A4["排名4: doc_B<br/>BM25分=2.0"]
     end
 
-    subgraph 向量排名列表[向量检索排名列表 cosine similarity]
+    subgraph 向量排名列表["向量检索排名列表 cosine similarity"]
         B1["排名1: doc_A<br/>余弦相似度=0.91"]
         B2["排名2: doc_B<br/>余弦相似度=0.88"]
         B3["排名3: doc_C<br/>余弦相似度=0.79"]
         B4["排名4: doc_E<br/>余弦相似度=0.75"]
     end
 
-    subgraph RRF计算[RRF计算 k=60 忽略原始分数只用排名]
+    subgraph RRF计算["RRF计算 k=60 忽略原始分数只用排名"]
         C1["doc_A: 1/(60+2)+1/(60+1) = 0.01613+0.01639 = 0.03252"]
         C2["doc_B: 1/(60+4)+1/(60+2) = 0.01563+0.01613 = 0.03175"]
         C3["doc_C: 1/(60+1)+1/(60+3) = 0.01639+0.01587 = 0.03226"]
@@ -299,7 +299,7 @@ graph LR
         C5["doc_E: 0+1/(60+4) = 0+0.01563 = 0.01563"]
     end
 
-    subgraph 最终融合排序[最终融合排序结果]
+    subgraph 最终融合排序["最终融合排序结果"]
         F1["1. doc_A  0.03252"]
         F2["2. doc_C  0.03226"]
         F3["3. doc_B  0.03175"]

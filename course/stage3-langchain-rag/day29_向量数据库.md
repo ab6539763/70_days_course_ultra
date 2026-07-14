@@ -184,7 +184,7 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    subgraph 向量空间(简化为二维示意)
+    subgraph VSPACE["向量空间(简化为二维示意)"]
         direction TB
         A1(("螺杆转速报警<br/>说明1"))
         A2(("转速超限<br/>处理办法"))
