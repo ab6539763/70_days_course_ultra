@@ -2417,6 +2417,1844 @@ python ask_ai.py --provider deepseek
 python ask_ai.py --provider qwen
 ```
 
+### 文件九:`test_api_exceptions.py`(异常体系单元测试)
+
+> 补充说明:上面的README.md把今天产出的七个核心文件走了一遍运行手册,但陈铭在周末整理代码的时候意识到,api_exceptions.py这套异常体系,虽然被ask_ai.py和error_handling_demo.py广泛使用,却从未被专门测试过——`CangqiongError.__str__`在有detail和没有detail两种情况下是否都拼接正确、`RateLimitError`的默认`retry_after`是否符合预期、五个具体子类是否都能被`ModelAPIError`和`CangqiongError`正确捕获,这些问题过去都只是靠"跑一下demo脚本, 眼睛看一下输出对不对"这种不严谨的方式验证的。以下补充的这几份代码,把"异常体系本身对不对""网络层错误处理逻辑在各种边界情况下对不对""重试策略的决策对不对""对话历史分析工具对不对"这四类问题,分别用正式的单元测试与配套的工具模块补齐,进一步把Day12这条"HTTP协议->requests库->大模型API->错误处理"的链路夯实。
+
+```python
+"""
+文件名: test_api_exceptions.py
+说明:
+    针对api_exceptions.py中定义的整套异常体系补充的单元测试。
+
+    背景:
+        陈铭在今天下午写完api_exceptions.py之后,只是在ask_ai.py和
+        error_handling_demo.py里"顺带"用到了这些异常类,从未针对异常类
+        本身写过一行专门的测试——比如CangqiongError的__str__方法在有
+        detail和没有detail两种情况下是否都能正确拼接文案、RateLimitError
+        的retry_after默认值是否符合预期、ModelAPIError子类之间的继承关系
+        是否严格符合设计(比如AuthenticationError必须能被ModelAPIError
+        捕获到, 也必须能被最顶层的CangqiongError捕获到)。这些"异常类本身
+        对不对"的问题,过去都是靠"跑一下demo脚本, 眼睛看一下报错文案对
+        不对"这种不严谨的方式验证的, 今天补上一套正式的单元测试。
+
+    运行方式:
+        python -m unittest test_api_exceptions.py -v
+"""
+
+from __future__ import annotations
+
+import unittest
+
+from api_exceptions import (
+    AuthenticationError,
+    CangqiongError,
+    ConfigurationError,
+    ModelAPIError,
+    ModelConnectionError,
+    ModelResponseParseError,
+    ModelTimeoutError,
+    RateLimitError,
+)
+
+
+class TestCangqiongErrorBaseClass(unittest.TestCase):
+    """测试异常体系最顶层基类CangqiongError的基础行为。"""
+
+    def test_str_without_detail_returns_message_only(self):
+        """没有传入detail参数时, __str__应该只返回message本身。"""
+        exc = CangqiongError("发生了一个错误")
+        self.assertEqual(str(exc), "发生了一个错误")
+
+    def test_str_with_detail_appends_detail_in_parentheses(self):
+        """传入detail参数时, __str__应该把detail以"(详情: xxx)"的格式追加在后面。"""
+        exc = CangqiongError("发生了一个错误", detail="这是补充说明")
+        self.assertEqual(str(exc), "发生了一个错误(详情: 这是补充说明)")
+
+    def test_message_and_detail_are_accessible_as_attributes(self):
+        """message和detail都应该能作为实例属性被外部代码读取。"""
+        exc = CangqiongError("消息文本", detail="详情文本")
+        self.assertEqual(exc.message, "消息文本")
+        self.assertEqual(exc.detail, "详情文本")
+
+    def test_is_a_real_exception_subclass(self):
+        """CangqiongError必须是Python内置Exception的子类, 才能被try/except正常捕获。"""
+        self.assertTrue(issubclass(CangqiongError, Exception))
+        with self.assertRaises(CangqiongError):
+            raise CangqiongError("测试抛出")
+
+
+class TestConfigurationError(unittest.TestCase):
+    """测试ConfigurationError, 今天最常见的触发场景是环境变量未设置。"""
+
+    def test_missing_key_attribute_recorded_correctly(self):
+        exc = ConfigurationError("未检测到环境变量", missing_key="DEEPSEEK_API_KEY")
+        self.assertEqual(exc.missing_key, "DEEPSEEK_API_KEY")
+
+    def test_missing_key_defaults_to_none_when_not_provided(self):
+        """如果调用方没有传missing_key, 不应该报错, 而是应该有一个安全的默认值None。"""
+        exc = ConfigurationError("配置有问题")
+        self.assertIsNone(exc.missing_key)
+
+    def test_is_subclass_of_cangqiong_error(self):
+        self.assertTrue(issubclass(ConfigurationError, CangqiongError))
+
+
+class TestModelAPIErrorAndSubclasses(unittest.TestCase):
+    """
+    测试ModelAPIError这个中间层基类, 以及它派生出的
+    AuthenticationError/RateLimitError/ModelTimeoutError/
+    ModelConnectionError/ModelResponseParseError五个具体子类。
+    """
+
+    def test_model_api_error_records_provider_and_status_code(self):
+        exc = ModelAPIError("调用失败", provider="deepseek", status_code=500)
+        self.assertEqual(exc.provider, "deepseek")
+        self.assertEqual(exc.status_code, 500)
+
+    def test_model_api_error_provider_and_status_code_default_to_none(self):
+        exc = ModelAPIError("调用失败")
+        self.assertIsNone(exc.provider)
+        self.assertIsNone(exc.status_code)
+
+    def test_authentication_error_status_code_is_always_401(self):
+        """
+        AuthenticationError代表401场景, 它的status_code不需要外部传入,
+        应该在内部被硬编码为401, 因为401这个状态码本身就是"401鉴权失败"
+        这个异常类型的定义特征, 不应该由调用方随意指定成别的值。
+        """
+        exc = AuthenticationError("鉴权失败", provider="qwen")
+        self.assertEqual(exc.status_code, 401)
+        self.assertEqual(exc.provider, "qwen")
+
+    def test_authentication_error_is_a_model_api_error_and_cangqiong_error(self):
+        """
+        验证继承链条完整: AuthenticationError -> ModelAPIError -> CangqiongError。
+        这个测试的意义在于, 调用方代码如果写了except ModelAPIError,
+        应该能捕获到AuthenticationError这个更具体的子类实例, 反之如果写了
+        except AuthenticationError, 则不应该捕获到其他不相关的ModelAPIError子类。
+        """
+        exc = AuthenticationError("鉴权失败")
+        self.assertIsInstance(exc, ModelAPIError)
+        self.assertIsInstance(exc, CangqiongError)
+
+    def test_rate_limit_error_default_retry_after_is_three_seconds(self):
+        """RateLimitError如果调用方没有指定retry_after, 应该有一个合理的默认等待时间。"""
+        exc = RateLimitError("触发限流")
+        self.assertEqual(exc.retry_after, 3.0)
+        self.assertEqual(exc.status_code, 429)
+
+    def test_rate_limit_error_custom_retry_after_is_respected(self):
+        exc = RateLimitError("触发限流", retry_after=12.5, provider="deepseek")
+        self.assertEqual(exc.retry_after, 12.5)
+
+    def test_model_timeout_error_records_timeout_seconds(self):
+        exc = ModelTimeoutError("请求超时", timeout_seconds=0.01, provider="deepseek")
+        self.assertEqual(exc.timeout_seconds, 0.01)
+        # 超时场景约定用504(网关超时)作为一种内部统一的语义标记,
+        # 即使requests库本身在纯客户端超时时并不会真正返回一个具体的HTTP状态码
+        self.assertEqual(exc.status_code, 504)
+
+    def test_model_connection_error_status_code_is_none(self):
+        """
+        ModelConnectionError对应的是"连TCP连接都没建立起来"的场景,
+        这种情况下根本没有从服务器收到任何带状态码的响应, 因此status_code
+        理应保持为None, 而不是被强行赋予一个虚构的数值。
+        """
+        exc = ModelConnectionError("网络连接失败")
+        self.assertIsNone(exc.status_code)
+
+    def test_model_response_parse_error_records_raw_response(self):
+        """
+        ModelResponseParseError专门用于"状态码是200,但响应体结构不对"的场景,
+        因此它应该固定status_code为200, 并且能记录原始响应文本便于排查。
+        """
+        raw = '{"id": "abc", "object": "chat.completion"}'
+        exc = ModelResponseParseError("响应结构异常", raw_response=raw, provider="qwen")
+        self.assertEqual(exc.status_code, 200)
+        self.assertEqual(exc.raw_response, raw)
+
+    def test_all_five_subclasses_are_catchable_as_model_api_error(self):
+        """
+        用一个循环, 系统性地验证所有具体子类, 都能被更上层的ModelAPIError
+        和CangqiongError正确捕获, 避免未来有人新增子类时忘记继承正确的基类。
+        """
+        subclasses_and_kwargs = [
+            (AuthenticationError, {"message": "x"}),
+            (RateLimitError, {"message": "x"}),
+            (ModelTimeoutError, {"message": "x", "timeout_seconds": 1.0}),
+            (ModelConnectionError, {"message": "x"}),
+            (ModelResponseParseError, {"message": "x"}),
+        ]
+        for cls, kwargs in subclasses_and_kwargs:
+            with self.subTest(cls=cls.__name__):
+                instance = cls(**kwargs)
+                self.assertIsInstance(instance, ModelAPIError)
+                self.assertIsInstance(instance, CangqiongError)
+
+
+class TestExceptionChaining(unittest.TestCase):
+    """
+    测试异常链(exception chaining, 即raise ... from exc)在整个体系里是否
+    被正确保留, 这对排查真实问题时"追根溯源"非常重要——如果没有正确保留
+    __cause__, 排查者只能看到最外层的自定义异常文案, 却看不到最初到底是
+    requests库内部具体抛出的哪一种原始异常。
+    """
+
+    def test_raise_from_preserves_original_cause(self):
+        original = ValueError("这是原始的底层错误")
+        try:
+            try:
+                raise original
+            except ValueError as exc:
+                raise ModelResponseParseError("包装后的错误") from exc
+        except ModelResponseParseError as wrapped:
+            self.assertIs(wrapped.__cause__, original)
+
+    def test_error_without_explicit_chaining_has_no_cause(self):
+        exc = ConfigurationError("独立抛出, 没有链式来源")
+        self.assertIsNone(exc.__cause__)
+
+
+class TestMaskKeyLogicIndependentReimplementation(unittest.TestCase):
+    """
+    call_deepseek_api.py和call_qwen_api.py里各自实现了一份逻辑完全相同的
+    mask_key函数(脱敏处理API Key), 为了不在测试文件里重复import两份几乎
+    一样的实现,这里重新按同样的规则实现一份纯函数版本, 用它验证
+    "脱敏规则本身"在各种边界长度下是否表现正确——这套用例可以同时
+    用来校验两份原始实现是否遵循了同样的行为约定。
+    """
+
+    @staticmethod
+    def mask_key(api_key: str) -> str:
+        if len(api_key) <= 12:
+            return "*" * len(api_key)
+        return f"{api_key[:8]}{'*' * 8}{api_key[-4:]}"
+
+    def test_short_key_is_fully_masked(self):
+        self.assertEqual(self.mask_key("short-key"), "*" * len("short-key"))
+
+    def test_key_of_exactly_twelve_chars_is_fully_masked(self):
+        key = "a" * 12
+        self.assertEqual(self.mask_key(key), "*" * 12)
+
+    def test_key_of_thirteen_chars_shows_prefix_and_suffix(self):
+        key = "a" * 13
+        masked = self.mask_key(key)
+        self.assertTrue(masked.startswith("a" * 8))
+        self.assertTrue(masked.endswith("a" * 4))
+        self.assertIn("*" * 8, masked)
+
+    def test_long_realistic_key_masks_middle_section(self):
+        key = "sk-1234567890abcdefghijklmnopqrstuvwxyz"
+        masked = self.mask_key(key)
+        self.assertEqual(masked[:8], key[:8])
+        self.assertEqual(masked[-4:], key[-4:])
+        self.assertNotIn(key[8:-4], masked)
+
+    def test_empty_key_returns_empty_string(self):
+        self.assertEqual(self.mask_key(""), "")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+```
+
+### 文件十:`test_error_handling_with_mock.py`(基于Mock的网络错误场景全覆盖测试)
+
+> 说明:error_handling_demo.py里的五个演示函数全部依赖真实网络请求,这类测试只能人工运行、人工观察,没办法放进持续集成(CI)环境反复自动运行。这里用Python标准库`unittest.mock`,把`requests.post`替换成一个完全在内存中运行的假函数,在不联网、不消耗任何真实调用额度的情况下,完整验证`call_deepseek_with_typed_errors`在面对401/429/超时/连接失败/响应结构异常等场景时,是否都能正确转换成对应的自定义异常类型。这是往后长期需要对接第三方API的AI应用开发工作中,一项非常重要的测试能力。
+
+```python
+"""
+文件名: test_error_handling_with_mock.py
+说明:
+    error_handling_demo.py里的五个演示函数, 全部依赖真实的网络请求
+    (需要真实的DEEPSEEK_API_KEY, 需要真实触发401/429/超时), 这类测试
+    只能靠人工运行、人工观察输出, 没办法放进持续集成(CI)环境里自动化
+    反复运行——CI环境通常没有网络权限, 也不应该在每次代码提交时都真的
+    去消耗一次真实的API调用额度。
+
+    今天补充的这套测试, 用Python标准库unittest.mock, 把requests.post
+    这个真正发起网络请求的函数"替换"成一个完全在内存里运行的假函数,
+    让它按照测试代码指定的方式"伪造"出各种响应(200/401/429/超时异常/
+    连接异常), 从而在完全不联网、不消耗任何真实调用额度的情况下,
+    完整地验证call_deepseek_with_typed_errors这个函数在面对
+    "服务器真实返回401""服务器真实返回429""网络层面直接超时"
+    "网络层面直接连接失败""响应体格式异常"这五大类场景时,
+    是否都能正确地转换成对应的自定义异常类型。
+
+    这是一种非常重要的工程能力——"如何在不依赖真实外部服务的情况下,
+    测试那些原本依赖外部服务的代码逻辑", Mock技术是解决这个问题最
+    常用的手段之一, 在往后需要频繁对接第三方API的AI应用开发工作中,
+    这套思路会反复被用到。
+
+    运行方式:
+        python -m unittest test_error_handling_with_mock.py -v
+"""
+
+from __future__ import annotations
+
+import json
+import unittest
+from unittest.mock import MagicMock, patch
+
+import requests
+
+from api_exceptions import (
+    AuthenticationError,
+    ConfigurationError,
+    ModelConnectionError,
+    ModelResponseParseError,
+    ModelTimeoutError,
+    RateLimitError,
+)
+from error_handling_demo import call_deepseek_with_typed_errors
+
+
+def make_fake_response(
+    status_code: int,
+    json_body: dict | None = None,
+    headers: dict | None = None,
+    text: str = "",
+) -> MagicMock:
+    """
+    构造一个"看起来像"requests.Response对象的假对象, 用于Mock场景。
+
+    真实的requests.Response是一个C扩展支撑的复杂对象, 完整模拟它的
+    所有行为成本很高, 也没有必要——我们只需要模拟被测代码里实际会
+    用到的那几个属性/方法: status_code、headers、.json()、.text。
+
+    :param status_code: 要伪造的HTTP状态码
+    :param json_body: .json()方法应该返回的字典, 为None时.json()会抛出异常
+    :param headers: 伪造的响应头字典, 默认为空字典
+    :param text: .text属性应该返回的原始文本
+    :return: 一个配置好的MagicMock对象, 可以当作Response使用
+    """
+    fake = MagicMock(spec=requests.Response)
+    fake.status_code = status_code
+    fake.headers = headers or {}
+    fake.text = text or (json.dumps(json_body, ensure_ascii=False) if json_body else "")
+    if json_body is not None:
+        fake.json.return_value = json_body
+    else:
+        fake.json.side_effect = ValueError("响应体不是合法JSON")
+    return fake
+
+
+class TestSuccessfulCallReturnsContent(unittest.TestCase):
+    """验证正常成功场景(状态码200, 结构完整)下, 能正确提取出回复文本。"""
+
+    @patch("error_handling_demo.requests.post")
+    def test_normal_200_response_returns_reply_content(self, mock_post):
+        mock_post.return_value = make_fake_response(
+            200,
+            json_body={
+                "id": "chatcmpl-fake-001",
+                "choices": [{"message": {"role": "assistant", "content": "这是伪造的AI回复"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            },
+        )
+        result = call_deepseek_with_typed_errors("sk-fake-key", [{"role": "user", "content": "你好"}])
+        self.assertEqual(result, "这是伪造的AI回复")
+        mock_post.assert_called_once()
+
+    @patch("error_handling_demo.requests.post")
+    def test_post_is_called_with_correct_bearer_header(self, mock_post):
+        """
+        验证无论响应内容如何, 实际发出的请求头里, Authorization字段
+        的格式必须严格是"Bearer <key>", 这是DeepSeek等厂商鉴权协议的硬性要求,
+        一旦这个格式被不小心改动(比如少了空格), 会导致所有请求都收到401。
+        """
+        mock_post.return_value = make_fake_response(
+            200, json_body={"choices": [{"message": {"content": "ok"}}]}
+        )
+        call_deepseek_with_typed_errors("sk-my-real-looking-key", [{"role": "user", "content": "hi"}])
+
+        _, kwargs = mock_post.call_args
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer sk-my-real-looking-key")
+        self.assertEqual(kwargs["headers"]["Content-Type"], "application/json")
+
+
+class TestConfigurationErrorOnEmptyKey(unittest.TestCase):
+    """验证空Key场景在发起任何网络请求之前就应该被拦截。"""
+
+    @patch("error_handling_demo.requests.post")
+    def test_empty_key_raises_configuration_error_without_calling_network(self, mock_post):
+        with self.assertRaises(ConfigurationError):
+            call_deepseek_with_typed_errors("", [{"role": "user", "content": "你好"}])
+        # 关键校验点: 既然Key为空这件事在本地就能判断出来, 根本不应该
+        # 浪费一次真实的网络往返, mock_post理应完全没有被调用过
+        mock_post.assert_not_called()
+
+
+class TestAuthenticationErrorFromMockedResponse(unittest.TestCase):
+    """验证服务器真实返回401时, 能被正确转换为AuthenticationError。"""
+
+    @patch("error_handling_demo.requests.post")
+    def test_status_401_raises_authentication_error(self, mock_post):
+        mock_post.return_value = make_fake_response(
+            401,
+            json_body={"error": {"message": "Authentication Fails", "type": "authentication_error"}},
+        )
+        with self.assertRaises(AuthenticationError) as ctx:
+            call_deepseek_with_typed_errors("sk-wrong-key", [{"role": "user", "content": "你好"}])
+        self.assertEqual(ctx.exception.status_code, 401)
+        self.assertEqual(ctx.exception.provider, "deepseek")
+
+
+class TestRateLimitErrorFromMockedResponse(unittest.TestCase):
+    """验证429限流场景, 包括Retry-After响应头存在与不存在两种情况。"""
+
+    @patch("error_handling_demo.requests.post")
+    def test_status_429_with_retry_after_header_is_parsed(self, mock_post):
+        mock_post.return_value = make_fake_response(
+            429,
+            json_body={"error": {"message": "Rate limit reached"}},
+            headers={"Retry-After": "7"},
+        )
+        with self.assertRaises(RateLimitError) as ctx:
+            call_deepseek_with_typed_errors("sk-any-key", [{"role": "user", "content": "你好"}])
+        self.assertEqual(ctx.exception.retry_after, 7.0)
+
+    @patch("error_handling_demo.requests.post")
+    def test_status_429_without_retry_after_header_uses_default(self, mock_post):
+        """
+        如果服务器返回429但没有附带Retry-After响应头(有些厂商确实不提供这个头),
+        代码里的兜底逻辑应该使用一个合理的默认等待秒数, 而不应该直接报错崩溃。
+        """
+        mock_post.return_value = make_fake_response(
+            429, json_body={"error": {"message": "Rate limit reached"}}, headers={}
+        )
+        with self.assertRaises(RateLimitError) as ctx:
+            call_deepseek_with_typed_errors("sk-any-key", [{"role": "user", "content": "你好"}])
+        self.assertEqual(ctx.exception.retry_after, 3.0)
+
+
+class TestTimeoutAndConnectionErrorFromRawExceptions(unittest.TestCase):
+    """
+    验证requests.post本身直接抛出异常(而不是返回一个带状态码的Response)的场景,
+    这类场景对应"请求根本没有从对方那里收到任何回应"的情况。
+    """
+
+    @patch("error_handling_demo.requests.post")
+    def test_requests_timeout_is_converted_to_model_timeout_error(self, mock_post):
+        mock_post.side_effect = requests.exceptions.ReadTimeout("Read timed out")
+        with self.assertRaises(ModelTimeoutError) as ctx:
+            call_deepseek_with_typed_errors(
+                "sk-any-key", [{"role": "user", "content": "你好"}], timeout=0.01
+            )
+        self.assertEqual(ctx.exception.timeout_seconds, 0.01)
+
+    @patch("error_handling_demo.requests.post")
+    def test_connect_timeout_is_also_treated_as_timeout_error(self, mock_post):
+        """ConnectTimeout是Timeout的子类, 同样应该被归类为ModelTimeoutError。"""
+        mock_post.side_effect = requests.exceptions.ConnectTimeout("Connection timed out")
+        with self.assertRaises(ModelTimeoutError):
+            call_deepseek_with_typed_errors("sk-any-key", [{"role": "user", "content": "你好"}])
+
+    @patch("error_handling_demo.requests.post")
+    def test_connection_error_is_converted_to_model_connection_error(self, mock_post):
+        mock_post.side_effect = requests.exceptions.ConnectionError("Failed to establish a new connection")
+        with self.assertRaises(ModelConnectionError):
+            call_deepseek_with_typed_errors("sk-any-key", [{"role": "user", "content": "你好"}])
+
+    @patch("error_handling_demo.requests.post")
+    def test_generic_request_exception_falls_back_to_connection_error(self, mock_post):
+        """
+        对于requests.exceptions.RequestException这个大家族里, 除了Timeout和
+        ConnectionError之外的其他未特殊分类的异常(比如TooManyRedirects),
+        代码里有一个兜底分支, 统一转换成ModelConnectionError, 这里验证
+        这个兜底分支确实生效, 不会让一个未预料到的异常直接冒泡到调用方。
+        """
+        mock_post.side_effect = requests.exceptions.TooManyRedirects("Exceeded 30 redirects")
+        with self.assertRaises(ModelConnectionError):
+            call_deepseek_with_typed_errors("sk-any-key", [{"role": "user", "content": "你好"}])
+
+
+class TestResponseParseErrorFromMalformedBody(unittest.TestCase):
+    """验证状态码正常但响应体结构异常时, 能被正确转换为ModelResponseParseError。"""
+
+    @patch("error_handling_demo.requests.post")
+    def test_non_json_body_raises_parse_error(self, mock_post):
+        mock_post.return_value = make_fake_response(200, json_body=None, text="<html>not json</html>")
+        with self.assertRaises(ModelResponseParseError):
+            call_deepseek_with_typed_errors("sk-any-key", [{"role": "user", "content": "你好"}])
+
+    @patch("error_handling_demo.requests.post")
+    def test_missing_choices_field_raises_parse_error(self, mock_post):
+        mock_post.return_value = make_fake_response(200, json_body={"id": "abc", "object": "chat.completion"})
+        with self.assertRaises(ModelResponseParseError):
+            call_deepseek_with_typed_errors("sk-any-key", [{"role": "user", "content": "你好"}])
+
+    @patch("error_handling_demo.requests.post")
+    def test_empty_choices_list_raises_parse_error(self, mock_post):
+        """choices字段存在, 但是是一个空列表, 取choices[0]会触发IndexError, 应该被转换。"""
+        mock_post.return_value = make_fake_response(200, json_body={"choices": []})
+        with self.assertRaises(ModelResponseParseError):
+            call_deepseek_with_typed_errors("sk-any-key", [{"role": "user", "content": "你好"}])
+
+    @patch("error_handling_demo.requests.post")
+    def test_choices_present_but_message_missing_content_raises_parse_error(self, mock_post):
+        mock_post.return_value = make_fake_response(
+            200, json_body={"choices": [{"message": {"role": "assistant"}}]}
+        )
+        with self.assertRaises(ModelResponseParseError):
+            call_deepseek_with_typed_errors("sk-any-key", [{"role": "user", "content": "你好"}])
+
+
+class TestUnclassifiedHttpErrorStatusCodes(unittest.TestCase):
+    """
+    验证除401/429之外的其他4xx/5xx状态码(比如400/500/503),
+    会走"通用错误"分支, 被转换为ModelResponseParseError并保留原始响应文本,
+    而不是被错误地误判为401或429。
+    """
+
+    @patch("error_handling_demo.requests.post")
+    def test_status_400_is_not_misclassified_as_auth_or_rate_limit(self, mock_post):
+        mock_post.return_value = make_fake_response(
+            400, json_body={"error": {"message": "Bad Request"}}, text='{"error": "bad request"}'
+        )
+        with self.assertRaises(ModelResponseParseError) as ctx:
+            call_deepseek_with_typed_errors("sk-any-key", [{"role": "user", "content": "你好"}])
+        self.assertIn("400", str(ctx.exception))
+
+    @patch("error_handling_demo.requests.post")
+    def test_status_500_preserves_raw_response_text(self, mock_post):
+        mock_post.return_value = make_fake_response(
+            500, json_body={"error": "internal"}, text='{"error": "internal server error"}'
+        )
+        with self.assertRaises(ModelResponseParseError) as ctx:
+            call_deepseek_with_typed_errors("sk-any-key", [{"role": "user", "content": "你好"}])
+        self.assertEqual(ctx.exception.raw_response, '{"error": "internal server error"}')
+
+
+class TestMultipleSequentialCallsWithDifferentOutcomes(unittest.TestCase):
+    """
+    验证mock_post.side_effect支持传入一个"结果列表", 依次模拟连续多次调用
+    分别得到不同的结果——这模拟了real_handling_demo.py里
+    demo_rate_limit_simulation()那种"连续请求, 前几次成功, 某一次突然
+    触发限流"的真实场景, 用完全不联网的方式复现同样的测试意图。
+    """
+
+    @patch("error_handling_demo.requests.post")
+    def test_third_call_triggers_rate_limit_after_two_successes(self, mock_post):
+        success_response = make_fake_response(200, json_body={"choices": [{"message": {"content": "ok"}}]})
+        rate_limited_response = make_fake_response(
+            429, json_body={"error": {"message": "限流"}}, headers={"Retry-After": "4"}
+        )
+        mock_post.side_effect = [success_response, success_response, rate_limited_response]
+
+        results = []
+        errors = []
+        for _ in range(3):
+            try:
+                results.append(
+                    call_deepseek_with_typed_errors("sk-any-key", [{"role": "user", "content": "你好"}])
+                )
+            except RateLimitError as exc:
+                errors.append(exc)
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0].retry_after, 4.0)
+        self.assertEqual(mock_post.call_count, 3)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+```
+
+### 文件十一:`retry_strategy_lab.py`(按错误类型区分的手写重试策略模块)
+
+> 说明:这份代码承接requests_usage_demo.py里`manual_retry_without_decorator`这个"笨办法"手写重试函数,以及课后作业第6题里给出的分析框架——"401不重试、429等待后重试、超时立即或短暂等待后重试"——把这套分析框架落地成一套真正可以运行、可以针对不同异常类型采用不同处理策略的重试工具模块。依然没有使用装饰器(那是Day13的内容),全部用显式的循环加函数调用实现,目的是让"重试策略"这个概念本身先被理解透彻,明天学装饰器时才能真正体会到装饰器帮忙省掉了多少重复的样板代码。
+
+```python
+"""
+文件名: retry_strategy_lab.py
+说明:
+    这份代码承接requests_usage_demo.py里manual_retry_without_decorator
+    这个"笨办法"手写重试函数, 以及课后作业第6题里给出的思考框架——
+    "401不重试、429等待后重试、超时立即或短暂等待后重试"——把这套
+    分析框架, 落地成一套真正可以运行、可以按错误类型区分处理策略的
+    重试工具模块。
+
+    需要特别说明: 这里依然没有使用装饰器(那是Day13的内容), 全部通过
+    显式的循环加函数调用实现, 目的是让"重试策略"这个概念本身先被理解
+    透彻, 明天学装饰器的时候, 才能真正体会到装饰器帮我们省掉了多少
+    重复的样板代码(boilerplate), 而不是本末倒置地先学一个"看起来很酷"
+    的语法糖, 却不理解它到底解决了什么问题。
+
+    本模块提供的核心能力:
+        1. RetryOutcome: 记录一次完整重试过程的结果(成功与否、
+           尝试次数、每次尝试的耗时与结果)。
+        2. RetryStrategy: 一个可配置的重试策略描述, 区分"是否应该重试"
+           "重试前等待多久"两个维度, 且能针对不同异常类型给出不同策略。
+        3. execute_with_retry_strategy: 真正执行"调用函数 -> 判断是否
+           需要重试 -> 等待 -> 再次调用"这套循环逻辑的核心函数。
+        4. 一组预置的策略工厂函数, 分别对应401/429/超时/连接失败四类场景,
+           直接对应课后作业第6题的分析结论。
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import Callable, List, Optional, Type
+
+from api_exceptions import (
+    AuthenticationError,
+    ModelConnectionError,
+    ModelTimeoutError,
+    RateLimitError,
+)
+
+
+@dataclass
+class AttemptRecord:
+    """记录一次单独尝试的结果, 用于事后复盘一次完整重试流程发生了什么。"""
+
+    attempt_number: int
+    succeeded: bool
+    elapsed_seconds: float
+    error_type: Optional[str] = None
+    error_message: Optional[str] = None
+    waited_before_seconds: float = 0.0
+
+
+@dataclass
+class RetryOutcome:
+    """一次完整"可能包含多轮重试"的调用过程的最终结果汇总。"""
+
+    succeeded: bool
+    total_attempts: int
+    total_elapsed_seconds: float
+    attempts: List[AttemptRecord] = field(default_factory=list)
+    final_result: object = None
+    final_error: Optional[Exception] = None
+
+    def summary_text(self) -> str:
+        """生成一段用于打印到终端或写入日志的中文摘要文本。"""
+        status = "成功" if self.succeeded else "最终失败"
+        lines = [
+            f"重试流程{status}, 共尝试{self.total_attempts}次, "
+            f"总耗时约{self.total_elapsed_seconds:.2f}秒",
+        ]
+        for record in self.attempts:
+            outcome_text = "成功" if record.succeeded else f"失败({record.error_type}: {record.error_message})"
+            wait_note = f", 等待{record.waited_before_seconds:.1f}秒后发起本次尝试" if record.waited_before_seconds else ""
+            lines.append(
+                f"  第{record.attempt_number}次尝试{wait_note}: {outcome_text}, "
+                f"耗时{record.elapsed_seconds:.2f}秒"
+            )
+        return "\n".join(lines)
+
+
+@dataclass
+class RetryStrategy:
+    """
+    描述"面对某一类具体异常, 应该怎么重试"的策略。
+
+    :param should_retry: 遇到这类异常时是否应该重试
+    :param max_attempts: 最大尝试次数(包含第一次), 例如3表示最多尝试3次
+    :param base_wait_seconds: 基础等待秒数
+    :param use_exponential_backoff: 是否采用指数退避(每次等待时间翻倍)
+    :param respect_retry_after: 是否优先使用异常对象自带的retry_after建议值
+        (目前只有RateLimitError携带这个信息)
+    """
+
+    should_retry: bool
+    max_attempts: int = 1
+    base_wait_seconds: float = 0.0
+    use_exponential_backoff: bool = False
+    respect_retry_after: bool = False
+
+    def compute_wait_seconds(self, attempt_index: int, exc: Optional[Exception]) -> float:
+        """
+        计算"第attempt_index次失败之后, 下一次重试前应该等待多少秒"。
+
+        :param attempt_index: 从1开始计数的、刚刚失败的这次尝试的序号
+        :param exc: 刚刚捕获到的异常实例, 用于读取retry_after等动态信息
+        :return: 建议等待的秒数
+        """
+        if self.respect_retry_after and isinstance(exc, RateLimitError):
+            return exc.retry_after
+        if not self.use_exponential_backoff:
+            return self.base_wait_seconds
+        # 指数退避: 第1次失败后等base, 第2次等base*2, 第3次等base*4, 以此类推
+        return self.base_wait_seconds * (2 ** (attempt_index - 1))
+
+
+def strategy_for_authentication_error() -> RetryStrategy:
+    """
+    401鉴权失败对应的策略: 不重试。
+
+    理由(对应课后作业第6题的分析): 401的根本原因是凭证本身有问题,
+    不改变凭证的情况下, 重试多少次结果都会是同一个401, 是纯粹的无意义
+    重复劳动, 甚至可能因为反复无效请求触发额外的账户风控。
+    """
+    return RetryStrategy(should_retry=False, max_attempts=1)
+
+
+def strategy_for_rate_limit_error() -> RetryStrategy:
+    """
+    429限流对应的策略: 应该重试, 但必须等待, 且优先尊重服务器建议的
+    Retry-After时间, 没有这个信息时才退化为固定等待时间。
+    """
+    return RetryStrategy(
+        should_retry=True,
+        max_attempts=4,
+        base_wait_seconds=3.0,
+        respect_retry_after=True,
+    )
+
+
+def strategy_for_timeout_error() -> RetryStrategy:
+    """
+    超时对应的策略: 应该重试, 且大多数情况下可以短暂等待后立即重试,
+    因为超时往往源于网络的临时抖动, 采用指数退避避免"连续超时的网络问题
+    还没缓解就立刻又发起下一次请求"这种无效的快速重试。
+    """
+    return RetryStrategy(
+        should_retry=True,
+        max_attempts=3,
+        base_wait_seconds=1.0,
+        use_exponential_backoff=True,
+    )
+
+
+def strategy_for_connection_error() -> RetryStrategy:
+    """
+    网络连接失败对应的策略: 与超时类似, 应该重试, 但由于"完全连不上"
+    往往比"连上了但响应慢"更严重, 采用相对更长的基础等待时间。
+    """
+    return RetryStrategy(
+        should_retry=True,
+        max_attempts=3,
+        base_wait_seconds=2.0,
+        use_exponential_backoff=True,
+    )
+
+
+DEFAULT_STRATEGY_MAP: dict = {
+    AuthenticationError: strategy_for_authentication_error(),
+    RateLimitError: strategy_for_rate_limit_error(),
+    ModelTimeoutError: strategy_for_timeout_error(),
+    ModelConnectionError: strategy_for_connection_error(),
+}
+
+
+def resolve_strategy_for_exception(
+    exc: Exception, strategy_map: Optional[dict] = None
+) -> RetryStrategy:
+    """
+    根据异常的具体类型, 从策略映射表中查找对应的重试策略。
+
+    查找规则: 优先精确匹配异常的确切类型; 如果没有精确匹配,
+    再按照isinstance逐一尝试映射表中的每个键(兼容异常子类的场景);
+    如果依然找不到任何匹配, 返回一个"不重试"的保守兜底策略,
+    避免遇到未知异常类型时程序陷入不受控制的无限重试。
+
+    :param exc: 捕获到的异常实例
+    :param strategy_map: 异常类型到RetryStrategy的映射, 默认使用
+        DEFAULT_STRATEGY_MAP
+    :return: 匹配到的重试策略
+    """
+    strategy_map = strategy_map if strategy_map is not None else DEFAULT_STRATEGY_MAP
+
+    exact_match = strategy_map.get(type(exc))
+    if exact_match is not None:
+        return exact_match
+
+    for exc_type, strategy in strategy_map.items():
+        if isinstance(exc, exc_type):
+            return strategy
+
+    return RetryStrategy(should_retry=False, max_attempts=1)
+
+
+def execute_with_retry_strategy(
+    func: Callable[[], object],
+    strategy_map: Optional[dict] = None,
+    sleep_func: Callable[[float], None] = time.sleep,
+    time_func: Callable[[], float] = time.time,
+) -> RetryOutcome:
+    """
+    执行func(), 如果抛出异常, 根据异常类型查表决定是否重试、重试前等待多久,
+    直到成功、或者达到该异常类型允许的最大尝试次数、或者遇到一个"不应该
+    重试"的异常类型为止。
+
+    :param func: 一个不接受参数的可调用对象, 内部包含实际的业务逻辑
+        (比如一次真实的API调用), 调用者需要自行用闭包或functools.partial
+        把具体参数绑定好
+    :param strategy_map: 自定义的策略映射表, 默认使用DEFAULT_STRATEGY_MAP
+    :param sleep_func: 用于等待的函数, 测试时可以替换为不真正休眠的假函数,
+        避免单元测试因为真实sleep而变慢
+    :param time_func: 用于计时的函数, 同样便于测试时替换为可控的假实现
+    :return: 一份完整记录了整个重试过程的RetryOutcome
+    """
+    attempts: List[AttemptRecord] = []
+    attempt_number = 0
+    waited_before = 0.0
+    process_start = time_func()
+
+    while True:
+        attempt_number += 1
+        attempt_start = time_func()
+        try:
+            result = func()
+        except Exception as exc:  # noqa: BLE001 - 这里故意捕获所有异常, 交给策略判断如何处理
+            elapsed = time_func() - attempt_start
+            attempts.append(
+                AttemptRecord(
+                    attempt_number=attempt_number,
+                    succeeded=False,
+                    elapsed_seconds=elapsed,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                    waited_before_seconds=waited_before,
+                )
+            )
+            strategy = resolve_strategy_for_exception(exc, strategy_map)
+
+            should_continue = strategy.should_retry and attempt_number < strategy.max_attempts
+            if not should_continue:
+                total_elapsed = time_func() - process_start
+                return RetryOutcome(
+                    succeeded=False,
+                    total_attempts=attempt_number,
+                    total_elapsed_seconds=total_elapsed,
+                    attempts=attempts,
+                    final_error=exc,
+                )
+
+            waited_before = strategy.compute_wait_seconds(attempt_number, exc)
+            if waited_before > 0:
+                sleep_func(waited_before)
+            continue
+        else:
+            elapsed = time_func() - attempt_start
+            attempts.append(
+                AttemptRecord(
+                    attempt_number=attempt_number,
+                    succeeded=True,
+                    elapsed_seconds=elapsed,
+                    waited_before_seconds=waited_before,
+                )
+            )
+            total_elapsed = time_func() - process_start
+            return RetryOutcome(
+                succeeded=True,
+                total_attempts=attempt_number,
+                total_elapsed_seconds=total_elapsed,
+                attempts=attempts,
+                final_result=result,
+            )
+
+
+def demo_authentication_error_never_retries() -> None:
+    """演示401场景: 无论max_attempts配置得多大, should_retry=False意味着只会尝试一次。"""
+    print("=" * 60)
+    print("演示1: 401鉴权失败, 策略应为完全不重试")
+    print("=" * 60)
+
+    call_count = 0
+
+    def always_fail_with_401():
+        nonlocal call_count
+        call_count += 1
+        raise AuthenticationError("模拟的401鉴权失败", provider="deepseek")
+
+    outcome = execute_with_retry_strategy(always_fail_with_401, sleep_func=lambda seconds: None)
+    print(outcome.summary_text())
+    print(f"实际调用次数: {call_count}(预期为1, 因为401不应该重试)")
+    print()
+
+
+def demo_rate_limit_error_retries_with_retry_after() -> None:
+    """演示429场景: 前两次失败(带Retry-After), 第三次成功, 验证重试后能拿到最终结果。"""
+    print("=" * 60)
+    print("演示2: 429限流, 前两次失败, 第三次成功")
+    print("=" * 60)
+
+    call_count = 0
+    waited_amounts: List[float] = []
+
+    def sleep_recorder(seconds: float) -> None:
+        waited_amounts.append(seconds)
+
+    def fail_twice_then_succeed():
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 2:
+            raise RateLimitError("模拟的429限流", retry_after=2.0, provider="deepseek")
+        return "第三次终于成功拿到的AI回复"
+
+    outcome = execute_with_retry_strategy(fail_twice_then_succeed, sleep_func=sleep_recorder)
+    print(outcome.summary_text())
+    print(f"最终结果: {outcome.final_result}")
+    print(f"记录到的等待秒数序列: {waited_amounts}(预期两次都是2.0, 因为尊重了Retry-After建议值)")
+    print()
+
+
+def demo_timeout_error_uses_exponential_backoff() -> None:
+    """演示超时场景下指数退避的等待秒数序列: 1秒, 2秒, ……"""
+    print("=" * 60)
+    print("演示3: 超时场景, 指数退避等待秒数验证")
+    print("=" * 60)
+
+    call_count = 0
+    waited_amounts: List[float] = []
+
+    def sleep_recorder(seconds: float) -> None:
+        waited_amounts.append(seconds)
+
+    def always_timeout():
+        nonlocal call_count
+        call_count += 1
+        raise ModelTimeoutError("模拟的持续超时", timeout_seconds=0.01, provider="deepseek")
+
+    outcome = execute_with_retry_strategy(always_timeout, sleep_func=sleep_recorder)
+    print(outcome.summary_text())
+    print(f"记录到的等待秒数序列: {waited_amounts}(预期为[1.0, 2.0], 体现指数退避)")
+    print()
+
+
+def demo_unknown_exception_type_falls_back_to_no_retry() -> None:
+    """演示遇到策略表里完全没有登记的未知异常类型时, 兜底策略是不重试, 避免失控。"""
+    print("=" * 60)
+    print("演示4: 未登记的未知异常类型, 兜底为不重试")
+    print("=" * 60)
+
+    call_count = 0
+
+    def raise_unexpected_value_error():
+        nonlocal call_count
+        call_count += 1
+        raise ValueError("这是一个策略表里完全没有登记过的异常类型")
+
+    outcome = execute_with_retry_strategy(raise_unexpected_value_error, sleep_func=lambda seconds: None)
+    print(outcome.summary_text())
+    print(f"实际调用次数: {call_count}(预期为1, 未知异常走保守的不重试兜底策略)")
+    print()
+
+
+def main() -> None:
+    demo_authentication_error_never_retries()
+    demo_rate_limit_error_retries_with_retry_after()
+    demo_timeout_error_uses_exponential_backoff()
+    demo_unknown_exception_type_falls_back_to_no_retry()
+    print("全部重试策略演示运行完毕。")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 文件十二:`test_retry_strategy_lab.py`(重试策略模块单元测试)
+
+> 说明:针对retry_strategy_lab.py这套手写重试策略模块的单元测试,重点验证"重试逻辑的决策是否正确",完全不需要真实发起网络请求,只需要构造一个"会按照测试代码指定的次数失败、之后再成功(或永远失败)"的假函数传给`execute_with_retry_strategy`,观察其行为是否符合预期。所有测试都传入一个只负责记录"被要求等待了多少秒"而不会真正休眠的假sleep函数,确保整套测试套件运行飞快。
+
+```python
+"""
+文件名: test_retry_strategy_lab.py
+说明:
+    针对retry_strategy_lab.py这套手写重试策略模块的单元测试。
+
+    测试的重点不是"网络请求本身", 而是"重试逻辑的决策是否正确"——
+    这类测试完全不需要真实发起网络请求, 只需要构造一个"会按照测试代码
+    指定的次数失败, 之后再成功(或者永远失败)"的假函数, 传给
+    execute_with_retry_strategy, 观察它的行为是否符合预期。
+
+    为了让测试运行得飞快(不会因为真的sleep几秒而拖慢整个测试套件),
+    所有测试都会传入一个"假的sleep函数", 它只负责记录"被要求等待了
+    多少秒", 而不会真的让测试暂停。
+
+    运行方式:
+        python -m unittest test_retry_strategy_lab.py -v
+"""
+
+from __future__ import annotations
+
+import unittest
+from typing import List
+
+from api_exceptions import (
+    AuthenticationError,
+    ModelConnectionError,
+    ModelTimeoutError,
+    RateLimitError,
+)
+from retry_strategy_lab import (
+    RetryStrategy,
+    execute_with_retry_strategy,
+    resolve_strategy_for_exception,
+    strategy_for_authentication_error,
+    strategy_for_connection_error,
+    strategy_for_rate_limit_error,
+    strategy_for_timeout_error,
+)
+
+
+class FakeClock:
+    """
+    一个完全可控的假时钟, 每次调用都按固定步长递增, 用于让"耗时统计"
+    这类依赖time.time()的逻辑在测试环境下也能得到确定性的、可预测的数值,
+    避免测试断言依赖真实的系统时间, 那样的测试会因为机器性能波动而不稳定。
+    """
+
+    def __init__(self, step: float = 0.1) -> None:
+        self._current = 0.0
+        self._step = step
+
+    def __call__(self) -> float:
+        self._current += self._step
+        return self._current
+
+
+class TestRetryStrategyBasicFields(unittest.TestCase):
+    """测试RetryStrategy数据类本身的字段与compute_wait_seconds计算逻辑。"""
+
+    def test_fixed_wait_without_backoff_stays_constant(self):
+        strategy = RetryStrategy(should_retry=True, max_attempts=5, base_wait_seconds=2.0)
+        self.assertEqual(strategy.compute_wait_seconds(1, None), 2.0)
+        self.assertEqual(strategy.compute_wait_seconds(3, None), 2.0)
+
+    def test_exponential_backoff_doubles_each_time(self):
+        strategy = RetryStrategy(
+            should_retry=True, max_attempts=5, base_wait_seconds=1.0, use_exponential_backoff=True
+        )
+        self.assertEqual(strategy.compute_wait_seconds(1, None), 1.0)
+        self.assertEqual(strategy.compute_wait_seconds(2, None), 2.0)
+        self.assertEqual(strategy.compute_wait_seconds(3, None), 4.0)
+        self.assertEqual(strategy.compute_wait_seconds(4, None), 8.0)
+
+    def test_respect_retry_after_overrides_base_wait_for_rate_limit_error(self):
+        strategy = RetryStrategy(
+            should_retry=True, max_attempts=3, base_wait_seconds=1.0, respect_retry_after=True
+        )
+        exc = RateLimitError("限流", retry_after=9.5)
+        self.assertEqual(strategy.compute_wait_seconds(1, exc), 9.5)
+
+    def test_respect_retry_after_ignored_for_non_rate_limit_exception(self):
+        """
+        respect_retry_after=True这个配置项, 只应该对RateLimitError生效,
+        如果传入的异常不是RateLimitError(比如意外传了个ModelTimeoutError),
+        应该老老实实退回到base_wait_seconds, 而不是尝试读取一个可能不存在的属性。
+        """
+        strategy = RetryStrategy(
+            should_retry=True, max_attempts=3, base_wait_seconds=1.5, respect_retry_after=True
+        )
+        exc = ModelTimeoutError("超时", timeout_seconds=1.0)
+        self.assertEqual(strategy.compute_wait_seconds(1, exc), 1.5)
+
+
+class TestPresetStrategyFactories(unittest.TestCase):
+    """
+    验证四个预置策略工厂函数生成的策略, 严格符合课后作业第6题里
+    分析出来的结论, 这套测试实质上是把"文字分析"转换成了"可执行的断言",
+    确保未来如果有人不小心改动了策略参数, 能立刻被测试发现。
+    """
+
+    def test_authentication_error_strategy_never_retries(self):
+        strategy = strategy_for_authentication_error()
+        self.assertFalse(strategy.should_retry)
+        self.assertEqual(strategy.max_attempts, 1)
+
+    def test_rate_limit_error_strategy_retries_and_respects_retry_after(self):
+        strategy = strategy_for_rate_limit_error()
+        self.assertTrue(strategy.should_retry)
+        self.assertGreater(strategy.max_attempts, 1)
+        self.assertTrue(strategy.respect_retry_after)
+
+    def test_timeout_error_strategy_uses_exponential_backoff(self):
+        strategy = strategy_for_timeout_error()
+        self.assertTrue(strategy.should_retry)
+        self.assertTrue(strategy.use_exponential_backoff)
+
+    def test_connection_error_strategy_has_longer_base_wait_than_timeout(self):
+        """
+        连接失败通常意味着更严重的网络问题(而不是单纯的响应慢),
+        因此其基础等待时间理应不短于超时场景的基础等待时间,
+        这是一个体现"策略设计合理性"的对比性断言。
+        """
+        connection_strategy = strategy_for_connection_error()
+        timeout_strategy = strategy_for_timeout_error()
+        self.assertGreaterEqual(connection_strategy.base_wait_seconds, timeout_strategy.base_wait_seconds)
+
+
+class TestResolveStrategyForException(unittest.TestCase):
+    """测试根据异常实例反查对应重试策略的逻辑, 包括子类兼容与未知类型兜底。"""
+
+    def test_exact_type_match_returns_correct_strategy(self):
+        exc = AuthenticationError("鉴权失败")
+        strategy = resolve_strategy_for_exception(exc)
+        self.assertFalse(strategy.should_retry)
+
+    def test_rate_limit_exact_match(self):
+        exc = RateLimitError("限流")
+        strategy = resolve_strategy_for_exception(exc)
+        self.assertTrue(strategy.should_retry)
+        self.assertTrue(strategy.respect_retry_after)
+
+    def test_unknown_exception_type_returns_conservative_no_retry_strategy(self):
+        strategy = resolve_strategy_for_exception(ValueError("未登记类型"))
+        self.assertFalse(strategy.should_retry)
+        self.assertEqual(strategy.max_attempts, 1)
+
+    def test_custom_strategy_map_is_respected_over_default(self):
+        """
+        验证调用方可以传入一份自定义的策略映射表, 覆盖掉默认的DEFAULT_STRATEGY_MAP,
+        这为不同业务场景(比如某些内部管理后台可以接受对429做更激进的重试)
+        提供了灵活的定制空间。
+        """
+        custom_map = {RateLimitError: RetryStrategy(should_retry=True, max_attempts=10, base_wait_seconds=0.5)}
+        strategy = resolve_strategy_for_exception(RateLimitError("限流"), strategy_map=custom_map)
+        self.assertEqual(strategy.max_attempts, 10)
+
+
+class TestExecuteWithRetryStrategyEndToEnd(unittest.TestCase):
+    """
+    针对execute_with_retry_strategy这个核心执行函数的端到端测试,
+    覆盖"第一次就成功""重试几次后成功""最终失败"三大类场景。
+    """
+
+    def _no_op_sleep(self, seconds: float) -> None:
+        """测试专用的空sleep函数, 不真正阻塞, 只是满足接口签名要求。"""
+        return None
+
+    def test_immediate_success_records_single_attempt(self):
+        outcome = execute_with_retry_strategy(
+            lambda: "立即成功", sleep_func=self._no_op_sleep, time_func=FakeClock()
+        )
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual(outcome.total_attempts, 1)
+        self.assertEqual(outcome.final_result, "立即成功")
+
+    def test_authentication_error_stops_after_first_attempt(self):
+        call_count = 0
+
+        def always_401():
+            nonlocal call_count
+            call_count += 1
+            raise AuthenticationError("鉴权失败")
+
+        outcome = execute_with_retry_strategy(always_401, sleep_func=self._no_op_sleep, time_func=FakeClock())
+        self.assertFalse(outcome.succeeded)
+        self.assertEqual(call_count, 1)
+        self.assertIsInstance(outcome.final_error, AuthenticationError)
+
+    def test_rate_limit_error_retries_until_success_within_limit(self):
+        call_count = 0
+        recorded_waits: List[float] = []
+
+        def sleep_recorder(seconds: float) -> None:
+            recorded_waits.append(seconds)
+
+        def fail_twice_then_succeed():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise RateLimitError("限流", retry_after=1.5)
+            return "成功结果"
+
+        outcome = execute_with_retry_strategy(
+            fail_twice_then_succeed, sleep_func=sleep_recorder, time_func=FakeClock()
+        )
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual(outcome.total_attempts, 3)
+        self.assertEqual(recorded_waits, [1.5, 1.5])
+
+    def test_rate_limit_error_gives_up_after_max_attempts(self):
+        """
+        429场景的max_attempts是有限的(默认4次), 如果连续失败次数超过这个上限,
+        应该老老实实放弃, 而不是无限重试下去, 这里验证max_attempts真的被遵守了。
+        """
+        call_count = 0
+
+        def always_rate_limited():
+            nonlocal call_count
+            call_count += 1
+            raise RateLimitError("持续限流", retry_after=0.1)
+
+        outcome = execute_with_retry_strategy(
+            always_rate_limited, sleep_func=self._no_op_sleep, time_func=FakeClock()
+        )
+        self.assertFalse(outcome.succeeded)
+        self.assertEqual(call_count, strategy_for_rate_limit_error().max_attempts)
+
+    def test_timeout_error_exponential_backoff_wait_sequence(self):
+        recorded_waits: List[float] = []
+
+        def sleep_recorder(seconds: float) -> None:
+            recorded_waits.append(seconds)
+
+        def always_timeout():
+            raise ModelTimeoutError("持续超时", timeout_seconds=0.01)
+
+        outcome = execute_with_retry_strategy(
+            always_timeout, sleep_func=sleep_recorder, time_func=FakeClock()
+        )
+        self.assertFalse(outcome.succeeded)
+        expected_waits = [1.0, 2.0]  # 对应max_attempts=3, 失败2次之后触发2次等待
+        self.assertEqual(recorded_waits, expected_waits)
+
+    def test_connection_error_eventually_succeeds_after_transient_failures(self):
+        call_count = 0
+
+        def fail_once_then_succeed():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise ModelConnectionError("临时网络抖动")
+            return "网络恢复后成功"
+
+        outcome = execute_with_retry_strategy(
+            fail_once_then_succeed, sleep_func=self._no_op_sleep, time_func=FakeClock()
+        )
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual(outcome.final_result, "网络恢复后成功")
+        self.assertEqual(outcome.total_attempts, 2)
+
+    def test_outcome_summary_text_contains_key_information(self):
+        """验证summary_text()生成的文本至少包含尝试次数与最终状态这些关键信息, 便于日志排查。"""
+        outcome = execute_with_retry_strategy(
+            lambda: "结果", sleep_func=self._no_op_sleep, time_func=FakeClock()
+        )
+        text = outcome.summary_text()
+        self.assertIn("成功", text)
+        self.assertIn("1", text)
+
+    def test_attempt_records_are_ordered_and_numbered_sequentially(self):
+        """验证每次尝试的AttemptRecord.attempt_number严格按1,2,3...递增, 没有跳号或乱序。"""
+        call_count = 0
+
+        def fail_twice_then_succeed():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise ModelTimeoutError("超时", timeout_seconds=0.01)
+            return "ok"
+
+        outcome = execute_with_retry_strategy(
+            fail_twice_then_succeed, sleep_func=self._no_op_sleep, time_func=FakeClock()
+        )
+        numbers = [record.attempt_number for record in outcome.attempts]
+        self.assertEqual(numbers, [1, 2, 3])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+```
+
+### 文件十三:`conversation_history_analyzer.py`(对话历史统计分析工具)
+
+> 说明:ask_ai.py的F8功能会把每一次会话保存成一份带时间戳的json文件,但ask_ai.py本身没有提供任何"回头去看这些历史文件、做统计分析"的能力。陈铭在整理自己这几天攒下来的对话记录时,意识到这是一个值得单独做的小工具——统计"自己最常问哪一类问题""哪个模型服务商回复平均更长""哪次对话轮次最多"这些信息,对复盘自己的学习过程、以及后续苍穹项目里"用户行为分析"模块的设计,都是一次有意义的练习。
+
+```python
+"""
+文件名: conversation_history_analyzer.py
+说明:
+    ask_ai.py的F8功能(对话历史落盘)会把每一次会话保存成一份
+    conversation_history/conversation_<provider>_<时间戳>.json文件,
+    但ask_ai.py本身只负责"保存", 没有提供任何"回头去看这些历史文件,
+    做一些统计分析"的能力。陈铭在周末整理自己这几天攒下来的对话记录时,
+    意识到这其实是一个值得单独做的小工具——统计"自己最常问哪一类问题"
+    "哪个模型服务商回复平均更长""哪次对话轮次最多"这些信息, 对复盘
+    自己的学习过程、以及后续苍穹项目里"用户行为分析"模块的设计,
+    都是一次有意义的练习。
+
+    本模块提供的能力:
+        1. load_conversation_file: 加载单份对话历史json文件, 做基本的
+           结构校验, 校验失败时给出清晰的错误说明而不是让程序直接崩溃。
+        2. load_all_conversation_files: 批量加载一个目录下的所有对话历史文件,
+           自动跳过无法解析的文件, 并记录哪些文件被跳过、原因是什么。
+        3. ConversationStats: 汇总统计结果的数据结构。
+        4. compute_stats_for_single_conversation /
+           compute_aggregate_stats: 分别计算单份对话与多份对话汇总的统计信息。
+        5. render_stats_report: 把统计结果渲染成一段人类可读的中文报告文本。
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+
+@dataclass
+class LoadedConversation:
+    """成功加载的单份对话历史, 附带来源文件路径, 便于后续报告中溯源。"""
+
+    file_path: Path
+    provider: str
+    saved_at: str
+    messages: list
+
+
+@dataclass
+class SkippedFile:
+    """加载失败被跳过的文件记录, 附带跳过原因, 便于排查数据质量问题。"""
+
+    file_path: Path
+    reason: str
+
+
+def load_conversation_file(file_path: Path) -> LoadedConversation:
+    """
+    加载单份对话历史json文件, 校验其结构是否符合ask_ai.py保存时的约定格式
+    (必须包含provider/saved_at/messages三个顶层字段, messages必须是列表,
+    且列表中每个元素都必须是包含role/content两个字段的字典)。
+
+    :param file_path: 对话历史json文件路径
+    :raises ValueError: 文件内容不是合法JSON, 或者结构不符合约定格式
+    :return: 校验通过的LoadedConversation对象
+    """
+    try:
+        raw_text = file_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"无法读取文件: {exc}") from exc
+
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"文件内容不是合法的JSON: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError("顶层结构必须是一个JSON对象(字典), 而不是列表或其他类型")
+
+    for required_field in ("provider", "saved_at", "messages"):
+        if required_field not in data:
+            raise ValueError(f"缺少必需的顶层字段: {required_field}")
+
+    messages = data["messages"]
+    if not isinstance(messages, list):
+        raise ValueError("messages字段必须是一个列表")
+
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise ValueError(f"messages[{index}]必须是一个字典, 实际类型: {type(message).__name__}")
+        if "role" not in message or "content" not in message:
+            raise ValueError(f"messages[{index}]缺少role或content字段")
+
+    return LoadedConversation(
+        file_path=file_path,
+        provider=str(data["provider"]),
+        saved_at=str(data["saved_at"]),
+        messages=messages,
+    )
+
+
+def load_all_conversation_files(
+    directory: Path,
+) -> Tuple[List[LoadedConversation], List[SkippedFile]]:
+    """
+    批量加载目录下所有以.json为扩展名的对话历史文件。
+
+    :param directory: 存放对话历史文件的目录(通常是ask_ai.py里的
+        conversation_history/目录)
+    :return: 二元组(成功加载的对话列表, 被跳过的文件及原因列表)
+    """
+    loaded: List[LoadedConversation] = []
+    skipped: List[SkippedFile] = []
+
+    if not directory.exists():
+        return loaded, skipped
+
+    for file_path in sorted(directory.glob("*.json")):
+        try:
+            loaded.append(load_conversation_file(file_path))
+        except ValueError as exc:
+            skipped.append(SkippedFile(file_path=file_path, reason=str(exc)))
+
+    return loaded, skipped
+
+
+@dataclass
+class ConversationStats:
+    """一份(或多份汇总)对话历史的统计结果。"""
+
+    provider: Optional[str] = None
+    total_conversations: int = 0
+    total_user_messages: int = 0
+    total_assistant_messages: int = 0
+    total_user_characters: int = 0
+    total_assistant_characters: int = 0
+    longest_user_message: str = ""
+    longest_assistant_message: str = ""
+    max_rounds_in_single_conversation: int = 0
+    per_provider_conversation_count: dict = field(default_factory=dict)
+
+    @property
+    def average_assistant_reply_length(self) -> float:
+        """AI回复的平均字符长度, 用于粗略衡量"这个厂商的回复是不是普遍更啰嗦"。"""
+        if self.total_assistant_messages == 0:
+            return 0.0
+        return self.total_assistant_characters / self.total_assistant_messages
+
+    @property
+    def average_rounds_per_conversation(self) -> float:
+        """平均每次对话包含多少轮问答(一轮 = 一条user消息 + 一条assistant消息)。"""
+        if self.total_conversations == 0:
+            return 0.0
+        return self.total_user_messages / self.total_conversations
+
+
+def compute_stats_for_single_conversation(conversation: LoadedConversation) -> ConversationStats:
+    """计算单份对话历史的统计信息, 常用于"我这一次对话到底聊了些什么"的场景。"""
+    stats = ConversationStats(provider=conversation.provider, total_conversations=1)
+
+    user_messages = [m for m in conversation.messages if m.get("role") == "user"]
+    assistant_messages = [m for m in conversation.messages if m.get("role") == "assistant"]
+
+    stats.total_user_messages = len(user_messages)
+    stats.total_assistant_messages = len(assistant_messages)
+    stats.total_user_characters = sum(len(str(m.get("content", ""))) for m in user_messages)
+    stats.total_assistant_characters = sum(len(str(m.get("content", ""))) for m in assistant_messages)
+    stats.max_rounds_in_single_conversation = len(user_messages)
+
+    if user_messages:
+        stats.longest_user_message = max(
+            (str(m.get("content", "")) for m in user_messages), key=len
+        )
+    if assistant_messages:
+        stats.longest_assistant_message = max(
+            (str(m.get("content", "")) for m in assistant_messages), key=len
+        )
+
+    stats.per_provider_conversation_count[conversation.provider] = 1
+    return stats
+
+
+def compute_aggregate_stats(conversations: List[LoadedConversation]) -> ConversationStats:
+    """
+    汇总计算多份对话历史的整体统计信息, 用于"我这一周总共问了多少问题,
+    分别用了哪些模型服务商"这类回顾性分析。
+
+    :param conversations: 已成功加载的多份对话历史
+    :return: 汇总后的ConversationStats(provider字段在多provider混合场景下
+        保留为None, 表示"这是一份跨服务商的汇总统计", 具体分布见
+        per_provider_conversation_count字段)
+    """
+    aggregate = ConversationStats(total_conversations=len(conversations))
+
+    longest_user_candidate = ""
+    longest_assistant_candidate = ""
+
+    for conversation in conversations:
+        single_stats = compute_stats_for_single_conversation(conversation)
+
+        aggregate.total_user_messages += single_stats.total_user_messages
+        aggregate.total_assistant_messages += single_stats.total_assistant_messages
+        aggregate.total_user_characters += single_stats.total_user_characters
+        aggregate.total_assistant_characters += single_stats.total_assistant_characters
+        aggregate.max_rounds_in_single_conversation = max(
+            aggregate.max_rounds_in_single_conversation,
+            single_stats.max_rounds_in_single_conversation,
+        )
+
+        if len(single_stats.longest_user_message) > len(longest_user_candidate):
+            longest_user_candidate = single_stats.longest_user_message
+        if len(single_stats.longest_assistant_message) > len(longest_assistant_candidate):
+            longest_assistant_candidate = single_stats.longest_assistant_message
+
+        provider = conversation.provider
+        aggregate.per_provider_conversation_count[provider] = (
+            aggregate.per_provider_conversation_count.get(provider, 0) + 1
+        )
+
+    aggregate.longest_user_message = longest_user_candidate
+    aggregate.longest_assistant_message = longest_assistant_candidate
+
+    if len(aggregate.per_provider_conversation_count) == 1:
+        aggregate.provider = next(iter(aggregate.per_provider_conversation_count))
+
+    return aggregate
+
+
+def truncate_for_display(text: str, max_length: int = 60) -> str:
+    """把过长的文本截断到指定长度用于展示, 避免报告里出现一整段几百字的原文, 影响阅读。"""
+    if len(text) <= max_length:
+        return text
+    return text[:max_length] + "……(已截断)"
+
+
+def render_stats_report(stats: ConversationStats, title: str = "对话历史统计报告") -> str:
+    """把ConversationStats渲染成一段结构清晰的中文文本报告。"""
+    lines = [
+        "=" * 50,
+        title,
+        "=" * 50,
+        f"对话文件总数: {stats.total_conversations}",
+        f"累计提问次数: {stats.total_user_messages}",
+        f"累计AI回复次数: {stats.total_assistant_messages}",
+        f"平均每次对话的问答轮数: {stats.average_rounds_per_conversation:.1f}",
+        f"AI回复平均长度(字符数): {stats.average_assistant_reply_length:.1f}",
+        f"单次对话中最多的问答轮数: {stats.max_rounds_in_single_conversation}",
+    ]
+
+    if stats.per_provider_conversation_count:
+        lines.append("各模型服务商使用次数分布:")
+        for provider, count in sorted(
+            stats.per_provider_conversation_count.items(), key=lambda item: item[1], reverse=True
+        ):
+            lines.append(f"  {provider}: {count}次")
+
+    if stats.longest_user_message:
+        lines.append(f"最长的一次提问: {truncate_for_display(stats.longest_user_message)}")
+    if stats.longest_assistant_message:
+        lines.append(f"最长的一次AI回复: {truncate_for_display(stats.longest_assistant_message)}")
+
+    lines.append("=" * 50)
+    return "\n".join(lines)
+
+
+def main() -> None:
+    """
+    命令行入口: 加载conversation_history/目录下的全部历史文件, 打印汇总统计报告,
+    并对每个被跳过的文件给出跳过原因(这在教学阶段有意保留了两份可能残缺的
+    测试文件, 用于演示"数据质量问题不应该导致整个分析工具直接崩溃"这一原则)。
+    """
+    history_dir = Path(__file__).resolve().parent / "conversation_history"
+    loaded, skipped = load_all_conversation_files(history_dir)
+
+    if not loaded:
+        print(f"目录{history_dir}下没有找到任何有效的对话历史文件。")
+        print("(提示: 先运行ask_ai.py, 在退出时选择保存对话历史, 再重新运行本工具)")
+    else:
+        aggregate_stats = compute_aggregate_stats(loaded)
+        print(render_stats_report(aggregate_stats, title="全部对话历史汇总统计"))
+
+    if skipped:
+        print()
+        print(f"以下{len(skipped)}个文件因格式问题被跳过:")
+        for item in skipped:
+            print(f"  {item.file_path.name}: {item.reason}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 文件十四:`test_conversation_history_analyzer.py`(对话历史分析工具单元测试)
+
+> 说明:针对conversation_history_analyzer.py的单元测试,使用Python标准库`tempfile`在系统临时目录下创建真实的、结构或明或暗有问题的json文件,验证加载与统计逻辑在各种正常与异常输入下都表现符合预期。选择"真的写文件再读回来"这种测试方式,是因为`load_conversation_file`的核心职责之一就是"处理来自磁盘文件的、可能存在各种格式问题的原始文本",这部分逻辑必须通过真实的文件读写才能被充分覆盖测试到。
+
+```python
+"""
+文件名: test_conversation_history_analyzer.py
+说明:
+    针对conversation_history_analyzer.py的单元测试, 使用Python标准库
+    tempfile在系统临时目录下创建真实的、结构或明或暗有问题的json文件,
+    验证加载与统计逻辑在各种正常与异常输入下都表现符合预期。
+
+    之所以选择"真的写文件再读回来"这种略显"重"的测试方式, 而不是
+    只在内存里构造Python字典直接调用compute_stats_for_single_conversation,
+    是因为load_conversation_file这个函数本身的核心职责之一,
+    就是"处理来自磁盘文件的、可能存在各种格式问题的原始文本",
+    这部分逻辑必须通过真实的文件读写才能被充分覆盖测试到。
+
+    运行方式:
+        python -m unittest test_conversation_history_analyzer.py -v
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import tempfile
+import unittest
+from pathlib import Path
+
+from conversation_history_analyzer import (
+    compute_aggregate_stats,
+    compute_stats_for_single_conversation,
+    load_all_conversation_files,
+    load_conversation_file,
+    render_stats_report,
+    truncate_for_display,
+)
+
+
+def write_json_file(directory: Path, filename: str, content) -> Path:
+    """辅助函数: 把content序列化为JSON并写入指定目录下的filename文件, 返回完整路径。"""
+    file_path = directory / filename
+    if isinstance(content, str):
+        file_path.write_text(content, encoding="utf-8")
+    else:
+        file_path.write_text(json.dumps(content, ensure_ascii=False), encoding="utf-8")
+    return file_path
+
+
+class ConversationHistoryTestCase(unittest.TestCase):
+    """
+    提供一个每个测试方法都会自动创建/清理的临时目录, 避免测试之间
+    互相污染文件系统状态, 也避免测试结束后在磁盘上留下垃圾文件。
+    """
+
+    def setUp(self) -> None:
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="day12_conv_history_test_"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+
+class TestLoadConversationFile(ConversationHistoryTestCase):
+    """测试单份文件加载与结构校验逻辑。"""
+
+    def test_valid_file_loads_successfully(self):
+        content = {
+            "provider": "deepseek",
+            "saved_at": "2026-07-14T10:00:00",
+            "messages": [
+                {"role": "system", "content": "你是助手"},
+                {"role": "user", "content": "你好"},
+                {"role": "assistant", "content": "你好, 有什么可以帮你"},
+            ],
+        }
+        file_path = write_json_file(self.temp_dir, "valid.json", content)
+
+        loaded = load_conversation_file(file_path)
+        self.assertEqual(loaded.provider, "deepseek")
+        self.assertEqual(len(loaded.messages), 3)
+
+    def test_invalid_json_text_raises_value_error(self):
+        file_path = write_json_file(self.temp_dir, "broken.json", "{this is not valid json")
+        with self.assertRaises(ValueError) as ctx:
+            load_conversation_file(file_path)
+        self.assertIn("JSON", str(ctx.exception))
+
+    def test_top_level_not_a_dict_raises_value_error(self):
+        file_path = write_json_file(self.temp_dir, "list_top_level.json", ["not", "a", "dict"])
+        with self.assertRaises(ValueError) as ctx:
+            load_conversation_file(file_path)
+        self.assertIn("JSON对象", str(ctx.exception))
+
+    def test_missing_required_field_raises_value_error(self):
+        content = {"provider": "qwen", "messages": []}  # 缺少saved_at字段
+        file_path = write_json_file(self.temp_dir, "missing_field.json", content)
+        with self.assertRaises(ValueError) as ctx:
+            load_conversation_file(file_path)
+        self.assertIn("saved_at", str(ctx.exception))
+
+    def test_messages_not_a_list_raises_value_error(self):
+        content = {"provider": "qwen", "saved_at": "x", "messages": "不应该是字符串"}
+        file_path = write_json_file(self.temp_dir, "bad_messages_type.json", content)
+        with self.assertRaises(ValueError) as ctx:
+            load_conversation_file(file_path)
+        self.assertIn("messages字段必须是一个列表", str(ctx.exception))
+
+    def test_message_missing_role_field_raises_value_error(self):
+        content = {
+            "provider": "qwen",
+            "saved_at": "x",
+            "messages": [{"content": "缺少role字段的消息"}],
+        }
+        file_path = write_json_file(self.temp_dir, "bad_message_item.json", content)
+        with self.assertRaises(ValueError) as ctx:
+            load_conversation_file(file_path)
+        self.assertIn("messages[0]", str(ctx.exception))
+
+    def test_message_item_not_a_dict_raises_value_error(self):
+        content = {"provider": "qwen", "saved_at": "x", "messages": ["这应该是字典而不是字符串"]}
+        file_path = write_json_file(self.temp_dir, "message_not_dict.json", content)
+        with self.assertRaises(ValueError):
+            load_conversation_file(file_path)
+
+    def test_nonexistent_file_raises_value_error_not_crash(self):
+        nonexistent = self.temp_dir / "does_not_exist.json"
+        with self.assertRaises(ValueError):
+            load_conversation_file(nonexistent)
+
+
+class TestLoadAllConversationFiles(ConversationHistoryTestCase):
+    """测试批量加载目录下所有文件的逻辑, 包括正常文件与残缺文件混合的场景。"""
+
+    def test_empty_directory_returns_empty_results(self):
+        loaded, skipped = load_all_conversation_files(self.temp_dir)
+        self.assertEqual(loaded, [])
+        self.assertEqual(skipped, [])
+
+    def test_nonexistent_directory_returns_empty_results_without_crashing(self):
+        loaded, skipped = load_all_conversation_files(self.temp_dir / "does_not_exist_dir")
+        self.assertEqual(loaded, [])
+        self.assertEqual(skipped, [])
+
+    def test_mixed_valid_and_invalid_files_are_separated_correctly(self):
+        write_json_file(
+            self.temp_dir,
+            "conversation_deepseek_20260714_100000.json",
+            {
+                "provider": "deepseek",
+                "saved_at": "2026-07-14T10:00:00",
+                "messages": [{"role": "user", "content": "问题一"}],
+            },
+        )
+        write_json_file(
+            self.temp_dir,
+            "conversation_qwen_20260714_110000.json",
+            {
+                "provider": "qwen",
+                "saved_at": "2026-07-14T11:00:00",
+                "messages": [{"role": "user", "content": "问题二"}],
+            },
+        )
+        write_json_file(self.temp_dir, "conversation_broken.json", "not valid json at all {{{")
+
+        loaded, skipped = load_all_conversation_files(self.temp_dir)
+        self.assertEqual(len(loaded), 2)
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0].file_path.name, "conversation_broken.json")
+
+    def test_non_json_files_are_ignored_entirely(self):
+        """非.json扩展名的文件(比如README.txt)不应该被当作候选文件尝试加载, 也不应该出现在skipped列表里。"""
+        (self.temp_dir / "README.txt").write_text("这不是对话历史文件", encoding="utf-8")
+        write_json_file(
+            self.temp_dir,
+            "conversation_deepseek_1.json",
+            {"provider": "deepseek", "saved_at": "x", "messages": []},
+        )
+        loaded, skipped = load_all_conversation_files(self.temp_dir)
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(len(skipped), 0)
+
+    def test_files_are_loaded_in_sorted_filename_order(self):
+        """
+        验证加载顺序是按文件名排序的(而不是操作系统返回的任意顺序),
+        这对报告的可重复性、以及"最早一份对话是哪个"这类分析很重要。
+        """
+        for suffix in ("c", "a", "b"):
+            write_json_file(
+                self.temp_dir,
+                f"conversation_{suffix}.json",
+                {"provider": "deepseek", "saved_at": suffix, "messages": []},
+            )
+        loaded, _ = load_all_conversation_files(self.temp_dir)
+        saved_at_order = [item.saved_at for item in loaded]
+        self.assertEqual(saved_at_order, ["a", "b", "c"])
+
+
+class TestComputeStatsForSingleConversation(unittest.TestCase):
+    """测试单份对话的统计计算逻辑, 使用内存构造的LoadedConversation, 不涉及文件系统。"""
+
+    def _build_loaded(self, provider: str, messages: list):
+        from conversation_history_analyzer import LoadedConversation
+
+        return LoadedConversation(
+            file_path=Path("/tmp/fake.json"), provider=provider, saved_at="x", messages=messages
+        )
+
+    def test_counts_user_and_assistant_messages_separately(self):
+        conversation = self._build_loaded(
+            "deepseek",
+            [
+                {"role": "system", "content": "系统消息不计入统计"},
+                {"role": "user", "content": "问题一"},
+                {"role": "assistant", "content": "回答一"},
+                {"role": "user", "content": "问题二"},
+                {"role": "assistant", "content": "回答二"},
+            ],
+        )
+        stats = compute_stats_for_single_conversation(conversation)
+        self.assertEqual(stats.total_user_messages, 2)
+        self.assertEqual(stats.total_assistant_messages, 2)
+        self.assertEqual(stats.max_rounds_in_single_conversation, 2)
+
+    def test_longest_message_detection(self):
+        conversation = self._build_loaded(
+            "qwen",
+            [
+                {"role": "user", "content": "短问题"},
+                {"role": "user", "content": "这是一个明显更长一些的问题内容"},
+                {"role": "assistant", "content": "简短回答"},
+            ],
+        )
+        stats = compute_stats_for_single_conversation(conversation)
+        self.assertEqual(stats.longest_user_message, "这是一个明显更长一些的问题内容")
+
+    def test_empty_messages_list_produces_zeroed_stats_without_crashing(self):
+        conversation = self._build_loaded("deepseek", [])
+        stats = compute_stats_for_single_conversation(conversation)
+        self.assertEqual(stats.total_user_messages, 0)
+        self.assertEqual(stats.average_assistant_reply_length, 0.0)
+        self.assertEqual(stats.longest_user_message, "")
+
+    def test_average_assistant_reply_length_calculation(self):
+        conversation = self._build_loaded(
+            "deepseek",
+            [
+                {"role": "assistant", "content": "12345"},  # 5字符
+                {"role": "assistant", "content": "1234567890"},  # 10字符
+            ],
+        )
+        stats = compute_stats_for_single_conversation(conversation)
+        self.assertAlmostEqual(stats.average_assistant_reply_length, 7.5)
+
+
+class TestComputeAggregateStats(unittest.TestCase):
+    """测试多份对话汇总统计的逻辑, 重点验证跨provider的分布统计是否正确。"""
+
+    def _build_loaded(self, provider: str, messages: list):
+        from conversation_history_analyzer import LoadedConversation
+
+        return LoadedConversation(
+            file_path=Path("/tmp/fake.json"), provider=provider, saved_at="x", messages=messages
+        )
+
+    def test_aggregate_across_multiple_providers(self):
+        conversations = [
+            self._build_loaded("deepseek", [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]),
+            self._build_loaded("deepseek", [{"role": "user", "content": "q2"}, {"role": "assistant", "content": "a2"}]),
+            self._build_loaded("qwen", [{"role": "user", "content": "q3"}, {"role": "assistant", "content": "a3"}]),
+        ]
+        aggregate = compute_aggregate_stats(conversations)
+
+        self.assertEqual(aggregate.total_conversations, 3)
+        self.assertEqual(aggregate.per_provider_conversation_count["deepseek"], 2)
+        self.assertEqual(aggregate.per_provider_conversation_count["qwen"], 1)
+        # 混合了多个provider, provider字段应保持为None(表示这是跨厂商汇总)
+        self.assertIsNone(aggregate.provider)
+
+    def test_aggregate_with_single_provider_sets_provider_field(self):
+        conversations = [
+            self._build_loaded("deepseek", [{"role": "user", "content": "q1"}]),
+            self._build_loaded("deepseek", [{"role": "user", "content": "q2"}]),
+        ]
+        aggregate = compute_aggregate_stats(conversations)
+        self.assertEqual(aggregate.provider, "deepseek")
+
+    def test_aggregate_of_empty_list_returns_zeroed_stats(self):
+        aggregate = compute_aggregate_stats([])
+        self.assertEqual(aggregate.total_conversations, 0)
+        self.assertEqual(aggregate.average_rounds_per_conversation, 0.0)
+
+
+class TestRenderStatsReportAndTruncate(unittest.TestCase):
+    """测试报告渲染文本与截断辅助函数的边界情况。"""
+
+    def test_truncate_short_text_unchanged(self):
+        self.assertEqual(truncate_for_display("短文本", max_length=60), "短文本")
+
+    def test_truncate_long_text_appends_marker(self):
+        long_text = "字" * 100
+        truncated = truncate_for_display(long_text, max_length=20)
+        self.assertTrue(truncated.startswith("字" * 20))
+        self.assertIn("已截断", truncated)
+
+    def test_render_report_contains_title_and_counts(self):
+        from conversation_history_analyzer import ConversationStats
+
+        stats = ConversationStats(total_conversations=5, total_user_messages=10)
+        report = render_stats_report(stats, title="测试标题")
+        self.assertIn("测试标题", report)
+        self.assertIn("5", report)
+        self.assertIn("10", report)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+```
+
 ## ask_ai.py 交互指令说明
 
 - 直接输入问题并回车: 向当前模型服务商提问
