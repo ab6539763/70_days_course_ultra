@@ -2570,6 +2570,2054 @@ if __name__ == "__main__":
 
 这份扩展版脚本跑起来之后,`check_permission_model_declarative`这一项恰好命中了WARNING——因为陈铭还没来得及把YAML配置里`permission_architecture.style`这个字段补上,脚本诚实地报告了"当前方案还没有声明采用声明式权限模型"。他把这一项也记进了明天要更新的YAML配置清单里,顺手把健康度评分打印出来看了一眼:87.3分,B级,"建议修复WARNING项后提交"。他把这个数字截图发给老王,附言只写了一句:"今晚先做到这里,明天评审前把WARNING项清完,争取冲到A级再上会。"过了几分钟,老王回了一条消息:"分数是给别人看的参考,你自己心里要清楚每一分扣在哪、为什么扣、值不值得为了凑分数硬改。睡吧,明天两场评审,都不轻松。"
 
+### 六、单元测试:多租户权限隔离数据模型测试套件
+
+方案文档写得再漂亮,权限判断逻辑本身如果只靠`if __name__ == "__main__"`里几行手工调用去验证,评审专家一旦追问"如果授权还没到生效时间会怎样""同一个知识子域被授予两次会怎样"这类边界问题,现场是答不上来的。陈铭连夜给`tenant_isolation_models.py`补了一套完整的单元测试,用SQLite内存数据库搭建独立的测试夹具,覆盖子域访问控制、跨租户授权有效期、审计日志完整性、供应链字段屏蔽边界值、新租户接入这五大类场景,一共29个测试用例,全部可以在CI流水线里反复运行,不依赖任何真实数据库环境。
+
+```python
+"""
+苍穹1.0 全域智能体平台 —— 多租户权限隔离数据模型单元测试
+文件: test_tenant_isolation_models.py
+
+背景:
+    技术方案评审前,陈铭意识到`tenant_isolation_models.py`里最核心的几条
+    权限判断逻辑——跨租户授权的有效期校验、子域访问的显式拒绝、
+    审计日志的强制落库——目前都只有`if __name__ == "__main__"`里
+    几行手工调用验证过,没有一套可以反复运行、可以在CI里跑的测试。
+    他用SQLite内存数据库(不依赖真实数据库环境)重新搭建了一套测试夹具,
+    覆盖正常路径、权限边界、审计日志完整性三大类场景。
+
+依赖:
+    pip install sqlalchemy pydantic
+"""
+
+from __future__ import annotations
+
+import enum
+import uuid
+import unittest
+from datetime import datetime, timedelta
+from typing import Optional, List
+
+from sqlalchemy import (
+    create_engine, Column, String, Boolean, DateTime, ForeignKey,
+    Enum as SAEnum, Integer, Text, UniqueConstraint, Index, JSON,
+)
+from sqlalchemy.orm import declarative_base, relationship, Session, sessionmaker
+from pydantic import BaseModel, Field, field_validator, ValidationError
+
+Base = declarative_base()
+
+
+class TenantCode(str, enum.Enum):
+    LEGAL_CENTER = "legal_center"
+    HR_CENTER = "hr_center"
+    SCM_CENTER = "scm_center"
+
+
+class AuditActionType(str, enum.Enum):
+    ACCESS_GRANTED = "access_granted"
+    ACCESS_DENIED = "access_denied"
+    CROSS_TENANT_GRANTED = "cross_tenant_granted"
+    CROSS_TENANT_DENIED = "cross_tenant_denied"
+
+
+class Tenant(Base):
+    __tablename__ = "tenants"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_code = Column(SAEnum(TenantCode), nullable=False, unique=True)
+    tenant_name = Column(String(128), nullable=False)
+    vector_collection_name = Column(String(128), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    is_active = Column(Boolean, default=True)
+
+    users = relationship("PlatformUser", back_populates="tenant")
+    knowledge_domains = relationship("KnowledgeSubDomain", back_populates="tenant")
+
+
+class PlatformUser(Base):
+    __tablename__ = "platform_users"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    sso_account = Column(String(128), nullable=False, unique=True)
+    display_name = Column(String(128), nullable=False)
+    tenant_id = Column(String(36), ForeignKey("tenants.id"), nullable=False)
+    employee_id = Column(String(64), nullable=True)
+    procurement_level = Column(Integer, nullable=True)
+    business_line = Column(String(64), nullable=True)
+    is_active = Column(Boolean, default=True)
+
+    tenant = relationship("Tenant", back_populates="users")
+
+    __table_args__ = (
+        Index("ix_platform_users_tenant_employee", "tenant_id", "employee_id"),
+    )
+
+
+class KnowledgeSubDomain(Base):
+    __tablename__ = "knowledge_sub_domains"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id = Column(String(36), ForeignKey("tenants.id"), nullable=False)
+    domain_code = Column(String(64), nullable=False)
+    domain_name = Column(String(128), nullable=False)
+
+    tenant = relationship("Tenant", back_populates="knowledge_domains")
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "domain_code", name="uq_tenant_domain_code"),
+    )
+
+
+class UserDomainAccess(Base):
+    __tablename__ = "user_domain_access"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("platform_users.id"), nullable=False)
+    domain_id = Column(String(36), ForeignKey("knowledge_sub_domains.id"), nullable=False)
+    granted_at = Column(DateTime, default=datetime.utcnow)
+    granted_by = Column(String(128), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "domain_id", name="uq_user_domain"),
+    )
+
+
+class CrossTenantGrant(Base):
+    __tablename__ = "cross_tenant_grants"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("platform_users.id"), nullable=False)
+    source_tenant_id = Column(String(36), ForeignKey("tenants.id"), nullable=False)
+    target_tenant_id = Column(String(36), ForeignKey("tenants.id"), nullable=False)
+    scope_description = Column(Text, nullable=False)
+    approved_by_source = Column(String(128), nullable=False)
+    approved_by_target = Column(String(128), nullable=False)
+    valid_from = Column(DateTime, default=datetime.utcnow)
+    valid_until = Column(DateTime, nullable=False)
+    is_revoked = Column(Boolean, default=False)
+
+    def is_currently_valid(self) -> bool:
+        now = datetime.utcnow()
+        return (
+            not self.is_revoked
+            and self.valid_from <= now <= self.valid_until
+        )
+
+
+class AccessAuditLog(Base):
+    __tablename__ = "access_audit_logs"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("platform_users.id"), nullable=False)
+    action_type = Column(SAEnum(AuditActionType), nullable=False)
+    source_tenant_id = Column(String(36), nullable=False)
+    target_tenant_id = Column(String(36), nullable=True)
+    data_scope_accessed = Column(JSON, nullable=True)
+    result_summary = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class PermissionDeniedError(Exception):
+    pass
+
+
+class TenantScopedQuery(BaseModel):
+    requester_user_id: str
+    primary_tenant_id: str = Field(..., description="发起请求的用户所属主租户,必填")
+    target_tenant_id: Optional[str] = Field(default=None)
+    sub_domain_codes: List[str] = Field(default_factory=list)
+    query_text: str
+
+    @field_validator("primary_tenant_id")
+    @classmethod
+    def primary_tenant_must_not_be_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("primary_tenant_id 不能为空,任何查询必须明确携带租户上下文")
+        return v
+
+
+def check_sub_domain_access(session: Session, user_id: str, domain_id: str) -> bool:
+    record = (
+        session.query(UserDomainAccess)
+        .filter(
+            UserDomainAccess.user_id == user_id,
+            UserDomainAccess.domain_id == domain_id,
+        )
+        .first()
+    )
+    return record is not None
+
+
+def check_cross_tenant_grant(
+    session: Session, user_id: str, source_tenant_id: str, target_tenant_id: str
+) -> CrossTenantGrant:
+    grant = (
+        session.query(CrossTenantGrant)
+        .filter(
+            CrossTenantGrant.user_id == user_id,
+            CrossTenantGrant.source_tenant_id == source_tenant_id,
+            CrossTenantGrant.target_tenant_id == target_tenant_id,
+        )
+        .first()
+    )
+    if grant is None or not grant.is_currently_valid():
+        raise PermissionDeniedError(
+            f"用户 {user_id} 不具备从租户 {source_tenant_id} "
+            f"访问租户 {target_tenant_id} 数据的有效授权"
+        )
+    return grant
+
+
+def resolve_scm_field_mask(procurement_level: int) -> List[str]:
+    if procurement_level >= 3:
+        return []
+    elif procurement_level == 2:
+        return ["contract_specific_price"]
+    else:
+        return ["contract_specific_price", "cross_category_price_comparison"]
+
+
+def write_audit_log(
+    session: Session,
+    user_id: str,
+    action_type: AuditActionType,
+    source_tenant_id: str,
+    target_tenant_id: Optional[str] = None,
+    data_scope_accessed: Optional[dict] = None,
+    result_summary: Optional[str] = None,
+) -> AccessAuditLog:
+    log_entry = AccessAuditLog(
+        user_id=user_id,
+        action_type=action_type,
+        source_tenant_id=source_tenant_id,
+        target_tenant_id=target_tenant_id,
+        data_scope_accessed=data_scope_accessed,
+        result_summary=result_summary,
+    )
+    session.add(log_entry)
+    session.commit()
+    return log_entry
+
+
+class CrossTenantRequestHandler:
+    def __init__(self, session: Session):
+        self.session = session
+
+    def handle(self, query: TenantScopedQuery) -> dict:
+        if query.target_tenant_id is None or query.target_tenant_id == query.primary_tenant_id:
+            return {
+                "status": "ok",
+                "cross_tenant": False,
+                "message": "单租户请求,按常规权限校验后处理",
+            }
+
+        try:
+            grant = check_cross_tenant_grant(
+                self.session,
+                query.requester_user_id,
+                query.primary_tenant_id,
+                query.target_tenant_id,
+            )
+        except PermissionDeniedError as e:
+            write_audit_log(
+                self.session,
+                user_id=query.requester_user_id,
+                action_type=AuditActionType.CROSS_TENANT_DENIED,
+                source_tenant_id=query.primary_tenant_id,
+                target_tenant_id=query.target_tenant_id,
+                result_summary=str(e),
+            )
+            return {
+                "status": "partial_denied",
+                "cross_tenant": True,
+                "message": "无跨租户协同授权,仅返回本租户权限范围内数据,"
+                           "请联系相关部门负责人申请跨部门协同权限",
+            }
+
+        result_a = {"source": query.primary_tenant_id, "data": "本租户范围数据(示意)"}
+        result_b = {"source": query.target_tenant_id, "data": "已授权跨租户数据(示意)"}
+
+        write_audit_log(
+            self.session,
+            user_id=query.requester_user_id,
+            action_type=AuditActionType.CROSS_TENANT_GRANTED,
+            source_tenant_id=query.primary_tenant_id,
+            target_tenant_id=query.target_tenant_id,
+            data_scope_accessed={"scope": grant.scope_description},
+            result_summary="跨租户请求已授权并完成聚合",
+        )
+
+        return {
+            "status": "ok",
+            "cross_tenant": True,
+            "results": [result_a, result_b],
+        }
+
+
+def onboard_new_tenant(
+    session: Session,
+    tenant_code: str,
+    tenant_name: str,
+    vector_collection_name: Optional[str] = None,
+) -> Tenant:
+    new_tenant = Tenant(
+        tenant_code=tenant_code,
+        tenant_name=tenant_name,
+        vector_collection_name=vector_collection_name,
+    )
+    session.add(new_tenant)
+    session.commit()
+    return new_tenant
+
+
+# ---------------------------------------------------------------------------
+# 单元测试正文
+# ---------------------------------------------------------------------------
+
+class TenantIsolationTestCase(unittest.TestCase):
+    """
+    公共测试基类:每个测试用例都在独立的SQLite内存数据库上运行,
+    避免测试之间互相污染数据——这一点在权限相关的测试里尤其重要,
+    如果测试数据互相串了,很容易掩盖掉真正的权限漏洞。
+    """
+
+    def setUp(self):
+        self.engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(self.engine)
+        session_factory = sessionmaker(bind=self.engine)
+        self.session: Session = session_factory()
+
+    def tearDown(self):
+        self.session.close()
+        self.engine.dispose()
+
+    def _create_tenant(self, code: TenantCode, name: str) -> Tenant:
+        tenant = Tenant(tenant_code=code, tenant_name=name)
+        self.session.add(tenant)
+        self.session.commit()
+        return tenant
+
+    def _create_user(self, tenant: Tenant, sso_account: str, **kwargs) -> PlatformUser:
+        user = PlatformUser(
+            sso_account=sso_account, display_name=sso_account,
+            tenant_id=tenant.id, **kwargs,
+        )
+        self.session.add(user)
+        self.session.commit()
+        return user
+
+
+class TestTenantScopedQueryValidation(unittest.TestCase):
+    """验证 TenantScopedQuery 的Pydantic校验逻辑,这是"杜绝忘记传租户上下文"的第一道防线"""
+
+    def test_valid_query_passes_validation(self):
+        query = TenantScopedQuery(
+            requester_user_id="u1", primary_tenant_id="legal_center", query_text="测试"
+        )
+        self.assertEqual(query.primary_tenant_id, "legal_center")
+
+    def test_empty_primary_tenant_id_raises_validation_error(self):
+        with self.assertRaises(ValidationError):
+            TenantScopedQuery(requester_user_id="u1", primary_tenant_id="", query_text="测试")
+
+    def test_whitespace_only_primary_tenant_id_raises_validation_error(self):
+        """
+        纯空格的租户ID是一个容易被忽略的边界场景——
+        字符串非空但strip之后为空,同样应该被拒绝。
+        """
+        with self.assertRaises(ValidationError):
+            TenantScopedQuery(requester_user_id="u1", primary_tenant_id="   ", query_text="测试")
+
+    def test_missing_primary_tenant_id_raises_validation_error(self):
+        """primary_tenant_id是必填字段,完全不传也应该报错,而不是使用某个隐式默认值"""
+        with self.assertRaises(ValidationError):
+            TenantScopedQuery(requester_user_id="u1", query_text="测试")
+
+    def test_target_tenant_id_defaults_to_none(self):
+        query = TenantScopedQuery(
+            requester_user_id="u1", primary_tenant_id="legal_center", query_text="测试"
+        )
+        self.assertIsNone(query.target_tenant_id)
+
+    def test_sub_domain_codes_defaults_to_empty_list_not_shared_mutable(self):
+        """
+        default_factory=list是必要的写法,如果误写成default=[],
+        多个实例会共享同一个可变默认值,这是Python里一个经典陷阱,
+        本测试用于确保这个陷阱没有在这个模型上发生。
+        """
+        query_a = TenantScopedQuery(
+            requester_user_id="u1", primary_tenant_id="legal_center", query_text="a"
+        )
+        query_b = TenantScopedQuery(
+            requester_user_id="u2", primary_tenant_id="legal_center", query_text="b"
+        )
+        query_a.sub_domain_codes.append("domestic")
+        self.assertEqual(query_b.sub_domain_codes, [])
+
+
+class TestSubDomainAccessControl(TenantIsolationTestCase):
+    """验证法务中心场景下的子域访问控制:未显式授权必须被拒绝"""
+
+    def test_user_without_grant_cannot_access_domain(self):
+        tenant = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        user = self._create_user(tenant, "chen_legal")
+        domain = KnowledgeSubDomain(tenant_id=tenant.id, domain_code="overseas", domain_name="境外业务")
+        self.session.add(domain)
+        self.session.commit()
+
+        self.assertFalse(check_sub_domain_access(self.session, user.id, domain.id))
+
+    def test_user_with_explicit_grant_can_access_domain(self):
+        tenant = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        user = self._create_user(tenant, "zhao_legal_senior")
+        domain = KnowledgeSubDomain(tenant_id=tenant.id, domain_code="subsidiary", domain_name="子公司专属")
+        self.session.add(domain)
+        self.session.commit()
+
+        grant = UserDomainAccess(user_id=user.id, domain_id=domain.id, granted_by="老王")
+        self.session.add(grant)
+        self.session.commit()
+
+        self.assertTrue(check_sub_domain_access(self.session, user.id, domain.id))
+
+    def test_grant_for_different_domain_does_not_leak_access(self):
+        """
+        授予A子域的访问权限,不应该意外地让用户能访问B子域——
+        这是权限系统里最基本、也最容易被误测漏掉的一条隔离性验证。
+        """
+        tenant = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        user = self._create_user(tenant, "chen_legal_junior")
+        domain_a = KnowledgeSubDomain(tenant_id=tenant.id, domain_code="domestic", domain_name="境内业务")
+        domain_b = KnowledgeSubDomain(tenant_id=tenant.id, domain_code="overseas", domain_name="境外业务")
+        self.session.add_all([domain_a, domain_b])
+        self.session.commit()
+
+        self.session.add(UserDomainAccess(user_id=user.id, domain_id=domain_a.id, granted_by="老王"))
+        self.session.commit()
+
+        self.assertTrue(check_sub_domain_access(self.session, user.id, domain_a.id))
+        self.assertFalse(check_sub_domain_access(self.session, user.id, domain_b.id))
+
+    def test_duplicate_grant_for_same_user_domain_raises_integrity_error(self):
+        """
+        UniqueConstraint("user_id", "domain_id")应该阻止重复授权记录,
+        这既是数据完整性保证,也避免审计时出现"同一权限被授予了两次"的困惑。
+        """
+        from sqlalchemy.exc import IntegrityError
+
+        tenant = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        user = self._create_user(tenant, "chen_legal_dup")
+        domain = KnowledgeSubDomain(tenant_id=tenant.id, domain_code="domestic", domain_name="境内业务")
+        self.session.add(domain)
+        self.session.commit()
+
+        self.session.add(UserDomainAccess(user_id=user.id, domain_id=domain.id, granted_by="老王"))
+        self.session.commit()
+
+        self.session.add(UserDomainAccess(user_id=user.id, domain_id=domain.id, granted_by="郭建军"))
+        with self.assertRaises(IntegrityError):
+            self.session.commit()
+        self.session.rollback()
+
+
+class TestCrossTenantGrantValidity(TenantIsolationTestCase):
+    """验证跨租户授权的有效期与撤销逻辑"""
+
+    def _make_grant(self, user, source, target, valid_from=None, valid_until=None, is_revoked=False):
+        grant = CrossTenantGrant(
+            user_id=user.id,
+            source_tenant_id=source.id,
+            target_tenant_id=target.id,
+            scope_description="测试授权范围",
+            approved_by_source="法务负责人",
+            approved_by_target="供应链负责人",
+            valid_from=valid_from or (datetime.utcnow() - timedelta(days=1)),
+            valid_until=valid_until or (datetime.utcnow() + timedelta(days=30)),
+            is_revoked=is_revoked,
+        )
+        self.session.add(grant)
+        self.session.commit()
+        return grant
+
+    def test_valid_grant_within_time_window_is_currently_valid(self):
+        legal = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        scm = self._create_tenant(TenantCode.SCM_CENTER, "供应链管理中心")
+        user = self._create_user(legal, "chen_cross")
+        grant = self._make_grant(user, legal, scm)
+        self.assertTrue(grant.is_currently_valid())
+
+    def test_revoked_grant_is_not_valid_even_within_time_window(self):
+        legal = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        scm = self._create_tenant(TenantCode.SCM_CENTER, "供应链管理中心")
+        user = self._create_user(legal, "chen_revoked")
+        grant = self._make_grant(user, legal, scm, is_revoked=True)
+        self.assertFalse(grant.is_currently_valid())
+
+    def test_expired_grant_is_not_valid(self):
+        legal = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        scm = self._create_tenant(TenantCode.SCM_CENTER, "供应链管理中心")
+        user = self._create_user(legal, "chen_expired")
+        grant = self._make_grant(
+            user, legal, scm,
+            valid_from=datetime.utcnow() - timedelta(days=60),
+            valid_until=datetime.utcnow() - timedelta(days=1),
+        )
+        self.assertFalse(grant.is_currently_valid())
+
+    def test_not_yet_effective_grant_is_not_valid(self):
+        """
+        授权还没到生效时间(valid_from在未来)也应该被判定为无效——
+        这是一个容易被忽略的边界场景,很多实现只检查valid_until,漏了valid_from。
+        """
+        legal = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        scm = self._create_tenant(TenantCode.SCM_CENTER, "供应链管理中心")
+        user = self._create_user(legal, "chen_future")
+        grant = self._make_grant(
+            user, legal, scm,
+            valid_from=datetime.utcnow() + timedelta(days=1),
+            valid_until=datetime.utcnow() + timedelta(days=30),
+        )
+        self.assertFalse(grant.is_currently_valid())
+
+    def test_check_cross_tenant_grant_raises_when_no_grant_exists(self):
+        legal = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        scm = self._create_tenant(TenantCode.SCM_CENTER, "供应链管理中心")
+        user = self._create_user(legal, "chen_no_grant")
+
+        with self.assertRaises(PermissionDeniedError):
+            check_cross_tenant_grant(self.session, user.id, legal.id, scm.id)
+
+    def test_check_cross_tenant_grant_raises_when_grant_expired(self):
+        legal = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        scm = self._create_tenant(TenantCode.SCM_CENTER, "供应链管理中心")
+        user = self._create_user(legal, "chen_expired_check")
+        self._make_grant(
+            user, legal, scm,
+            valid_from=datetime.utcnow() - timedelta(days=60),
+            valid_until=datetime.utcnow() - timedelta(days=1),
+        )
+        with self.assertRaises(PermissionDeniedError):
+            check_cross_tenant_grant(self.session, user.id, legal.id, scm.id)
+
+    def test_grant_does_not_apply_to_reversed_direction(self):
+        """
+        A租户授权用户访问B租户,不代表B租户的用户可以访问A租户——
+        授权方向是单向的,不应该被隐式对称化。
+        """
+        legal = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        scm = self._create_tenant(TenantCode.SCM_CENTER, "供应链管理中心")
+        user = self._create_user(legal, "chen_direction")
+        self._make_grant(user, legal, scm)
+
+        with self.assertRaises(PermissionDeniedError):
+            check_cross_tenant_grant(self.session, user.id, scm.id, legal.id)
+
+
+class TestCrossTenantRequestHandlerFlow(TenantIsolationTestCase):
+    """
+    集成级测试:验证CrossTenantRequestHandler对三种典型场景的完整处理路径,
+    并验证每一种场景都正确落库了审计日志——这是需求文档里"不可绕过"的硬性要求。
+    """
+
+    def test_single_tenant_request_does_not_write_cross_tenant_audit_log(self):
+        legal = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        user = self._create_user(legal, "chen_single")
+        handler = CrossTenantRequestHandler(self.session)
+
+        query = TenantScopedQuery(
+            requester_user_id=user.id, primary_tenant_id=legal.id, query_text="单租户查询"
+        )
+        result = handler.handle(query)
+        self.assertFalse(result["cross_tenant"])
+
+        logs = self.session.query(AccessAuditLog).all()
+        self.assertEqual(len(logs), 0)
+
+    def test_cross_tenant_request_without_grant_is_denied_and_logged(self):
+        legal = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        scm = self._create_tenant(TenantCode.SCM_CENTER, "供应链管理中心")
+        user = self._create_user(legal, "chen_denied")
+        handler = CrossTenantRequestHandler(self.session)
+
+        query = TenantScopedQuery(
+            requester_user_id=user.id, primary_tenant_id=legal.id,
+            target_tenant_id=scm.id, query_text="跨租户查询",
+        )
+        result = handler.handle(query)
+
+        self.assertEqual(result["status"], "partial_denied")
+        logs = self.session.query(AccessAuditLog).all()
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0].action_type, AuditActionType.CROSS_TENANT_DENIED)
+
+    def test_cross_tenant_request_with_valid_grant_is_approved_and_logged(self):
+        legal = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        scm = self._create_tenant(TenantCode.SCM_CENTER, "供应链管理中心")
+        user = self._create_user(legal, "chen_approved")
+
+        grant = CrossTenantGrant(
+            user_id=user.id, source_tenant_id=legal.id, target_tenant_id=scm.id,
+            scope_description="联合尽调项目",
+            approved_by_source="法务负责人", approved_by_target="供应链负责人",
+            valid_from=datetime.utcnow() - timedelta(days=1),
+            valid_until=datetime.utcnow() + timedelta(days=30),
+        )
+        self.session.add(grant)
+        self.session.commit()
+
+        handler = CrossTenantRequestHandler(self.session)
+        query = TenantScopedQuery(
+            requester_user_id=user.id, primary_tenant_id=legal.id,
+            target_tenant_id=scm.id, query_text="跨租户查询",
+        )
+        result = handler.handle(query)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["cross_tenant"])
+        self.assertEqual(len(result["results"]), 2)
+
+        logs = self.session.query(AccessAuditLog).all()
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0].action_type, AuditActionType.CROSS_TENANT_GRANTED)
+
+    def test_expired_grant_is_treated_same_as_no_grant(self):
+        """过期授权应该走和'无授权'完全相同的拒绝+审计路径,不应该有特殊处理导致行为不一致"""
+        legal = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        scm = self._create_tenant(TenantCode.SCM_CENTER, "供应链管理中心")
+        user = self._create_user(legal, "chen_expired_flow")
+
+        grant = CrossTenantGrant(
+            user_id=user.id, source_tenant_id=legal.id, target_tenant_id=scm.id,
+            scope_description="已过期项目",
+            approved_by_source="法务负责人", approved_by_target="供应链负责人",
+            valid_from=datetime.utcnow() - timedelta(days=60),
+            valid_until=datetime.utcnow() - timedelta(days=1),
+        )
+        self.session.add(grant)
+        self.session.commit()
+
+        handler = CrossTenantRequestHandler(self.session)
+        query = TenantScopedQuery(
+            requester_user_id=user.id, primary_tenant_id=legal.id,
+            target_tenant_id=scm.id, query_text="跨租户查询",
+        )
+        result = handler.handle(query)
+        self.assertEqual(result["status"], "partial_denied")
+
+
+class TestScmFieldMaskResolution(unittest.TestCase):
+    """验证供应链场景职级到字段屏蔽规则的边界值"""
+
+    def test_director_level_has_no_field_restriction(self):
+        self.assertEqual(resolve_scm_field_mask(3), [])
+
+    def test_manager_level_hides_only_specific_price(self):
+        self.assertEqual(resolve_scm_field_mask(2), ["contract_specific_price"])
+
+    def test_specialist_level_hides_two_fields(self):
+        masked = resolve_scm_field_mask(1)
+        self.assertIn("contract_specific_price", masked)
+        self.assertIn("cross_category_price_comparison", masked)
+
+    def test_level_above_director_still_has_no_restriction(self):
+        """职级5、10这类超出预期范围但仍然>=3的值,不应该导致异常,应该和职级3一样处理"""
+        self.assertEqual(resolve_scm_field_mask(10), [])
+
+    def test_zero_or_negative_level_treated_as_most_restrictive(self):
+        """职级0或负数是异常输入,但函数不应该崩溃,应该按最严格的规则处理,拒绝优先于放行"""
+        self.assertEqual(
+            resolve_scm_field_mask(0),
+            ["contract_specific_price", "cross_category_price_comparison"],
+        )
+        self.assertEqual(
+            resolve_scm_field_mask(-1),
+            ["contract_specific_price", "cross_category_price_comparison"],
+        )
+
+
+class TestOnboardNewTenant(TenantIsolationTestCase):
+    """验证新租户接入函数,这是"平台化"设计的核心验证点之一"""
+
+    def test_onboard_creates_tenant_with_expected_fields(self):
+        tenant = onboard_new_tenant(
+            self.session, tenant_code=TenantCode.SCM_CENTER,
+            tenant_name="供应链管理中心", vector_collection_name="scm_center_v1",
+        )
+        self.assertIsNotNone(tenant.id)
+        self.assertEqual(tenant.tenant_name, "供应链管理中心")
+        self.assertTrue(tenant.is_active)
+
+    def test_onboarding_duplicate_tenant_code_raises_integrity_error(self):
+        """
+        tenant_code设置了unique约束,重复接入同一个租户编码应该报错,
+        而不是静默产生两条数据,造成后续查询行为不可预测。
+        """
+        from sqlalchemy.exc import IntegrityError
+
+        onboard_new_tenant(self.session, tenant_code=TenantCode.HR_CENTER, tenant_name="人力资源中心")
+        with self.assertRaises(IntegrityError):
+            onboard_new_tenant(self.session, tenant_code=TenantCode.HR_CENTER, tenant_name="人力资源中心重复")
+        self.session.rollback()
+
+    def test_new_tenant_has_no_users_or_domains_by_default(self):
+        tenant = onboard_new_tenant(self.session, tenant_code=TenantCode.LEGAL_CENTER, tenant_name="法务中心")
+        self.assertEqual(len(tenant.users), 0)
+        self.assertEqual(len(tenant.knowledge_domains), 0)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+```
+
+跑完这29个用例,陈铭在提交前的最后一次自查里,顺手把`test_grant_does_not_apply_to_reversed_direction`这个用例圈了出来发到评审群里——"跨租户授权方向不能被隐式对称化"这条规则,在方案文档的文字描述里其实很容易被一句话带过,但只有写成一条可执行的断言,才能确保未来任何人改动`check_cross_tenant_grant`的实现时都不会不小心引入方向性漏洞。
+
+### 七、单元测试与边界情况覆盖:RBAC声明式策略引擎
+
+方案评审会上另一个尖锐的问题来自安全团队:"`PolicyEngine`替代了原来硬编码的`resolve_scm_field_mask`函数,新旧两套逻辑给出的结果真的完全一致吗?"陈铭此前只是用三个已知职级角色手工跑了一遍做了肉眼比对,这显然不够严谨。他把这次比对固化成了一套系统性的单元测试,覆盖deny-overrides合并逻辑、通配符规则、动态条件占位符、多角色叠加、角色配置的序列化往返,以及最关键的——新旧两套方案在三个职级角色上的完整对比断言。这个过程中他也顺手修正了策略引擎里两处隐藏的边界情况bug:一是动态占位符在上下文缺失属性时会被错误地判定为"条件满足",二是专员和经理角色缺少通配符ALLOW规则兜底,导致未被显式提及的基础字段会被"默认拒绝"原则误伤。
+
+```python
+"""
+苍穹1.0 全域智能体平台 —— RBAC声明式策略引擎单元测试与边界情况覆盖
+文件: test_rbac_policy_engine.py
+
+背景:
+    PolicyEngine是替代旧版resolve_scm_field_mask等硬编码函数的核心组件,
+    陈铭在评审前用旧函数和新引擎做了一次输出结果比对,确认了行为等价性,
+    但那只是针对已知的三个职级角色跑了一遍,没有系统性覆盖deny-overrides
+    合并逻辑、未匹配规则时的默认拒绝、多角色叠加等更复杂的场景。
+    这套测试补齐了这些覆盖缺口。
+"""
+
+from __future__ import annotations
+
+import unittest
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+
+class PolicyEffect(str, Enum):
+    ALLOW = "allow"
+    DENY = "deny"
+
+
+class ResourceScope(str, Enum):
+    FIELD = "field"
+    ROW_FILTER = "row_filter"
+    SUB_DOMAIN = "sub_domain"
+    CROSS_TENANT = "cross_tenant"
+    ACTION = "action"
+
+
+@dataclass
+class PolicyRule:
+    rule_id: str
+    scope: ResourceScope
+    effect: PolicyEffect
+    target: str
+    condition: Dict[str, Any] = field(default_factory=dict)
+    description: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "rule_id": self.rule_id,
+            "scope": self.scope.value,
+            "effect": self.effect.value,
+            "target": self.target,
+            "condition": self.condition,
+            "description": self.description,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "PolicyRule":
+        return PolicyRule(
+            rule_id=d["rule_id"],
+            scope=ResourceScope(d["scope"]),
+            effect=PolicyEffect(d["effect"]),
+            target=d["target"],
+            condition=d.get("condition", {}),
+            description=d.get("description", ""),
+        )
+
+
+@dataclass
+class Role:
+    role_id: str
+    role_name: str
+    tenant_code: str
+    policies: List[PolicyRule] = field(default_factory=list)
+    description: str = ""
+
+    def add_policy(self, rule: PolicyRule) -> None:
+        self.policies.append(rule)
+
+
+@dataclass
+class UserRoleBinding:
+    user_id: str
+    role_ids: List[str] = field(default_factory=list)
+
+
+class RoleRegistry:
+    def __init__(self):
+        self._roles: Dict[str, Role] = {}
+
+    def register(self, role: Role) -> None:
+        self._roles[role.role_id] = role
+
+    def get(self, role_id: str) -> Optional[Role]:
+        return self._roles.get(role_id)
+
+    def list_by_tenant(self, tenant_code: str) -> List[Role]:
+        return [r for r in self._roles.values() if r.tenant_code == tenant_code]
+
+    def export_to_dict(self) -> dict:
+        return {
+            role_id: {
+                "role_name": role.role_name,
+                "tenant_code": role.tenant_code,
+                "description": role.description,
+                "policies": [p.to_dict() for p in role.policies],
+            }
+            for role_id, role in self._roles.items()
+        }
+
+    def load_from_dict(self, data: dict) -> None:
+        for role_id, role_data in data.items():
+            role = Role(
+                role_id=role_id,
+                role_name=role_data["role_name"],
+                tenant_code=role_data["tenant_code"],
+                description=role_data.get("description", ""),
+                policies=[PolicyRule.from_dict(p) for p in role_data.get("policies", [])],
+            )
+            self.register(role)
+
+
+@dataclass
+class PolicyDecision:
+    allowed: bool
+    scope: ResourceScope
+    target: str
+    matched_rules: List[str] = field(default_factory=list)
+    reason: str = ""
+
+
+class PolicyEvaluationContext:
+    def __init__(self, user_attributes: Dict[str, Any]):
+        self.user_attributes = user_attributes
+
+    def resolve(self, value: Any) -> Any:
+        if isinstance(value, str) and value.startswith("${user.") and value.endswith("}"):
+            attr_name = value[len("${user."):-1]
+            return self.user_attributes.get(attr_name)
+        return value
+
+
+class PolicyEngine:
+    def __init__(self, role_registry: RoleRegistry, role_bindings: Dict[str, UserRoleBinding]):
+        self._registry = role_registry
+        self._bindings = role_bindings
+
+    def _get_user_roles(self, user_id: str) -> List[Role]:
+        binding = self._bindings.get(user_id)
+        if binding is None:
+            return []
+        roles = []
+        for role_id in binding.role_ids:
+            role = self._registry.get(role_id)
+            if role is not None:
+                roles.append(role)
+        return roles
+
+    def evaluate(
+        self,
+        user_id: str,
+        scope: ResourceScope,
+        target: str,
+        context_attributes: Optional[Dict[str, Any]] = None,
+    ) -> PolicyDecision:
+        roles = self._get_user_roles(user_id)
+        ctx = PolicyEvaluationContext(context_attributes or {})
+
+        matched_deny: List[str] = []
+        matched_allow: List[str] = []
+
+        for role in roles:
+            for rule in role.policies:
+                if rule.scope != scope:
+                    continue
+                if rule.target != target and rule.target != "*":
+                    continue
+                if not self._condition_satisfied(rule.condition, ctx):
+                    continue
+                if rule.effect == PolicyEffect.DENY:
+                    matched_deny.append(rule.rule_id)
+                else:
+                    matched_allow.append(rule.rule_id)
+
+        if matched_deny:
+            return PolicyDecision(
+                allowed=False, scope=scope, target=target,
+                matched_rules=matched_deny, reason="命中显式拒绝规则,拒绝优先于允许",
+            )
+        if matched_allow:
+            return PolicyDecision(
+                allowed=True, scope=scope, target=target,
+                matched_rules=matched_allow, reason="命中显式允许规则",
+            )
+        return PolicyDecision(
+            allowed=False, scope=scope, target=target,
+            matched_rules=[], reason="未命中任何显式规则,按最小权限原则默认拒绝",
+        )
+
+    def _condition_satisfied(self, condition: Dict[str, Any], ctx: PolicyEvaluationContext) -> bool:
+        if not condition:
+            return True
+        for key, expected in condition.items():
+            if isinstance(expected, str) and expected.startswith("${user.") and expected.endswith("}"):
+                attr_name = expected[len("${user."):-1]
+                if attr_name not in ctx.user_attributes:
+                    # 占位符引用的用户属性在上下文里根本不存在,
+                    # 说明调用方没有正确传递上下文,应该按"条件不满足"处理,
+                    # 而不是把None当成一个合法值参与比较(那样反而可能意外放行)。
+                    return False
+                resolved_expected = ctx.user_attributes[attr_name]
+            else:
+                resolved_expected = expected
+            actual = ctx.user_attributes.get(key)
+            if resolved_expected != actual:
+                return False
+        return True
+
+    def resolve_visible_fields(
+        self, user_id: str, all_fields: List[str], context_attributes: Optional[Dict[str, Any]] = None
+    ) -> List[str]:
+        visible = []
+        for f in all_fields:
+            decision = self.evaluate(user_id, ResourceScope.FIELD, f, context_attributes)
+            if decision.allowed:
+                visible.append(f)
+        return visible
+
+    def resolve_row_filter(
+        self, user_id: str, context_attributes: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        roles = self._get_user_roles(user_id)
+        ctx = PolicyEvaluationContext(context_attributes or {})
+        filters = []
+        for role in roles:
+            for rule in role.policies:
+                if rule.scope != ResourceScope.ROW_FILTER or rule.effect != PolicyEffect.ALLOW:
+                    continue
+                resolved_condition = {
+                    k: ctx.resolve(v) for k, v in rule.condition.items()
+                }
+                filters.append(resolved_condition)
+        return filters
+
+
+# ---------------------------------------------------------------------------
+# 单元测试正文
+# ---------------------------------------------------------------------------
+
+class TestPolicyEngineDefaultDeny(unittest.TestCase):
+    """验证"未命中任何规则时默认拒绝"这一最小权限原则"""
+
+    def test_user_with_no_roles_is_denied_everything(self):
+        registry = RoleRegistry()
+        engine = PolicyEngine(registry, {})
+        decision = engine.evaluate("ghost_user", ResourceScope.FIELD, "any_field")
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.matched_rules, [])
+
+    def test_user_with_role_but_no_matching_policy_is_denied(self):
+        registry = RoleRegistry()
+        role = Role("r1", "空角色", "scm_center")
+        registry.register(role)
+        bindings = {"u1": UserRoleBinding("u1", ["r1"])}
+        engine = PolicyEngine(registry, bindings)
+
+        decision = engine.evaluate("u1", ResourceScope.FIELD, "some_field")
+        self.assertFalse(decision.allowed)
+
+    def test_unknown_role_id_in_binding_is_silently_ignored(self):
+        """
+        绑定关系里引用了一个注册中心里不存在的role_id(比如角色被删除但绑定没清理),
+        引擎应该忽略这个无效角色,而不是抛异常导致整个权限判断失败——
+        这是一个健壮性要求:数据不一致不应该导致系统崩溃,而应该退化到"该角色视为无权限"。
+        """
+        registry = RoleRegistry()
+        bindings = {"u1": UserRoleBinding("u1", ["deleted_role_id"])}
+        engine = PolicyEngine(registry, bindings)
+        decision = engine.evaluate("u1", ResourceScope.FIELD, "some_field")
+        self.assertFalse(decision.allowed)
+
+
+class TestPolicyEngineDenyOverridesAllow(unittest.TestCase):
+    """验证deny-overrides合并逻辑:拒绝优先于允许,即使允许规则也匹配"""
+
+    def test_deny_wins_when_both_allow_and_deny_match(self):
+        registry = RoleRegistry()
+        role_allow = Role("r_allow", "允许角色", "scm_center")
+        role_allow.add_policy(PolicyRule("p1", ResourceScope.FIELD, PolicyEffect.ALLOW, "price"))
+        role_deny = Role("r_deny", "拒绝角色", "scm_center")
+        role_deny.add_policy(PolicyRule("p2", ResourceScope.FIELD, PolicyEffect.DENY, "price"))
+        registry.register(role_allow)
+        registry.register(role_deny)
+
+        bindings = {"u1": UserRoleBinding("u1", ["r_allow", "r_deny"])}
+        engine = PolicyEngine(registry, bindings)
+
+        decision = engine.evaluate("u1", ResourceScope.FIELD, "price")
+        self.assertFalse(decision.allowed)
+        self.assertIn("p2", decision.matched_rules)
+
+    def test_deny_wins_regardless_of_role_binding_order(self):
+        """
+        deny-overrides不应该受角色绑定顺序影响——
+        无论DENY角色在列表前面还是后面,结果都应该是拒绝。
+        """
+        registry = RoleRegistry()
+        role_allow = Role("r_allow", "允许角色", "scm_center")
+        role_allow.add_policy(PolicyRule("p1", ResourceScope.FIELD, PolicyEffect.ALLOW, "price"))
+        role_deny = Role("r_deny", "拒绝角色", "scm_center")
+        role_deny.add_policy(PolicyRule("p2", ResourceScope.FIELD, PolicyEffect.DENY, "price"))
+        registry.register(role_allow)
+        registry.register(role_deny)
+
+        bindings_order_1 = {"u1": UserRoleBinding("u1", ["r_deny", "r_allow"])}
+        engine_1 = PolicyEngine(registry, bindings_order_1)
+        self.assertFalse(engine_1.evaluate("u1", ResourceScope.FIELD, "price").allowed)
+
+
+class TestPolicyEngineWildcardTarget(unittest.TestCase):
+    """验证通配符target='*'的行为"""
+
+    def test_wildcard_allow_matches_any_field(self):
+        registry = RoleRegistry()
+        role = Role("r_director", "总监", "scm_center")
+        role.add_policy(PolicyRule("p1", ResourceScope.FIELD, PolicyEffect.ALLOW, "*"))
+        registry.register(role)
+        bindings = {"u1": UserRoleBinding("u1", ["r_director"])}
+        engine = PolicyEngine(registry, bindings)
+
+        for field_name in ["price", "supplier_name", "anything_else"]:
+            decision = engine.evaluate("u1", ResourceScope.FIELD, field_name)
+            self.assertTrue(decision.allowed, f"字段{field_name}应该被通配符规则允许")
+
+    def test_specific_deny_overrides_wildcard_allow(self):
+        """
+        即使有通配符ALLOW规则,一条具体字段的DENY规则也应该生效——
+        这验证了通配符匹配和具体匹配在同一次evaluate里能够共存并正确合并。
+        """
+        registry = RoleRegistry()
+        role = Role("r_special", "特殊角色", "scm_center")
+        role.add_policy(PolicyRule("p1", ResourceScope.FIELD, PolicyEffect.ALLOW, "*"))
+        role.add_policy(PolicyRule("p2", ResourceScope.FIELD, PolicyEffect.DENY, "salary"))
+        registry.register(role)
+        bindings = {"u1": UserRoleBinding("u1", ["r_special"])}
+        engine = PolicyEngine(registry, bindings)
+
+        self.assertFalse(engine.evaluate("u1", ResourceScope.FIELD, "salary").allowed)
+        self.assertTrue(engine.evaluate("u1", ResourceScope.FIELD, "other_field").allowed)
+
+
+class TestPolicyEngineConditionalRules(unittest.TestCase):
+    """验证带condition的动态条件规则,这是"仅能查询本业务线数据"这类行级权限的核心机制"""
+
+    def test_condition_with_dynamic_placeholder_matches_when_equal(self):
+        registry = RoleRegistry()
+        role = Role("r1", "采购专员", "scm_center")
+        role.add_policy(PolicyRule(
+            "p1", ResourceScope.ROW_FILTER, PolicyEffect.ALLOW, "supplier_data",
+            condition={"business_line": "${user.business_line}"},
+        ))
+        registry.register(role)
+        bindings = {"u1": UserRoleBinding("u1", ["r1"])}
+        engine = PolicyEngine(registry, bindings)
+
+        decision = engine.evaluate(
+            "u1", ResourceScope.ROW_FILTER, "supplier_data",
+            context_attributes={"business_line": "raw_material"},
+        )
+        self.assertTrue(decision.allowed)
+
+    def test_condition_placeholder_with_missing_context_attribute_fails_safely(self):
+        """
+        如果上下文里根本没有传business_line属性,动态占位符解析为None,
+        条件不满足,应该判定为不匹配(拒绝),不应该抛异常或意外放行。
+        """
+        registry = RoleRegistry()
+        role = Role("r1", "采购专员", "scm_center")
+        role.add_policy(PolicyRule(
+            "p1", ResourceScope.ROW_FILTER, PolicyEffect.ALLOW, "supplier_data",
+            condition={"business_line": "${user.business_line}"},
+        ))
+        registry.register(role)
+        bindings = {"u1": UserRoleBinding("u1", ["r1"])}
+        engine = PolicyEngine(registry, bindings)
+
+        decision = engine.evaluate("u1", ResourceScope.ROW_FILTER, "supplier_data", context_attributes={})
+        self.assertFalse(decision.allowed)
+
+    def test_condition_with_static_value_matches_literal(self):
+        """condition也支持写死的静态值(不是${user.xxx}占位符),应该按字面值比较"""
+        registry = RoleRegistry()
+        role = Role("r1", "专项角色", "hr_center")
+        role.add_policy(PolicyRule(
+            "p1", ResourceScope.ACTION, PolicyEffect.ALLOW, "export_report",
+            condition={"region": "overseas"},
+        ))
+        registry.register(role)
+        bindings = {"u1": UserRoleBinding("u1", ["r1"])}
+        engine = PolicyEngine(registry, bindings)
+
+        allowed_decision = engine.evaluate(
+            "u1", ResourceScope.ACTION, "export_report", context_attributes={"region": "overseas"}
+        )
+        denied_decision = engine.evaluate(
+            "u1", ResourceScope.ACTION, "export_report", context_attributes={"region": "domestic"}
+        )
+        self.assertTrue(allowed_decision.allowed)
+        self.assertFalse(denied_decision.allowed)
+
+    def test_empty_condition_dict_always_matches(self):
+        """空条件字典代表'无附加限制',应该总是满足,对应'采购总监无行级限制'这类场景"""
+        registry = RoleRegistry()
+        role = Role("r_director", "总监", "scm_center")
+        role.add_policy(PolicyRule(
+            "p1", ResourceScope.ROW_FILTER, PolicyEffect.ALLOW, "supplier_data", condition={},
+        ))
+        registry.register(role)
+        bindings = {"u1": UserRoleBinding("u1", ["r_director"])}
+        engine = PolicyEngine(registry, bindings)
+
+        decision = engine.evaluate("u1", ResourceScope.ROW_FILTER, "supplier_data")
+        self.assertTrue(decision.allowed)
+
+
+class TestPolicyEngineMultiRoleAggregation(unittest.TestCase):
+    """验证一个用户被授予多个角色时,策略是否正确叠加"""
+
+    def test_user_inherits_policies_from_all_bound_roles(self):
+        registry = RoleRegistry()
+        role_a = Role("r_a", "角色A", "scm_center")
+        role_a.add_policy(PolicyRule("pa1", ResourceScope.FIELD, PolicyEffect.ALLOW, "field_a"))
+        role_b = Role("r_b", "角色B", "scm_center")
+        role_b.add_policy(PolicyRule("pb1", ResourceScope.FIELD, PolicyEffect.ALLOW, "field_b"))
+        registry.register(role_a)
+        registry.register(role_b)
+
+        bindings = {"u1": UserRoleBinding("u1", ["r_a", "r_b"])}
+        engine = PolicyEngine(registry, bindings)
+
+        visible = engine.resolve_visible_fields("u1", ["field_a", "field_b", "field_c"])
+        self.assertEqual(sorted(visible), ["field_a", "field_b"])
+
+    def test_resolve_row_filter_aggregates_filters_from_all_roles(self):
+        registry = RoleRegistry()
+        role_a = Role("r_a", "角色A", "scm_center")
+        role_a.add_policy(PolicyRule(
+            "pa1", ResourceScope.ROW_FILTER, PolicyEffect.ALLOW, "supplier_data",
+            condition={"business_line": "raw_material"},
+        ))
+        role_b = Role("r_b", "角色B", "scm_center")
+        role_b.add_policy(PolicyRule(
+            "pb1", ResourceScope.ROW_FILTER, PolicyEffect.ALLOW, "supplier_data",
+            condition={"business_line": "packaging"},
+        ))
+        registry.register(role_a)
+        registry.register(role_b)
+
+        bindings = {"u1": UserRoleBinding("u1", ["r_a", "r_b"])}
+        engine = PolicyEngine(registry, bindings)
+
+        filters = engine.resolve_row_filter("u1")
+        self.assertEqual(len(filters), 2)
+
+
+class TestRoleRegistrySerializationRoundTrip(unittest.TestCase):
+    """验证角色与策略配置的导出/导入是否能完整还原,这是"配置可以对接配置中心"这一设计目标的验证"""
+
+    def test_export_then_load_preserves_all_policies(self):
+        registry = RoleRegistry()
+        role = Role("r1", "测试角色", "scm_center", description="用于序列化测试")
+        role.add_policy(PolicyRule(
+            "p1", ResourceScope.FIELD, PolicyEffect.DENY, "price",
+            condition={"level": 1}, description="测试策略",
+        ))
+        registry.register(role)
+
+        exported = registry.export_to_dict()
+
+        new_registry = RoleRegistry()
+        new_registry.load_from_dict(exported)
+
+        restored_role = new_registry.get("r1")
+        self.assertIsNotNone(restored_role)
+        self.assertEqual(restored_role.role_name, "测试角色")
+        self.assertEqual(len(restored_role.policies), 1)
+        self.assertEqual(restored_role.policies[0].rule_id, "p1")
+        self.assertEqual(restored_role.policies[0].condition, {"level": 1})
+
+    def test_load_from_dict_with_multiple_roles(self):
+        registry = RoleRegistry()
+        role_1 = Role("r1", "角色1", "hr_center")
+        role_2 = Role("r2", "角色2", "legal_center")
+        registry.register(role_1)
+        registry.register(role_2)
+
+        exported = registry.export_to_dict()
+        new_registry = RoleRegistry()
+        new_registry.load_from_dict(exported)
+
+        self.assertEqual(len(new_registry.list_by_tenant("hr_center")), 1)
+        self.assertEqual(len(new_registry.list_by_tenant("legal_center")), 1)
+
+    def test_list_by_tenant_returns_empty_for_unknown_tenant(self):
+        registry = RoleRegistry()
+        registry.register(Role("r1", "角色1", "hr_center"))
+        self.assertEqual(registry.list_by_tenant("finance_center"), [])
+
+
+class TestPolicyEngineParityWithLegacyFunction(unittest.TestCase):
+    """
+    集成级验证:确保新引擎在寰宇集团三个已知职级角色上,
+    与旧版resolve_scm_field_mask函数给出完全一致的可见字段结果——
+    这正是陈铭在评审前手工做过的那次对比,现在把它固化成可重复运行的测试。
+    """
+
+    def _legacy_resolve_scm_field_mask(self, procurement_level: int) -> List[str]:
+        if procurement_level >= 3:
+            return []
+        elif procurement_level == 2:
+            return ["contract_specific_price"]
+        else:
+            return ["contract_specific_price", "cross_category_price_comparison"]
+
+    def _build_engine(self) -> PolicyEngine:
+        registry = RoleRegistry()
+
+        # 注意:专员与经理角色都需要一条通配符ALLOW规则作为"基础字段兜底",
+        # 否则supplier_name、delivery_rate这类未被显式提及的字段会因为
+        # "默认拒绝"原则而不可见,与旧版函数"只屏蔽名单内字段、其余全部可见"
+        # 的语义不一致。deny-overrides-allow的合并顺序保证了具体的DENY规则
+        # 仍然能够覆盖这条通配符ALLOW。
+        specialist = Role("scm_role_specialist", "普通采购专员", "scm_center")
+        specialist.add_policy(PolicyRule("p0", ResourceScope.FIELD, PolicyEffect.ALLOW, "*"))
+        specialist.add_policy(PolicyRule("p1", ResourceScope.FIELD, PolicyEffect.DENY, "contract_specific_price"))
+        specialist.add_policy(PolicyRule("p2", ResourceScope.FIELD, PolicyEffect.DENY, "cross_category_price_comparison"))
+        registry.register(specialist)
+
+        manager = Role("scm_role_manager", "采购经理", "scm_center")
+        manager.add_policy(PolicyRule("p0", ResourceScope.FIELD, PolicyEffect.ALLOW, "*"))
+        manager.add_policy(PolicyRule("p3", ResourceScope.FIELD, PolicyEffect.DENY, "contract_specific_price"))
+        manager.add_policy(PolicyRule("p4", ResourceScope.FIELD, PolicyEffect.ALLOW, "cross_category_price_comparison"))
+        registry.register(manager)
+
+        director = Role("scm_role_director", "采购总监", "scm_center")
+        director.add_policy(PolicyRule("p5", ResourceScope.FIELD, PolicyEffect.ALLOW, "*"))
+        registry.register(director)
+
+        bindings = {
+            "specialist_user": UserRoleBinding("specialist_user", ["scm_role_specialist"]),
+            "manager_user": UserRoleBinding("manager_user", ["scm_role_manager"]),
+            "director_user": UserRoleBinding("director_user", ["scm_role_director"]),
+        }
+        return PolicyEngine(registry, bindings)
+
+    def test_all_three_levels_produce_same_masked_fields_as_legacy(self):
+        engine = self._build_engine()
+        all_fields = ["supplier_name", "delivery_rate", "contract_specific_price", "cross_category_price_comparison"]
+        base_fields = {"supplier_name", "delivery_rate"}
+
+        level_to_user = {1: "specialist_user", 2: "manager_user", 3: "director_user"}
+
+        for level, user_id in level_to_user.items():
+            legacy_masked = set(self._legacy_resolve_scm_field_mask(level))
+            legacy_visible = sorted(set(all_fields) - legacy_masked)
+
+            new_visible = sorted(engine.resolve_visible_fields(user_id, all_fields))
+
+            self.assertEqual(
+                new_visible, legacy_visible,
+                f"职级{level}的新旧方案可见字段不一致: 新={new_visible}, 旧={legacy_visible}",
+            )
+            self.assertTrue(base_fields.issubset(set(new_visible)))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+```
+
+这套测试跑完之后,陈铭把`test_all_three_levels_produce_same_masked_fields_as_legacy`失败的第一版截图留了下来,发到了评审前的自查记录里——他觉得这比单纯说"我做了新旧对比,结果一致"更有说服力:这是一次真实的、在补测试过程中发现并修复的设计缺陷,而不是事后补的、恰好通过的测试。
+
+### 八、审计日志查询与导出工具 + 新租户接入自动化脚本
+
+合规负责人在评审预沟通会上补了一刀:"审计日志表设计得再完整,没有配套的查询、导出、留痕工具,出了安全事件也没办法在短时间内把完整链路扒出来。"陈铭趁着周末把这个缺口也补上了——一套支持多维度过滤、分页、CSV/JSON导出的审计日志查询服务,外加一个每日审计摘要生成器给合规团队做日常巡检。同时,他还把"新租户接入"这个此前只存在于方案文档文字描述里的流程,写成了一个真正可执行、可重复运行的幂等自动化脚本。
+
+```python
+"""
+苍穹1.0 全域智能体平台 —— 审计日志查询与导出工具 + 新租户接入自动化脚本
+文件: audit_log_toolkit.py
+
+背景:
+    技术方案评审会上,合规负责人提出了一个尖锐的问题:"审计日志表设计得再完整,
+    如果没有配套的查询、导出、留痕工具,出了安全事件之后还是没办法在短时间内
+    把'谁在什么时间跨租户访问了什么数据'这条链路完整地扒出来。"
+    陈铭据此补充了一套审计日志查询与导出工具,支持按时间窗口、租户、
+    动作类型多维度过滤,支持CSV/JSON两种导出格式,并附带一个每日
+    审计摘要生成器,用于给合规团队做每日巡检报告。
+
+    同时,为了让"新租户接入"这个此前只存在于方案文档里的流程真正可执行,
+    这里还补充了一个新租户接入自动化脚本,把"创建租户记录->初始化默认
+    知识子域->注册默认角色->生成初始管理员绑定"这几个步骤串联成一个
+    幂等的、可重复执行的自动化流程,并配套了完整的单元测试。
+
+依赖:
+    pip install sqlalchemy pydantic
+"""
+
+from __future__ import annotations
+
+import csv
+import io
+import json
+import unittest
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
+
+from sqlalchemy import (
+    create_engine, Column, String, Boolean, DateTime, ForeignKey,
+    Enum as SAEnum, Integer, Text, UniqueConstraint, JSON,
+)
+from sqlalchemy.orm import declarative_base, relationship, Session, sessionmaker
+import enum
+
+Base = declarative_base()
+
+
+class TenantCode(str, enum.Enum):
+    LEGAL_CENTER = "legal_center"
+    HR_CENTER = "hr_center"
+    SCM_CENTER = "scm_center"
+    FINANCE_CENTER = "finance_center"
+
+
+class AuditActionType(str, enum.Enum):
+    ACCESS_GRANTED = "access_granted"
+    ACCESS_DENIED = "access_denied"
+    CROSS_TENANT_GRANTED = "cross_tenant_granted"
+    CROSS_TENANT_DENIED = "cross_tenant_denied"
+
+
+class Tenant(Base):
+    __tablename__ = "tk_tenants"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_code = Column(SAEnum(TenantCode), nullable=False, unique=True)
+    tenant_name = Column(String(128), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    is_active = Column(Boolean, default=True)
+
+    knowledge_domains = relationship("KnowledgeSubDomain", back_populates="tenant")
+    users = relationship("PlatformUser", back_populates="tenant")
+
+
+class KnowledgeSubDomain(Base):
+    __tablename__ = "tk_knowledge_sub_domains"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id = Column(String(36), ForeignKey("tk_tenants.id"), nullable=False)
+    domain_code = Column(String(64), nullable=False)
+    domain_name = Column(String(128), nullable=False)
+    is_default = Column(Boolean, default=False)
+
+    tenant = relationship("Tenant", back_populates="knowledge_domains")
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "domain_code", name="uq_tk_tenant_domain_code"),
+    )
+
+
+class PlatformUser(Base):
+    __tablename__ = "tk_platform_users"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    sso_account = Column(String(128), nullable=False, unique=True)
+    display_name = Column(String(128), nullable=False)
+    tenant_id = Column(String(36), ForeignKey("tk_tenants.id"), nullable=False)
+    role_code = Column(String(64), nullable=True)
+    is_active = Column(Boolean, default=True)
+
+    tenant = relationship("Tenant", back_populates="users")
+
+
+class AccessAuditLog(Base):
+    __tablename__ = "tk_access_audit_logs"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), nullable=False)
+    action_type = Column(SAEnum(AuditActionType), nullable=False)
+    source_tenant_id = Column(String(36), nullable=False)
+    target_tenant_id = Column(String(36), nullable=True)
+    data_scope_accessed = Column(JSON, nullable=True)
+    result_summary = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# 审计日志查询过滤条件与查询服务
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AuditLogQueryFilter:
+    """
+    审计日志查询过滤条件。
+
+    设计上刻意把所有过滤字段都设为可选,调用方可以只传其中一两个维度,
+    也可以叠加多个维度组合查询,这是合规巡检场景里最常见的使用方式——
+    比如"查询过去24小时内所有跨租户拒绝记录"就只需要传
+    start_time + action_types两个维度。
+    """
+
+    tenant_id: Optional[str] = None
+    user_id: Optional[str] = None
+    action_types: List[AuditActionType] = field(default_factory=list)
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    page: int = 1
+    page_size: int = 50
+
+    def validate(self) -> List[str]:
+        """
+        返回校验错误列表(空列表代表校验通过)。
+        这里不直接抛异常,是为了让调用方(比如一个HTTP接口)能够
+        把所有校验错误一次性收集起来返回给前端,而不是抛第一个错误就中断。
+        """
+        errors: List[str] = []
+        if self.page < 1:
+            errors.append("page必须大于等于1")
+        if self.page_size < 1 or self.page_size > 500:
+            errors.append("page_size必须在1到500之间,避免单次查询拖垮数据库")
+        if self.start_time and self.end_time and self.start_time > self.end_time:
+            errors.append("start_time不能晚于end_time")
+        return errors
+
+
+@dataclass
+class AuditLogQueryResult:
+    total_count: int
+    page: int
+    page_size: int
+    records: List[AccessAuditLog]
+
+    @property
+    def total_pages(self) -> int:
+        if self.page_size == 0:
+            return 0
+        return (self.total_count + self.page_size - 1) // self.page_size
+
+    @property
+    def has_next_page(self) -> bool:
+        return self.page < self.total_pages
+
+
+class AuditLogQueryService:
+    """
+    审计日志查询服务:封装分页、多维度过滤、导出等常用操作,
+    避免每个调用方各自手写一遍SQLAlchemy查询语句导致过滤逻辑不一致。
+    """
+
+    def __init__(self, session: Session):
+        self.session = session
+
+    def query(self, filters: AuditLogQueryFilter) -> AuditLogQueryResult:
+        errors = filters.validate()
+        if errors:
+            raise ValueError(f"审计日志查询参数不合法: {'; '.join(errors)}")
+
+        base_query = self.session.query(AccessAuditLog)
+
+        if filters.tenant_id:
+            base_query = base_query.filter(
+                (AccessAuditLog.source_tenant_id == filters.tenant_id)
+                | (AccessAuditLog.target_tenant_id == filters.tenant_id)
+            )
+        if filters.user_id:
+            base_query = base_query.filter(AccessAuditLog.user_id == filters.user_id)
+        if filters.action_types:
+            base_query = base_query.filter(AccessAuditLog.action_type.in_(filters.action_types))
+        if filters.start_time:
+            base_query = base_query.filter(AccessAuditLog.created_at >= filters.start_time)
+        if filters.end_time:
+            base_query = base_query.filter(AccessAuditLog.created_at <= filters.end_time)
+
+        total_count = base_query.count()
+
+        records = (
+            base_query.order_by(AccessAuditLog.created_at.desc())
+            .offset((filters.page - 1) * filters.page_size)
+            .limit(filters.page_size)
+            .all()
+        )
+
+        return AuditLogQueryResult(
+            total_count=total_count,
+            page=filters.page,
+            page_size=filters.page_size,
+            records=records,
+        )
+
+    def export_to_csv(self, filters: AuditLogQueryFilter, max_records: int = 10000) -> str:
+        """
+        导出为CSV文本。为了避免一次性把海量数据全部拉进内存,
+        这里限制了max_records上限,超出上限时应该引导调用方缩小时间窗口
+        分批导出,而不是无脑一次性全量导出。
+        """
+        export_filters = AuditLogQueryFilter(
+            tenant_id=filters.tenant_id,
+            user_id=filters.user_id,
+            action_types=filters.action_types,
+            start_time=filters.start_time,
+            end_time=filters.end_time,
+            page=1,
+            page_size=min(max_records, 500),
+        )
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "id", "user_id", "action_type", "source_tenant_id",
+            "target_tenant_id", "result_summary", "created_at",
+        ])
+
+        collected = 0
+        current_page = 1
+        while collected < max_records:
+            export_filters.page = current_page
+            result = self.query(export_filters)
+            if not result.records:
+                break
+            for record in result.records:
+                writer.writerow([
+                    record.id, record.user_id, record.action_type.value,
+                    record.source_tenant_id, record.target_tenant_id or "",
+                    record.result_summary or "", record.created_at.isoformat(),
+                ])
+                collected += 1
+                if collected >= max_records:
+                    break
+            if not result.has_next_page:
+                break
+            current_page += 1
+
+        return output.getvalue()
+
+    def export_to_json(self, filters: AuditLogQueryFilter, max_records: int = 10000) -> str:
+        csv_text = self.export_to_csv(filters, max_records=max_records)
+        reader = csv.DictReader(io.StringIO(csv_text))
+        return json.dumps(list(reader), ensure_ascii=False, indent=2)
+
+    def build_daily_summary(self, tenant_id: str, day: datetime) -> Dict[str, Any]:
+        """
+        构建某个租户在某一天的审计摘要,给合规团队做每日巡检。
+        统计维度包括:各动作类型的次数、跨租户拒绝率。
+        """
+        day_start = datetime(day.year, day.month, day.day)
+        day_end = day_start + timedelta(days=1)
+
+        filters = AuditLogQueryFilter(
+            tenant_id=tenant_id, start_time=day_start, end_time=day_end, page_size=500,
+        )
+
+        action_counts: Dict[str, int] = {a.value: 0 for a in AuditActionType}
+        page = 1
+        while True:
+            filters.page = page
+            result = self.query(filters)
+            for record in result.records:
+                action_counts[record.action_type.value] += 1
+            if not result.has_next_page:
+                break
+            page += 1
+
+        cross_tenant_total = (
+            action_counts[AuditActionType.CROSS_TENANT_GRANTED.value]
+            + action_counts[AuditActionType.CROSS_TENANT_DENIED.value]
+        )
+        denial_rate = (
+            action_counts[AuditActionType.CROSS_TENANT_DENIED.value] / cross_tenant_total
+            if cross_tenant_total > 0 else 0.0
+        )
+
+        return {
+            "tenant_id": tenant_id,
+            "date": day_start.date().isoformat(),
+            "action_counts": action_counts,
+            "cross_tenant_denial_rate": round(denial_rate, 4),
+        }
+
+
+# ---------------------------------------------------------------------------
+# 新租户接入自动化脚本
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TenantOnboardingSpec:
+    tenant_code: TenantCode
+    tenant_name: str
+    default_sub_domains: List[str] = field(default_factory=list)
+    initial_admin_sso_account: Optional[str] = None
+    initial_admin_display_name: Optional[str] = None
+
+
+@dataclass
+class TenantOnboardingResult:
+    tenant_id: str
+    created_sub_domain_ids: List[str]
+    admin_user_id: Optional[str]
+    already_existed: bool
+
+
+class TenantOnboardingError(Exception):
+    pass
+
+
+class TenantOnboardingAutomation:
+    """
+    新租户接入自动化脚本:把"创建租户->初始化默认知识子域->
+    创建初始管理员账号"这一整套动作封装成一个幂等操作。
+
+    幂等性设计:
+        如果租户编码已经存在,不会重复创建租户记录,而是复用已有记录,
+        并在已有租户下补齐缺失的默认子域——这样运维人员可以放心地
+        重复执行同一份接入脚本,而不用担心产生重复数据。
+    """
+
+    def __init__(self, session: Session):
+        self.session = session
+
+    def onboard(self, spec: TenantOnboardingSpec) -> TenantOnboardingResult:
+        existing_tenant = (
+            self.session.query(Tenant)
+            .filter(Tenant.tenant_code == spec.tenant_code)
+            .first()
+        )
+
+        already_existed = existing_tenant is not None
+        if existing_tenant is None:
+            existing_tenant = Tenant(
+                tenant_code=spec.tenant_code, tenant_name=spec.tenant_name,
+            )
+            self.session.add(existing_tenant)
+            self.session.commit()
+
+        created_domain_ids = self._ensure_default_sub_domains(existing_tenant, spec.default_sub_domains)
+
+        admin_user_id = None
+        if spec.initial_admin_sso_account:
+            admin_user_id = self._ensure_admin_user(
+                existing_tenant, spec.initial_admin_sso_account,
+                spec.initial_admin_display_name or spec.initial_admin_sso_account,
+            )
+
+        return TenantOnboardingResult(
+            tenant_id=existing_tenant.id,
+            created_sub_domain_ids=created_domain_ids,
+            admin_user_id=admin_user_id,
+            already_existed=already_existed,
+        )
+
+    def _ensure_default_sub_domains(self, tenant: Tenant, domain_codes: List[str]) -> List[str]:
+        created_ids: List[str] = []
+        for code in domain_codes:
+            existing = (
+                self.session.query(KnowledgeSubDomain)
+                .filter(
+                    KnowledgeSubDomain.tenant_id == tenant.id,
+                    KnowledgeSubDomain.domain_code == code,
+                )
+                .first()
+            )
+            if existing is not None:
+                continue
+            domain = KnowledgeSubDomain(
+                tenant_id=tenant.id, domain_code=code, domain_name=code, is_default=True,
+            )
+            self.session.add(domain)
+            self.session.commit()
+            created_ids.append(domain.id)
+        return created_ids
+
+    def _ensure_admin_user(self, tenant: Tenant, sso_account: str, display_name: str) -> str:
+        existing_user = (
+            self.session.query(PlatformUser)
+            .filter(PlatformUser.sso_account == sso_account)
+            .first()
+        )
+        if existing_user is not None:
+            if existing_user.tenant_id != tenant.id:
+                raise TenantOnboardingError(
+                    f"SSO账号 {sso_account} 已经绑定到另一个租户,不能重复接入到租户 {tenant.tenant_name}"
+                )
+            return existing_user.id
+
+        user = PlatformUser(
+            sso_account=sso_account, display_name=display_name,
+            tenant_id=tenant.id, role_code="tenant_admin",
+        )
+        self.session.add(user)
+        self.session.commit()
+        return user.id
+
+
+# ---------------------------------------------------------------------------
+# 单元测试正文
+# ---------------------------------------------------------------------------
+
+class AuditToolkitTestCase(unittest.TestCase):
+    def setUp(self):
+        self.engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(self.engine)
+        session_factory = sessionmaker(bind=self.engine)
+        self.session: Session = session_factory()
+
+    def tearDown(self):
+        self.session.close()
+        self.engine.dispose()
+
+    def _create_tenant(self, code: TenantCode, name: str) -> Tenant:
+        tenant = Tenant(tenant_code=code, tenant_name=name)
+        self.session.add(tenant)
+        self.session.commit()
+        return tenant
+
+    def _write_log(self, user_id, action_type, source_tenant_id, target_tenant_id=None, created_at=None):
+        log = AccessAuditLog(
+            user_id=user_id, action_type=action_type,
+            source_tenant_id=source_tenant_id, target_tenant_id=target_tenant_id,
+            created_at=created_at or datetime.utcnow(),
+        )
+        self.session.add(log)
+        self.session.commit()
+        return log
+
+
+class TestAuditLogQueryFilterValidation(unittest.TestCase):
+    """验证查询过滤条件的自校验逻辑"""
+
+    def test_default_filter_is_valid(self):
+        self.assertEqual(AuditLogQueryFilter().validate(), [])
+
+    def test_page_less_than_one_is_invalid(self):
+        errors = AuditLogQueryFilter(page=0).validate()
+        self.assertTrue(any("page" in e for e in errors))
+
+    def test_page_size_exceeding_upper_bound_is_invalid(self):
+        errors = AuditLogQueryFilter(page_size=1000).validate()
+        self.assertTrue(any("page_size" in e for e in errors))
+
+    def test_page_size_zero_is_invalid(self):
+        errors = AuditLogQueryFilter(page_size=0).validate()
+        self.assertTrue(any("page_size" in e for e in errors))
+
+    def test_start_time_after_end_time_is_invalid(self):
+        now = datetime.utcnow()
+        errors = AuditLogQueryFilter(start_time=now, end_time=now - timedelta(days=1)).validate()
+        self.assertTrue(any("start_time" in e for e in errors))
+
+    def test_start_time_equal_end_time_is_valid(self):
+        """开始时间等于结束时间是合法的边界情况,代表查询某一精确时刻的记录"""
+        now = datetime.utcnow()
+        errors = AuditLogQueryFilter(start_time=now, end_time=now).validate()
+        self.assertEqual(errors, [])
+
+
+class TestAuditLogQueryServiceFiltering(AuditToolkitTestCase):
+    """验证查询服务的多维度过滤是否正确"""
+
+    def test_query_raises_on_invalid_filter(self):
+        service = AuditLogQueryService(self.session)
+        with self.assertRaises(ValueError):
+            service.query(AuditLogQueryFilter(page=-1))
+
+    def test_query_filters_by_tenant_id_on_source_side(self):
+        legal = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        scm = self._create_tenant(TenantCode.SCM_CENTER, "供应链管理中心")
+        self._write_log("u1", AuditActionType.ACCESS_GRANTED, legal.id)
+        self._write_log("u2", AuditActionType.ACCESS_GRANTED, scm.id)
+
+        service = AuditLogQueryService(self.session)
+        result = service.query(AuditLogQueryFilter(tenant_id=legal.id))
+        self.assertEqual(result.total_count, 1)
+        self.assertEqual(result.records[0].source_tenant_id, legal.id)
+
+    def test_query_filters_by_tenant_id_on_target_side(self):
+        """
+        跨租户日志里,某个租户可能是target而不是source,
+        查询该租户相关的所有日志时,两个方向都应该能命中。
+        """
+        legal = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        scm = self._create_tenant(TenantCode.SCM_CENTER, "供应链管理中心")
+        self._write_log("u1", AuditActionType.CROSS_TENANT_GRANTED, legal.id, target_tenant_id=scm.id)
+
+        service = AuditLogQueryService(self.session)
+        result = service.query(AuditLogQueryFilter(tenant_id=scm.id))
+        self.assertEqual(result.total_count, 1)
+
+    def test_query_filters_by_action_types(self):
+        legal = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        self._write_log("u1", AuditActionType.ACCESS_GRANTED, legal.id)
+        self._write_log("u1", AuditActionType.ACCESS_DENIED, legal.id)
+
+        service = AuditLogQueryService(self.session)
+        result = service.query(AuditLogQueryFilter(
+            tenant_id=legal.id, action_types=[AuditActionType.ACCESS_DENIED],
+        ))
+        self.assertEqual(result.total_count, 1)
+        self.assertEqual(result.records[0].action_type, AuditActionType.ACCESS_DENIED)
+
+    def test_query_filters_by_time_window(self):
+        legal = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        old_time = datetime.utcnow() - timedelta(days=10)
+        recent_time = datetime.utcnow() - timedelta(hours=1)
+        self._write_log("u1", AuditActionType.ACCESS_GRANTED, legal.id, created_at=old_time)
+        self._write_log("u1", AuditActionType.ACCESS_GRANTED, legal.id, created_at=recent_time)
+
+        service = AuditLogQueryService(self.session)
+        result = service.query(AuditLogQueryFilter(
+            tenant_id=legal.id, start_time=datetime.utcnow() - timedelta(days=1),
+        ))
+        self.assertEqual(result.total_count, 1)
+
+    def test_query_pagination_returns_correct_page(self):
+        legal = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        for i in range(5):
+            self._write_log(f"u{i}", AuditActionType.ACCESS_GRANTED, legal.id)
+
+        service = AuditLogQueryService(self.session)
+        page_1 = service.query(AuditLogQueryFilter(tenant_id=legal.id, page=1, page_size=2))
+        page_2 = service.query(AuditLogQueryFilter(tenant_id=legal.id, page=2, page_size=2))
+
+        self.assertEqual(len(page_1.records), 2)
+        self.assertEqual(len(page_2.records), 2)
+        self.assertEqual(page_1.total_pages, 3)
+        self.assertTrue(page_1.has_next_page)
+
+    def test_query_on_empty_dataset_returns_zero_total_pages(self):
+        service = AuditLogQueryService(self.session)
+        result = service.query(AuditLogQueryFilter())
+        self.assertEqual(result.total_count, 0)
+        self.assertEqual(result.total_pages, 0)
+        self.assertFalse(result.has_next_page)
+
+    def test_last_page_has_no_next_page(self):
+        legal = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        for i in range(3):
+            self._write_log(f"u{i}", AuditActionType.ACCESS_GRANTED, legal.id)
+
+        service = AuditLogQueryService(self.session)
+        last_page = service.query(AuditLogQueryFilter(tenant_id=legal.id, page=2, page_size=2))
+        self.assertFalse(last_page.has_next_page)
+
+
+class TestAuditLogExport(AuditToolkitTestCase):
+    """验证CSV/JSON导出功能"""
+
+    def test_export_to_csv_includes_header_and_all_records(self):
+        legal = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        self._write_log("u1", AuditActionType.ACCESS_GRANTED, legal.id, )
+        self._write_log("u2", AuditActionType.ACCESS_DENIED, legal.id)
+
+        service = AuditLogQueryService(self.session)
+        csv_text = service.export_to_csv(AuditLogQueryFilter(tenant_id=legal.id))
+
+        lines = [l.rstrip("\r") for l in csv_text.strip().split("\n")]
+        self.assertEqual(lines[0], "id,user_id,action_type,source_tenant_id,target_tenant_id,result_summary,created_at")
+        self.assertEqual(len(lines), 3)
+
+    def test_export_to_csv_respects_max_records_limit(self):
+        legal = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        for i in range(10):
+            self._write_log(f"u{i}", AuditActionType.ACCESS_GRANTED, legal.id)
+
+        service = AuditLogQueryService(self.session)
+        csv_text = service.export_to_csv(AuditLogQueryFilter(tenant_id=legal.id), max_records=3)
+
+        data_lines = csv_text.strip().split("\n")[1:]
+        self.assertEqual(len(data_lines), 3)
+
+    def test_export_to_csv_on_empty_result_returns_only_header(self):
+        service = AuditLogQueryService(self.session)
+        csv_text = service.export_to_csv(AuditLogQueryFilter())
+        lines = csv_text.strip().split("\n")
+        self.assertEqual(len(lines), 1)
+
+    def test_export_to_json_produces_valid_json_array(self):
+        legal = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        self._write_log("u1", AuditActionType.ACCESS_GRANTED, legal.id)
+
+        service = AuditLogQueryService(self.session)
+        json_text = service.export_to_json(AuditLogQueryFilter(tenant_id=legal.id))
+        parsed = json.loads(json_text)
+
+        self.assertIsInstance(parsed, list)
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["user_id"], "u1")
+
+
+class TestDailySummaryBuilder(AuditToolkitTestCase):
+    """验证每日审计摘要构建逻辑"""
+
+    def test_summary_counts_all_action_types(self):
+        legal = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        scm = self._create_tenant(TenantCode.SCM_CENTER, "供应链管理中心")
+        today = datetime.utcnow()
+
+        self._write_log("u1", AuditActionType.ACCESS_GRANTED, legal.id, created_at=today)
+        self._write_log("u1", AuditActionType.ACCESS_DENIED, legal.id, created_at=today)
+        self._write_log("u1", AuditActionType.CROSS_TENANT_GRANTED, legal.id, target_tenant_id=scm.id, created_at=today)
+        self._write_log("u1", AuditActionType.CROSS_TENANT_DENIED, legal.id, target_tenant_id=scm.id, created_at=today)
+
+        service = AuditLogQueryService(self.session)
+        summary = service.build_daily_summary(legal.id, today)
+
+        self.assertEqual(summary["action_counts"][AuditActionType.ACCESS_GRANTED.value], 1)
+        self.assertEqual(summary["action_counts"][AuditActionType.ACCESS_DENIED.value], 1)
+        self.assertEqual(summary["cross_tenant_denial_rate"], 0.5)
+
+    def test_summary_excludes_records_outside_the_day(self):
+        legal = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        today = datetime.utcnow()
+        yesterday = today - timedelta(days=1)
+
+        self._write_log("u1", AuditActionType.ACCESS_GRANTED, legal.id, created_at=yesterday)
+
+        service = AuditLogQueryService(self.session)
+        summary = service.build_daily_summary(legal.id, today)
+        self.assertEqual(summary["action_counts"][AuditActionType.ACCESS_GRANTED.value], 0)
+
+    def test_summary_with_no_cross_tenant_activity_has_zero_denial_rate(self):
+        """
+        没有任何跨租户请求时,拒绝率应该是0而不是抛除零异常——
+        这是一个容易被漏掉的边界场景。
+        """
+        legal = self._create_tenant(TenantCode.LEGAL_CENTER, "法务中心")
+        today = datetime.utcnow()
+        self._write_log("u1", AuditActionType.ACCESS_GRANTED, legal.id, created_at=today)
+
+        service = AuditLogQueryService(self.session)
+        summary = service.build_daily_summary(legal.id, today)
+        self.assertEqual(summary["cross_tenant_denial_rate"], 0.0)
+
+
+class TestTenantOnboardingAutomation(AuditToolkitTestCase):
+    """验证新租户接入自动化脚本的幂等性与完整性"""
+
+    def test_onboard_new_tenant_creates_tenant_and_domains(self):
+        spec = TenantOnboardingSpec(
+            tenant_code=TenantCode.FINANCE_CENTER, tenant_name="财务共享中心",
+            default_sub_domains=["domestic", "overseas"],
+            initial_admin_sso_account="finance_admin",
+        )
+        automation = TenantOnboardingAutomation(self.session)
+        result = automation.onboard(spec)
+
+        self.assertFalse(result.already_existed)
+        self.assertEqual(len(result.created_sub_domain_ids), 2)
+        self.assertIsNotNone(result.admin_user_id)
+
+    def test_onboarding_same_tenant_twice_is_idempotent(self):
+        """
+        重复执行同一份接入脚本,第二次不应该重复创建租户或子域,
+        应该识别出租户已存在并复用,只补齐缺失的部分。
+        """
+        spec = TenantOnboardingSpec(
+            tenant_code=TenantCode.FINANCE_CENTER, tenant_name="财务共享中心",
+            default_sub_domains=["domestic"],
+        )
+        automation = TenantOnboardingAutomation(self.session)
+        result_1 = automation.onboard(spec)
+        result_2 = automation.onboard(spec)
+
+        self.assertFalse(result_1.already_existed)
+        self.assertTrue(result_2.already_existed)
+        self.assertEqual(result_1.tenant_id, result_2.tenant_id)
+        self.assertEqual(len(result_2.created_sub_domain_ids), 0)
+
+        total_domains = (
+            self.session.query(KnowledgeSubDomain)
+            .filter(KnowledgeSubDomain.tenant_id == result_1.tenant_id)
+            .count()
+        )
+        self.assertEqual(total_domains, 1)
+
+    def test_onboarding_adds_missing_domain_on_rerun(self):
+        """
+        第一次只声明了一个子域,第二次声明了两个子域(其中一个是新增的),
+        重跑脚本应该只补齐新增的那一个,而不是报错或重复创建已有的。
+        """
+        automation = TenantOnboardingAutomation(self.session)
+        automation.onboard(TenantOnboardingSpec(
+            tenant_code=TenantCode.HR_CENTER, tenant_name="人力资源中心",
+            default_sub_domains=["compensation"],
+        ))
+        result = automation.onboard(TenantOnboardingSpec(
+            tenant_code=TenantCode.HR_CENTER, tenant_name="人力资源中心",
+            default_sub_domains=["compensation", "recruitment"],
+        ))
+
+        self.assertTrue(result.already_existed)
+        self.assertEqual(len(result.created_sub_domain_ids), 1)
+
+    def test_onboarding_without_admin_account_leaves_admin_user_id_none(self):
+        spec = TenantOnboardingSpec(
+            tenant_code=TenantCode.LEGAL_CENTER, tenant_name="法务中心",
+        )
+        automation = TenantOnboardingAutomation(self.session)
+        result = automation.onboard(spec)
+        self.assertIsNone(result.admin_user_id)
+
+    def test_reusing_sso_account_for_same_tenant_returns_same_user_id(self):
+        automation = TenantOnboardingAutomation(self.session)
+        spec = TenantOnboardingSpec(
+            tenant_code=TenantCode.SCM_CENTER, tenant_name="供应链管理中心",
+            initial_admin_sso_account="scm_admin",
+        )
+        result_1 = automation.onboard(spec)
+        result_2 = automation.onboard(spec)
+        self.assertEqual(result_1.admin_user_id, result_2.admin_user_id)
+
+    def test_reusing_sso_account_across_different_tenants_raises_error(self):
+        """
+        同一个SSO账号不应该被接入脚本绑定到两个不同租户——
+        这在真实场景里往往意味着配置写错了租户编码,应该快速失败并报错,
+        而不是静默产生一个跨租户身份混淆的账号。
+        """
+        automation = TenantOnboardingAutomation(self.session)
+        automation.onboard(TenantOnboardingSpec(
+            tenant_code=TenantCode.SCM_CENTER, tenant_name="供应链管理中心",
+            initial_admin_sso_account="shared_admin",
+        ))
+        with self.assertRaises(TenantOnboardingError):
+            automation.onboard(TenantOnboardingSpec(
+                tenant_code=TenantCode.HR_CENTER, tenant_name="人力资源中心",
+                initial_admin_sso_account="shared_admin",
+            ))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+```
+
+审计工具和接入脚本一起提交测试跑完,27个用例全部通过。陈铭把这份测试报告和前面两份(编排引擎、RBAC引擎)一起打包成了明天评审的附件材料——"代码是可以运行、可以验证的,不是PPT里的架构图。"他在提交前的最后一条commit信息里写下这句话,然后合上了电脑。
+
 ---
 
 ## 今日复盘
