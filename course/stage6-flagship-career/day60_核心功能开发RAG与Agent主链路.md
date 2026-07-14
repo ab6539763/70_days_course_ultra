@@ -814,7 +814,8 @@ class LLMBatchReranker:
     @staticmethod
     def _parse_scores(raw_output: str, expected_count: int) -> List[float]:
         cleaned = raw_output.strip()
-        if cleaned.startswith("```"):
+        markdown_fence = "`" * 3  # 避免在源码里直接写出三个反引号,防止与本文档的代码块围栏字符冲突
+        if cleaned.startswith(markdown_fence):
             cleaned = cleaned.strip("`")
             cleaned = cleaned.replace("json", "", 1).strip()
         scores = json.loads(cleaned)
@@ -2973,6 +2974,1258 @@ jobs:
 这套CI流程今天晚上跑通了第一次,赵航看着绿色的检查结果,开玩笑说"这大概是今天最不费劲但看着最有成就感的一件事"。陈铭倒是觉得这份"轻量但确实存在"的持续集成配置,是今天所有产出里最不起眼、但长期来看性价比最高的一部分——接下来几天团队要在同一套代码基础上持续叠加新功能,有这道自动化检查关卡兜底,能大幅降低"改了新功能却不小心破坏了已有功能"这种回归问题被引入代码库的概率。
 
 以上代码,从统一检索接口的数据契约,到三个知识库适配器的具体实现,再到业务 Agent 的工厂化生成、Supervisor 的配置驱动路由判断,最后由 LangGraph 状态图串成完整主链路,加上配置管理、API封装、多轮工具调用循环的预留实现,以及单元测试与故障注入测试,构成了今天冲刺日的核心产出。陈铭在写完最后一个自测脚本、跑通九条测试问题之后,又对照上午的架构图和流程图逐一核对了一遍,确认代码实现和图纸设计基本一致——检索能力全部内聚在统一检索引擎和适配器层,业务 Agent 只通过标准工具接口访问检索能力,Supervisor 的路由判断完全基于配置和大模型语义理解,没有一行硬编码的关键词规则。他把这份自查记录也整理进了今天的复盘。
+
+### 7.13 审计日志数据模型与合规留痕埋点
+
+周雪在晨会上提的那个要求——"每一次涉及法务和人力敏感信息的问答,都要能留存日志,包括提问人、提问内容、系统给出的回答、命中的知识来源"——陈铭一直记在待办里。趁着晚上收尾的空档,他把这部分数据模型和最基础的落盘能力补上了。这里要强调的是,今天做的只是"把字段定全、把埋点能力搭好",还不是完整的审计系统(比如查询审计日志的后台管理页面、按合规要求的留存期限自动归档等,都还没做),但字段一旦一次性定全,后面无论是接文件、接数据库还是接专门的审计服务,都不需要再回头改埋点代码本身,这正是老王强调的"字段定全一次成本很低,漏了字段以后返工成本很高"。
+
+```python
+"""
+文件: audit/models.py
+说明: 合规留痕审计日志的数据模型。字段设计直接对应晨会上周雪提出的要求:
+      提问人、提问内容、系统回答、命中的知识来源都必须能被完整还原,
+      另外补充了路由置信度、是否降级等运维排查会用到的字段,
+      一次性定全,避免后续为审计功能专门返工。
+"""
+
+from __future__ import annotations
+
+import re
+import uuid
+from datetime import datetime
+from enum import Enum
+from typing import List, Optional
+
+from pydantic import BaseModel, Field
+
+# 用于从检索结果拼接文本(参见 RetrievalResponse.top_content_joined 的输出格式)中
+# 反向解析出"来源"标注,便于审计日志记录知识来源而不需要额外改造业务Agent的返回结构。
+_SOURCE_PATTERN = re.compile(r"来源:\s*([^|]+?)\s*\|")
+
+
+class AuditEventType(str, Enum):
+    """审计事件分类,便于后续按类型筛选日志,比如合规部门可能只想看敏感问答记录。"""
+
+    NORMAL_QA = "normal_qa"
+    SENSITIVE_QA = "sensitive_qa"
+    LOW_CONFIDENCE_ROUTE = "low_confidence_route"
+    DEGRADED_RESPONSE = "degraded_response"
+    CROSS_DOMAIN_QA = "cross_domain_qa"
+
+
+# 命中以下场景时,一律视为敏感问答,即便本次没有实际检索到敏感条款,
+# 这是周雪确认过的口径:"法务和人力相关的问答,只要命中场景就算敏感,
+# 不需要等到真的检索出敏感条款才留痕,留痕的粒度宁可粗一点,不能漏"。
+_SENSITIVE_SCENES = {"legal", "hr"}
+
+
+class AuditLogEntry(BaseModel):
+    """
+    单条审计日志的完整结构。
+    设计原则: 字段宁可多定义几个暂时用不上的,也不要漏掉未来可能需要补查的信息,
+    因为审计日志一旦没打点,历史数据是补不回来的,这与普通业务日志"缺了可以后补"不同。
+    """
+
+    log_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    occurred_at: datetime = Field(default_factory=datetime.utcnow)
+
+    # 提问人信息
+    user_id: str
+    user_role: Optional[str] = None
+    department: Optional[str] = None
+    session_id: Optional[str] = Field(default=None, description="多轮对话场景下的会话标识,单轮问答可为空")
+
+    # 提问内容(原始问题与经过多轮追问改写后的完整问题都要留存,便于还原真实语义)
+    raw_query: str
+    rewritten_query: Optional[str] = Field(default=None, description="经过追问改写后的完整查询,若未发生改写则与raw_query相同")
+
+    # 路由与处理结果
+    hit_scene: str
+    hit_display_name: str
+    route_confidence: float
+    is_low_confidence_route: bool = False
+    is_cross_domain: bool = False
+
+    # 系统回答与知识来源
+    answer_excerpt: str = Field(..., description="系统回答内容,出于存储成本考虑做适当截断,完整内容另有落盘")
+    knowledge_sources: List[str] = Field(default_factory=list, description="本次回答依据的知识来源列表,如'寰宇集团保密协议模板·第5条'")
+
+    # 运维与合规排查字段
+    took_ms: float
+    degraded: bool = False
+    degraded_reason: Optional[str] = None
+    event_type: AuditEventType = AuditEventType.NORMAL_QA
+
+    @classmethod
+    def build_from_chain_result(
+        cls,
+        *,
+        user_id: str,
+        user_role: Optional[str],
+        department: Optional[str],
+        session_id: Optional[str],
+        raw_query: str,
+        rewritten_query: Optional[str],
+        chain_result: dict,
+        knowledge_source_text: str = "",
+        answer_excerpt_max_chars: int = 300,
+    ) -> "AuditLogEntry":
+        """
+        从主链路 MainChainRunner.run() 返回的结果字典构造一条审计日志。
+        knowledge_source_text 通常是业务Agent工具调用返回的检索拼接文本
+        (即 RetrievalResponse.top_content_joined() 的输出),本方法负责从中
+        反向解析出来源标注列表,这样业务Agent层不需要为了配合审计而改造返回结构。
+        """
+        sources = _SOURCE_PATTERN.findall(knowledge_source_text)
+        sources = [s.strip() for s in sources]
+
+        hit_scene = chain_result.get("hit_scene", "unknown")
+        is_low_confidence = chain_result.get("route_confidence", 1.0) < 0.6
+        event_type = AuditEventType.NORMAL_QA
+        if hit_scene in _SENSITIVE_SCENES:
+            event_type = AuditEventType.SENSITIVE_QA
+        if is_low_confidence:
+            event_type = AuditEventType.LOW_CONFIDENCE_ROUTE
+
+        answer = chain_result.get("answer", "")
+        return cls(
+            user_id=user_id,
+            user_role=user_role,
+            department=department,
+            session_id=session_id,
+            raw_query=raw_query,
+            rewritten_query=rewritten_query or raw_query,
+            hit_scene=hit_scene,
+            hit_display_name=chain_result.get("hit_display_name", ""),
+            route_confidence=chain_result.get("route_confidence", 0.0),
+            is_low_confidence_route=is_low_confidence,
+            answer_excerpt=answer[:answer_excerpt_max_chars],
+            knowledge_sources=sources,
+            took_ms=chain_result.get("took_ms", 0.0),
+            event_type=event_type,
+        )
+```
+
+```python
+"""
+文件: audit/logger.py
+说明: 审计日志的落盘能力。今天先给出"内存版"与"文件版"两种最简单的实现,
+      完整的审计系统(集中存储、检索、留存期限管理)属于后续合规专项的范围,
+      今天的目标只是"埋点先打上,落盘先跑通",不追求完整的审计产品能力。
+"""
+
+from __future__ import annotations
+
+import abc
+import json
+import logging
+import threading
+from pathlib import Path
+from typing import Callable, List
+
+from audit.models import AuditLogEntry
+
+logger = logging.getLogger("cangqiong.audit")
+
+
+class AuditSink(abc.ABC):
+    """审计日志落盘目标的抽象基类,与retrieval包的适配器设计思路一致——
+    机制(记录一条日志)通用,落盘目标(内存/文件/未来的专门审计服务)可插拔替换。"""
+
+    @abc.abstractmethod
+    def write(self, entry: AuditLogEntry) -> None:
+        raise NotImplementedError
+
+
+class InMemoryAuditSink(AuditSink):
+    """内存版实现,主要用于单元测试和本地调试,不具备持久化能力。"""
+
+    def __init__(self):
+        self._entries: List[AuditLogEntry] = []
+        self._lock = threading.Lock()
+
+    def write(self, entry: AuditLogEntry) -> None:
+        with self._lock:
+            self._entries.append(entry)
+
+    def all(self) -> List[AuditLogEntry]:
+        with self._lock:
+            return list(self._entries)
+
+
+class FileAuditSink(AuditSink):
+    """
+    文件版实现,以JSON Lines格式逐行追加写入,今天先满足"审计数据不丢"这个最低要求。
+    正式生产环境中,寰宇集团合规部门要求审计日志需要保留至少三年,
+    这意味着后续必须迁移到专门的日志归档存储,今天的文件版实现只作为过渡方案。
+    """
+
+    def __init__(self, file_path: str):
+        self._path = Path(file_path)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+
+    def write(self, entry: AuditLogEntry) -> None:
+        line = entry.model_dump_json()
+        with self._lock:
+            with self._path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
+
+class AuditLogger:
+    """
+    审计日志记录器,业务代码只应该依赖这个类,不直接操作AuditSink,
+    这样未来切换落盘目标(比如从文件切到专门的审计服务)时,调用方代码零改动。
+    """
+
+    def __init__(self, sink: AuditSink, enabled: bool = True):
+        self._sink = sink
+        self._enabled = enabled
+
+    def record(self, entry: AuditLogEntry) -> None:
+        if not self._enabled:
+            return
+        try:
+            self._sink.write(entry)
+        except Exception:  # noqa: BLE001 - 审计埋点绝不能反过来影响主业务流程
+            logger.exception("审计日志写入失败,已忽略本次埋点,不影响主流程返回")
+
+
+def wrap_runner_with_audit(
+    run_func: Callable[..., dict],
+    audit_logger: AuditLogger,
+    *,
+    user_role_resolver: Callable[[str], str] = lambda user_id: "employee",
+    department_resolver: Callable[[str], str] = lambda user_id: None,
+) -> Callable[..., dict]:
+    """
+    以装饰器风格包装 MainChainRunner.run 方法,在不改动 main_chain.py 既有代码的前提下
+    补齐审计埋点,这也是"新增能力优先考虑组合而不是侵入式修改已验证代码"的一个实践示范。
+    """
+
+    def _wrapped(user_query: str, user_id: str = "test_user", **kwargs) -> dict:
+        result = run_func(user_query, user_id=user_id, **kwargs)
+        entry = AuditLogEntry.build_from_chain_result(
+            user_id=user_id,
+            user_role=user_role_resolver(user_id),
+            department=department_resolver(user_id),
+            session_id=kwargs.get("session_id"),
+            raw_query=user_query,
+            rewritten_query=kwargs.get("rewritten_query"),
+            chain_result=result,
+            knowledge_source_text="\n".join(result.get("used_tool_results", []) or []),
+        )
+        audit_logger.record(entry)
+        return result
+
+    return _wrapped
+```
+
+### 7.14 统一检索接口增强:多知识库并行检索与跨域结果聚合
+
+上午设计统一检索接口的时候,王振宇提过一句"今天不追求 Supervisor 能完美处理所有交叉场景",但赵航下午测试"我怀孕了,产假期间的合同还有效吗"这类交叉领域问题的时候,陈铭已经隐约意识到——即便协同处理的完整逻辑要等到第61天,今天至少可以先把"能同时查询多个知识库"这件事在统一检索引擎层面预先打通,明天做 Supervisor 协同判断时就不需要再回头改检索层,只需要在 Agent 编排层决定"什么时候调用这个能力"。这是一次典型的"底层先留口子,上层逻辑分阶段补齐"的设计取舍,晚上收尾时陈铭把这部分也一并写了。
+
+```python
+"""
+文件: retrieval/cross_domain.py
+说明: 跨知识库并行检索能力,是统一检索接口在"单知识库路由"之外的补充形态。
+      核心场景: Supervisor 判断出多个候选场景置信度接近(交叉领域问题)时,
+      不再只查一个知识库,而是并行查询多个候选知识库,合并结果供生成阶段综合处理。
+      本模块不改动 UnifiedRetriever 原有的单知识库检索行为,是纯粹的能力叠加。
+"""
+
+from __future__ import annotations
+
+import logging
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from typing import Dict, List, Optional
+
+from pydantic import BaseModel, Field
+
+from retrieval.schema import (
+    KnowledgeBaseID,
+    RetrievalFilter,
+    RetrievalQuery,
+    RetrievalResponse,
+    RetrievalResultItem,
+    UserContext,
+)
+from retrieval.unified_retriever import UnifiedRetriever, unified_retriever
+
+logger = logging.getLogger("cangqiong.retrieval.cross_domain")
+
+# 单次跨域检索允许并行查询的知识库数量上限,防止某次判断异常时并行发起过多请求
+# 拖慢整体响应,这个数值和赵航测的"三个知识库同时查大概多贵"这个粗略数据对齐过。
+MAX_PARALLEL_KNOWLEDGE_BASES = 3
+
+# 单个知识库检索的超时时间,遵循晨会上"所有外部调用必须设超时"的硬性要求,
+# 跨域场景下要查询多个知识库,单个的超时时间要比单知识库场景更保守一些,
+# 避免一个慢知识库拖慢整体跨域检索的响应时间。
+PER_KB_TIMEOUT_SECONDS = 2.5
+
+
+class CrossDomainCandidate(BaseModel):
+    """一个跨域检索候选知识库及其权重(通常来自Supervisor给出的多候选置信度)。"""
+
+    knowledge_base_id: KnowledgeBaseID
+    weight: float = Field(..., ge=0.0, le=1.0)
+
+
+class CrossDomainRetrievalResult(BaseModel):
+    """跨域检索的聚合结果,既保留了每个知识库各自的原始响应,也提供合并后的统一列表。"""
+
+    per_kb_responses: Dict[str, RetrievalResponse] = Field(default_factory=dict)
+    merged_items: List[RetrievalResultItem] = Field(default_factory=list)
+    partial_failure_kb_ids: List[str] = Field(default_factory=list, description="并行查询中失败或超时的知识库标识")
+
+    @property
+    def has_partial_failure(self) -> bool:
+        return len(self.partial_failure_kb_ids) > 0
+
+
+class CrossDomainRetriever:
+    """
+    跨知识库并行检索器。内部复用 UnifiedRetriever 已有的适配器分发、缓存、重排能力,
+    只是在"查哪些库"这一层做了并行化扩展,严格遵守"机制通用、按需叠加能力"的设计原则,
+    没有重新实现一套独立于 UnifiedRetriever 的检索逻辑。
+    """
+
+    def __init__(self, retriever: UnifiedRetriever = unified_retriever, max_workers: int = MAX_PARALLEL_KNOWLEDGE_BASES):
+        self._retriever = retriever
+        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="cross-domain-retrieval")
+
+    def retrieve(
+        self,
+        query_text: str,
+        candidates: List[CrossDomainCandidate],
+        user_context: Optional[UserContext] = None,
+        top_k_per_kb: int = 3,
+        overall_top_k: int = 6,
+    ) -> CrossDomainRetrievalResult:
+        if not candidates:
+            return CrossDomainRetrievalResult()
+
+        candidates = candidates[:MAX_PARALLEL_KNOWLEDGE_BASES]
+        future_to_kb: Dict[Future, str] = {}
+
+        for candidate in candidates:
+            query = RetrievalQuery(
+                query=query_text,
+                knowledge_base_id=candidate.knowledge_base_id,
+                top_k=top_k_per_kb,
+                user_context=user_context,
+                filters=RetrievalFilter(extra={"cross_domain_weight": candidate.weight}),
+            )
+            future = self._executor.submit(self._retriever.retrieve, query)
+            future_to_kb[future] = candidate.knowledge_base_id.value
+
+        per_kb_responses: Dict[str, RetrievalResponse] = {}
+        failed_kb_ids: List[str] = []
+
+        for future in as_completed(future_to_kb, timeout=PER_KB_TIMEOUT_SECONDS * len(candidates)):
+            kb_id = future_to_kb[future]
+            try:
+                response = future.result(timeout=PER_KB_TIMEOUT_SECONDS)
+                per_kb_responses[kb_id] = response
+                if response.degraded:
+                    failed_kb_ids.append(kb_id)
+            except Exception:  # noqa: BLE001 - 单个知识库的失败不能影响其它知识库的结果
+                logger.exception("跨域并行检索中知识库[%s]查询失败,已忽略该知识库结果", kb_id)
+                failed_kb_ids.append(kb_id)
+
+        weight_by_kb = {c.knowledge_base_id.value: c.weight for c in candidates}
+        merged_items = self._merge_and_rank(per_kb_responses, weight_by_kb, overall_top_k)
+
+        return CrossDomainRetrievalResult(
+            per_kb_responses=per_kb_responses,
+            merged_items=merged_items,
+            partial_failure_kb_ids=failed_kb_ids,
+        )
+
+    @staticmethod
+    def _merge_and_rank(
+        per_kb_responses: Dict[str, RetrievalResponse],
+        weight_by_kb: Dict[str, float],
+        overall_top_k: int,
+    ) -> List[RetrievalResultItem]:
+        """
+        合并多个知识库的检索结果。合并时用候选权重(来自Supervisor的置信度)
+        对各知识库结果的原始分数做一次加权调整,再统一排序截断,
+        保证"更像是这个领域的问题"的知识库结果排在更靠前的位置,
+        而不是简单地把三个知识库的结果按原始分数直接拼在一起。
+        """
+        merged: List[RetrievalResultItem] = []
+        for kb_id, response in per_kb_responses.items():
+            weight = weight_by_kb.get(kb_id, 0.5)
+            for item in response.items:
+                adjusted = item.model_copy()
+                adjusted.score = round(adjusted.score * (0.5 + 0.5 * weight), 4)
+                adjusted.metadata = {**adjusted.metadata, "source_scene_id": kb_id}
+                merged.append(adjusted)
+        merged.sort(key=lambda x: x.score, reverse=True)
+        return merged[:overall_top_k]
+
+    def shutdown(self) -> None:
+        """应用退出时调用,释放线程池资源,避免遗留线程导致进程无法正常退出。"""
+        self._executor.shutdown(wait=False)
+
+
+# 全局单例,供Supervisor在判断出交叉领域场景后直接调用,与unified_retriever的单例模式保持一致。
+cross_domain_retriever = CrossDomainRetriever()
+```
+
+### 7.15 业务Agent扩展工具集与Prompt强化(为多轮追问与精细化回答预置)
+
+补完统一检索接口的跨域能力之后,陈铭又回头看了一眼三个业务 Agent 目前绑定的工具——每个 Agent 目前都只绑了一个检索工具,这在今天验收"能跑通"的标准下是够用的,但老王在第43天专门讲过一句话他一直记着:"工具绑得越单一,Agent 看起来越像一个检索页面的对话框皮肤,只有绑上真正能'做事'的工具,才算得上是 Agent。"今天时间不够把这些工具真正接上真实的业务系统(比如触发请假申请、生成合同审核意见),但可以先把工具的骨架和绑定关系写好,一部分是纯计算型工具(不需要外部系统,今天就能跑),一部分是需要接后端业务系统的工具(今天先返回结构化的模拟数据,明确标注为待接入),这样明天要真正接上真实系统时,只需要替换工具函数内部实现,Agent 层和 Supervisor 层都不需要动。
+
+```python
+"""
+文件: agents/extended_tools.py
+说明: 三个业务Agent的扩展工具集。相比tool_factory.py里只绑定检索工具的基础版本,
+      这里补充了一部分计算型工具(今天可直接跑通)和业务动作型工具(今天先用结构化模拟数据打通调用链路,
+      明天接入寰宇集团真实业务系统时只需替换函数体内部实现)。
+      今天验收演示仍使用基础版工具集,本模块作为技术储备随代码一并提交。
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import date, datetime
+from typing import Optional
+
+from langchain_core.tools import tool
+
+from databases.contract_ledger import ContractLedgerRepository
+from retrieval.schema import KnowledgeBaseID, RetrievalQuery, UserContext
+from retrieval.unified_retriever import unified_retriever
+
+logger = logging.getLogger("cangqiong.agents.extended_tools")
+
+
+# ------------------------------------------------------------------
+# 法务场景扩展工具
+# ------------------------------------------------------------------
+
+@tool
+def legal_clause_lookup_tool(document_title: str, clause_no: str) -> str:
+    """按文档名称与条款号精确定位一条法务条款原文,适合用户明确指出"第几条"的场景,
+    比单纯的语义检索更精准,减少因语义相似但条款号不同而引用错误条款的风险。"""
+    query = RetrievalQuery(
+        query=f"{document_title} 第{clause_no}条",
+        knowledge_base_id=KnowledgeBaseID.LEGAL,
+        top_k=3,
+    )
+    response = unified_retriever.retrieve(query)
+    if response.is_empty:
+        return f"未能在《{document_title}》中定位到第{clause_no}条,请核实文档名称与条款号是否准确。"
+    return response.top_content_joined()
+
+
+@tool
+def compliance_checklist_tool(business_action: str) -> str:
+    """查询某类业务动作(如'对外投资'、'对外担保'、'签订大额合同')对应的内部合规审批清单,
+    帮助员工在动手办理前先了解需要走哪些审批环节,避免漏批导致合规风险。"""
+    query = RetrievalQuery(
+        query=f"{business_action} 合规审批清单 需要哪些审批环节",
+        knowledge_base_id=KnowledgeBaseID.LEGAL,
+        top_k=5,
+    )
+    response = unified_retriever.retrieve(query)
+    if response.is_empty:
+        return f"未检索到关于「{business_action}」的合规审批清单,建议直接联系法务部门确认。"
+    return response.top_content_joined()
+
+
+# ------------------------------------------------------------------
+# 人力场景扩展工具
+# ------------------------------------------------------------------
+
+# 年假计算规则摘自寰宇集团HR政策文档,今天先按最常见的"工作年限分档"规则实现,
+# 特殊情况(比如入职不满一年、跨年度调整)暂未覆盖,已知局限性记入技术债列表,
+# 正式启用前必须经HR业务方复核这份规则的准确性,不能只凭课件里的假设直接上线。
+_ANNUAL_LEAVE_TIERS = [
+    (1, 5),    # 工作年限 < 1年:5天
+    (10, 10),  # 1年 <= 工作年限 < 10年:10天
+    (20, 15),  # 10年 <= 工作年限 < 20年:15天
+]
+_ANNUAL_LEAVE_MAX_DAYS = 20
+
+
+def _calc_annual_leave_days(tenure_years: float) -> int:
+    for threshold, days in _ANNUAL_LEAVE_TIERS:
+        if tenure_years < threshold:
+            return days
+    return _ANNUAL_LEAVE_MAX_DAYS
+
+
+@tool
+def leave_balance_calculator_tool(hire_date: str, used_days: float = 0.0) -> str:
+    """
+    根据入职日期计算员工当前的年假总额与剩余可用天数。
+    hire_date 格式要求为 YYYY-MM-DD,used_days 为本年度已使用的年假天数。
+    注意: 本工具给出的是基于通用规则的计算结果,不能替代HR系统里的官方年假余额记录,
+    如与HR系统显示不一致,以HR系统记录为准,这一点必须在回答中提醒用户。
+    """
+    try:
+        hire = datetime.strptime(hire_date, "%Y-%m-%d").date()
+    except ValueError:
+        return "入职日期格式不正确,请使用 YYYY-MM-DD 格式重新提供,例如 2022-03-15。"
+
+    tenure_years = (date.today() - hire).days / 365.25
+    total_days = _calc_annual_leave_days(tenure_years)
+    remaining = max(total_days - used_days, 0)
+
+    return (
+        f"根据入职日期{hire_date}推算,工作年限约{tenure_years:.1f}年,"
+        f"按通用年假规则本年度年假总额为{total_days}天,已使用{used_days}天,"
+        f"剩余可用约{remaining}天。此结果为通用规则估算,具体余额请以HR系统内记录为准。"
+    )
+
+
+@tool
+def policy_effective_checker_tool(policy_title: str, check_date: Optional[str] = None) -> str:
+    """检查某项人力政策在指定日期(默认为今天)是否处于生效状态,
+    适合用户询问"这个政策现在还有效吗"这类带时效性判断的问题。"""
+    query = RetrievalQuery(
+        query=f"{policy_title} 生效日期 失效日期",
+        knowledge_base_id=KnowledgeBaseID.HR,
+        top_k=3,
+    )
+    response = unified_retriever.retrieve(query)
+    if response.is_empty:
+        return f"未检索到《{policy_title}》相关的生效时效信息,建议联系人力资源部门确认。"
+    target_date = check_date or str(date.today())
+    return f"检索到与《{policy_title}》相关的政策内容(比对时间点: {target_date}):\n{response.top_content_joined()}"
+
+
+# ------------------------------------------------------------------
+# 供应链场景扩展工具
+# ------------------------------------------------------------------
+
+_ledger_repo_for_tools: Optional[ContractLedgerRepository] = None
+
+
+def _get_ledger_repo() -> ContractLedgerRepository:
+    global _ledger_repo_for_tools
+    if _ledger_repo_for_tools is None:
+        _ledger_repo_for_tools = ContractLedgerRepository()
+        _ledger_repo_for_tools.connect()
+    return _ledger_repo_for_tools
+
+
+@tool
+def contract_expiry_checker_tool(contract_no: str) -> str:
+    """按合同编号精确查询该合同的到期时间与剩余天数,适合用户已知具体合同编号的场景,
+    比模糊的语义检索更快、更准确地给出结构化答案。"""
+    try:
+        repo = _get_ledger_repo()
+        records = repo.query_contracts(vendor_keyword=None, limit=50)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("合同台账查询异常")
+        return f"合同台账当前暂时无法查询({exc}),请稍后重试或联系供应链管理部门核实。"
+
+    matched = [r for r in records if r.contract_no == contract_no]
+    if not matched:
+        return f"未在合同台账中找到编号为{contract_no}的合同,请核实合同编号是否正确。"
+
+    record = matched[0]
+    days_left = (record.end_date - date.today()).days
+    status_desc = "已到期" if days_left < 0 else f"还剩{days_left}天到期"
+    return (
+        f"合同编号{record.contract_no}(供应商: {record.vendor_name}): "
+        f"签约金额{record.amount}元,到期日期{record.end_date},当前{status_desc},状态: {record.status}。"
+    )
+
+
+@tool
+def vendor_credit_lookup_tool(vendor_name: str) -> str:
+    """查询指定供应商名下的历史合同记录,用于辅助判断该供应商的合作履历,
+    今天先用台账数据做简单的历史合同列举,未来可结合供应商履约评分系统做更完整的信用画像。"""
+    try:
+        repo = _get_ledger_repo()
+        records = repo.query_contracts(vendor_keyword=vendor_name, limit=10)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("供应商台账查询异常")
+        return f"供应商台账当前暂时无法查询({exc}),请稍后重试。"
+
+    if not records:
+        return f"未在台账中找到供应商「{vendor_name}」的合同记录。"
+
+    lines = [
+        f"- 合同{r.contract_no}: 金额{r.amount}元,{r.start_date}至{r.end_date},状态{r.status}"
+        for r in records
+    ]
+    return f"供应商「{vendor_name}」名下共查询到{len(records)}份合同记录:\n" + "\n".join(lines)
+
+
+# ------------------------------------------------------------------
+# 扩展工具与场景配置的组装
+# ------------------------------------------------------------------
+
+_EXTENDED_TOOLS_BY_SCENE = {
+    "legal": [legal_clause_lookup_tool, compliance_checklist_tool],
+    "hr": [leave_balance_calculator_tool, policy_effective_checker_tool],
+    "supply_chain": [contract_expiry_checker_tool, vendor_credit_lookup_tool],
+}
+
+
+def build_extended_agent_configs():
+    """
+    基于基础版 BUSINESS_AGENT_CONFIGS,生成绑定了扩展工具集的增强版配置副本。
+    今天的验收演示仍使用基础版配置(business_agent_factory.py 中的原始列表),
+    这里刻意不去修改原始配置,而是生成新的副本列表,
+    这样明天评审扩展工具是否可以正式启用时,只需要切换Agent工厂读取的配置来源,
+    不需要在配置定义层面做任何回退操作。
+    """
+    from agents.business_agent_factory import BUSINESS_AGENT_CONFIGS
+
+    extended_configs = []
+    for cfg in BUSINESS_AGENT_CONFIGS:
+        extra_tools = _EXTENDED_TOOLS_BY_SCENE.get(cfg.scene_id, [])
+        extended_cfg = cfg.model_copy(deep=True) if hasattr(cfg, "model_copy") else cfg
+        # BusinessAgentConfig是dataclass而非pydantic模型,这里用dataclasses.replace更贴切,
+        # 但为了保持与前文一致的书写习惯,这里显式重新构造一个新实例,语义上更直观。
+        from dataclasses import replace
+
+        extended_cfg = replace(cfg, tools=[*cfg.tools, *extra_tools])
+        extended_configs.append(extended_cfg)
+    return extended_configs
+```
+
+关于 Prompt 强化,陈铭没有另起一套提示词体系,而是给三个基础版系统提示词各补充了一段"少样本示例(few-shot)"后缀,专门用来演示"检索资料不足时应该怎么措辞拒答"和"多条资料冲突时应该怎么措辞"这两类他在测试中发现容易被基础版提示词忽略的边界情况。
+
+```python
+"""
+文件: agents/prompt_enhancements.py
+说明: 在基础版系统提示词之外补充少样本示例后缀,
+      针对"资料不足时如何拒答"和"多条资料冲突时如何表述"两类边界情况做强化,
+      这两类情况在下午测试时被发现是基础版提示词最容易表现不稳定的地方。
+"""
+
+from __future__ import annotations
+
+LEGAL_FEWSHOT_SUFFIX = """
+
+以下是两个回答示例,请模仿其中的措辞方式与结构:
+
+示例1(资料不足时):
+问题: 我们和某供应商的合同里有没有约定不可抗力条款?
+资料: [未检索到相关条款]
+回答: 根据现有检索资料,暂未找到与该合同不可抗力条款直接相关的内容,无法给出明确结论。建议您联系法务部门核实原始合同文本,或提供更具体的合同名称以便进一步检索。
+
+示例2(多条资料存在细微差异时):
+问题: 对外投资审批的金额门槛是多少?
+资料: [资料1指出500万元以上需董事会审批;资料2指出300万元以上需总经理审批]
+回答: 根据检索到的资料,对外投资审批存在分级门槛:金额在300万元(含)以上、500万元以下的,需总经理审批(来源: 资料2);金额达到500万元(含)以上的,需董事会审批(来源: 资料1)。请以此分级口径为准,如实际情况与此有出入,建议进一步核实最新版审批制度。
+"""
+
+HR_FEWSHOT_SUFFIX = """
+
+以下是两个回答示例,请模仿其中的措辞方式与结构:
+
+示例1(政策存在适用范围限定时):
+问题: 我们公司的销售提成政策是怎么算的?
+资料: [提成政策仅适用于销售部,资料明确标注适用部门]
+回答: 检索到的提成政策仅适用于销售部门(来源已标注),如果您不在销售部门,该政策可能不适用于您的岗位,具体计算方式为……如果您对自己是否适用存在疑问,建议联系人力资源部门确认。
+
+示例2(资料不足时):
+问题: 外派海外的员工有没有额外的安家补贴?
+资料: [未检索到与海外外派相关的补贴条款]
+回答: 根据现有资料,暂未找到关于海外外派安家补贴的明确规定,无法直接回答。建议您联系人力资源部门,海外外派通常涉及个案审批,具体补贴标准可能需要单独确认。
+"""
+
+SUPPLY_CHAIN_FEWSHOT_SUFFIX = """
+
+以下是两个回答示例,请模仿其中的措辞方式与结构:
+
+示例1(结构化台账信息与合同文本信息合并呈现时):
+问题: A供应商的合同还有多久到期,续签需要走什么流程?
+资料: [台账显示到期日期与剩余天数;合同文本资料显示续签需要走的审批流程]
+回答: 根据合同台账记录,A供应商的合同将于XX日期到期,剩余约XX天(来源: 供应链合同台账)。关于续签流程,根据合同条款(来源已标注),需要……请留意剩余时间,建议提前启动续签流程以避免合同到期后出现空窗期。
+
+示例2(多条候选合同容易混淆时):
+问题: 我们和B公司的合同金额是多少?
+资料: [台账中存在两条与"B公司"相关但合同编号不同的记录]
+回答: 台账中查询到两份与"B公司"相关的合同记录,请确认具体是哪一份:合同编号XX,金额XX元;合同编号XX,金额XX元。如需进一步确认,建议提供具体的合同编号。
+"""
+```
+
+### 7.16 Supervisor 意图识别强化与多轮追问处理完整实现
+
+统一检索接口有了跨域并行能力之后,Supervisor 这一侧也需要相应补齐两块能力,才能真正把"多知识库路由"和"多轮追问"用起来,而不是让 7.14 的代码变成一段孤零零地摆在那里、没有任何调用方的"死代码"。陈铭晚上补的这部分严格遵守了王振宇上午定的红线——不允许写成一堆 if-else 硬编码关键词判断,关键词只能作为辅助信号,最终决策权始终在大模型的结构化输出上。
+
+```python
+"""
+文件: agents/intent_prefilter.py
+说明: 意图识别的辅助信号提取器。这里的关键词表严格定位为"提示信号",
+      不参与任何硬性路由决策,决策权始终交由Supervisor里基于大模型的结构化判断,
+      这一点在类文档字符串里反复强调,是为了防止未来有人在维护时把它误用成硬编码规则判断的入口。
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Dict, List
+
+# 关键词表仅用于生成"辅助提示信息",拼进Supervisor的路由提示词供大模型参考,
+# 决不能绕过大模型直接用关键词命中数量来做路由决策——这是本模块唯一、且不可违背的设计红线。
+_DOMAIN_KEYWORD_HINTS: Dict[str, List[str]] = {
+    "legal": ["合同", "违约", "保密协议", "竞业", "合规审批", "知识产权", "条款", "法律责任"],
+    "hr": ["年假", "病假", "产假", "加班费", "试用期", "绩效考核", "入职", "离职", "安家费", "调薪"],
+    "supply_chain": ["供应商", "采购", "到期", "续签", "台账", "合同金额", "供应链", "交货"],
+}
+
+_TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fa5]{2,6}")
+
+
+class KeywordHintExtractor:
+    """
+    从用户查询中提取"命中了哪些场景的关键词、命中了几个"这样的辅助统计信息,
+    Supervisor会把这份统计结果作为提示词的一部分交给大模型参考,
+    但绝不直接依据命中数量做出路由决定,这是与"硬编码规则路由"最本质的区别。
+    """
+
+    def __init__(self, keyword_hints: Dict[str, List[str]] = None):
+        self._keyword_hints = keyword_hints or _DOMAIN_KEYWORD_HINTS
+
+    def extract_hints(self, query_text: str) -> Dict[str, int]:
+        hits: Dict[str, int] = {}
+        for scene_id, keywords in self._keyword_hints.items():
+            count = sum(1 for kw in keywords if kw in query_text)
+            if count > 0:
+                hits[scene_id] = count
+        return hits
+
+    def format_hint_text(self, query_text: str) -> str:
+        hits = self.extract_hints(query_text)
+        if not hits:
+            return "关键词提示: 未检测到明显的领域关键词,请完全依据语义理解判断。"
+        parts = [f"{scene_id}(命中{count}个关键词)" for scene_id, count in sorted(hits.items(), key=lambda x: -x[1])]
+        return (
+            "关键词提示(仅供参考,不代表最终判断,请结合语义综合考虑,"
+            "尤其注意关键词命中不代表该场景就是最合适的答案,只是一个弱信号): "
+            + "、".join(parts)
+        )
+```
+
+```python
+"""
+文件: agents/followup_rewriter.py
+说明: 多轮追问的查询改写器。处理"续签流程呢""那年假怎么算"这类依赖上文才能理解的追问,
+      把追问改写为一个语义完整、脱离上下文也能独立理解的查询,再交给Supervisor做路由判断
+      和交给检索层做检索,避免因为查询本身信息不完整而导致路由错误或检索召回质量下降。
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Callable, Optional
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+
+from memory.session_state import SessionState
+
+logger = logging.getLogger("cangqiong.agents.followup_rewriter")
+
+_REWRITE_SYSTEM_PROMPT = """你是一个查询改写助手,任务是把用户在多轮对话中的追问,改写为一个不依赖上文也能被独立理解的完整查询。
+改写规则:
+1. 如果用户的当前问题已经是完整、独立的问题(不依赖上文指代),原样返回,不做任何改写。
+2. 如果当前问题存在指代(比如"那个""它""续签流程呢""刚才说的政策"等),需要结合历史对话,补全为完整的问题。
+3. 改写后的查询必须只包含改写结果本身,不要输出任何解释性文字。
+4. 改写时不要引入历史对话中没有出现过的新信息,只做指代补全,不要过度联想或编造。
+"""
+
+
+class FollowUpQueryRewriter:
+    """
+    追问改写器。设计上刻意做了一个性能优化: 如果当前会话没有历史记录(第一轮提问),
+    直接跳过大模型调用,原样返回查询文本,避免给单轮问答场景引入不必要的额外延迟和成本,
+    这个判断放在方法最前面,是本模块里最容易被忽略但很重要的一处工程细节。
+    """
+
+    def __init__(self, llm_factory: Callable[[], ChatOpenAI]):
+        self._llm_factory = llm_factory
+        self._llm = None
+
+    def _get_llm(self):
+        if self._llm is None:
+            self._llm = self._llm_factory()
+        return self._llm
+
+    def rewrite(self, session: Optional[SessionState], current_query: str) -> str:
+        if session is None or not session.turns:
+            return current_query
+
+        history_summary = session.recent_context_summary(max_turns=3)
+        if not history_summary:
+            return current_query
+
+        prompt_messages = [
+            SystemMessage(content=_REWRITE_SYSTEM_PROMPT),
+            HumanMessage(
+                content=f"历史对话:\n{history_summary}\n\n用户当前的追问: {current_query}\n\n改写后的完整查询:"
+            ),
+        ]
+
+        try:
+            llm = self._get_llm()
+            response = llm.invoke(prompt_messages)
+            rewritten = (response.content or "").strip()
+            if not rewritten:
+                logger.warning("追问改写返回空结果,回退使用原始查询")
+                return current_query
+            logger.info("追问改写: 原始=%r 改写后=%r", current_query, rewritten)
+            return rewritten
+        except Exception:
+            logger.exception("追问改写过程发生异常,回退使用原始查询,不阻塞主链路")
+            return current_query
+```
+
+```python
+"""
+文件: agents/enhanced_supervisor.py
+说明: Supervisor的增强版实现,在基础版SupervisorAgent(agents/supervisor.py)之上
+      叠加三项能力: 1) 多轮追问改写(依赖7.16的FollowUpQueryRewriter);
+      2) 关键词辅助提示(依赖7.16的KeywordHintExtractor,仅作弱信号,不做硬性判断);
+      3) 多候选路由输出(为7.14的跨域并行检索提供触发依据)。
+      今天验收演示仍使用基础版SupervisorAgent以保证主链路的稳定性和可预期性,
+      增强版作为完整技术方案随代码一并提交,计划明天(第61天)评审后正式切换。
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Callable, List, Optional
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field
+
+from agents.business_agent_factory import BUSINESS_AGENT_CONFIGS, BusinessAgentConfig
+from agents.followup_rewriter import FollowUpQueryRewriter
+from agents.intent_prefilter import KeywordHintExtractor
+from config.settings import app_settings
+from memory.session_state import SessionState
+
+logger = logging.getLogger("cangqiong.agents.enhanced_supervisor")
+
+
+class RouteCandidate(BaseModel):
+    """单个路由候选场景及其置信度。"""
+
+    scene_id: str
+    confidence: float = Field(..., ge=0.0, le=1.0)
+
+
+class EnhancedRouteDecision(BaseModel):
+    """增强版路由决策输出,相比基础版RouteDecision新增了候选列表与追问相关字段。"""
+
+    primary_scene_id: str = Field(..., description="置信度最高的主场景标识")
+    primary_confidence: float = Field(..., ge=0.0, le=1.0)
+    candidates: List[RouteCandidate] = Field(default_factory=list, description="按置信度从高到低排列的候选场景,至少包含主场景本身")
+    reason: str
+    rewritten_query: str = Field(..., description="经过追问改写处理后的完整查询,若无需改写则与原始查询一致")
+    is_followup: bool = False
+    is_low_confidence: bool = False
+    is_cross_domain: bool = False
+
+
+class _StructuredCandidateOutput(BaseModel):
+    """供大模型结构化输出使用的中间模型,只承载"主场景+备选场景"两个候选,
+    今天先只做两候选,后续如果发现三方交叉的场景比例较高,再考虑扩展为更多候选。"""
+
+    primary_scene_id: str
+    primary_confidence: float = Field(..., ge=0.0, le=1.0)
+    alternative_scene_id: Optional[str] = None
+    alternative_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    reason: str
+
+
+class EnhancedSupervisorAgent:
+    def __init__(
+        self,
+        llm_factory: Callable[[], ChatOpenAI],
+        scene_configs: Optional[List[BusinessAgentConfig]] = None,
+    ):
+        self._llm_factory = llm_factory
+        self._llm = None
+        self.scene_configs = scene_configs or BUSINESS_AGENT_CONFIGS
+        self._rewriter = FollowUpQueryRewriter(llm_factory)
+        self._hint_extractor = KeywordHintExtractor()
+
+    def _get_llm(self):
+        if self._llm is None:
+            self._llm = self._llm_factory()
+        return self._llm
+
+    def route_with_context(self, session: Optional[SessionState], user_query: str) -> EnhancedRouteDecision:
+        """
+        带上下文的完整路由流程,依次完成: 追问改写 -> 关键词辅助提示 -> 多候选结构化路由判断 -> 交叉域标记。
+        这是今天晚上补的完整版本,明天评审通过后计划取代main_chain.py里对基础版SupervisorAgent的直接调用。
+        """
+        is_followup = session is not None and len(session.turns) > 0
+        rewritten_query = self._rewriter.rewrite(session, user_query)
+
+        candidate_output = self._structured_route(rewritten_query)
+
+        candidates = [RouteCandidate(scene_id=candidate_output.primary_scene_id, confidence=candidate_output.primary_confidence)]
+        if candidate_output.alternative_scene_id and candidate_output.alternative_scene_id != candidate_output.primary_scene_id:
+            candidates.append(
+                RouteCandidate(scene_id=candidate_output.alternative_scene_id, confidence=candidate_output.alternative_confidence)
+            )
+
+        is_low_confidence = candidate_output.primary_confidence < app_settings.supervisor.low_confidence_threshold
+        gap = candidate_output.primary_confidence - candidate_output.alternative_confidence
+        is_cross_domain = (
+            len(candidates) > 1 and gap < app_settings.supervisor.cross_domain_gap_threshold
+        )
+
+        decision = EnhancedRouteDecision(
+            primary_scene_id=candidate_output.primary_scene_id,
+            primary_confidence=candidate_output.primary_confidence,
+            candidates=candidates,
+            reason=candidate_output.reason,
+            rewritten_query=rewritten_query,
+            is_followup=is_followup,
+            is_low_confidence=is_low_confidence,
+            is_cross_domain=is_cross_domain,
+        )
+        logger.info(
+            "增强版路由决策: query=%r rewritten=%r primary=%s gap=%.2f cross_domain=%s",
+            user_query, rewritten_query, decision.primary_scene_id, gap, is_cross_domain,
+        )
+        return decision
+
+    def _structured_route(self, query_text: str) -> _StructuredCandidateOutput:
+        valid_scene_ids = {cfg.scene_id for cfg in self.scene_configs}
+        prompt = self._build_prompt_with_hints(query_text)
+        try:
+            llm = self._get_llm()
+            structured_llm = llm.with_structured_output(_StructuredCandidateOutput)
+            output: _StructuredCandidateOutput = structured_llm.invoke(
+                [SystemMessage(content=prompt), HumanMessage(content=query_text)]
+            )
+        except Exception:
+            logger.exception("增强版Supervisor路由判断异常,采用保底策略")
+            fallback_scene = self.scene_configs[0].scene_id
+            return _StructuredCandidateOutput(
+                primary_scene_id=fallback_scene, primary_confidence=0.0, reason="路由判断过程发生异常,已采用保底策略",
+            )
+
+        if output.primary_scene_id not in valid_scene_ids:
+            logger.warning("增强版路由结果场景标识非法: %s,回退至首个配置场景", output.primary_scene_id)
+            output.primary_scene_id = self.scene_configs[0].scene_id
+            output.primary_confidence = 0.0
+        if output.alternative_scene_id and output.alternative_scene_id not in valid_scene_ids:
+            output.alternative_scene_id = None
+            output.alternative_confidence = 0.0
+        return output
+
+    def _build_prompt_with_hints(self, query_text: str) -> str:
+        """
+        与基础版SupervisorAgent._build_routing_prompt的场景描述拼装逻辑基本一致,
+        额外新增两点: 1) 要求模型同时给出备选场景及其置信度,用于判断是否存在交叉领域情况;
+        2) 拼入关键词辅助提示文本,但反复用文字强调这只是弱信号,不能替代语义判断,
+        这里存在与基础版一定程度的实现重复,评审时老王指出过这一点,
+        计划后续把两版的场景描述拼装逻辑抽取为共享的辅助函数,今天先如实保留两份实现,
+        原因是这两个版本目前分别对应"今天验收使用的稳定版"和"预告的下一版",
+        在评审通过正式切换之前,故意不做提前合并,避免稳定版本被未评审的改动连带影响。
+        """
+        scene_blocks = []
+        for cfg in self.scene_configs:
+            examples = "\n".join(f"    - {q}" for q in cfg.example_questions)
+            scene_blocks.append(
+                f"场景标识: {cfg.scene_id}\n场景名称: {cfg.display_name}\n"
+                f"覆盖范围: {cfg.scene_description}\n典型问题示例:\n{examples}"
+            )
+        scenes_text = "\n\n".join(scene_blocks)
+        hint_text = self._hint_extractor.format_hint_text(query_text)
+
+        return (
+            "你是一个企业内部智能助手的意图路由判断模块。"
+            "以下是当前系统支持的所有业务场景及其覆盖范围和典型问题示例:\n\n"
+            f"{scenes_text}\n\n{hint_text}\n\n"
+            "请判断用户问题最符合哪一个业务场景(主场景),并给出0到1之间的置信度评分。"
+            "如果用户问题同时明显涉及第二个场景(交叉领域问题),请给出备选场景标识及其置信度评分,"
+            "如果不存在明显的第二个场景,备选场景可以留空。"
+            "必须严格从给定的场景标识列表中选择,不能自行创造新的场景标识。"
+        )
+```
+
+### 7.17 集成测试:跨域检索、多轮追问与审计埋点的端到端验证
+
+前面几节新增的能力——跨域并行检索、扩展工具集、增强版 Supervisor、审计埋点——目前都还没有接入今天验收演示所使用的主链路,属于"技术方案已就位,等待明天评审后正式启用"的状态。但赵航坚持一点:"没有测试覆盖的代码,不算真正完成,哪怕它今天不上线。"于是这几块新增能力也各自配了对应的测试,保证明天真正启用的时候,不是从零开始验证,而是直接在已有的测试基线上做小范围回归确认。
+
+```python
+"""
+文件: tests/test_cross_domain_retriever.py
+说明: 跨知识库并行检索器的单元测试,覆盖正常并行合并、部分知识库失败时的降级隔离、
+      合并排序权重是否生效等场景。
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock
+
+from retrieval.cross_domain import CrossDomainCandidate, CrossDomainRetriever
+from retrieval.schema import KnowledgeBaseID, RetrievalResponse, RetrievalResultItem
+
+
+def _make_response(kb_id: KnowledgeBaseID, items, degraded=False):
+    return RetrievalResponse(items=items, knowledge_base_id=kb_id, query="测试", took_ms=10.0, degraded=degraded)
+
+
+def test_merge_ranks_by_weight_adjusted_score():
+    mock_retriever = MagicMock()
+
+    def _fake_retrieve(query):
+        if query.knowledge_base_id == KnowledgeBaseID.HR:
+            return _make_response(
+                KnowledgeBaseID.HR,
+                [RetrievalResultItem(content="人力条款", source="人力政策·休假", score=0.6, metadata={})],
+            )
+        return _make_response(
+            KnowledgeBaseID.LEGAL,
+            [RetrievalResultItem(content="法务条款", source="劳动合同·第8条", score=0.6, metadata={})],
+        )
+
+    mock_retriever.retrieve.side_effect = _fake_retrieve
+    cross_retriever = CrossDomainRetriever(retriever=mock_retriever, max_workers=2)
+
+    candidates = [
+        CrossDomainCandidate(knowledge_base_id=KnowledgeBaseID.HR, weight=0.9),
+        CrossDomainCandidate(knowledge_base_id=KnowledgeBaseID.LEGAL, weight=0.4),
+    ]
+    result = cross_retriever.retrieve("产假期间的合同还有效吗", candidates)
+
+    assert len(result.merged_items) == 2
+    # 权重更高的hr知识库结果,加权后分数应排在前面
+    assert result.merged_items[0].metadata["source_scene_id"] == "hr"
+    assert result.has_partial_failure is False
+
+
+def test_partial_failure_does_not_break_other_kb_results():
+    mock_retriever = MagicMock()
+
+    def _fake_retrieve(query):
+        if query.knowledge_base_id == KnowledgeBaseID.SUPPLY_CHAIN:
+            raise ConnectionError("模拟供应链向量库超时")
+        return _make_response(
+            KnowledgeBaseID.LEGAL,
+            [RetrievalResultItem(content="法务条款", source="来源A", score=0.7, metadata={})],
+        )
+
+    mock_retriever.retrieve.side_effect = _fake_retrieve
+    cross_retriever = CrossDomainRetriever(retriever=mock_retriever, max_workers=2)
+
+    candidates = [
+        CrossDomainCandidate(knowledge_base_id=KnowledgeBaseID.LEGAL, weight=0.8),
+        CrossDomainCandidate(knowledge_base_id=KnowledgeBaseID.SUPPLY_CHAIN, weight=0.5),
+    ]
+    result = cross_retriever.retrieve("测试问题", candidates)
+
+    assert len(result.merged_items) == 1
+    assert "supply_chain" in result.partial_failure_kb_ids
+```
+
+```python
+"""
+文件: tests/test_enhanced_supervisor.py
+说明: 增强版Supervisor的单元测试,覆盖追问改写触发条件、交叉领域判断逻辑、
+      非法场景标识回退等场景,均使用Mock LLM,不依赖真实模型服务。
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock
+
+from agents.enhanced_supervisor import EnhancedSupervisorAgent, _StructuredCandidateOutput
+from memory.session_state import ConversationTurn, SessionState
+
+
+def _make_mock_llm(structured_output: _StructuredCandidateOutput, rewrite_text: str = ""):
+    mock_llm = MagicMock()
+    mock_structured = MagicMock()
+    mock_structured.invoke.return_value = structured_output
+    mock_llm.with_structured_output.return_value = mock_structured
+
+    mock_rewrite_response = MagicMock()
+    mock_rewrite_response.content = rewrite_text
+    mock_llm.invoke.return_value = mock_rewrite_response
+    return mock_llm
+
+
+def test_no_session_history_skips_rewrite_and_routes_normally():
+    output = _StructuredCandidateOutput(primary_scene_id="hr", primary_confidence=0.9, reason="明确的年假问题")
+    supervisor = EnhancedSupervisorAgent(llm_factory=lambda: _make_mock_llm(output))
+
+    decision = supervisor.route_with_context(session=None, user_query="试用期年假怎么算")
+
+    assert decision.is_followup is False
+    assert decision.rewritten_query == "试用期年假怎么算"
+    assert decision.primary_scene_id == "hr"
+
+
+def test_followup_with_session_history_triggers_rewrite():
+    output = _StructuredCandidateOutput(primary_scene_id="supply_chain", primary_confidence=0.85, reason="续签流程问题")
+    supervisor = EnhancedSupervisorAgent(
+        llm_factory=lambda: _make_mock_llm(output, rewrite_text="A供应商合同续签需要走什么流程")
+    )
+
+    session = SessionState(session_id="s1", user_id="u1")
+    session.append_turn(
+        ConversationTurn(turn_id=1, user_query="A供应商的合同还有多久到期", hit_scene="supply_chain",
+                          final_answer="还有30天到期", route_confidence=0.9)
+    )
+
+    decision = supervisor.route_with_context(session=session, user_query="续签流程呢")
+
+    assert decision.is_followup is True
+    assert decision.rewritten_query == "A供应商合同续签需要走什么流程"
+
+
+def test_close_confidence_gap_is_marked_cross_domain():
+    output = _StructuredCandidateOutput(
+        primary_scene_id="hr", primary_confidence=0.55,
+        alternative_scene_id="legal", alternative_confidence=0.5,
+        reason="问题同时涉及产假与合同效力",
+    )
+    supervisor = EnhancedSupervisorAgent(llm_factory=lambda: _make_mock_llm(output))
+
+    decision = supervisor.route_with_context(session=None, user_query="我怀孕了,产假期间的合同还有效吗")
+
+    assert decision.is_cross_domain is True
+    assert len(decision.candidates) == 2
+
+
+def test_invalid_alternative_scene_is_dropped():
+    output = _StructuredCandidateOutput(
+        primary_scene_id="legal", primary_confidence=0.8,
+        alternative_scene_id="not_a_real_scene", alternative_confidence=0.6,
+        reason="模型给出了非法备选场景",
+    )
+    supervisor = EnhancedSupervisorAgent(llm_factory=lambda: _make_mock_llm(output))
+
+    decision = supervisor.route_with_context(session=None, user_query="任意问题")
+
+    assert len(decision.candidates) == 1
+```
+
+```python
+"""
+文件: scripts/integration_test_end_to_end.py
+说明: 端到端集成测试脚本,串联"追问改写 -> 增强版路由 -> 跨域并行检索 -> 审计埋点"完整链路,
+      使用Mock LLM和Mock适配器,不依赖真实的大模型服务与向量库,可在CI环境直接运行,
+      验证的重点不是"回答内容对不对"(那需要真实模型),而是"这几块新能力能否正确串联工作"。
+"""
+
+from __future__ import annotations
+
+import logging
+from unittest.mock import MagicMock
+
+from agents.enhanced_supervisor import EnhancedSupervisorAgent, _StructuredCandidateOutput
+from audit.logger import AuditLogger, InMemoryAuditSink
+from audit.models import AuditLogEntry
+from memory.session_state import ConversationTurn, SessionState, SessionStore
+from retrieval.cross_domain import CrossDomainCandidate, CrossDomainRetriever
+from retrieval.schema import KnowledgeBaseID, RetrievalResponse, RetrievalResultItem
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("cangqiong.integration_test")
+
+
+def _build_mock_llm_for_cross_domain():
+    output = _StructuredCandidateOutput(
+        primary_scene_id="hr", primary_confidence=0.52,
+        alternative_scene_id="legal", alternative_confidence=0.48,
+        reason="问题同时涉及产假(人力)与合同效力(法务),两个场景置信度接近",
+    )
+    mock_llm = MagicMock()
+    mock_structured = MagicMock()
+    mock_structured.invoke.return_value = output
+    mock_llm.with_structured_output.return_value = mock_structured
+    return mock_llm
+
+
+def _build_mock_cross_domain_retriever() -> CrossDomainRetriever:
+    mock_retriever = MagicMock()
+
+    def _fake_retrieve(query):
+        if query.knowledge_base_id == KnowledgeBaseID.HR:
+            items = [RetrievalResultItem(content="产假期间劳动合同关系不受影响", source="人力政策·产假管理办法", score=0.75, metadata={})]
+        else:
+            items = [RetrievalResultItem(content="产假期间用人单位不得解除劳动合同", source="劳动合同法条款摘录", score=0.7, metadata={})]
+        return RetrievalResponse(items=items, knowledge_base_id=query.knowledge_base_id, query=query.query, took_ms=15.0)
+
+    mock_retriever.retrieve.side_effect = _fake_retrieve
+    return CrossDomainRetriever(retriever=mock_retriever, max_workers=2)
+
+
+def run_cross_domain_followup_scenario() -> None:
+    """
+    模拟场景: 用户先问一个人力相关的问题,紧接着追问一个跨领域的复合问题,
+    验证追问改写、交叉领域识别、跨域并行检索、审计埋点四个环节能否串联工作。
+    """
+    session_store = SessionStore()
+    session = session_store.get_or_create(session_id="int_test_session_1", user_id="u_integration_test")
+    session.append_turn(
+        ConversationTurn(turn_id=1, user_query="我们公司产假一共有多少天", hit_scene="hr",
+                          final_answer="法定产假98天,寰宇集团在此基础上额外增加了15天", route_confidence=0.93)
+    )
+
+    supervisor = EnhancedSupervisorAgent(llm_factory=_build_mock_llm_for_cross_domain)
+    decision = supervisor.route_with_context(session=session, user_query="那我怀孕了,产假期间的合同还有效吗")
+
+    assert decision.is_cross_domain is True, "集成测试失败: 未能识别出交叉领域场景"
+    logger.info("路由决策: primary=%s candidates=%s", decision.primary_scene_id, decision.candidates)
+
+    cross_retriever = _build_mock_cross_domain_retriever()
+    cross_candidates = [
+        CrossDomainCandidate(knowledge_base_id=KnowledgeBaseID(c.scene_id), weight=c.confidence)
+        for c in decision.candidates
+    ]
+    retrieval_result = cross_retriever.retrieve(decision.rewritten_query, cross_candidates)
+
+    assert len(retrieval_result.merged_items) >= 1, "集成测试失败: 跨域检索未返回任何合并结果"
+    logger.info("跨域检索合并结果条数: %d", len(retrieval_result.merged_items))
+
+    audit_sink = InMemoryAuditSink()
+    audit_logger = AuditLogger(sink=audit_sink)
+    knowledge_source_text = "\n".join(f"来源: {item.source} |" for item in retrieval_result.merged_items)
+    fake_chain_result = {
+        "answer": "综合人力与法务两方面资料,产假期间劳动合同关系依法不受影响……",
+        "hit_scene": decision.primary_scene_id,
+        "hit_display_name": "人力助手(交叉领域协同)",
+        "route_confidence": decision.primary_confidence,
+        "took_ms": 1234.5,
+    }
+    audit_entry = AuditLogEntry.build_from_chain_result(
+        user_id="u_integration_test",
+        user_role="employee",
+        department="研发部",
+        session_id=session.session_id,
+        raw_query="那我怀孕了,产假期间的合同还有效吗",
+        rewritten_query=decision.rewritten_query,
+        chain_result=fake_chain_result,
+        knowledge_source_text=knowledge_source_text,
+    )
+    audit_logger.record(audit_entry)
+
+    recorded = audit_sink.all()
+    assert len(recorded) == 1, "集成测试失败: 审计日志未成功记录"
+    assert recorded[0].event_type.value in {"sensitive_qa", "cross_domain_qa", "low_confidence_route"}
+    logger.info("审计日志记录成功: log_id=%s knowledge_sources=%s", recorded[0].log_id, recorded[0].knowledge_sources)
+
+    logger.info("端到端集成测试通过: 追问改写 -> 交叉领域识别 -> 跨域并行检索 -> 审计埋点 全链路串联成功")
+
+
+if __name__ == "__main__":
+    run_cross_domain_followup_scenario()
+```
+
+这套集成测试今天晚上跑了一遍,顺利通过。陈铭在提交代码前特意把这几个新模块(`retrieval/cross_domain.py`、`agents/extended_tools.py`、`agents/prompt_enhancements.py`、`agents/intent_prefilter.py`、`agents/followup_rewriter.py`、`agents/enhanced_supervisor.py`、`audit/models.py`、`audit/logger.py`)在提交说明里单独列了一段备注,写清楚"今天验收演示不使用这批模块,均为预告版技术方案,已通过独立测试,计划明天评审后再决定是否正式替换现有主链路的对应部分",避免赵航明天回归测试时误以为主链路已经切换到了增强版实现。这种"新能力先落地验证、再决定何时切换"的节奏,也是老王一直强调的冲刺阶段工作方式——"跑得快不等于跑得乱,想清楚什么时候切换比什么时候写完更重要"。
 
 ## 八、今日复盘
 
