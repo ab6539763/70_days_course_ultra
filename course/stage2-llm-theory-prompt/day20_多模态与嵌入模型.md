@@ -2264,6 +2264,968 @@ python semantic_search_mini_demo.py
 "向量化 + 余弦相似度检索"这套核心原理完全不变。
 ````
 
+晚自习收尾前,四人吃外卖聊天的时候,张凡忽然想起下午苏梦提过的一个问题:"苏梦你问的那个'海纳制造现场照片分辨率很高怎么办',还有韩露问的'换了Embedding模型旧缓存能不能用',这两个问题老王当时是口头回答的,咱们代码里好像都没真正落地。"老王刚好经过工位听到这句话,笑着说:"既然你们还惦记着这两个问题,那就不算是白问了——趁着晚自习还剩一点时间,再加四个小文件,把这两个'口头答案'变成'能跑起来、能测试的代码',顺便再补一个大家可能以后会踩的坑——多模态和Embedding这类调用,成本记录该怎么做,以及知识库规模变大之后,现在这种'两两比对'的查找方式到底能撑多久。这几块不算今天任务书的必修项,但都是今天讨论中冒出来、值得当场钉死的技术点。"
+
+### 文件九:`image_preprocessing_utils.py`(图片预处理:压缩与格式统一)
+
+```python
+"""
+文件名: image_preprocessing_utils.py
+说明:
+    回应苏梦在课堂笔记中提出的问题 —— 海纳制造集团这类工业客户现场拍摄的
+    设备照片, 出于记录细节的需要, 往往分辨率很高、文件体积很大, 直接原样
+    传给多模态API, 容易超出接口的大小限制, 也会拖慢请求速度、增加不必要
+    的传输成本。
+
+    这个模块提供图片预处理的标准流程 —— 在真正调用vision_understanding_demo.py
+    里的图片理解接口之前, 先对图片做统一的尺寸压缩、格式转换、文件大小校验,
+    这一层预处理逻辑, 应当是产品后端的标准职责, 不能指望终端用户自己先手动
+    压缩好图片再上传, 这也是老王反复强调的"看不见但很重要的工程细节"之一。
+
+    依赖: Pillow(PIL)图像处理库, 使用前请先执行 pip install Pillow
+"""
+
+from __future__ import annotations
+
+import io
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Tuple
+
+from PIL import Image
+
+# 大部分多模态接口对图片大小有明确限制, 这里保守设定为8MB, 留出一定余量,
+# 具体数值应以实际对接的厂商文档为准
+MAX_IMAGE_SIZE_BYTES = 8 * 1024 * 1024
+# 单边分辨率超过这个数值时, 按比例缩小, 兼顾图片内容清晰度与传输效率
+MAX_DIMENSION_PIXELS = 2048
+# JPEG压缩质量, 数值越高画质越好但文件越大, 90是兼顾画质与体积的常用经验值
+DEFAULT_JPEG_QUALITY = 90
+
+
+@dataclass
+class ImagePreprocessResult:
+    """一次图片预处理操作的结果摘要, 便于记录日志或返回给调用方展示处理效果。"""
+
+    original_size_bytes: int
+    processed_size_bytes: int
+    original_dimensions: Tuple[int, int]
+    processed_dimensions: Tuple[int, int]
+    was_resized: bool
+    was_recompressed: bool
+
+    @property
+    def compression_ratio(self) -> float:
+        """压缩后体积占原始体积的比例, 数值越小说明压缩效果越明显。"""
+        if self.original_size_bytes == 0:
+            return 1.0
+        return round(self.processed_size_bytes / self.original_size_bytes, 4)
+
+
+def _resize_if_too_large(image: Image.Image, max_dimension: int) -> Tuple[Image.Image, bool]:
+    """
+    如果图片任意一边的分辨率超过max_dimension, 按原始宽高比等比例缩小,
+    否则原样返回。
+
+    :param image: 已经用PIL打开的图片对象
+    :param max_dimension: 允许的最大单边分辨率(像素)
+    :return: (处理后的图片对象, 是否实际执行了缩放)
+    """
+    width, height = image.size
+    if width <= max_dimension and height <= max_dimension:
+        return image, False
+
+    scale = max_dimension / max(width, height)
+    new_size = (int(width * scale), int(height * scale))
+    # LANCZOS重采样算法在缩小图片时能较好地保留细节, 是缩略图处理的常见选择
+    resized_image = image.resize(new_size, Image.LANCZOS)
+    return resized_image, True
+
+
+def _encode_to_jpeg_bytes(image: Image.Image, quality: int) -> bytes:
+    """将图片对象按指定质量编码为JPEG格式的二进制内容。"""
+    # JPEG格式不支持RGBA(带透明通道)模式, 统一转换为RGB, 避免保存时报错
+    if image.mode in ("RGBA", "P"):
+        image = image.convert("RGB")
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=quality, optimize=True)
+    return buffer.getvalue()
+
+
+def preprocess_image_file(
+    image_path: str,
+    max_size_bytes: int = MAX_IMAGE_SIZE_BYTES,
+    max_dimension: int = MAX_DIMENSION_PIXELS,
+    jpeg_quality: int = DEFAULT_JPEG_QUALITY,
+) -> Tuple[bytes, ImagePreprocessResult]:
+    """
+    对一张本地图片文件执行标准的预处理流程: 分辨率压缩 + 格式统一为JPEG +
+    体积超限时进一步降低压缩质量重试。
+
+    :param image_path: 原始图片文件路径
+    :param max_size_bytes: 处理后允许的最大文件体积(字节)
+    :param max_dimension: 允许的最大单边分辨率(像素)
+    :param jpeg_quality: 初始JPEG压缩质量(1-100)
+    :raises FileNotFoundError: 文件不存在时抛出
+    :raises ValueError: 即使降到最低质量仍然超出体积限制时抛出
+    :return: (处理后的图片二进制内容, 处理结果摘要)
+    """
+    path = Path(image_path)
+    if not path.exists():
+        raise FileNotFoundError(f"找不到图片文件: {image_path}")
+
+    original_size_bytes = path.stat().st_size
+
+    with Image.open(path) as image:
+        original_dimensions = image.size
+        resized_image, was_resized = _resize_if_too_large(image, max_dimension)
+
+        current_quality = jpeg_quality
+        processed_bytes = _encode_to_jpeg_bytes(resized_image, current_quality)
+        was_recompressed = was_resized
+
+        # 如果压缩之后体积依然超出限制, 逐步降低JPEG质量重试, 直到满足要求
+        # 或者质量已经降到无法再降的下限(50), 此时视为无法在保证基本可辨识度
+        # 的前提下满足体积要求, 抛出异常提示调用方
+        while len(processed_bytes) > max_size_bytes and current_quality > 50:
+            current_quality -= 10
+            processed_bytes = _encode_to_jpeg_bytes(resized_image, current_quality)
+            was_recompressed = True
+
+        if len(processed_bytes) > max_size_bytes:
+            raise ValueError(
+                f"图片'{image_path}'即使压缩到质量{current_quality}后, "
+                f"体积仍为{len(processed_bytes)}字节, 超出限制{max_size_bytes}字节, "
+                f"建议进一步降低分辨率上限或联系客户确认是否可以提供更小尺寸的原图。"
+            )
+
+        result = ImagePreprocessResult(
+            original_size_bytes=original_size_bytes,
+            processed_size_bytes=len(processed_bytes),
+            original_dimensions=original_dimensions,
+            processed_dimensions=resized_image.size,
+            was_resized=was_resized,
+            was_recompressed=was_recompressed,
+        )
+        return processed_bytes, result
+
+
+def format_preprocess_summary(result: ImagePreprocessResult) -> str:
+    """把预处理结果摘要格式化为一段人类可读的说明文字, 便于记录日志或展示。"""
+    lines = [
+        f"原始文件大小: {result.original_size_bytes / 1024:.1f} KB, "
+        f"原始分辨率: {result.original_dimensions[0]}x{result.original_dimensions[1]}",
+        f"处理后文件大小: {result.processed_size_bytes / 1024:.1f} KB, "
+        f"处理后分辨率: {result.processed_dimensions[0]}x{result.processed_dimensions[1]}",
+        f"压缩比: {result.compression_ratio:.2%}"
+        f"(即处理后体积约为原始体积的{result.compression_ratio:.0%})",
+    ]
+    if result.was_resized:
+        lines.append("说明: 图片分辨率超出限制, 已按比例缩小。")
+    if result.was_recompressed:
+        lines.append("说明: 已重新编码为JPEG格式并调整压缩质量以满足体积限制。")
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2:
+        print("用法: python image_preprocessing_utils.py <图片文件路径>")
+        sys.exit(1)
+
+    try:
+        _, summary = preprocess_image_file(sys.argv[1])
+        print(format_preprocess_summary(summary))
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"[预处理失败] {exc}")
+```
+
+老王看完这份代码,补充了一个产品化的细节:"你们注意`preprocess_image_file`最后那个'降质量重试'的循环——真实业务里,不会无限制地一直往下降质量,总要有个下限,不然画质差到连人眼都看不清楚,处理这一步的意义就没有了。我在这里给了一个50作为下限,超过这个下限还压不下去体积,宁可让流程失败、报一个清楚的错误,提示相关同事去确认是不是原图本身有问题,也不要为了'凑合能跑'硬压出一张糊得看不清细节的图片再传给模型——如果模型看不清图片细节,给出的判断反而可能更不可靠,这跟咱们一直强调的'能跑不代表对'是同一个道理。"
+
+### 文件十:`embedding_model_version_guard.py`(Embedding模型版本一致性校验)
+
+```python
+"""
+文件名: embedding_model_version_guard.py
+说明:
+    回应韩露在课堂笔记中提出的问题 —— 如果切换了Embedding模型的版本,
+    之前缓存的向量还能不能继续使用。老王当时给出的答案是"不能, 必须
+    整体重新计算", 这个模块把这条口头强调的规则, 转换成代码层面的
+    强制校验机制, 防止未来某次不经意的模型升级, 悄悄污染了缓存数据,
+    导致检索效果在没有任何明显报错的情况下悄悄劣化。
+
+    核心思路: 缓存文件中除了存储{问题: 向量}这样的映射, 额外记录一份
+    "元数据"(使用的模型名称、向量维度), 每次读取缓存时, 都先校验元数据
+    是否与当前配置的模型一致, 不一致就拒绝直接复用, 强制要求重新计算。
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Dict, List, Optional
+
+
+class EmbeddingModelMismatchError(Exception):
+    """缓存文件记录的Embedding模型信息与当前配置不一致时抛出。"""
+
+
+@dataclass
+class EmbeddingCacheMetadata:
+    """描述一份向量缓存文件所使用的Embedding模型信息。"""
+
+    model_name: str
+    vector_dimension: int
+
+
+@dataclass
+class GuardedEmbeddingCache:
+    """向量缓存的内容与元数据打包在一起的完整结构。"""
+
+    metadata: EmbeddingCacheMetadata
+    vectors: Dict[str, List[float]]
+
+
+class EmbeddingModelVersionGuard:
+    """
+    带模型版本校验能力的向量缓存管理器。
+
+    使用方式: 在读取任何缓存向量之前, 先调用load_or_init方法,
+    如果缓存文件不存在, 会以当前配置的模型信息初始化一份空缓存;
+    如果缓存文件存在但记录的模型信息与当前配置不一致, 会拒绝直接
+    使用旧缓存, 抛出明确的异常, 而不是悄悄地把新旧模型的向量混在
+    一起继续用(这正是韩露提出的问题里最危险的那种情况 —— 没有报错,
+    但结果已经悄悄错了)。
+    """
+
+    def __init__(self, cache_file_path: str, current_model_name: str, current_vector_dimension: int) -> None:
+        self.cache_file_path = Path(cache_file_path)
+        self.current_model_name = current_model_name
+        self.current_vector_dimension = current_vector_dimension
+
+    def load_or_init(self, allow_auto_rebuild: bool = False) -> GuardedEmbeddingCache:
+        """
+        读取缓存文件, 并校验其中记录的模型信息是否与当前配置一致。
+
+        :param allow_auto_rebuild: 如果检测到模型不一致, 是否自动清空旧缓存、
+            以当前模型信息重新初始化一份空缓存(相当于"自动重建"), 而不是
+            直接抛出异常中断程序。生产环境建议保持False, 让这类不一致
+            以显式报错的方式暴露出来, 由人工确认后再决定是否重建, 避免
+            "模型偷偷换了, 缓存也悄悄重建了, 但没人知道发生过这件事"。
+        :raises EmbeddingModelMismatchError: 检测到模型不一致且allow_auto_rebuild为False时抛出
+        :return: 校验通过后的缓存内容
+        """
+        if not self.cache_file_path.exists():
+            return self._init_empty_cache()
+
+        try:
+            raw = json.loads(self.cache_file_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            print("[提示] 缓存文件损坏或无法解析, 将重新初始化。")
+            return self._init_empty_cache()
+
+        metadata_raw = raw.get("metadata")
+        if metadata_raw is None:
+            # 兼容早期版本(similar_question_matcher.py最初的缓存格式)没有
+            # 元数据字段的情况, 出于安全考虑, 视为"版本信息未知, 无法确认
+            # 一致性", 按不一致处理
+            return self._handle_mismatch(
+                reason="缓存文件中缺少模型元数据信息(可能是早期版本生成的缓存文件)",
+                allow_auto_rebuild=allow_auto_rebuild,
+            )
+
+        cached_metadata = EmbeddingCacheMetadata(**metadata_raw)
+        if (
+            cached_metadata.model_name != self.current_model_name
+            or cached_metadata.vector_dimension != self.current_vector_dimension
+        ):
+            return self._handle_mismatch(
+                reason=(
+                    f"缓存记录的模型为'{cached_metadata.model_name}'"
+                    f"(维度{cached_metadata.vector_dimension}), "
+                    f"当前配置的模型为'{self.current_model_name}'"
+                    f"(维度{self.current_vector_dimension}), 两者不一致"
+                ),
+                allow_auto_rebuild=allow_auto_rebuild,
+            )
+
+        return GuardedEmbeddingCache(metadata=cached_metadata, vectors=raw.get("vectors", {}))
+
+    def _handle_mismatch(self, reason: str, allow_auto_rebuild: bool) -> GuardedEmbeddingCache:
+        if not allow_auto_rebuild:
+            raise EmbeddingModelMismatchError(
+                f"检测到Embedding模型版本不一致, 拒绝直接复用旧缓存: {reason}。"
+                f"请确认是否为有意的模型升级, 如果是, 需要对全部知识库内容"
+                f"重新计算向量, 不能只更新部分数据。"
+            )
+        print(f"[自动重建] {reason}, 已按allow_auto_rebuild=True的配置自动清空旧缓存重新开始。")
+        return self._init_empty_cache()
+
+    def _init_empty_cache(self) -> GuardedEmbeddingCache:
+        return GuardedEmbeddingCache(
+            metadata=EmbeddingCacheMetadata(
+                model_name=self.current_model_name,
+                vector_dimension=self.current_vector_dimension,
+            ),
+            vectors={},
+        )
+
+    def save(self, cache: GuardedEmbeddingCache) -> None:
+        """把缓存内容(含元数据)写回本地文件。"""
+        payload = {"metadata": asdict(cache.metadata), "vectors": cache.vectors}
+        self.cache_file_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+if __name__ == "__main__":
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cache_path = str(Path(tmp_dir) / "guarded_cache.json")
+
+        print("场景1: 首次使用, 缓存文件不存在, 应当正常初始化为空缓存")
+        guard_v3 = EmbeddingModelVersionGuard(cache_path, "text-embedding-v3", 1024)
+        cache = guard_v3.load_or_init()
+        cache.vectors["苍穹平台支持哪些大模型?"] = [0.01, 0.02, 0.03]
+        guard_v3.save(cache)
+        print(f"  缓存已保存, 当前包含{len(cache.vectors)}条向量\n")
+
+        print("场景2: 用同一个模型再次加载, 应当能正常复用旧缓存")
+        cache_again = guard_v3.load_or_init()
+        print(f"  复用成功, 缓存包含{len(cache_again.vectors)}条向量\n")
+
+        print("场景3: 切换到新模型版本再加载, 应当拒绝直接复用并抛出异常")
+        guard_v4 = EmbeddingModelVersionGuard(cache_path, "text-embedding-v4-hypothetical", 1536)
+        try:
+            guard_v4.load_or_init()
+        except EmbeddingModelMismatchError as exc:
+            print(f"  校验拒绝(符合预期): {exc}\n")
+
+        print("场景4: 显式允许自动重建, 应当清空旧缓存重新开始, 不抛异常")
+        rebuilt_cache = guard_v4.load_or_init(allow_auto_rebuild=True)
+        print(f"  自动重建成功, 新缓存包含{len(rebuilt_cache.vectors)}条向量(应为0)")
+```
+
+苏梦看完这份代码,提了一个很实际的问题:"如果`allow_auto_rebuild`设成`True`,是不是就相当于把韩露提的那个坑,又悄悄绕回去了?"
+
+"这个问题问得特别关键。"老王说,"`allow_auto_rebuild=True`这个选项,我加进来不是为了'绕过'这个问题,而是为了覆盖一种明确、可控的场景——比如你们自己在开发环境里反复调试、故意切换模型做对比实验,这时候你清楚地知道自己在干什么,不需要每次都手动删缓存文件、每次都被异常打断,这种情况下用`allow_auto_rebuild=True`是合理的。但真正的生产环境,我会要求把这个选项锁定为`False`,让'模型不一致'这件事,永远以一个响亮的报错的方式暴露出来,逼着负责这次模型升级的人,必须主动、有意识地去处理'把知识库全部重新计算一遍向量'这件事,而不是让程序自己悄悄地把旧数据一冲了之——这两种做法的关键区别在于,是不是有一个人真正'知道并且确认了'这件事正在发生,这才是这段代码真正想守住的底线。"
+
+### 文件十一:`multimodal_cost_estimator.py`(多模态调用成本估算器)
+
+```python
+"""
+文件名: multimodal_cost_estimator.py
+说明:
+    与Day19的cost_tracker.py呼应, 那个模块统计的是纯文字对话按token计费
+    的场景, 而今天接触的三类接口 —— 图片理解(按token, 但视觉部分的计费
+    方式因厂商而异)、图片生成(按张计费)、Embedding(按token计费, 但通常
+    单价远低于对话接口) —— 计费模式和对话接口不完全一样, 需要一个专门的
+    估算器来分别处理, 这样才能在预研报告里, 给出一份对得起林悦要求的
+    "调用成本控制在合理范围内"这条验收标准的、真正有依据的成本数字。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import List
+
+
+class CallType(str, Enum):
+    """今天涉及的三类多模态/Embedding调用类型。"""
+
+    VISION_UNDERSTANDING = "vision_understanding"
+    IMAGE_GENERATION = "image_generation"
+    EMBEDDING = "embedding"
+
+
+# 教学参考单价, 具体数字请以服务商官网当时公示的价格为准, 这里给出的是
+# 便于估算和对比量级的近似经验值, 重点是理解"不同调用类型计费方式完全不同"
+# 这件事, 不是要求记住具体价格
+_VISION_PRICE_PER_THOUSAND_TOKENS_CNY = 0.008
+_IMAGE_GENERATION_PRICE_PER_IMAGE_CNY = 0.20
+_EMBEDDING_PRICE_PER_THOUSAND_TOKENS_CNY = 0.0007
+
+
+@dataclass
+class CostRecord:
+    """一次调用的成本记录, call_type不同, 字段的实际含义会略有差异。"""
+
+    call_type: CallType
+    description: str
+    quantity: float  # 视调用类型而定: token数量, 或者生成的图片张数
+    estimated_cost_cny: float
+
+
+@dataclass
+class MultimodalCostEstimator:
+    """
+    跨多种调用类型的成本估算与累计统计器。
+
+    使用方式: 分别针对图片理解、图片生成、Embedding三类调用,
+    调用对应的record_*方法记录一次调用的用量, 最终通过get_summary
+    获取按类型分类汇总的成本报告。
+    """
+
+    records: List[CostRecord] = field(default_factory=list)
+
+    def record_vision_call(self, description: str, total_tokens: int) -> CostRecord:
+        """记录一次图片理解调用的成本(按token估算)。"""
+        cost = total_tokens / 1000 * _VISION_PRICE_PER_THOUSAND_TOKENS_CNY
+        record = CostRecord(
+            call_type=CallType.VISION_UNDERSTANDING,
+            description=description,
+            quantity=total_tokens,
+            estimated_cost_cny=round(cost, 6),
+        )
+        self.records.append(record)
+        return record
+
+    def record_image_generation_call(self, description: str, image_count: int) -> CostRecord:
+        """记录一次图片生成调用的成本(按张计费)。"""
+        cost = image_count * _IMAGE_GENERATION_PRICE_PER_IMAGE_CNY
+        record = CostRecord(
+            call_type=CallType.IMAGE_GENERATION,
+            description=description,
+            quantity=image_count,
+            estimated_cost_cny=round(cost, 6),
+        )
+        self.records.append(record)
+        return record
+
+    def record_embedding_call(self, description: str, total_tokens: int) -> CostRecord:
+        """记录一次Embedding调用的成本(按token估算, 单价远低于对话与视觉接口)。"""
+        cost = total_tokens / 1000 * _EMBEDDING_PRICE_PER_THOUSAND_TOKENS_CNY
+        record = CostRecord(
+            call_type=CallType.EMBEDDING,
+            description=description,
+            quantity=total_tokens,
+            estimated_cost_cny=round(cost, 6),
+        )
+        self.records.append(record)
+        return record
+
+    def get_total_cost(self) -> float:
+        """返回目前累计的估算总成本(人民币元), 覆盖全部三类调用。"""
+        return round(sum(record.estimated_cost_cny for record in self.records), 6)
+
+    def get_cost_breakdown_by_type(self) -> dict:
+        """按调用类型分类汇总成本, 便于观察"哪一类调用贡献了大部分成本"。"""
+        breakdown = {call_type: 0.0 for call_type in CallType}
+        for record in self.records:
+            breakdown[record.call_type] += record.estimated_cost_cny
+        return {call_type.value: round(cost, 6) for call_type, cost in breakdown.items()}
+
+    def get_summary(self) -> str:
+        """生成一段人类可读的成本汇总报告。"""
+        lines = [f"本次预研任务共记录了{len(self.records)}次调用:"]
+        for record in self.records:
+            lines.append(
+                f"  [{record.call_type.value}] {record.description}: "
+                f"用量={record.quantity}, 预估花费={record.estimated_cost_cny:.6f}元"
+            )
+
+        breakdown = self.get_cost_breakdown_by_type()
+        lines.append("\n按调用类型汇总:")
+        for call_type_value, cost in breakdown.items():
+            lines.append(f"  {call_type_value}: {cost:.6f}元")
+
+        lines.append(f"\n累计预估总花费: {self.get_total_cost():.6f}元")
+        return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    estimator = MultimodalCostEstimator()
+
+    # 模拟今天上午四个图片理解演示的调用
+    estimator.record_vision_call("图片内容描述", total_tokens=850)
+    estimator.record_vision_call("图片具体问答(2次)", total_tokens=1600)
+    estimator.record_vision_call("多图片对比分析", total_tokens=1100)
+    estimator.record_vision_call("模拟工业巡检场景问答", total_tokens=900)
+
+    # 模拟图片生成的2次调用(林悦要求控制在10次以内)
+    estimator.record_image_generation_call("基础文生图演示", image_count=1)
+    estimator.record_image_generation_call("详细提示词文生图演示", image_count=1)
+
+    # 模拟Embedding的调用: 知识库15条问题的首次计算 + 若干次用户查询
+    estimator.record_embedding_call("知识库15条FAQ首次计算向量", total_tokens=320)
+    estimator.record_embedding_call("测试用例5次查询", total_tokens=95)
+
+    print(estimator.get_summary())
+```
+
+林悦看到这份估算器的输出,评价道:"这正是我想要的那种'有依据的技术可行性判断'——不是含糊地说'多模态调用比较贵',而是能具体拆解出'贵在哪一部分'。看这份汇总,图片生成的成本占比明显是最高的,这提醒我,如果未来真的要在正式产品里加上'文生图'这类功能,计费模式上可能需要单独考虑,不能简单套用现在按对话token计费的那套逻辑,这个信息,我会写进给管理层的技术储备汇报里。"
+
+### 文件十二:`vector_index_benchmark.py`(向量检索性能基准测试:为什么规模变大后需要向量数据库)
+
+```python
+"""
+文件名: vector_index_benchmark.py
+说明:
+    呼应架构设计图讨论环节里, 老王关于"向量数据库解决的是纯粹的工程性能
+    问题"这一段说明。这个模块用可测量的耗时数据, 直观验证"当向量数量从
+    十几条增长到几万条之后, 现在这种朴素的、两两比对的线性扫描方式,
+    耗时会怎样增长", 为两周后Day25引入Chroma向量数据库时"为什么需要
+    专门的索引结构"这个问题, 提前打下一份可以拿出来对照的实验数据。
+
+    这里不引入任何真实的向量数据库, 只是纯粹用numpy模拟不同规模下的
+    线性扫描耗时, 目的是建立数量级上的直观感受, 不是要在今天就解决
+    性能问题本身。
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from typing import List
+
+import numpy as np
+
+from vector_math_utils import batch_cosine_similarity
+
+
+@dataclass
+class BenchmarkResult:
+    """一次基准测试的结果记录。"""
+
+    vector_count: int
+    vector_dimension: int
+    elapsed_seconds: float
+
+    @property
+    def queries_per_second_estimate(self) -> float:
+        """按本次耗时估算, 这个规模下大约每秒能支撑多少次完整的检索查询。"""
+        if self.elapsed_seconds == 0:
+            return float("inf")
+        return round(1 / self.elapsed_seconds, 2)
+
+
+def generate_random_vectors(count: int, dimension: int, seed: int = 42) -> np.ndarray:
+    """
+    生成指定数量、指定维度的随机向量, 用于模拟不同规模的知识库,
+    真实的Embedding向量数值分布与随机数不完全一致, 但对于"比较不同规模下
+    线性扫描耗时"这个目的而言, 随机向量已经足够, 因为耗时主要取决于
+    矩阵运算本身的计算量, 与向量具体数值无关。
+
+    :param count: 生成的向量数量
+    :param dimension: 每个向量的维度
+    :param seed: 随机种子, 固定种子保证每次运行结果可复现
+    :return: 形状为(count, dimension)的numpy数组
+    """
+    rng = np.random.default_rng(seed)
+    return rng.normal(size=(count, dimension))
+
+
+def benchmark_linear_scan(vector_count: int, dimension: int = 1024, repeat: int = 5) -> BenchmarkResult:
+    """
+    对指定规模的向量集合, 执行一次"线性扫描"式的相似度检索基准测试
+    (即similar_question_matcher.py和semantic_search_mini_demo.py里
+    实际采用的做法 —— 拿查询向量, 和知识库里每一个向量逐一计算相似度)。
+
+    :param vector_count: 模拟的知识库向量数量
+    :param dimension: 向量维度, 默认1024, 与今天使用的text-embedding-v3一致
+    :param repeat: 重复执行的次数, 取平均值以降低单次测量的随机误差
+    :return: 基准测试结果
+    """
+    candidate_vectors = generate_random_vectors(vector_count, dimension)
+    query_vector = generate_random_vectors(1, dimension)[0]
+
+    elapsed_times = []
+    for _ in range(repeat):
+        start = time.perf_counter()
+        batch_cosine_similarity(query_vector, candidate_vectors)
+        elapsed_times.append(time.perf_counter() - start)
+
+    average_elapsed = sum(elapsed_times) / len(elapsed_times)
+    return BenchmarkResult(
+        vector_count=vector_count,
+        vector_dimension=dimension,
+        elapsed_seconds=round(average_elapsed, 6),
+    )
+
+
+def run_scaling_benchmark(scales: List[int]) -> List[BenchmarkResult]:
+    """
+    针对一组不同规模的知识库数量, 依次执行基准测试, 观察耗时随规模增长的趋势。
+
+    :param scales: 待测试的知识库规模列表, 例如[15, 1000, 10000, 100000]
+    :return: 与scales顺序一致的基准测试结果列表
+    """
+    results = []
+    for scale in scales:
+        result = benchmark_linear_scan(scale)
+        results.append(result)
+    return results
+
+
+def format_benchmark_report(results: List[BenchmarkResult]) -> str:
+    """把一组基准测试结果, 格式化为一份便于对比阅读的报告文本。"""
+    lines = ["向量检索(线性扫描方式)性能基准测试报告", "=" * 60]
+    lines.append(f"{'知识库规模':>10} | {'平均耗时(秒)':>14} | {'预估每秒查询数':>16}")
+    lines.append("-" * 60)
+    for result in results:
+        lines.append(
+            f"{result.vector_count:>10} | {result.elapsed_seconds:>14.6f} | "
+            f"{result.queries_per_second_estimate:>16.2f}"
+        )
+
+    lines.append("")
+    if len(results) >= 2:
+        smallest, largest = results[0], results[-1]
+        if smallest.elapsed_seconds > 0:
+            slowdown_factor = largest.elapsed_seconds / smallest.elapsed_seconds
+            scale_factor = largest.vector_count / smallest.vector_count
+            lines.append(
+                f"知识库规模从{smallest.vector_count}条增长到{largest.vector_count}条"
+                f"(增长{scale_factor:.0f}倍)时, 单次检索耗时增长了约{slowdown_factor:.1f}倍。"
+            )
+    lines.append(
+        "结论: 线性扫描的耗时基本随知识库规模线性增长(增长几倍, 耗时也大致增长几倍), "
+        "在规模较小(几十到几千条)时完全够用, 但当规模膨胀到几万、几十万条时, "
+        "单次检索耗时可能从几毫秒膨胀到几十甚至上百毫秒, 这就是向量数据库这类"
+        "专门为大规模向量检索设计的索引结构(如HNSW、IVF等算法)真正要解决的问题 —— "
+        "让检索耗时不再随知识库规模线性增长, 而是能维持在一个近似常数或对数级别增长的水平。"
+    )
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    test_scales = [15, 500, 5000, 50000]
+    print(f"即将对以下知识库规模执行基准测试: {test_scales}")
+    print("(注意: 规模较大的测试项, 生成随机向量本身也需要一定内存与时间, 请耐心等待)\n")
+
+    benchmark_results = run_scaling_benchmark(test_scales)
+    print(format_benchmark_report(benchmark_results))
+```
+
+张凡跑完这份基准测试,盯着终端里"耗时随规模增长"的那组数字感慨:"看着今天知识库才15条,`similar_question_matcher.py`跑起来几乎感觉不到延迟,但要是真的按这个趋势推算到几万条,单次查询耗时可能真的会涨到让用户能感觉到'卡顿'的程度。"老王点头:"这正是我想让你们提前建立的数字直觉——不是让你们今天就去优化这个性能问题(优化手段就是两周后要学的向量数据库),而是让你们对'什么时候必须开始考虑用专门的向量索引结构'这件事,有一个基于真实测量数据、而不是凭空猜测的判断依据。這也回应了苏梦之前问的'向量数据库到底解决什么问题'——现在你们手上有了具体的耗时对比数字,这个问题的答案,应该比单纯听我口头讲解时更扎实了。"
+
+### 配套测试:`test_day20_extended_utilities.py`
+
+```python
+"""
+文件名: test_day20_extended_utilities.py
+说明:
+    针对晚自习额外补充的四个模块(image_preprocessing_utils、
+    embedding_model_version_guard、multimodal_cost_estimator、
+    vector_index_benchmark)的单元测试, 风格延续Day19的self_check测试,
+    不依赖真实网络请求, 只验证纯本地的逻辑正确性。图片相关的测试会
+    在临时目录中现场生成一张测试图片, 不依赖任何外部图片文件。
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
+from PIL import Image
+
+from image_preprocessing_utils import preprocess_image_file, ImagePreprocessResult
+from embedding_model_version_guard import (
+    EmbeddingModelVersionGuard,
+    EmbeddingModelMismatchError,
+)
+from multimodal_cost_estimator import MultimodalCostEstimator, CallType
+from vector_index_benchmark import (
+    generate_random_vectors,
+    benchmark_linear_scan,
+    run_scaling_benchmark,
+)
+
+
+class TestImagePreprocessingUtils:
+    """图片预处理工具的行为验证。"""
+
+    def _create_test_image(self, tmp_path: Path, width: int, height: int) -> Path:
+        """在临时目录中生成一张纯色测试图片, 用于测试而不依赖外部素材。"""
+        image_path = tmp_path / "test_image.jpg"
+        image = Image.new("RGB", (width, height), color=(120, 180, 220))
+        image.save(image_path, format="JPEG", quality=95)
+        return image_path
+
+    def test_small_image_is_not_resized(self, tmp_path):
+        image_path = self._create_test_image(tmp_path, 800, 600)
+        _, result = preprocess_image_file(str(image_path), max_dimension=2048)
+        assert result.was_resized is False
+
+    def test_large_image_is_resized_within_limit(self, tmp_path):
+        image_path = self._create_test_image(tmp_path, 4000, 3000)
+        _, result = preprocess_image_file(str(image_path), max_dimension=2048)
+        assert result.was_resized is True
+        assert max(result.processed_dimensions) <= 2048
+
+    def test_missing_file_raises_error(self):
+        with pytest.raises(FileNotFoundError):
+            preprocess_image_file("/tmp/definitely_not_exists_12345.jpg")
+
+
+class TestEmbeddingModelVersionGuard:
+    """Embedding模型版本一致性校验器的行为验证。"""
+
+    def test_first_time_use_initializes_empty_cache(self, tmp_path):
+        cache_path = str(tmp_path / "cache.json")
+        guard = EmbeddingModelVersionGuard(cache_path, "text-embedding-v3", 1024)
+        cache = guard.load_or_init()
+        assert cache.vectors == {}
+        assert cache.metadata.model_name == "text-embedding-v3"
+
+    def test_same_model_reload_succeeds(self, tmp_path):
+        cache_path = str(tmp_path / "cache.json")
+        guard = EmbeddingModelVersionGuard(cache_path, "text-embedding-v3", 1024)
+        cache = guard.load_or_init()
+        cache.vectors["问题A"] = [0.1, 0.2]
+        guard.save(cache)
+
+        reloaded = guard.load_or_init()
+        assert reloaded.vectors == {"问题A": [0.1, 0.2]}
+
+    def test_different_model_raises_mismatch_error(self, tmp_path):
+        cache_path = str(tmp_path / "cache.json")
+        guard_v3 = EmbeddingModelVersionGuard(cache_path, "text-embedding-v3", 1024)
+        guard_v3.save(guard_v3.load_or_init())
+
+        guard_v4 = EmbeddingModelVersionGuard(cache_path, "text-embedding-v4", 1536)
+        with pytest.raises(EmbeddingModelMismatchError):
+            guard_v4.load_or_init()
+
+    def test_auto_rebuild_bypasses_mismatch_error(self, tmp_path):
+        cache_path = str(tmp_path / "cache.json")
+        guard_v3 = EmbeddingModelVersionGuard(cache_path, "text-embedding-v3", 1024)
+        guard_v3.save(guard_v3.load_or_init())
+
+        guard_v4 = EmbeddingModelVersionGuard(cache_path, "text-embedding-v4", 1536)
+        rebuilt = guard_v4.load_or_init(allow_auto_rebuild=True)
+        assert rebuilt.vectors == {}
+        assert rebuilt.metadata.model_name == "text-embedding-v4"
+
+
+class TestMultimodalCostEstimator:
+    """多模态调用成本估算器的行为验证。"""
+
+    def test_vision_call_cost_is_positive(self):
+        estimator = MultimodalCostEstimator()
+        record = estimator.record_vision_call("测试图片描述", total_tokens=1000)
+        assert record.estimated_cost_cny > 0
+        assert record.call_type == CallType.VISION_UNDERSTANDING
+
+    def test_total_cost_accumulates_across_call_types(self):
+        estimator = MultimodalCostEstimator()
+        estimator.record_vision_call("图片理解", total_tokens=1000)
+        estimator.record_image_generation_call("文生图", image_count=2)
+        estimator.record_embedding_call("知识库向量化", total_tokens=500)
+
+        total = estimator.get_total_cost()
+        breakdown = estimator.get_cost_breakdown_by_type()
+        assert total > 0
+        assert abs(sum(breakdown.values()) - total) < 1e-6
+
+    def test_image_generation_cost_scales_with_count(self):
+        estimator = MultimodalCostEstimator()
+        record_one = estimator.record_image_generation_call("单张", image_count=1)
+        record_three = estimator.record_image_generation_call("三张", image_count=3)
+        assert record_three.estimated_cost_cny == pytest.approx(record_one.estimated_cost_cny * 3)
+
+
+class TestVectorIndexBenchmark:
+    """向量检索性能基准测试模块的行为验证。"""
+
+    def test_generate_random_vectors_shape_is_correct(self):
+        vectors = generate_random_vectors(count=10, dimension=128)
+        assert vectors.shape == (10, 128)
+
+    def test_same_seed_produces_reproducible_vectors(self):
+        vectors_a = generate_random_vectors(count=5, dimension=16, seed=1)
+        vectors_b = generate_random_vectors(count=5, dimension=16, seed=1)
+        assert np.array_equal(vectors_a, vectors_b)
+
+    def test_benchmark_returns_non_negative_elapsed_time(self):
+        result = benchmark_linear_scan(vector_count=100, dimension=64, repeat=2)
+        assert result.elapsed_seconds >= 0
+        assert result.vector_count == 100
+
+    def test_scaling_benchmark_returns_result_per_scale(self):
+        scales = [10, 100]
+        results = run_scaling_benchmark(scales)
+        assert len(results) == len(scales)
+        assert [r.vector_count for r in results] == scales
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
+```
+
+四人一起把这份测试跑通,已经快21点。陈铭提议:"既然四块都补完了,要不要写一个小脚本,把它们串起来跑一遍完整流程,看看这几个新模块能不能真正配合起来用,而不是各自孤立地能跑通?"老王觉得这个提议不错:"这是个很好的收尾方式——单独测试每个模块能跑,不代表它们组合在一起也天然没问题,接口能不能对得上,往往要真正串一遍才知道。你们最后再写一个集成演示脚本,把今天写的这些模块串成一条完整的链路,就当是今天的最后一段代码。"
+
+### 文件十三:`day20_pipeline_integration_demo.py`(端到端集成演示:把今天的模块串起来)
+
+```python
+"""
+文件名: day20_pipeline_integration_demo.py
+说明:
+    今天晚自习的收尾脚本, 把本文件涉及的多个模块串成一条完整的
+    "模拟业务链路", 验证它们组合起来使用时接口是否顺畅、逻辑是否自洽:
+
+        1. 用image_preprocessing_utils对一张(模拟生成的)高分辨率图片做预处理
+        2. 用multimodal_cost_estimator记录这一次图片理解调用的成本
+        3. 用embedding_model_version_guard管理一份带版本校验的向量缓存
+        4. 用vector_math_utils与similar_question_matcher里的核心逻辑,
+           对知识库做一次相似问题匹配, 并用multimodal_cost_estimator
+           记录这次Embedding调用的成本
+        5. 最终输出一份汇总报告, 展示整条链路的执行结果与总成本
+
+    这个脚本不依赖任何真实的网络API调用(全部使用本地模拟数据), 目的是
+    验证"模块之间的接口能不能对得上", 而不是验证"真实调用的效果好不好"
+    (真实调用效果已经在各自的demo脚本里单独验证过)。
+"""
+
+from __future__ import annotations
+
+import tempfile
+from pathlib import Path
+from typing import List
+
+import numpy as np
+from PIL import Image
+
+from image_preprocessing_utils import preprocess_image_file, format_preprocess_summary
+from embedding_model_version_guard import EmbeddingModelVersionGuard
+from multimodal_cost_estimator import MultimodalCostEstimator
+from vector_math_utils import top_k_most_similar
+
+
+def _create_simulated_high_resolution_photo(save_dir: Path) -> Path:
+    """
+    模拟生成一张"海纳制造现场拍摄"风格的高分辨率照片, 用于验证图片预处理
+    模块能否正确处理这类大尺寸图片, 不依赖任何外部真实图片素材。
+    """
+    image_path = save_dir / "simulated_equipment_photo.jpg"
+    # 模拟一张4000x3000的高分辨率照片, 这个尺寸量级与工业现场实拍照片接近
+    image = Image.new("RGB", (4000, 3000), color=(90, 110, 130))
+    image.save(image_path, format="JPEG", quality=95)
+    return image_path
+
+
+def _generate_simulated_embedding(text: str, dimension: int = 1024, seed_offset: int = 0) -> List[float]:
+    """
+    用文本内容的哈希值作为随机种子, 生成一个确定性的模拟向量, 代替真实的
+    Embedding API调用。这样同一段文本每次生成的"模拟向量"都完全一致,
+    便于在没有真实API Key的环境下, 依然能确定性地验证整条链路的逻辑。
+    """
+    seed = (abs(hash(text)) % (2**31)) + seed_offset
+    rng = np.random.default_rng(seed)
+    return rng.normal(size=dimension).tolist()
+
+
+def step1_preprocess_equipment_photo(cost_estimator: MultimodalCostEstimator) -> None:
+    """第一步: 模拟对一张高分辨率设备照片做预处理, 并记录本次图片理解调用的估算成本。"""
+    print("=" * 60)
+    print("步骤1: 图片预处理(模拟海纳制造现场高分辨率照片)")
+    print("=" * 60)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        photo_path = _create_simulated_high_resolution_photo(Path(tmp_dir))
+        _, result = preprocess_image_file(str(photo_path))
+        print(format_preprocess_summary(result))
+
+    # 预处理后的图片体积更小, 意味着实际请求中视觉部分消耗的token通常也会更低,
+    # 这里用一个估算值模拟"预处理后调用图片理解接口"产生的token消耗
+    cost_estimator.record_vision_call("设备照片巡检问答(预处理后)", total_tokens=780)
+    print()
+
+
+def step2_build_versioned_knowledge_base(
+    cache_path: str, cost_estimator: MultimodalCostEstimator
+) -> EmbeddingModelVersionGuard:
+    """第二步: 构建一份带模型版本校验的知识库向量缓存, 并记录Embedding调用成本。"""
+    print("=" * 60)
+    print("步骤2: 构建带版本校验的知识库向量缓存")
+    print("=" * 60)
+
+    guard = EmbeddingModelVersionGuard(cache_path, current_model_name="text-embedding-v3", current_vector_dimension=1024)
+    cache = guard.load_or_init()
+
+    knowledge_base_questions = [
+        "苍穹平台支持哪些大模型?",
+        "苍穹平台怎么收费?",
+        "苍穹平台能识别图片内容吗?",
+    ]
+
+    newly_computed = 0
+    for question in knowledge_base_questions:
+        if question not in cache.vectors:
+            cache.vectors[question] = _generate_simulated_embedding(question)
+            newly_computed += 1
+
+    guard.save(cache)
+    if newly_computed > 0:
+        # 模拟这几条知识库问题首次计算向量所消耗的token
+        cost_estimator.record_embedding_call(
+            f"知识库{newly_computed}条问题首次计算向量", total_tokens=newly_computed * 12
+        )
+    print(f"知识库向量缓存已就绪, 共{len(cache.vectors)}条问题, 本次新增计算{newly_computed}条。")
+    print()
+    return guard
+
+
+def step3_run_similarity_query(
+    guard: EmbeddingModelVersionGuard, cost_estimator: MultimodalCostEstimator
+) -> None:
+    """第三步: 模拟一次用户查询, 对知识库做相似问题匹配, 并记录这次查询的Embedding成本。"""
+    print("=" * 60)
+    print("步骤3: 模拟用户查询, 执行相似问题匹配")
+    print("=" * 60)
+
+    cache = guard.load_or_init()
+    query = "这个平台能不能看懂设备照片?"
+    query_vector = _generate_simulated_embedding(query)
+
+    questions = list(cache.vectors.keys())
+    candidate_vectors = [cache.vectors[q] for q in questions]
+
+    top_matches = top_k_most_similar(query_vector, candidate_vectors, k=2)
+
+    cost_estimator.record_embedding_call("用户查询向量化(1次)", total_tokens=14)
+
+    print(f"用户查询: 「{query}」")
+    print("匹配到的Top-2候选问题(注意: 本演示使用的是模拟随机向量, 相似度数值本身")
+    print("不具备真实语义意义, 重点是验证top_k_most_similar函数与缓存数据能够正确配合工作):")
+    for idx, similarity in top_matches:
+        print(f"  - {questions[idx]}(模拟相似度: {similarity:.4f})")
+    print()
+
+
+def step4_print_final_report(cost_estimator: MultimodalCostEstimator) -> None:
+    """第四步: 输出整条链路的成本汇总报告。"""
+    print("=" * 60)
+    print("步骤4: 端到端链路执行完毕, 成本汇总报告")
+    print("=" * 60)
+    print(cost_estimator.get_summary())
+
+
+def main() -> None:
+    cost_estimator = MultimodalCostEstimator()
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cache_path = str(Path(tmp_dir) / "integration_demo_cache.json")
+
+        step1_preprocess_equipment_photo(cost_estimator)
+        guard = step2_build_versioned_knowledge_base(cache_path, cost_estimator)
+        step3_run_similarity_query(guard, cost_estimator)
+        step4_print_final_report(cost_estimator)
+
+    print("\n端到端集成演示运行完毕, 各模块接口配合正常。")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+四人跑完这个集成脚本,输出从图片预处理到成本汇总,完整地跑了一遍,没有出现任何接口不匹配的问题。韩露看着终端最后打印的"各模块接口配合正常",笑着说:"原来真的把零散的几个文件串起来看一遍,比单独看每个文件的测试用例,更有一种'这套东西真的能用'的实感。"老王最后总结了一句:"今天补的这四块加上这个串联脚本——图片预处理、模型版本校验、成本估算、检索性能基准、端到端集成——严格说都不属于今天任务书上要求的F1到F8,但它们都对应着今天讨论中真实冒出来的问题,而不是我凭空加的练习题。这也是我想让你们养成的一个习惯:讨论中被问出来、但当场没有代码去验证的问题,不要让它只停留在'口头上听起来讲得通'的阶段,有条件的时候,尽量落地成一段能跑、能测试、还能跟其他模块顺利拼在一起的代码,这样得到的理解,才会比单纯'听懂了'更扎实、更经得起时间考验。"他看了一眼时间,笑着补了一句:"行了,真的该收工了,明天见分晓。"
+
 ---
 
 ## 今日复盘
