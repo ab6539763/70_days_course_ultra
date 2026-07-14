@@ -2021,6 +2021,1146 @@ if __name__ == "__main__":
 
 老王看完陈铭整理出来的这一整套代码,提了两点要求:"第一,这套脚本今晚你自己至少在两份不同的样本文档上跑一遍——先跑一遍相对干净的电子书章节练手,再跑一遍海纳集团的脏文档,亲眼看看同一套代码,面对不同'脏度'的输入,清洗前后的字符数减少比例差多少;第二,把每次跑出来的`chunk_size`/`chunk_overlap`组合和对应的chunk数量、抽样检查结论,记到你自己的实验笔记里,这份笔记明天开始做向量数据库选型的时候,会直接用得上。"
 
+### 加练:把上午"工厂函数"的想法提前落地,再补上表格提取与批量容错处理
+
+八份文件整理完之后,时间还没到晚上七点,陈铭想起上午老王说过的那句话——"往后如果支持更多格式,应该往这个工厂函数里加新的分支,而不是在业务逻辑里到处判断文件后缀名",当时老王说这件事留到Day30统一做。陈铭对着白板拍的照片又看了一遍,盘算着:如果现在先把这个统一入口搭出来,哪怕只是一个"能跑、够用"的版本,明天做向量化的时候,直接调用一个函数就能拿到任意格式文档的Document列表,不用再对着五份不同的脚本挑来挑去。他把这个想法在项目群里跟老王提了一句,老王只回了两个字:"可以。"于是这部分内容,连同上午课堂笔记里提过、但今天没有正式落地的"专门的表格提取工具"和课后作业第6题讨论过的"批量容错处理流程",陈铭都趁着这股劲一并动手实现了,作为今天的加练内容,单独提交在一个新的commit里,和CQ-108、CQ-109任务卡验收的核心代码分开标注。
+
+#### 加练文件1:统一文档加载工厂(unified_loader_factory.py)
+
+```python
+# -*- coding: utf-8 -*-
+"""
+unified_loader_factory.py
+
+统一文档加载工厂,呼应上午老王提到的"工厂模式"设计思路。
+输入任意一个文件路径,自动判断文档类型(优先看后缀名,必要时用文件头魔数二次确认),
+调用对应的加载器,统一返回Document列表,并在metadata中补充"loader_type"字段,
+记录这份文档实际是被哪个加载器处理的,方便后续排查问题时快速定位。
+
+设计目标:
+1. 支持今天接触过的五种格式(PDF/Word/Markdown/网页/CSV),并额外补充PPT与纯文本TXT两种,
+   呼应苏梦当天在群里提出的"以后接触到新格式怎么办"这个问题。
+2. 后缀名判断和魔数判断双重校验,如果两者结果不一致,只给出警告,不直接拒绝处理
+   (毕竟有些历史遗留文件确实存在后缀名与真实格式不完全匹配、但内容依然可用的情况,
+   直接拒绝可能会把本来能处理的文档也挡在门外,这是一个"宁可多提醒,少直接拒绝"的取舍)。
+3. 新增格式只需要在FORMAT_DISPATCH注册表里加一行,不需要改动load_document主函数本身。
+"""
+
+import logging
+from pathlib import Path
+from typing import Callable, List
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("unified_loader_factory")
+
+
+# 常见文件格式的"魔数"(文件最开头的固定字节序列),用于在后缀名判断之外做二次校验。
+# 之所以只列出几种最常见的格式,是因为魔数校验的目的是"发现明显的后缀名误标"这类
+# 低概率但排查起来很隐蔽的问题,不追求覆盖所有已知格式。
+MAGIC_NUMBER_MAP = {
+    b"%PDF": "pdf",
+    b"PK\x03\x04": "zip_based",  # docx/pptx/xlsx本质上都是zip压缩包,魔数相同,无法单靠魔数细分
+}
+
+
+def detect_format_by_magic_number(file_path: str) -> str:
+    """
+    读取文件最开头的若干字节,匹配已知的魔数表,判断真实的文件格式类别。
+    如果无法匹配任何已知魔数,返回"unknown",调用方应该结合后缀名判断做兜底,
+    而不是直接认为文件不合法——很多文本类格式(txt/md/csv)本身没有固定的魔数。
+    """
+    try:
+        with open(file_path, "rb") as f:
+            header_bytes = f.read(8)
+    except OSError as exc:
+        logger.warning(f"读取文件头部字节失败: {file_path},原因: {exc}")
+        return "unknown"
+
+    for magic, fmt in MAGIC_NUMBER_MAP.items():
+        if header_bytes.startswith(magic):
+            return fmt
+    return "unknown"
+
+
+def _load_pdf(file_path: str) -> List:
+    from langchain_community.document_loaders import PyPDFLoader
+
+    loader = PyPDFLoader(file_path)
+    return loader.load()
+
+
+def _load_docx(file_path: str) -> List:
+    from langchain_community.document_loaders import Docx2txtLoader
+
+    loader = Docx2txtLoader(file_path)
+    return loader.load()
+
+
+def _load_markdown(file_path: str) -> List:
+    from langchain_community.document_loaders import UnstructuredMarkdownLoader
+
+    loader = UnstructuredMarkdownLoader(file_path, mode="elements")
+    return loader.load()
+
+
+def _load_csv(file_path: str) -> List:
+    from langchain_community.document_loaders import CSVLoader
+
+    # 复用今天上午写好的编码探测逻辑,csv_loader_demo.py里已经有独立实现,
+    # 这里为了保持本文件自足,内联一份精简版探测逻辑
+    encoding = _detect_encoding_simple(file_path)
+    loader = CSVLoader(file_path=file_path, encoding=encoding)
+    return loader.load()
+
+
+def _load_txt(file_path: str) -> List:
+    """
+    加载纯文本txt文件。之所以到今天才补上这个格式,是因为上午五份样本文档里
+    没有出现纯文本文件,但苏梦提的问题提醒了陈铭——纯文本几乎是最基础、
+    最容易被忽略、却也最常见的一种格式,统一工厂函数理应把它覆盖进去。
+    """
+    from langchain_community.document_loaders import TextLoader
+
+    encoding = _detect_encoding_simple(file_path)
+    loader = TextLoader(file_path, encoding=encoding)
+    return loader.load()
+
+
+def _load_pptx(file_path: str) -> List:
+    """
+    加载PowerPoint演示文稿。企业内部很多培训材料、汇报材料都是ppt/pptx格式,
+    这也是苏梦提到的"以后如果遇到PPT"的具体落地。
+    """
+    from langchain_community.document_loaders import UnstructuredPowerPointLoader
+
+    loader = UnstructuredPowerPointLoader(file_path, mode="elements")
+    return loader.load()
+
+
+def _detect_encoding_simple(file_path: str) -> str:
+    """
+    简化版编码探测,逐一尝试常见编码,能成功读取即返回,
+    与csv_loader_demo.py中的detect_encoding逻辑保持一致,便于统一维护。
+    """
+    for encoding in ["utf-8", "gb18030", "gbk", "gb2312"]:
+        try:
+            with open(file_path, encoding=encoding) as f:
+                f.read()
+            return encoding
+        except (UnicodeDecodeError, LookupError):
+            continue
+    logger.warning(f"未能自动识别 {file_path} 的编码,回退使用utf-8并容错处理异常字节")
+    return "utf-8"
+
+
+# 格式分发注册表:后缀名(小写,不含点) -> 对应的加载函数。
+# 新增支持的格式,只需要在这里加一行映射,不需要改动load_document函数本身,
+# 这正是上午课堂笔记里讨论过的"统一适配层"思路的具体落地。
+FORMAT_DISPATCH: dict[str, Callable[[str], List]] = {
+    "pdf": _load_pdf,
+    "docx": _load_docx,
+    "doc": _load_docx,  # 老版本.doc格式,Docx2txtLoader在部分场景下也能兼容处理
+    "md": _load_markdown,
+    "markdown": _load_markdown,
+    "csv": _load_csv,
+    "txt": _load_txt,
+    "pptx": _load_pptx,
+    "ppt": _load_pptx,
+}
+
+
+def load_document(file_path: str) -> List:
+    """
+    统一文档加载入口。
+
+    处理流程:
+    1. 检查文件是否存在
+    2. 取文件后缀名,查FORMAT_DISPATCH注册表,确定要用哪个加载函数
+    3. 用魔数做一次二次校验,如果和后缀名判断的类型明显冲突,打印警告但不阻断流程
+    4. 调用对应的加载函数,补充统一的loader_type元数据字段,返回结果
+
+    :param file_path: 文件路径
+    :raises FileNotFoundError: 文件不存在
+    :raises ValueError: 后缀名不在已支持的格式列表中
+    """
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"文件不存在: {file_path}")
+
+    extension = path.suffix.lower().lstrip(".")
+    if extension not in FORMAT_DISPATCH:
+        raise ValueError(
+            f"暂不支持的文件格式: .{extension}(文件: {file_path})。"
+            f"当前已支持的格式: {sorted(set(FORMAT_DISPATCH.keys()))}"
+        )
+
+    # 魔数二次校验,仅对pdf这种有明确固定魔数的格式做核实,
+    # zip_based(docx/pptx等)由于魔数相同无法细分,这里不做进一步判断,避免误报
+    magic_format = detect_format_by_magic_number(str(path))
+    if extension == "pdf" and magic_format != "pdf":
+        logger.warning(
+            f"文件 {file_path} 后缀名声明为.pdf,但文件头魔数校验未通过("
+            f"检测结果: {magic_format}),该文件可能被错误改名或已损坏,请人工确认"
+        )
+
+    loader_fn = FORMAT_DISPATCH[extension]
+    logger.info(f"[统一加载工厂] 文件: {file_path},判定格式: {extension},调用加载函数: {loader_fn.__name__}")
+
+    docs = loader_fn(file_path)
+    for doc in docs:
+        doc.metadata["loader_type"] = loader_fn.__name__
+        doc.metadata["source_file"] = path.name
+
+    logger.info(f"[统一加载工厂] 加载完成,共产出 {len(docs)} 个Document对象")
+    return docs
+
+
+def list_supported_formats() -> List[str]:
+    """返回当前工厂支持的全部文件格式后缀名列表,供上层代码或前端展示"上传支持的格式"时调用。"""
+    return sorted(set(FORMAT_DISPATCH.keys()))
+
+
+if __name__ == "__main__":
+    logger.info(f"当前统一加载工厂支持的格式: {list_supported_formats()}")
+
+    # 用一份纯文本文件做最简单的自测,验证工厂函数分发逻辑是否正确
+    demo_path = Path("output/_factory_smoke_test.txt")
+    demo_path.parent.mkdir(parents=True, exist_ok=True)
+    demo_path.write_text("这是统一加载工厂的自测文本,用于验证.txt格式分发是否正常工作。", encoding="utf-8")
+
+    docs = load_document(str(demo_path))
+    logger.info(f"自测结果: 共加载 {len(docs)} 个Document,loader_type={docs[0].metadata.get('loader_type')}")
+```
+
+#### 加练文件2:专用表格提取工具(table_extraction.py)
+
+```python
+# -*- coding: utf-8 -*-
+"""
+table_extraction.py
+
+专门处理PDF中表格数据的提取工具,呼应上午老王反复强调的一句话:
+"表格数据,优先用专门工具,不要依赖通用PDF加载器"。
+
+本文件用pdfplumber实现表格提取(选择pdfplumber而不是camelot,是因为
+pdfplumber纯Python实现,不需要额外依赖Ghostscript这类系统级工具,
+部署起来更省心,对海纳集团这类中等复杂度的表格已经足够好用;
+如果未来遇到特别复杂的、跨页合并单元格的表格,camelot在某些场景下
+识别精度会更高,但依赖更重,这是一个需要具体场景具体权衡的选择)。
+
+核心思路:表格提取出来之后,不是简单粗暴地转成一整段文字拼接,
+而是转换成"结构化的行列描述文本"——每一行数据,用"字段名:值"的形式
+重新表达,这样既保留了表格原本的行列对应关系,又能被后续的文本分割器
+正常处理(毕竟分割器操作的对象始终是纯文本字符串)。
+"""
+
+import json
+import logging
+from pathlib import Path
+from typing import List, Optional
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("table_extraction")
+
+
+def extract_tables_from_pdf(pdf_path: str, pages: Optional[List[int]] = None) -> List[dict]:
+    """
+    使用pdfplumber从PDF中提取表格,返回结构化的表格数据列表。
+
+    参数:
+        pdf_path: PDF文件路径
+        pages: 指定要处理的页码列表(从1开始计数),不传则处理全部页面
+
+    返回:
+        列表,每个元素形如:
+        {"page": 3, "table_index": 0, "rows": [["列1", "列2"], ["值1", "值2"]]}
+    """
+    import pdfplumber
+
+    results = []
+    with pdfplumber.open(pdf_path) as pdf:
+        target_pages = pages or range(1, len(pdf.pages) + 1)
+        for page_num in target_pages:
+            if page_num < 1 or page_num > len(pdf.pages):
+                logger.warning(f"指定的页码 {page_num} 超出文档实际页数({len(pdf.pages)}页),已跳过")
+                continue
+
+            page = pdf.pages[page_num - 1]
+            tables = page.extract_tables()
+
+            for table_index, table_rows in enumerate(tables):
+                # pdfplumber提取出的单元格可能是None(合并单元格或空单元格造成),
+                # 统一替换为空字符串,避免后续拼接文本时出现"None"字面量污染内容
+                cleaned_rows = [
+                    [cell if cell is not None else "" for cell in row]
+                    for row in table_rows
+                ]
+                results.append({
+                    "page": page_num,
+                    "table_index": table_index,
+                    "rows": cleaned_rows,
+                })
+
+    logger.info(f"[表格提取] 从 {pdf_path} 中共提取到 {len(results)} 个表格")
+    return results
+
+
+def table_to_structured_text(table: dict, header_row_index: int = 0) -> str:
+    """
+    把一个表格的行列数据,转换成"字段名: 值"形式的结构化文本描述,
+    每一行数据转换成一个独立的自然语言段落,保留原本的行列对应关系。
+
+    参数:
+        table: extract_tables_from_pdf返回的单个表格字典
+        header_row_index: 哪一行是表头(字段名所在行),默认第0行
+
+    返回:
+        结构化的文本描述,每行数据用一段话表达,类似:
+        "第1行记录 —— 故障代码: E-07;故障现象: 螺杆转速超限;排查步骤: 立即停机检查液压系统"
+    """
+    rows = table["rows"]
+    if len(rows) <= header_row_index:
+        return ""
+
+    headers = [h.strip() for h in rows[header_row_index]]
+    data_rows = rows[header_row_index + 1:]
+
+    lines = []
+    for i, row in enumerate(data_rows):
+        # 如果某一行的列数和表头列数不一致(常见于合并单元格造成的错位),
+        # 用zip截断到较短的长度,避免IndexError,并记录警告便于后续人工核查
+        if len(row) != len(headers):
+            logger.warning(
+                f"表格(页{table['page']}, 表{table['table_index']})第{i}行列数"
+                f"({len(row)})与表头列数({len(headers)})不一致,已按最短长度对齐处理"
+            )
+        pairs = [f"{h}: {v.strip()}" for h, v in zip(headers, row) if v and v.strip()]
+        if pairs:
+            lines.append(f"第{i + 1}行记录 —— " + ";".join(pairs))
+
+    return "\n".join(lines)
+
+
+def build_table_documents(pdf_path: str, pages: Optional[List[int]] = None):
+    """
+    从PDF中提取全部表格,并转换为LangChain的Document对象列表,
+    每个Document的metadata中记录来源页码和表格序号,便于后续检索定位溯源。
+    """
+    from langchain_core.documents import Document
+
+    tables = extract_tables_from_pdf(pdf_path, pages=pages)
+    documents = []
+
+    for table in tables:
+        structured_text = table_to_structured_text(table)
+        if not structured_text.strip():
+            logger.info(f"表格(页{table['page']}, 表{table['table_index']})转换后为空内容,已跳过")
+            continue
+
+        documents.append(
+            Document(
+                page_content=structured_text,
+                metadata={
+                    "source_file": Path(pdf_path).name,
+                    "page": table["page"],
+                    "table_index": table["table_index"],
+                    "content_type": "table",
+                },
+            )
+        )
+
+    logger.info(f"[表格转换] 共生成 {len(documents)} 个表格Document对象")
+    return documents
+
+
+def save_tables_as_json(pdf_path: str, output_path: str, pages: Optional[List[int]] = None) -> None:
+    """
+    把提取出的原始表格行列数据(未经过结构化文本转换)另存为JSON文件,
+    保留最原始的行列结构,供以后需要"完整还原表格"这类场景(比如生成一份
+    带表格的PDF摘要报告)时,直接读取使用,而不需要重新跑一遍PDF解析。
+    """
+    tables = extract_tables_from_pdf(pdf_path, pages=pages)
+    output_file = Path(output_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(tables, f, ensure_ascii=False, indent=2)
+    logger.info(f"[表格落盘] 已将 {len(tables)} 个原始表格数据保存到 {output_path}")
+
+
+if __name__ == "__main__":
+    demo_pdf = "data/haina/XJ-500操作维护手册.pdf"
+    if Path(demo_pdf).exists():
+        table_docs = build_table_documents(demo_pdf)
+        for doc in table_docs[:3]:
+            print(doc.metadata)
+            print(doc.page_content)
+            print("---")
+    else:
+        logger.warning(f"示例PDF文件不存在: {demo_pdf},请准备好海纳集团样本文档后再运行本脚本")
+```
+
+#### 加练文件3:批量文档处理与失败隔离流水线(batch_processing_pipeline.py)
+
+```python
+# -*- coding: utf-8 -*-
+"""
+batch_processing_pipeline.py
+
+批量文档处理流水线,正式落地课后作业第6题里讨论过的设计思路:
+"单文档处理逻辑独立封装、失败隔离、成功/失败清单分离记录、支持断点续跑"。
+
+陈铭把这份代码定位为"给海纳集团后续全量文档处理做准备的雏形"——
+今天CQ-108/109只处理了五份样本,但项目一旦立项,面对的可能是成百上千份文档,
+到那时候,如果没有这样一套具备容错和可追溯能力的批处理框架,
+任何一份文档的意外失败,都可能让整个批处理任务从头再来,代价太大。
+"""
+
+import json
+import logging
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, List
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("batch_processing_pipeline")
+
+
+class BatchProcessingReport:
+    """
+    批处理任务的执行报告,负责收集每一份文档的处理结果,
+    并提供落盘保存、断点续跑所需的"已处理清单"查询能力。
+    """
+
+    def __init__(self, report_dir: str):
+        self.report_dir = Path(report_dir)
+        self.report_dir.mkdir(parents=True, exist_ok=True)
+        self.success_log_path = self.report_dir / "success.jsonl"
+        self.failure_log_path = self.report_dir / "failure.jsonl"
+
+    def load_already_processed_paths(self) -> set:
+        """
+        读取已有的成功清单,返回一个文件路径集合,供断点续跑时跳过已处理过的文档。
+
+        注意:只有"成功"的文档才会被视为"已处理过,可以跳过",失败的文档
+        每次重新运行批处理任务时都会重新尝试,这是刻意的设计——失败原因
+        很可能在两次运行之间已经被人工修复(比如换了一份完好的文档),
+        不应该因为"曾经失败过"就永久跳过,那样等于把问题永久掩盖了。
+        """
+        processed = set()
+        if self.success_log_path.exists():
+            with open(self.success_log_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    record = json.loads(line)
+                    processed.add(record["path"])
+        return processed
+
+    def record_success(self, path: str, doc_count: int, chunk_count: int) -> None:
+        """把一次成功的处理结果,追加写入成功清单文件。"""
+        record = {
+            "path": path,
+            "doc_count": doc_count,
+            "chunk_count": chunk_count,
+            "processed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        with open(self.success_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def record_failure(self, path: str, error: Exception, error_category: str) -> None:
+        """把一次失败的处理结果,追加写入失败清单文件,包含分类后的错误原因摘要。"""
+        record = {
+            "path": path,
+            "error_category": error_category,
+            "error_message": str(error),
+            "processed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        with open(self.failure_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def summarize(self) -> dict:
+        """统计当前累积的成功/失败数量,供批处理任务收尾时打印总结。"""
+        success_count = 0
+        if self.success_log_path.exists():
+            with open(self.success_log_path, encoding="utf-8") as f:
+                success_count = sum(1 for _ in f)
+
+        failure_count = 0
+        failure_categories: dict = {}
+        if self.failure_log_path.exists():
+            with open(self.failure_log_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    record = json.loads(line)
+                    failure_count += 1
+                    category = record.get("error_category", "unknown")
+                    failure_categories[category] = failure_categories.get(category, 0) + 1
+
+        return {
+            "success_count": success_count,
+            "failure_count": failure_count,
+            "failure_categories": failure_categories,
+        }
+
+
+def categorize_error(exc: Exception) -> str:
+    """
+    对捕获到的异常做一次粗略分类,方便失败清单按类别汇总,
+    而不是每一条失败记录都只是一段看不出规律的原始异常文字。
+
+    分类规则是一套朴素的启发式规则,基于异常类型和异常信息中的关键字判断,
+    实际项目中可以根据观察到的真实失败案例持续补充新的分类规则。
+    """
+    error_text = str(exc).lower()
+    exc_type_name = type(exc).__name__
+
+    if exc_type_name == "FileNotFoundError":
+        return "file_not_found"
+    if "zipfile" in error_text or "badzipfile" in exc_type_name.lower():
+        return "corrupted_zip_based_file"
+    if "encrypt" in error_text or "password" in error_text:
+        return "encrypted_file"
+    if "unicodedecodeerror" in exc_type_name.lower() or "codec" in error_text:
+        return "encoding_error"
+    if "libmagic" in error_text or "poppler" in error_text or "tesseract" in error_text:
+        return "missing_system_dependency"
+    return "unknown_error"
+
+
+def process_single_document(file_path: str, chunk_size: int = 500, chunk_overlap: int = 100) -> dict:
+    """
+    单份文档的完整处理逻辑:统一加载 -> 简单清洗压缩空白 -> 分割 -> 返回统计结果。
+
+    这个函数刻意保持"轻量级"——不重复实现今天写过的完整清洗规则
+    (页眉页脚探测那部分逻辑更适合针对PDF这种页结构清晰的格式单独调用),
+    这里主要演示"批量处理框架本身"如何工作,清洗和分割的具体实现,
+    实际项目中会调用document_cleaner.py和splitter_comparison.py里已经写好的函数。
+
+    :return: {"doc_count": ..., "chunk_count": ...}
+    """
+    import re
+
+    from unified_loader_factory import load_document
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    docs = load_document(file_path)
+    if not docs:
+        raise ValueError(f"文档加载结果为空: {file_path}")
+
+    merged_text = "\n\n".join(d.page_content for d in docs)
+    merged_text = re.sub(r"\n{3,}", "\n\n", merged_text).strip()
+
+    if not merged_text:
+        raise ValueError(f"文档清洗后内容为空: {file_path}")
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=["\n\n", "\n", "。", "!", "?", ";", " ", ""],
+    )
+    chunks = splitter.split_text(merged_text)
+
+    return {"doc_count": len(docs), "chunk_count": len(chunks)}
+
+
+def run_batch(
+    file_paths: List[str],
+    report_dir: str,
+    process_fn: Callable[[str], dict] = process_single_document,
+    resume: bool = True,
+) -> dict:
+    """
+    批量处理入口函数。
+
+    参数:
+        file_paths: 待处理的文件路径列表
+        report_dir: 存放成功/失败清单的目录
+        process_fn: 单文档处理函数,默认使用process_single_document,
+            允许调用方传入自定义处理函数,方便针对不同项目复用这套批处理框架
+        resume: 是否启用断点续跑(跳过已经在成功清单里记录过的文档)
+
+    返回:
+        本次批处理任务的统计摘要字典
+    """
+    report = BatchProcessingReport(report_dir)
+    already_processed = report.load_already_processed_paths() if resume else set()
+
+    if already_processed:
+        logger.info(f"[断点续跑] 检测到已有 {len(already_processed)} 份文档处理成功过,本次将跳过它们")
+
+    total = len(file_paths)
+    for idx, path in enumerate(file_paths, start=1):
+        if path in already_processed:
+            logger.info(f"[{idx}/{total}] 跳过已处理过的文档: {path}")
+            continue
+
+        logger.info(f"[{idx}/{total}] 开始处理: {path}")
+        try:
+            result = process_fn(path)
+            report.record_success(path, result["doc_count"], result["chunk_count"])
+            logger.info(
+                f"[{idx}/{total}] 处理成功: {path},"
+                f"文档数={result['doc_count']}, chunk数={result['chunk_count']}"
+            )
+        except Exception as exc:
+            category = categorize_error(exc)
+            report.record_failure(path, exc, category)
+            logger.error(f"[{idx}/{total}] 处理失败: {path},分类={category},原因={exc}")
+            logger.debug(traceback.format_exc())
+            # 关键点:即使这份文档失败了,循环也会继续处理下一份文档,
+            # 不会因为一份文档的问题导致整个批处理任务中断
+            continue
+
+    summary = report.summarize()
+    logger.info("=" * 60)
+    logger.info("批处理任务完成,统计摘要:")
+    logger.info(f"  成功: {summary['success_count']} 份")
+    logger.info(f"  失败: {summary['failure_count']} 份")
+    if summary["failure_categories"]:
+        logger.info(f"  失败原因分类统计: {summary['failure_categories']}")
+    logger.info("=" * 60)
+
+    return summary
+
+
+if __name__ == "__main__":
+    sample_paths = [
+        "data/haina/XJ-500操作维护手册.pdf",
+        "data/haina/数控车床日常保养作业指导书.docx",
+        "data/haina/海纳设备管理知识库-使用说明.md",
+        "data/haina/设备台账-2024.csv",
+        "data/haina/不存在的文档.pdf",  # 故意加入一份不存在的文档,验证失败隔离机制
+    ]
+    run_batch(sample_paths, report_dir="output/batch_reports")
+```
+
+#### 加练文件4:简化版语义分割实验(semantic_chunker.py)
+
+```python
+# -*- coding: utf-8 -*-
+"""
+semantic_chunker.py
+
+简化版语义分割(Semantic Chunking)实现,呼应下午课堂笔记里老王介绍过的思路——
+"依次比较相邻句子的语义相似度,在相似度骤降的位置断开,形成新的chunk边界"。
+
+老王明确说过,这个方向今天不要求动手实现,但陈铭当晚兴趣正浓,想亲手验证一下
+"理论上更精确"这句话到底是什么效果,同时也提前为明天(Day29)要学的Embedding
+技术打个预习的前站。这份代码使用一个极简化的、基于字符重合度的"伪相似度"函数
+模拟语义相似度计算(因为真正的Embedding模型调用要等明天才正式学),
+仅用于建立直观理解,并不是生产可用的语义分割实现——这一点在代码注释里
+写得很清楚,避免以后有人误把这份教学演示代码直接搬进正式项目。
+"""
+
+import logging
+import re
+from typing import List
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("semantic_chunker")
+
+
+def split_into_sentences(text: str) -> List[str]:
+    """按中文常见句末标点,把文本拆分成句子列表,复用今天已经用过多次的思路。"""
+    sentence_pattern = re.compile(r"([^。!?]*[。!?])")
+    sentences = [s.strip() for s in sentence_pattern.findall(text) if s.strip()]
+    remainder = sentence_pattern.sub("", text).strip()
+    if remainder:
+        sentences.append(remainder)
+    return sentences
+
+
+def naive_similarity(sentence_a: str, sentence_b: str) -> float:
+    """
+    极简化的"伪相似度"函数,用两句话之间共享字符的Jaccard系数近似衡量相似程度,
+    数值范围0到1,数值越大代表两句话字面上重合度越高。
+
+    【重要提醒,写在代码里也写在这里】:这不是真正意义上的语义相似度计算——
+    两句话字面上完全不重合,也完全可能在语义上高度相关(比如"螺杆转速过高"和
+    "主轴转动速度超标"几乎是同一个意思,但字面重合度很低)。真正的语义相似度,
+    需要依赖Embedding模型把句子转换成向量,再计算向量之间的余弦相似度,
+    这部分技术要等明天Day29才正式展开。今天这个简化函数,只是为了不依赖任何
+    外部模型调用,就能让陈铭亲眼看到"相似度驱动的分割"这个流程本身是怎么运作的。
+    """
+    set_a = set(sentence_a)
+    set_b = set(sentence_b)
+    if not set_a or not set_b:
+        return 0.0
+    intersection = set_a & set_b
+    union = set_a | set_b
+    return len(intersection) / len(union)
+
+
+def semantic_split(
+    text: str,
+    similarity_drop_threshold: float = 0.3,
+    max_chunk_size: int = 600,
+) -> List[str]:
+    """
+    简化版语义分割主函数。
+
+    算法思路:
+    1. 把全文拆分成句子列表
+    2. 依次计算相邻两句话之间的相似度
+    3. 如果相似度低于similarity_drop_threshold(意味着话题可能发生了转折),
+       在这个位置断开,开启一个新的chunk
+    4. 同时兼顾max_chunk_size上限,即使相似度没有明显下降,
+       chunk长度超过上限时也要强制断开,避免产生过长的chunk
+
+    参数:
+        text: 待分割的完整文本
+        similarity_drop_threshold: 相似度低于此值时,判定为话题转折点
+        max_chunk_size: chunk长度的硬性上限,防止长时间没有话题转折导致chunk无限增长
+
+    返回:
+        分割后的chunk字符串列表
+    """
+    sentences = split_into_sentences(text)
+    if not sentences:
+        return []
+
+    chunks = []
+    current_sentences = [sentences[0]]
+
+    for i in range(1, len(sentences)):
+        prev_sentence = sentences[i - 1]
+        curr_sentence = sentences[i]
+        similarity = naive_similarity(prev_sentence, curr_sentence)
+
+        current_length = sum(len(s) for s in current_sentences)
+        would_exceed_max_size = current_length + len(curr_sentence) > max_chunk_size
+
+        if similarity < similarity_drop_threshold or would_exceed_max_size:
+            reason = "相似度骤降" if similarity < similarity_drop_threshold else "达到长度上限"
+            logger.debug(f"在句子 {i} 处断开chunk,原因: {reason}(相似度={similarity:.2f})")
+            chunks.append("".join(current_sentences))
+            current_sentences = [curr_sentence]
+        else:
+            current_sentences.append(curr_sentence)
+
+    if current_sentences:
+        chunks.append("".join(current_sentences))
+
+    return chunks
+
+
+def compare_with_fixed_length_splitting(text: str, chunk_size: int = 500, chunk_overlap: int = 100) -> dict:
+    """
+    对同一份文本,分别用语义分割与固定长度分割(RecursiveCharacterTextSplitter)处理,
+    对比两者的chunk数量与长度分布差异,复用今天下午已经写熟的统计方式。
+    """
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    semantic_chunks = semantic_split(text, max_chunk_size=chunk_size)
+
+    fixed_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=["\n\n", "\n", "。", "!", "?", ";", " ", ""],
+    )
+    fixed_chunks = fixed_splitter.split_text(text)
+
+    def _stats(chunks):
+        lengths = [len(c) for c in chunks]
+        if not lengths:
+            return {"count": 0, "avg": 0}
+        return {"count": len(lengths), "avg": round(sum(lengths) / len(lengths), 1)}
+
+    result = {
+        "semantic": _stats(semantic_chunks),
+        "fixed_length": _stats(fixed_chunks),
+    }
+    logger.info(f"简化语义分割: {result['semantic']}")
+    logger.info(f"固定长度分割(RecursiveCharacterTextSplitter): {result['fixed_length']}")
+    return result
+
+
+if __name__ == "__main__":
+    demo_text = (
+        "当螺杆转速超过额定值的120%时,系统会自动触发E-07报警。"
+        "此时应立即停机检查液压系统压力表读数。"
+        "如果E-07报警在停机后仍未消除,请联系设备科技术支持。"
+        "第四章 日常保养。"
+        "注塑机每日开机前,应完成以下检查项:液压油位是否在标准线之间。"
+        "料筒温度是否达到设定值。"
+        "安全门联锁装置是否正常闭合。"
+    )
+    chunks = semantic_split(demo_text, similarity_drop_threshold=0.15, max_chunk_size=100)
+    for i, c in enumerate(chunks):
+        print(f"chunk {i}: {c}")
+
+    print("\n对比实验:")
+    compare_with_fixed_length_splitting(demo_text * 5, chunk_size=200, chunk_overlap=40)
+```
+
+#### 加练文件5:分割质量自动化检查工具(chunk_quality_checker.py)
+
+```python
+# -*- coding: utf-8 -*-
+"""
+chunk_quality_checker.py
+
+分割质量自动化检查工具。呼应下午课堂笔记里反复强调的观点——
+"统计数字能告诉你切分结果长什么样,但回答不了好不好用这个问题,
+这层判断目前没有自动化指标能完全替代人工抽查"。
+
+这句话依然成立,但陈铭想做一件折中的事——用一些朴素的启发式规则,
+自动"标记出"那些疑似有问题的chunk(比如疑似被从句子中间切断、
+疑似内容重复度过高、疑似长度异常),把人工抽查的范围从"全部chunk"
+收窄到"被标记出来的可疑chunk",这样既不完全依赖机器判断,
+也不需要对着几十上百个chunk逐条盲目排查,是效率和严谨性之间的一个折中方案。
+"""
+
+import logging
+from typing import List
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("chunk_quality_checker")
+
+SENTENCE_END_CHARS = "。!?;:"
+SENTENCE_START_INDICATORS = ("的", "了", "着", "和", "或", "与", "但", "而")
+
+
+def check_sentence_boundary_violation(chunk: str) -> bool:
+    """
+    检查一个chunk,是否疑似"没有在完整句子边界处结束"——
+    简化判断规则:如果chunk末尾不是常见的句末标点,且chunk本身长度不算太短
+    (太短的chunk本身可能就是切分出来的边角料,单独判断意义不大),
+    则认为疑似存在句子被切断的风险。
+    """
+    stripped = chunk.strip()
+    if len(stripped) < 10:
+        return False
+    return stripped[-1] not in SENTENCE_END_CHARS
+
+
+def check_suspicious_start(chunk: str) -> bool:
+    """
+    检查一个chunk,开头是否是常见的"承接性"词语(的/了/着/和/或/与/但/而等),
+    这类词语在中文里通常不会作为一句话或一段话的开头出现,
+    如果chunk恰好以这类词开头,大概率意味着上一句话被切断了,
+    这句话的前半部分被划到了前一个chunk里。
+    """
+    stripped = chunk.strip()
+    return any(stripped.startswith(ind) for ind in SENTENCE_START_INDICATORS)
+
+
+def check_length_anomaly(chunk: str, expected_chunk_size: int, tolerance_ratio: float = 0.3) -> bool:
+    """
+    检查chunk长度是否明显偏离预期的chunk_size——
+    过短可能是清洗后残留的碎片,过长可能是分割器遇到无法进一步切分的超长段落。
+    """
+    lower_bound = expected_chunk_size * (1 - tolerance_ratio)
+    length = len(chunk.strip())
+    return length < lower_bound * 0.3 or length > expected_chunk_size * (1 + tolerance_ratio) * 1.5
+
+
+def check_high_repetition_with_neighbors(chunk: str, all_chunks: List[str], similarity_threshold: float = 0.8) -> bool:
+    """
+    检查一个chunk,是否与其他任意一个chunk存在过高的重合度——
+    这通常意味着chunk_overlap设置得过大,或者原文本身就存在大段重复内容。
+    使用和semantic_chunker.py中一致的朴素Jaccard相似度计算方式。
+    """
+    chunk_set = set(chunk)
+    if not chunk_set:
+        return False
+
+    for other in all_chunks:
+        if other is chunk:
+            continue
+        other_set = set(other)
+        if not other_set:
+            continue
+        intersection = chunk_set & other_set
+        union = chunk_set | other_set
+        similarity = len(intersection) / len(union) if union else 0.0
+        if similarity >= similarity_threshold:
+            return True
+    return False
+
+
+def run_quality_check(chunks: List[str], expected_chunk_size: int = 500) -> List[dict]:
+    """
+    对一组chunk批量运行全部质量检查规则,返回被标记为"疑似有问题"的chunk清单,
+    每条记录包含chunk的序号、内容预览、以及触发了哪些检查规则。
+
+    这个函数的输出,是给人工抽查环节准备的"重点排查清单",
+    而不是最终的自动化判定结果——最终这些chunk到底有没有问题,
+    仍然需要人工打开原文核实,机器只负责"缩小需要人工关注的范围"。
+    """
+    flagged_records = []
+
+    for idx, chunk in enumerate(chunks):
+        triggered_checks = []
+
+        if check_sentence_boundary_violation(chunk):
+            triggered_checks.append("疑似句子边界被切断")
+        if check_suspicious_start(chunk):
+            triggered_checks.append("疑似以承接性词语开头(上一句可能被切断)")
+        if check_length_anomaly(chunk, expected_chunk_size):
+            triggered_checks.append("长度明显偏离预期")
+        if check_high_repetition_with_neighbors(chunk, chunks):
+            triggered_checks.append("与其他chunk高度重复")
+
+        if triggered_checks:
+            flagged_records.append({
+                "index": idx,
+                "preview": chunk[:60] + ("..." if len(chunk) > 60 else ""),
+                "length": len(chunk),
+                "triggered_checks": triggered_checks,
+            })
+
+    logger.info(f"[质量检查] 共检查 {len(chunks)} 个chunk,标记出 {len(flagged_records)} 个疑似问题chunk")
+    for record in flagged_records:
+        logger.info(f"  chunk {record['index']}(长度{record['length']}): {record['triggered_checks']}")
+        logger.info(f"    内容预览: {record['preview']!r}")
+
+    return flagged_records
+
+
+if __name__ == "__main__":
+    demo_chunks = [
+        "当螺杆转速超过额定值的120%时,系统会自动触发E-07报警",  # 疑似未在句末标点结束
+        "的排查方法是首先检查液压系统压力表读数是否正常。",  # 疑似以承接性词语开头
+        "如果E-07报警在停机后仍未消除,请联系设备科技术支持,联系电话见附录A。",  # 正常
+        "第",  # 长度异常,极短
+        "当螺杆转速超过额定值的120%时,系统会自动触发E-07报警,此时应停机检查压力表。",  # 与chunk0高度重复
+    ]
+    run_quality_check(demo_chunks, expected_chunk_size=40)
+```
+
+#### 加练文件6:统一流水线与新增模块的单元测试(test_document_pipeline.py)
+
+```python
+# -*- coding: utf-8 -*-
+"""
+test_document_pipeline.py
+
+针对今晚加练新增的几个模块编写的pytest测试用例,覆盖:
+unified_loader_factory的格式分发逻辑、batch_processing_pipeline的失败隔离与
+断点续跑机制、semantic_chunker的基础分割行为、chunk_quality_checker的检测规则。
+
+测试中涉及真实PDF/Word解析的部分,用临时生成的纯文本文件替代,
+避免测试运行依赖海纳集团的真实样本文档(那些文档不应该出现在代码仓库里,
+这是林悦转达孙工要求时反复强调过的数据合规红线)。
+"""
+
+import json
+from pathlib import Path
+
+import pytest
+
+
+@pytest.fixture
+def temp_txt_file(tmp_path):
+    """创建一个临时的纯文本文件,供加载工厂的测试用例使用。"""
+    file_path = tmp_path / "sample.txt"
+    file_path.write_text("这是一份用于测试的纯文本内容,不包含任何真实客户数据。", encoding="utf-8")
+    return str(file_path)
+
+
+class TestUnifiedLoaderFactory:
+    """针对unified_loader_factory.py的测试。"""
+
+    def test_load_txt_returns_nonempty_documents(self, temp_txt_file):
+        from unified_loader_factory import load_document
+
+        docs = load_document(temp_txt_file)
+        assert len(docs) > 0
+        assert docs[0].metadata["loader_type"] == "_load_txt"
+
+    def test_unsupported_extension_raises_value_error(self, tmp_path):
+        from unified_loader_factory import load_document
+
+        bad_file = tmp_path / "sample.exe"
+        bad_file.write_bytes(b"\x00\x01\x02")
+        with pytest.raises(ValueError, match="暂不支持的文件格式"):
+            load_document(str(bad_file))
+
+    def test_missing_file_raises_file_not_found_error(self):
+        from unified_loader_factory import load_document
+
+        with pytest.raises(FileNotFoundError):
+            load_document("data/haina/这份文档根本不存在.pdf")
+
+    def test_list_supported_formats_includes_expected_types(self):
+        from unified_loader_factory import list_supported_formats
+
+        formats = list_supported_formats()
+        for expected in ["pdf", "docx", "md", "csv", "txt", "pptx"]:
+            assert expected in formats
+
+    def test_magic_number_detection_for_valid_pdf_header(self, tmp_path):
+        from unified_loader_factory import detect_format_by_magic_number
+
+        fake_pdf = tmp_path / "fake.pdf"
+        fake_pdf.write_bytes(b"%PDF-1.4\n%fake content for testing")
+        assert detect_format_by_magic_number(str(fake_pdf)) == "pdf"
+
+    def test_magic_number_detection_for_non_pdf_content(self, tmp_path):
+        from unified_loader_factory import detect_format_by_magic_number
+
+        fake_file = tmp_path / "notreally.pdf"
+        fake_file.write_text("这根本不是PDF文件,只是被人为改了后缀名", encoding="utf-8")
+        assert detect_format_by_magic_number(str(fake_file)) != "pdf"
+
+
+class TestBatchProcessingPipeline:
+    """针对batch_processing_pipeline.py的测试。"""
+
+    def test_categorize_error_recognizes_file_not_found(self):
+        from batch_processing_pipeline import categorize_error
+
+        assert categorize_error(FileNotFoundError("找不到文件")) == "file_not_found"
+
+    def test_categorize_error_recognizes_encoding_issue(self):
+        from batch_processing_pipeline import categorize_error
+
+        try:
+            b"\xff\xfe".decode("utf-8")
+        except UnicodeDecodeError as exc:
+            assert categorize_error(exc) == "encoding_error"
+
+    def test_run_batch_isolates_failures_and_continues(self, tmp_path):
+        from batch_processing_pipeline import run_batch
+
+        good_file = tmp_path / "good.txt"
+        good_file.write_text("正常文档内容" * 50, encoding="utf-8")
+
+        def fake_process_fn(path):
+            if "bad" in path:
+                raise ValueError("模拟的处理失败")
+            return {"doc_count": 1, "chunk_count": 3}
+
+        report_dir = tmp_path / "reports"
+        summary = run_batch(
+            [str(good_file), "bad_document.pdf"],
+            report_dir=str(report_dir),
+            process_fn=fake_process_fn,
+            resume=False,
+        )
+
+        assert summary["success_count"] == 1
+        assert summary["failure_count"] == 1
+
+    def test_run_batch_resume_skips_already_processed(self, tmp_path):
+        from batch_processing_pipeline import run_batch
+
+        good_file = tmp_path / "good.txt"
+        good_file.write_text("正常文档内容" * 50, encoding="utf-8")
+
+        call_count = {"count": 0}
+
+        def counting_process_fn(path):
+            call_count["count"] += 1
+            return {"doc_count": 1, "chunk_count": 2}
+
+        report_dir = tmp_path / "reports"
+        run_batch([str(good_file)], report_dir=str(report_dir), process_fn=counting_process_fn, resume=True)
+        run_batch([str(good_file)], report_dir=str(report_dir), process_fn=counting_process_fn, resume=True)
+
+        # 第二次运行应该因为断点续跑机制,跳过已经成功处理过的文档,
+        # process_fn实际只应该被调用一次
+        assert call_count["count"] == 1
+
+    def test_report_records_are_valid_jsonl(self, tmp_path):
+        from batch_processing_pipeline import run_batch
+
+        good_file = tmp_path / "good.txt"
+        good_file.write_text("正常文档内容" * 50, encoding="utf-8")
+        report_dir = tmp_path / "reports"
+
+        run_batch(
+            [str(good_file)],
+            report_dir=str(report_dir),
+            process_fn=lambda p: {"doc_count": 1, "chunk_count": 1},
+            resume=False,
+        )
+
+        success_log = report_dir / "success.jsonl"
+        assert success_log.exists()
+        with open(success_log, encoding="utf-8") as f:
+            line = f.readline()
+            record = json.loads(line)
+            assert record["path"] == str(good_file)
+            assert record["chunk_count"] == 1
+
+
+class TestSemanticChunker:
+    """针对semantic_chunker.py的测试。"""
+
+    def test_split_into_sentences_handles_mixed_punctuation(self):
+        from semantic_chunker import split_into_sentences
+
+        text = "第一句话。第二句话!第三句话?第四句没有标点"
+        sentences = split_into_sentences(text)
+        assert len(sentences) == 4
+        assert sentences[-1] == "第四句没有标点"
+
+    def test_naive_similarity_identical_sentences_returns_one(self):
+        from semantic_chunker import naive_similarity
+
+        assert naive_similarity("完全相同的句子", "完全相同的句子") == 1.0
+
+    def test_naive_similarity_completely_different_returns_low_value(self):
+        from semantic_chunker import naive_similarity
+
+        similarity = naive_similarity("苹果香蕉橙子", "汽车飞机轮船")
+        assert similarity < 0.3
+
+    def test_semantic_split_respects_max_chunk_size(self):
+        from semantic_chunker import semantic_split
+
+        long_text = "这是一段用于测试长度限制的重复内容。" * 30
+        chunks = semantic_split(long_text, similarity_drop_threshold=0.0, max_chunk_size=50)
+        for chunk in chunks:
+            assert len(chunk) <= 50 + len("这是一段用于测试长度限制的重复内容。")
+
+
+class TestChunkQualityChecker:
+    """针对chunk_quality_checker.py的测试。"""
+
+    def test_sentence_boundary_violation_detected(self):
+        from chunk_quality_checker import check_sentence_boundary_violation
+
+        assert check_sentence_boundary_violation("这句话没有以句末标点结束呢") is True
+        assert check_sentence_boundary_violation("这句话正常结束了。") is False
+
+    def test_suspicious_start_detected(self):
+        from chunk_quality_checker import check_suspicious_start
+
+        assert check_suspicious_start("的排查方法如下所示") is True
+        assert check_suspicious_start("排查方法如下所示") is False
+
+    def test_length_anomaly_detects_extremely_short_chunk(self):
+        from chunk_quality_checker import check_length_anomaly
+
+        assert check_length_anomaly("短", expected_chunk_size=500) is True
+
+    def test_high_repetition_detected_between_similar_chunks(self):
+        from chunk_quality_checker import check_high_repetition_with_neighbors
+
+        chunks = [
+            "螺杆转速超过额定值的120%时会触发报警",
+            "螺杆转速超过额定值的120%时会触发报警信息",
+            "完全不相关的另一段内容讲的是保养周期",
+        ]
+        assert check_high_repetition_with_neighbors(chunks[0], chunks, similarity_threshold=0.7) is True
+
+    def test_run_quality_check_returns_flagged_records_with_reasons(self):
+        from chunk_quality_checker import run_quality_check
+
+        chunks = ["短", "正常完整的一句话内容,长度适中,以句号结尾。"]
+        flagged = run_quality_check(chunks, expected_chunk_size=20)
+        assert any(r["index"] == 0 for r in flagged)
+```
+
+晚上九点多,陈铭把这六份加练文件跑通、测试全部通过之后,顺手把测试输出截图发到了项目群里。老王隔了几分钟回了一条比平时长一些的消息:"看完了,几点感受说一下。工厂函数和批处理框架这两块,做得比我预期的扎实,尤其是断点续跑这个设计,考虑到了'失败原因可能被人工修复'这层细节,这是很多人第一次写批处理框架时容易忽略的地方。语义分割那部分,你自己在注释里已经说清楚了'伪相似度不是真的语义相似度',这个诚实的态度比代码本身更值得肯定——很多人写这种教学演示代码,图省事就不会主动说清楚它的局限性,你这样写,以后别人接手这份代码,不会被误导。质量检查工具这个思路也很好,'缩小人工排查范围'比'完全依赖机器判断'更符合咱们一直强调的'不能只看数字下结论'这条原则。这些东西严格来说超出了CQ-108/CQ-109的任务范围,但既然做了,而且做得有价值,我会在明天的评审里一并给你记一笔。"
+
 ---
 
 ## 晚自习:一份电子书,一份脏手册,两种"脏度"的直观对比
