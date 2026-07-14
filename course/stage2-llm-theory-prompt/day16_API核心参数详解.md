@@ -2234,7 +2234,1098 @@ if __name__ == "__main__":
 
 老王看完测试文件,给出的评价是"覆盖了最该覆盖的几类分支,已经算合格",但也留了个问题让陈铭自己想:"你注意到没有,这些测试跑起来很快,几乎是秒开秒过,这是为什么?"陈铭很快反应过来:"因为mock掉了真实网络请求,不用真的等API响应。"老王点头:"这就是为什么正式项目里,单元测试必须尽量避免依赖真实外部服务——测试跑得慢,大家就不愿意跑;测试依赖网络,网络一抖动,测试就莫名其妙失败,大家会开始怀疑测试本身的可信度,进而不再信任测试。今天这个小测试文件,规模不大,但它遵守的这条原则,贯穿整个苍穹项目往后所有的测试代码。"
 
-六个文件全部整理完毕,已经快接近晚上九点。陈铭把它们统一放进了一个临时的`day16_practice/`目录下,提交到了自己在蓬远GitLab上的个人练习分支——按照公司规范,`feature/`分支的命名,他给自己起了个`feature/day16-param-experiment`。老王扫了一眼提交记录,没有多说什么,只在飞书任务卡CQ-119下面回复了一句:"代码结构不错,`ConversationManager`那个流式场景的接口缺口,记得别忘了,明天有空补一下。"这句简短的评语,让陈铭一整晚都没敢彻底放松,又把六个文件重新过了一遍,确认没有明显的遗漏。
+六个文件写完,陈铭刚准备收工,老王却把他叫住了,又追加了一项要求:"你上午整理的`SCENARIO_PRESETS`,现在是写死在`llm_client.py`里的一个Python字典——这在今天的实验阶段没问题,但你想过没有,以后模型管理台真正上线,运营同事想给'创意文案'这个场景把`max_tokens`从800调到1000,难道每次都要找你改代码、重新发布服务?这显然不现实。今天时间还够,我想让你把这一块也往前推一步——不是要你现在就搭一个完整的管理台前端,而是先把'场景预设可以被持久化存储、可以被安全地增删改查、每一次改动都有痕迹可查'这几件事的后端能力,先打好底子。顺带,把重试这块的逻辑也抽出来整理一下,你现在写在`llm_client.py`里的重试代码,以后embedding接口、多模态接口也会需要一份几乎一样的逻辑,不能每个模块都各写一套。"
+
+林悦在旁边听到这段对话,插了一句:"这个我举双手支持——上次听你们说,新增一个场景预设的默认值,还得走一遍代码发布流程,我当时就觉得这个环节有点重,运营同事天天要跟这些参数打交道,不能什么都指望工程师帮忙改代码。"老王笑着说:"这就是今天最后这一段要解决的问题。"于是,陈铭在原本六个文件的基础上,又续写了五个文件:场景预设的持久化存储与审计模块`scenario_config_store.py`;可复用的重试策略与简化版熔断器模块`retry_policy.py`;支持断线自动续接的流式客户端封装`stream_reconnect_client.py`;供模型管理台前端调用的场景预设管理接口`admin_api.py`;以及配套的两份单元测试`test_scenario_config_store.py`和`test_retry_policy.py`。
+
+### 7. `scenario_config_store.py` —— 场景预设的持久化存储与审计日志
+
+老王强调,这个模块要解决两件事:第一,场景预设配置不能再写死在代码里,要能被运营人员动态修改;第二,修改这件事本身,必须"有痕迹可查"——谁在什么时候把什么场景的什么参数从什么值改成了什么值,这条链路必须能够完整还原,这是企业级系统里"配置变更可追溯"的基本要求,苍穹以后接入正式客户,这条要求只会越来越硬性。
+
+```python
+"""
+scenario_config_store.py
+
+场景化参数预设的持久化存储模块。
+今天上午用的SCENARIO_PRESETS,只是一个写死在llm_client.py里的Python字典,
+足够支撑今天的实验,但撑不住"模型管理台"这个未来模块的真实需求——
+运营人员应该能够在界面上新增、修改、删除场景预设,而不需要工程师改代码重新部署。
+
+这个模块用SQLite把场景预设的CRUD操作和修改历史(审计日志)落到磁盘上,
+为后续admin_api.py提供的管理接口打底。
+
+设计要点:
+1. 每一次对预设的增、改、删操作,都会在audit_log表里留下一条记录,
+   包含操作类型、操作前后的完整配置快照、操作时间——这是企业级系统里
+   "配置变更可追溯"这条基本要求的最小实现。
+2. 对外暴露的接口仍然复用ChatParams做参数校验,保证"参数取值范围"这条规则
+   只有一处权威定义,不会因为多了一个存储层而产生第二套校验逻辑。
+"""
+
+import json
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime
+from typing import Dict, Any, List, Optional, Iterator
+
+from llm_client import ChatParams
+
+
+DEFAULT_DB_PATH = "data/scenario_presets.db"
+
+
+class ScenarioNotFoundError(Exception):
+    """请求的场景预设不存在时抛出。"""
+
+
+class ScenarioConfigStore:
+    """
+    场景预设配置的SQLite存储实现。
+
+    表结构说明:
+        scenario_presets: 当前生效的场景预设,一个场景名对应一行。
+        audit_log: 历史变更记录,每次create/update/delete都会追加一条,
+                   不会删除历史记录,保证审计链路完整。
+    """
+
+    def __init__(self, db_path: str = DEFAULT_DB_PATH):
+        self.db_path = db_path
+        self._ensure_tables()
+
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """统一管理数据库连接的打开与关闭,避免每个方法里重复写连接逻辑。"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _ensure_tables(self) -> None:
+        """首次使用时自动建表,避免手动执行SQL脚本这一步。"""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS scenario_presets (
+                    name TEXT PRIMARY KEY,
+                    config_json TEXT NOT NULL,
+                    description TEXT,
+                    updated_by TEXT,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scenario_name TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    before_json TEXT,
+                    after_json TEXT,
+                    operator TEXT,
+                    happened_at TEXT NOT NULL
+                )
+                """
+            )
+
+    def _write_audit(
+        self,
+        conn: sqlite3.Connection,
+        scenario_name: str,
+        action: str,
+        before: Optional[Dict[str, Any]],
+        after: Optional[Dict[str, Any]],
+        operator: str,
+    ) -> None:
+        """把一次变更记录写入审计日志表,before/after为None时表示该状态不存在(创建/删除场景)。"""
+        conn.execute(
+            """
+            INSERT INTO audit_log
+                (scenario_name, action, before_json, after_json, operator, happened_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                scenario_name,
+                action,
+                json.dumps(before, ensure_ascii=False) if before else None,
+                json.dumps(after, ensure_ascii=False) if after else None,
+                operator,
+                datetime.now().isoformat(),
+            ),
+        )
+
+    def create(
+        self,
+        name: str,
+        params: ChatParams,
+        description: str = "",
+        operator: str = "system",
+    ) -> None:
+        """
+        新增一个场景预设。
+
+        Args:
+            name: 场景名称,必须唯一
+            params: 该场景的参数配置,会先做一次validate()校验
+            description: 场景说明,给管理台界面展示用
+            operator: 操作人标识,用于审计日志
+
+        Raises:
+            ValueError: 场景名称已存在,或者params校验不通过
+        """
+        params.validate()
+        config = params.as_kwargs()
+
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT name FROM scenario_presets WHERE name = ?", (name,)
+            ).fetchone()
+            if existing:
+                raise ValueError(f"场景'{name}'已存在,如需修改请使用update方法")
+
+            conn.execute(
+                """
+                INSERT INTO scenario_presets
+                    (name, config_json, description, updated_by, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    name,
+                    json.dumps(config, ensure_ascii=False),
+                    description,
+                    operator,
+                    datetime.now().isoformat(),
+                ),
+            )
+            self._write_audit(conn, name, "create", None, config, operator)
+
+    def get(self, name: str) -> Dict[str, Any]:
+        """
+        读取一个场景预设的当前配置。
+
+        Returns:
+            包含config(参数字典)、description、updated_by、updated_at的字典
+
+        Raises:
+            ScenarioNotFoundError: 场景不存在
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM scenario_presets WHERE name = ?", (name,)
+            ).fetchone()
+        if not row:
+            raise ScenarioNotFoundError(f"场景'{name}'不存在")
+        return {
+            "name": row["name"],
+            "config": json.loads(row["config_json"]),
+            "description": row["description"],
+            "updated_by": row["updated_by"],
+            "updated_at": row["updated_at"],
+        }
+
+    def list_all(self) -> List[Dict[str, Any]]:
+        """返回当前所有场景预设的列表,供管理台界面渲染下拉列表使用。"""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT name, description, updated_at FROM scenario_presets ORDER BY name"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update(
+        self,
+        name: str,
+        params: ChatParams,
+        description: Optional[str] = None,
+        operator: str = "system",
+    ) -> None:
+        """
+        更新一个已存在的场景预设。
+
+        Args:
+            name: 场景名称
+            params: 新的参数配置
+            description: 新的说明文字,不传则保留原值
+            operator: 操作人标识
+
+        Raises:
+            ScenarioNotFoundError: 场景不存在
+            ValueError: params校验不通过
+        """
+        params.validate()
+        new_config = params.as_kwargs()
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM scenario_presets WHERE name = ?", (name,)
+            ).fetchone()
+            if not row:
+                raise ScenarioNotFoundError(f"场景'{name}'不存在,无法更新")
+
+            before_config = json.loads(row["config_json"])
+            final_description = description if description is not None else row["description"]
+
+            conn.execute(
+                """
+                UPDATE scenario_presets
+                SET config_json = ?, description = ?, updated_by = ?, updated_at = ?
+                WHERE name = ?
+                """,
+                (
+                    json.dumps(new_config, ensure_ascii=False),
+                    final_description,
+                    operator,
+                    datetime.now().isoformat(),
+                    name,
+                ),
+            )
+            self._write_audit(conn, name, "update", before_config, new_config, operator)
+
+    def delete(self, name: str, operator: str = "system") -> None:
+        """
+        删除一个场景预设(硬删除数据行,但审计日志会永久保留这次删除记录)。
+
+        Raises:
+            ScenarioNotFoundError: 场景不存在
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM scenario_presets WHERE name = ?", (name,)
+            ).fetchone()
+            if not row:
+                raise ScenarioNotFoundError(f"场景'{name}'不存在,无法删除")
+
+            before_config = json.loads(row["config_json"])
+            conn.execute("DELETE FROM scenario_presets WHERE name = ?", (name,))
+            self._write_audit(conn, name, "delete", before_config, None, operator)
+
+    def get_history(self, name: str) -> List[Dict[str, Any]]:
+        """
+        查询某个场景预设的完整变更历史,按时间正序返回。
+        这是"配置变更可追溯"能力在查询侧的体现——
+        运营人员如果发现某个场景的效果突然变差,可以顺着这份历史,
+        定位到是哪一次改动、谁改的、改之前是什么样子。
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT action, before_json, after_json, operator, happened_at
+                FROM audit_log
+                WHERE scenario_name = ?
+                ORDER BY happened_at ASC
+                """,
+                (name,),
+            ).fetchall()
+        history = []
+        for row in rows:
+            history.append(
+                {
+                    "action": row["action"],
+                    "before": json.loads(row["before_json"]) if row["before_json"] else None,
+                    "after": json.loads(row["after_json"]) if row["after_json"] else None,
+                    "operator": row["operator"],
+                    "happened_at": row["happened_at"],
+                }
+            )
+        return history
+
+    def seed_from_defaults(self, presets: Dict[str, Dict[str, Any]], operator: str = "init") -> None:
+        """
+        用llm_client.py里现有的SCENARIO_PRESETS字典,批量初始化数据库。
+        这个方法只在对应场景尚未存在的情况下才会真正创建,
+        用于把今天上午写死在代码里的默认配置,迁移进这套持久化存储,
+        后续新增/修改都走数据库,不再改动源代码里的常量。
+        """
+        for scenario_name, config in presets.items():
+            already_exists = True
+            try:
+                self.get(scenario_name)
+            except ScenarioNotFoundError:
+                already_exists = False
+            if not already_exists:
+                self.create(
+                    name=scenario_name,
+                    params=ChatParams(**config),
+                    description=f"由系统预置的{scenario_name}场景默认配置",
+                    operator=operator,
+                )
+
+
+if __name__ == "__main__":
+    from llm_client import SCENARIO_PRESETS
+
+    store = ScenarioConfigStore()
+    store.seed_from_defaults(SCENARIO_PRESETS)
+
+    print("当前所有场景预设:")
+    for item in store.list_all():
+        print(f"  - {item['name']}: {item['description']}")
+
+    print("\n更新code_assist场景的max_tokens为2000(模拟运营人员在管理台上的操作)...")
+    current = store.get("code_assist")
+    updated_params = ChatParams(**current["config"])
+    updated_params.max_tokens = 2000
+    store.update("code_assist", updated_params, operator="林悦")
+
+    print("\ncode_assist场景的变更历史:")
+    for record in store.get_history("code_assist"):
+        print(f"  [{record['happened_at']}] {record['action']} by {record['operator']}")
+```
+
+老王review这个文件时,重点看了`seed_from_defaults`这个方法:"这个方法的用意,是给'从写死的字典'过渡到'数据库存储'这件事,提供一条不破坏现有数据的迁移路径——如果数据库里已经有这个场景了,就不要用默认值覆盖别人可能已经调整过的配置,只补齐缺失的部分。这种'迁移脚本要对已有数据保持谨慎'的思路,以后咱们做任何数据结构升级,都要带着这份谨慎。"
+
+### 8. `retry_policy.py` —— 可复用的重试策略与简化版熔断器
+
+陈铭在写这个文件之前,先把`llm_client.py`里原来那段重试逻辑重新看了一遍,发现果然像老王说的那样——如果embedding接口也要写一遍类似的重试,几乎是把这段代码复制粘贴过去,只是把方法名换一下。于是他把"重试"这件事,提炼成了一个独立的、可以用装饰器语法直接套用的通用模块。
+
+```python
+"""
+retry_policy.py
+
+可复用的重试策略模块。
+llm_client.py里最初的重试逻辑,是直接写在CangqiongLLMClient.chat方法内部的,
+好处是直观,坏处是——如果以后有第二个、第三个方法也需要类似的重试能力
+(比如embedding接口、图片理解接口),就得把这段逻辑复制粘贴好几遍。
+
+这个模块把重试策略提炼成一个独立的装饰器retry_with_backoff,
+支持:
+1. 按异常类型分类,只对"值得重试"的异常做重试,其余异常直接向上抛出。
+2. 指数退避(exponential backoff),并加入随机抖动(jitter),
+   避免大量并发请求在完全相同的时间点集体重试,加重服务端压力。
+3. 可配置的最大重试次数与单次等待时间上限。
+
+除此之外,还额外提供了一个简化版的熔断器CircuitBreaker——
+重试解决的是"单次调用偶发失败,再试一次可能就好了"的问题,
+熔断器解决的是"下游服务已经持续故障,不该再无脑重试"的问题,两者互补。
+"""
+
+import functools
+import logging
+import random
+import time
+from typing import Callable, Optional, Tuple, Type, TypeVar
+
+logger = logging.getLogger("cangqiong.retry_policy")
+
+F = TypeVar("F", bound=Callable)
+
+
+class RetryExhaustedError(Exception):
+    """达到最大重试次数后,仍然失败时抛出的统一异常。"""
+
+    def __init__(self, attempts: int, last_error: Exception):
+        self.attempts = attempts
+        self.last_error = last_error
+        super().__init__(
+            f"重试{attempts}次后仍然失败,最后一次错误: {last_error!r}"
+        )
+
+
+def compute_backoff_seconds(
+    attempt: int,
+    base_seconds: float = 1.0,
+    max_seconds: float = 30.0,
+    jitter_ratio: float = 0.3,
+) -> float:
+    """
+    计算第attempt次重试前,应该等待的秒数,使用指数退避加随机抖动。
+
+    Args:
+        attempt: 当前是第几次重试(从1开始计数)
+        base_seconds: 基础等待时间
+        max_seconds: 等待时间上限,避免指数增长到不合理的数值
+        jitter_ratio: 抖动比例,实际等待时间会在
+                      [计算值*(1-jitter_ratio), 计算值*(1+jitter_ratio)]之间随机浮动
+
+    Returns:
+        本次应该等待的秒数
+    """
+    raw_seconds = min(base_seconds * (2 ** (attempt - 1)), max_seconds)
+    jitter = raw_seconds * jitter_ratio
+    return max(0.0, raw_seconds + random.uniform(-jitter, jitter))
+
+
+def retry_with_backoff(
+    retryable_exceptions: Tuple[Type[Exception], ...],
+    max_attempts: int = 3,
+    base_seconds: float = 1.0,
+    max_seconds: float = 30.0,
+    on_retry: Optional[Callable[[int, Exception, float], None]] = None,
+):
+    """
+    一个通用的重试装饰器工厂函数。
+
+    Args:
+        retryable_exceptions: 需要触发重试的异常类型元组,其余异常会直接向上抛出
+        max_attempts: 最大尝试次数(包含第一次尝试,不是"重试次数")
+        base_seconds: 指数退避的基础等待时间
+        max_seconds: 单次等待时间上限
+        on_retry: 可选的回调函数,签名为(attempt, exception, wait_seconds),
+                  在每次触发重试前调用,便于上层记录日志或上报监控指标
+
+    Returns:
+        装饰器函数
+
+    使用示例:
+        @retry_with_backoff((APIConnectionError, RateLimitError), max_attempts=3)
+        def call_api():
+            ...
+    """
+
+    def decorator(func: F) -> F:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_error: Optional[Exception] = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return func(*args, **kwargs)
+                except retryable_exceptions as exc:
+                    last_error = exc
+                    if attempt == max_attempts:
+                        break
+                    wait_seconds = compute_backoff_seconds(
+                        attempt, base_seconds=base_seconds, max_seconds=max_seconds
+                    )
+                    if on_retry:
+                        on_retry(attempt, exc, wait_seconds)
+                    else:
+                        logger.warning(
+                            "第%d次调用%s失败(%s),%.2f秒后重试",
+                            attempt, func.__name__, exc, wait_seconds,
+                        )
+                    time.sleep(wait_seconds)
+
+            raise RetryExhaustedError(attempts=max_attempts, last_error=last_error)
+
+        return wrapper
+
+    return decorator
+
+
+class CircuitBreaker:
+    """
+    一个简化版的熔断器实现,配合重试策略一起使用。
+
+    重试解决的是"单次调用偶发失败,再试一次可能就好了"的问题;
+    熔断器解决的是另一个问题——如果下游服务已经持续故障了一段时间,
+    继续无脑地一次次重试,只会让本来就有问题的服务雪上加霜,
+    也会让当前进程把大量时间浪费在"注定失败的等待"上。
+
+    熔断器的核心逻辑很朴素:连续失败次数超过阈值后,直接"跳闸",
+    在一段冷却时间内,不再真正发起调用,而是直接快速失败;
+    冷却时间过后,允许"试探性"地放一次请求通过,如果成功就重新闭合,
+    如果依然失败,则重新计时,继续保持跳闸状态。
+    """
+
+    def __init__(self, failure_threshold: int = 5, cooldown_seconds: float = 30.0):
+        self.failure_threshold = failure_threshold
+        self.cooldown_seconds = cooldown_seconds
+        self._consecutive_failures = 0
+        self._opened_at: Optional[float] = None
+
+    def _is_open(self) -> bool:
+        """判断熔断器当前是否处于"跳闸"状态。"""
+        if self._opened_at is None:
+            return False
+        if time.time() - self._opened_at >= self.cooldown_seconds:
+            # 冷却时间已过,允许一次试探性调用
+            return False
+        return True
+
+    def call(self, func: Callable, *args, **kwargs):
+        """
+        通过熔断器包装一次函数调用。
+
+        Raises:
+            RuntimeError: 熔断器处于跳闸状态时,直接快速失败,不真正调用func
+        """
+        if self._is_open():
+            remaining = self.cooldown_seconds - (time.time() - self._opened_at)
+            raise RuntimeError(
+                f"熔断器处于跳闸状态,距离冷却结束还有{remaining:.1f}秒,拒绝本次调用"
+            )
+
+        try:
+            result = func(*args, **kwargs)
+        except Exception:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self.failure_threshold:
+                self._opened_at = time.time()
+                logger.error(
+                    "连续失败%d次,达到阈值%d,熔断器跳闸,冷却%.0f秒",
+                    self._consecutive_failures, self.failure_threshold, self.cooldown_seconds,
+                )
+            raise
+        else:
+            # 调用成功,重置失败计数与跳闸状态
+            self._consecutive_failures = 0
+            self._opened_at = None
+            return result
+
+
+if __name__ == "__main__":
+    # 简单的自测:模拟一个"前两次失败,第三次成功"的函数,验证重试装饰器能正确工作
+    call_count = {"value": 0}
+
+    class FakeTransientError(Exception):
+        """模拟瞬时性错误。"""
+
+    @retry_with_backoff((FakeTransientError,), max_attempts=3, base_seconds=0.1, max_seconds=1.0)
+    def flaky_function():
+        call_count["value"] += 1
+        if call_count["value"] < 3:
+            raise FakeTransientError(f"第{call_count['value']}次调用模拟失败")
+        return "调用成功"
+
+    print(flaky_function())
+    print(f"总共尝试了{call_count['value']}次")
+```
+
+老王看完这个文件,特意问了陈铭一句:"重试和熔断,你觉得这两者,谁应该在外层,谁应该在内层?"陈铭想了想:"应该是熔断器在外层——先判断要不要放行这次调用,放行了,内部才谈得上要不要重试。如果反过来,熔断器在重试的内层,那每次重试都要重新判断一次熔断状态,逻辑会绕。"老王点头:"这个直觉是对的。今天这两个工具类先各自独立存在,怎么组合使用,等真正接入`llm_client.py`的时候再定,但你已经想清楚了组合顺序,说明这个知识点你是真的理解了,不是背下来的。"
+
+### 9. `stream_reconnect_client.py` —— 支持断线自动续接的流式客户端
+
+老王提出这个模块的场景是:"流式输出这件事,今天咱们只处理了'中断了就报错、把已收到的内容展示出来'这一种朴素策略。但真实场景里,如果客户正在跟AI客服聊一个稍微复杂的问题,回答说到一半网络抖了一下,直接给用户看一句说到一半的话,体验会很差。能不能让程序自动'接上'刚才没说完的内容,而不是让用户自己重新问一遍?"
+
+```python
+"""
+stream_reconnect_client.py
+
+支持断线重连的流式客户端封装。
+今天下午的流式demo(fastapi_stream_service.py / stream_typewriter_cli.py)里,
+遇到网络异常时的处理方式都比较简单粗暴——直接打断当前流式过程,
+把已经收到的部分内容原样展示给用户,然后结束。
+
+这在命令行demo里是可以接受的,但对一个要给真实客户使用的产品来说,
+体验会打折扣:用户提了一个复杂问题,模型刚说了一半,网络抖了一下,
+连接断开,用户看到的是一句说到一半就戛然而止的回复,体验很糟糕。
+
+这个模块实现了一个更进一步的策略——"断线后自动续接":
+1. 记录已经成功接收到的内容片段。
+2. 如果流式过程中途异常中断,自动发起一次新的请求,
+   把"已经说了什么"和"请接着刚才的内容继续往下说"作为新的提示,
+   让模型尽量从断点处衔接下去,而不是让用户重新发起一次完整提问。
+3. 限制最大重连次数,避免陷入无限重试的死循环。
+"""
+
+import logging
+import time
+from typing import Iterator, List, Optional
+
+from llm_client import CangqiongLLMClient, ChatParams, LLMClientError
+
+logger = logging.getLogger("cangqiong.stream_reconnect_client")
+
+
+class StreamInterruptedTooManyTimesError(Exception):
+    """流式请求中断次数超过最大重连次数上限时抛出。"""
+
+
+class ReconnectableStreamChat:
+    """
+    带自动重连能力的流式对话封装。
+
+    使用方式与CangqiongLLMClient.chat_stream类似,但内部会在检测到
+    连接中断时,自动尝试"接续"生成,对调用方而言,依然是一个连续、完整的
+    文本片段流,不需要关心中间发生过重连。
+    """
+
+    CONTINUE_INSTRUCTION_TEMPLATE = (
+        "我们的对话因为网络问题中断了,你刚才已经说到这里:\n"
+        "「{partial_content}」\n"
+        "请直接从这里自然地接着往下说完剩下的内容,"
+        "不要重复已经说过的部分,也不要说'好的,我继续'这类多余的话。"
+    )
+
+    def __init__(
+        self,
+        client: CangqiongLLMClient,
+        max_reconnect_attempts: int = 2,
+        reconnect_backoff_seconds: float = 1.0,
+    ):
+        self._client = client
+        self.max_reconnect_attempts = max_reconnect_attempts
+        self.reconnect_backoff_seconds = reconnect_backoff_seconds
+
+    def stream(
+        self,
+        messages: List[dict],
+        params: Optional[ChatParams] = None,
+    ) -> Iterator[str]:
+        """
+        发起一次具备自动重连能力的流式对话请求。
+
+        Args:
+            messages: 完整的消息历史(不包含"接续指令",接续指令由内部自动追加)
+            params: 调用参数
+
+        Yields:
+            连续的文本增量片段——即便中途发生了重连,
+            对调用方而言,这个生成器产出的内容,拼接起来依然是一份连贯的完整回复。
+
+        Raises:
+            StreamInterruptedTooManyTimesError: 中断次数超过max_reconnect_attempts
+        """
+        params = params or ChatParams()
+        accumulated_content = ""
+        current_messages = list(messages)
+        reconnect_count = 0
+
+        while True:
+            try:
+                for piece in self._client.chat_stream(messages=current_messages, params=params):
+                    accumulated_content += piece
+                    yield piece
+                # 正常遍历完成,说明这次生成完整结束,没有发生中断
+                return
+
+            except LLMClientError as exc:
+                reconnect_count += 1
+                logger.warning(
+                    "流式请求第%d次中断(累计已生成%d字符): %s",
+                    reconnect_count, len(accumulated_content), exc,
+                )
+
+                if reconnect_count > self.max_reconnect_attempts:
+                    raise StreamInterruptedTooManyTimesError(
+                        f"流式请求已中断{reconnect_count}次,超过最大重连次数"
+                        f"{self.max_reconnect_attempts},放弃继续尝试。"
+                        f"已生成的部分内容长度: {len(accumulated_content)}字符"
+                    ) from exc
+
+                time.sleep(self.reconnect_backoff_seconds * reconnect_count)
+
+                # 构造"接续指令",让模型基于已生成的内容,自然地续写下去,
+                # 而不是让用户感知到"重新问了一次"这种体验割裂。
+                continue_prompt = self.CONTINUE_INSTRUCTION_TEMPLATE.format(
+                    partial_content=accumulated_content[-300:]  # 只带最近一段内容,避免prompt过长
+                )
+                current_messages = list(messages) + [
+                    {"role": "assistant", "content": accumulated_content},
+                    {"role": "user", "content": continue_prompt},
+                ]
+
+
+def demo_simulated_interruption() -> str:
+    """
+    一个用于演示/测试的辅助函数:构造一个"前几次调用模拟异常中断,
+    最后一次调用正常返回"的假客户端,验证ReconnectableStreamChat的重连逻辑
+    确实能在不依赖真实网络故障的情况下被测试到。
+    """
+
+    class FakeInterruptingClient:
+        """模拟前N次流式调用中途抛异常,最后一次正常吐完剩余内容的假客户端。"""
+
+        def __init__(self, interrupt_times: int):
+            self.interrupt_times = interrupt_times
+            self.call_count = 0
+
+        def chat_stream(self, messages, params=None):
+            self.call_count += 1
+            if self.call_count <= self.interrupt_times:
+                for piece in ["这", "是", "第一", "段"]:
+                    yield piece
+                raise LLMClientError("模拟的网络中断")
+            else:
+                for piece in [",这是接续生成的", "剩余", "内容", "。"]:
+                    yield piece
+
+    fake_client = FakeInterruptingClient(interrupt_times=1)
+    reconnector = ReconnectableStreamChat(
+        client=fake_client, max_reconnect_attempts=2, reconnect_backoff_seconds=0.01
+    )
+
+    full_text = ""
+    for piece in reconnector.stream(messages=[{"role": "user", "content": "讲个故事"}]):
+        full_text += piece
+    return full_text
+
+
+if __name__ == "__main__":
+    result = demo_simulated_interruption()
+    print(f"模拟重连后拼接出的完整内容: {result}")
+    assert "接续生成" in result, "重连逻辑未生效,请检查实现"
+    print("自测通过:断线重连逻辑正确地把中断前后的内容拼接成了完整回复。")
+```
+
+陈铭跑通自测后,主动提出了一个问题反馈给老王:"这个'接续指令'的写法,会不会存在一个问题——如果连续中断好几次,累计起来的`accumulated_content`会不会越来越长,导致后面每次重连的prompt也越来越长,消耗更多token?"老王显然对这个问题很满意:"问得好,这也是为什么我在`CONTINUE_INSTRUCTION_TEMPLATE`里只截取了最后300个字符,而不是把完整的已生成内容都塞进去——只给模型看'最近说到哪儿了',它就有足够的信息接续下去,不需要看到从头到尾的全部内容。这也是一种权衡:接续的连贯性和token消耗之间,不需要追求完美,'差不多够用'就行。"
+
+### 10. `admin_api.py` —— 场景预设管理接口(模型管理台后端原型)
+
+有了持久化存储,老王让陈铭顺手把管理接口也搭出来,即便现在还没有配套的前端页面——他的理由是:"接口先行,是我们团队一贯的习惯。周晓她们做前端管理台的时候,不需要等你,只要接口的入参出参定好了,她们可以先拿假数据(mock)开发界面,你这边继续完善后端逻辑,两边并行推进。"
+
+```python
+"""
+admin_api.py
+
+场景预设管理后台API(模型管理台后端的最小原型)。
+基于scenario_config_store.py提供的持久化存储,
+封装成一组REST接口,供未来"模型管理台"前端调用,
+让运营/产品同学可以在界面上直接管理场景预设,不需要工程师改代码重新部署。
+
+这份接口目前只是原型,权限校验、多租户隔离等企业级能力尚未加入,
+老王把这些标注为"已知但暂不处理"的技术债,列进了后续需求列表。
+"""
+
+import logging
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+
+from llm_client import ChatParams
+from scenario_config_store import ScenarioConfigStore, ScenarioNotFoundError
+
+logger = logging.getLogger("cangqiong.admin_api")
+
+app = FastAPI(title="苍穹模型管理台 · 场景预设管理接口(原型)")
+
+_store = ScenarioConfigStore()
+
+
+class ScenarioPayload(BaseModel):
+    """创建/更新场景预设时,请求体的结构定义。"""
+
+    temperature: float = Field(..., ge=0.0, le=2.0, description="采样温度")
+    top_p: float = Field(default=1.0, ge=0.0, le=1.0, description="核采样阈值")
+    max_tokens: int = Field(..., gt=0, description="最大生成token数")
+    frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, description="频率惩罚")
+    presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, description="存在惩罚")
+    description: str = Field(default="", description="场景说明,给管理台界面展示")
+    operator: str = Field(default="unknown", description="操作人标识,用于审计日志")
+
+    def to_chat_params(self) -> ChatParams:
+        """把请求体转换成llm_client.py统一使用的ChatParams对象。"""
+        return ChatParams(
+            temperature=self.temperature,
+            top_p=self.top_p,
+            max_tokens=self.max_tokens,
+            frequency_penalty=self.frequency_penalty,
+            presence_penalty=self.presence_penalty,
+        )
+
+
+@app.get("/admin/scenarios")
+def list_scenarios():
+    """列出当前所有场景预设的概要信息(不含完整参数,只有名称/说明/更新时间)。"""
+    return {"scenarios": _store.list_all()}
+
+
+@app.get("/admin/scenarios/{name}")
+def get_scenario(name: str):
+    """查询单个场景预设的完整配置详情。"""
+    try:
+        return _store.get(name)
+    except ScenarioNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/admin/scenarios/{name}", status_code=201)
+def create_scenario(name: str, payload: ScenarioPayload):
+    """新增一个场景预设。"""
+    try:
+        params = payload.to_chat_params()
+        params.validate()
+        _store.create(
+            name=name,
+            params=params,
+            description=payload.description,
+            operator=payload.operator,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"message": f"场景'{name}'创建成功"}
+
+
+@app.put("/admin/scenarios/{name}")
+def update_scenario(name: str, payload: ScenarioPayload):
+    """更新一个已存在的场景预设。"""
+    try:
+        params = payload.to_chat_params()
+        params.validate()
+        _store.update(
+            name=name,
+            params=params,
+            description=payload.description,
+            operator=payload.operator,
+        )
+    except ScenarioNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"message": f"场景'{name}'更新成功"}
+
+
+@app.delete("/admin/scenarios/{name}")
+def delete_scenario(name: str, operator: str = "unknown"):
+    """删除一个场景预设。"""
+    try:
+        _store.delete(name, operator=operator)
+    except ScenarioNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"message": f"场景'{name}'已删除"}
+
+
+@app.get("/admin/scenarios/{name}/history")
+def get_scenario_history(name: str):
+    """查询某个场景预设的完整变更历史,供审计与问题追溯使用。"""
+    return {"scenario": name, "history": _store.get_history(name)}
+
+
+@app.get("/admin/health")
+def admin_health_check():
+    """管理接口的健康检查。"""
+    return {"status": "ok", "module": "admin_api"}
+```
+
+老王特意提了一句权限相关的提醒:"你现在这几个接口,谁都能调,没有做任何身份校验——这在今天的原型阶段没问题,但你要在代码注释里明确标注这是'临时状态',不然过几个月这份代码被直接搬进生产环境用了,权限的口子一直开着,会是个不小的安全隐患。"陈铭把这条提醒也补进了文件顶部的说明文字里。
+
+### 11. `test_scenario_config_store.py`与`test_retry_policy.py` —— 新增模块的配套测试
+
+按照团队规范,新写的两个核心模块也必须配上单元测试。陈铭延续了`test_llm_client.py`里"不依赖真实网络、用临时文件或假对象隔离外部依赖"的思路。
+
+```python
+"""
+test_scenario_config_store.py
+
+针对scenario_config_store.py的单元测试。
+使用临时文件路径作为数据库文件,保证每个测试用例互不干扰,
+测试结束后自动清理临时文件,不污染工作目录。
+"""
+
+import os
+import tempfile
+import unittest
+
+from llm_client import ChatParams
+from scenario_config_store import ScenarioConfigStore, ScenarioNotFoundError
+
+
+class TestScenarioConfigStore(unittest.TestCase):
+    """测试场景预设存储的CRUD与审计日志功能。"""
+
+    def setUp(self):
+        """每个测试用例开始前,创建一个全新的临时数据库文件。"""
+        self._tmp_fd, self._tmp_path = tempfile.mkstemp(suffix=".db")
+        os.close(self._tmp_fd)
+        self.store = ScenarioConfigStore(db_path=self._tmp_path)
+
+    def tearDown(self):
+        """测试结束后删除临时数据库文件,保持环境干净。"""
+        if os.path.exists(self._tmp_path):
+            os.remove(self._tmp_path)
+
+    def test_create_and_get_scenario(self):
+        """创建一个场景后,应该能够正确读取出完整配置。"""
+        params = ChatParams(temperature=0.5, max_tokens=500)
+        self.store.create("test_scenario", params, description="测试场景")
+
+        result = self.store.get("test_scenario")
+        self.assertEqual(result["config"]["temperature"], 0.5)
+        self.assertEqual(result["config"]["max_tokens"], 500)
+        self.assertEqual(result["description"], "测试场景")
+
+    def test_create_duplicate_name_raises_error(self):
+        """重复创建同名场景,应该抛出ValueError。"""
+        params = ChatParams(temperature=0.5, max_tokens=500)
+        self.store.create("duplicate_scenario", params)
+        with self.assertRaises(ValueError):
+            self.store.create("duplicate_scenario", params)
+
+    def test_get_nonexistent_scenario_raises_error(self):
+        """读取不存在的场景,应该抛出ScenarioNotFoundError。"""
+        with self.assertRaises(ScenarioNotFoundError):
+            self.store.get("scenario_that_does_not_exist")
+
+    def test_update_scenario_changes_config(self):
+        """更新场景后,再次读取应该拿到更新后的新配置。"""
+        self.store.create("to_be_updated", ChatParams(temperature=0.5, max_tokens=500))
+        self.store.update(
+            "to_be_updated", ChatParams(temperature=1.2, max_tokens=1000), operator="陈铭"
+        )
+
+        result = self.store.get("to_be_updated")
+        self.assertEqual(result["config"]["temperature"], 1.2)
+        self.assertEqual(result["config"]["max_tokens"], 1000)
+
+    def test_update_nonexistent_scenario_raises_error(self):
+        """更新不存在的场景,应该抛出ScenarioNotFoundError。"""
+        with self.assertRaises(ScenarioNotFoundError):
+            self.store.update("ghost_scenario", ChatParams(temperature=0.5, max_tokens=500))
+
+    def test_delete_scenario_removes_it_from_list(self):
+        """删除场景后,list_all结果中不应该再出现这个场景。"""
+        self.store.create("to_be_deleted", ChatParams(temperature=0.5, max_tokens=500))
+        self.store.delete("to_be_deleted")
+
+        names = [item["name"] for item in self.store.list_all()]
+        self.assertNotIn("to_be_deleted", names)
+
+    def test_history_records_all_changes_in_order(self):
+        """一个场景经历create->update->delete之后,历史记录应该按顺序完整保留三条。"""
+        self.store.create("lifecycle_scenario", ChatParams(temperature=0.5, max_tokens=500))
+        self.store.update("lifecycle_scenario", ChatParams(temperature=1.0, max_tokens=800))
+        self.store.delete("lifecycle_scenario")
+
+        history = self.store.get_history("lifecycle_scenario")
+        actions = [record["action"] for record in history]
+        self.assertEqual(actions, ["create", "update", "delete"])
+
+    def test_seed_from_defaults_does_not_overwrite_existing(self):
+        """seed_from_defaults应该只补齐缺失的场景,不覆盖已存在的场景配置。"""
+        self.store.create("general_qa", ChatParams(temperature=0.9, max_tokens=999))
+        self.store.seed_from_defaults(
+            {"general_qa": {"temperature": 1.0, "top_p": 1.0, "max_tokens": 600,
+                             "frequency_penalty": 0.3, "presence_penalty": 0.0}}
+        )
+
+        result = self.store.get("general_qa")
+        # 依然是最初创建时的配置(max_tokens=999),没有被默认值覆盖
+        self.assertEqual(result["config"]["max_tokens"], 999)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+```python
+"""
+test_retry_policy.py
+
+针对retry_policy.py的单元测试。
+用可控的假异常类和计数器,验证重试次数、退避策略、以及"不可重试异常应该立即抛出"
+这几个关键行为,不依赖真实网络或真实API。
+"""
+
+import unittest
+
+from retry_policy import (
+    retry_with_backoff,
+    compute_backoff_seconds,
+    RetryExhaustedError,
+    CircuitBreaker,
+)
+
+
+class RetryableError(Exception):
+    """测试专用的可重试异常。"""
+
+
+class FatalError(Exception):
+    """测试专用的不可重试异常。"""
+
+
+class TestComputeBackoffSeconds(unittest.TestCase):
+    """测试指数退避时间的计算逻辑。"""
+
+    def test_backoff_increases_with_attempt(self):
+        """在不考虑抖动的极限情况下,重试次数越多,基础等待时间应该越长。"""
+        first = compute_backoff_seconds(1, base_seconds=1.0, jitter_ratio=0.0)
+        second = compute_backoff_seconds(2, base_seconds=1.0, jitter_ratio=0.0)
+        third = compute_backoff_seconds(3, base_seconds=1.0, jitter_ratio=0.0)
+        self.assertLess(first, second)
+        self.assertLess(second, third)
+
+    def test_backoff_respects_max_seconds_cap(self):
+        """无论重试次数多大,等待时间都不应该超过max_seconds上限。"""
+        value = compute_backoff_seconds(
+            attempt=20, base_seconds=1.0, max_seconds=5.0, jitter_ratio=0.0
+        )
+        self.assertLessEqual(value, 5.0)
+
+
+class TestRetryWithBackoff(unittest.TestCase):
+    """测试重试装饰器的核心行为。"""
+
+    def test_succeeds_after_transient_failures(self):
+        """前几次抛出可重试异常,最后一次成功,装饰器应该最终返回正常结果。"""
+        call_count = {"value": 0}
+
+        @retry_with_backoff((RetryableError,), max_attempts=3, base_seconds=0.01, max_seconds=0.05)
+        def flaky():
+            call_count["value"] += 1
+            if call_count["value"] < 3:
+                raise RetryableError("模拟瞬时错误")
+            return "成功"
+
+        result = flaky()
+        self.assertEqual(result, "成功")
+        self.assertEqual(call_count["value"], 3)
+
+    def test_raises_retry_exhausted_after_max_attempts(self):
+        """一直失败,超过最大尝试次数后,应该抛出RetryExhaustedError。"""
+
+        @retry_with_backoff((RetryableError,), max_attempts=3, base_seconds=0.01, max_seconds=0.05)
+        def always_fails():
+            raise RetryableError("永远失败")
+
+        with self.assertRaises(RetryExhaustedError):
+            always_fails()
+
+    def test_non_retryable_exception_raised_immediately(self):
+        """遇到不在retryable_exceptions列表里的异常,应该立即抛出,不进行任何重试。"""
+        call_count = {"value": 0}
+
+        @retry_with_backoff((RetryableError,), max_attempts=5, base_seconds=0.01)
+        def fatal_failure():
+            call_count["value"] += 1
+            raise FatalError("这是一个不可重试的错误")
+
+        with self.assertRaises(FatalError):
+            fatal_failure()
+        # 不可重试的异常应该在第一次调用时就直接抛出,不会触发额外的重试尝试
+        self.assertEqual(call_count["value"], 1)
+
+
+class TestCircuitBreaker(unittest.TestCase):
+    """测试简化版熔断器的跳闸与冷却逻辑。"""
+
+    def test_opens_after_reaching_failure_threshold(self):
+        """连续失败次数达到阈值后,熔断器应该跳闸,拒绝后续调用。"""
+        breaker = CircuitBreaker(failure_threshold=2, cooldown_seconds=10.0)
+
+        def always_fails():
+            raise RuntimeError("模拟下游服务故障")
+
+        for _ in range(2):
+            with self.assertRaises(RuntimeError):
+                breaker.call(always_fails)
+
+        # 第三次调用时,熔断器应该已经跳闸,直接抛出跳闸异常,不会再真正执行always_fails
+        with self.assertRaises(RuntimeError) as ctx:
+            breaker.call(always_fails)
+        self.assertIn("熔断器处于跳闸状态", str(ctx.exception))
+
+    def test_resets_failure_count_after_success(self):
+        """一次成功调用之后,应该重置连续失败计数,不会因为很久之前的失败而误跳闸。"""
+        breaker = CircuitBreaker(failure_threshold=2, cooldown_seconds=10.0)
+
+        def fails_once_then_succeeds():
+            fails_once_then_succeeds.call_count += 1
+            if fails_once_then_succeeds.call_count == 1:
+                raise RuntimeError("第一次失败")
+            return "成功"
+
+        fails_once_then_succeeds.call_count = 0
+
+        with self.assertRaises(RuntimeError):
+            breaker.call(fails_once_then_succeeds)
+        result = breaker.call(fails_once_then_succeeds)
+        self.assertEqual(result, "成功")
+        self.assertEqual(breaker._consecutive_failures, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+两份测试跑完全部通过,陈铭长舒一口气。老王把最后这五个文件也过了一遍,评价比之前更简练:"这批东西,已经开始有'平台代码'的样子了,不再是'为了学习而写的demo'。今天先到这里,明天开始的内容,又是另一个方向了。"
+
+十一个文件全部整理完毕,已经快接近晚上九点。陈铭把它们统一放进了一个临时的`day16_practice/`目录下,提交到了自己在蓬远GitLab上的个人练习分支——按照公司规范,`feature/`分支的命名,他给自己起了个`feature/day16-param-experiment`。老王扫了一眼提交记录,没有多说什么,只在飞书任务卡CQ-119下面回复了一句:"代码结构不错,`ConversationManager`那个流式场景的接口缺口,记得别忘了,明天有空补一下。"这句简短的评语,让陈铭一整晚都没敢彻底放松,又把十一个文件重新过了一遍,确认没有明显的遗漏。
 
 ---
 
