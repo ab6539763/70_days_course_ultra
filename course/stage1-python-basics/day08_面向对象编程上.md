@@ -2063,6 +2063,979 @@ if __name__ == "__main__":
     print("格式化当前时间:", LogTimestamp.now_for_log())
 ```
 
+### 文件7:`conversation_history_extended.py` —— ConversationHistory功能扩展版
+
+> 晚自习结束后,陈铭对着白天架构图里"`ConversationHistory`会在Day14正式登场"这句话,还是没忍住多写了一点。他没有超出今天的知识范围去实现继承或者魔术方法(那是明天才学的东西),而是单纯在"一个类管理一批另一个类的对象"这个思路上,把`ConversationHistory`的能力扎扎实实地扩充了一遍——增加按角色过滤、增加简单的关键字搜索、增加批量导入历史记录、增加按session_id管理多个会话的注册表。这份加练代码,他专门在文件开头写了一句注释:"这是Day14正式项目的一次'抢跑',但抢跑的动作必须干净,不能用还没学过的语法。"
+
+```python
+"""
+文件名:conversation_history_extended.py
+作用:在chat_message_v3_validated.py里ConversationHistory雏形的基础上,
+     补充更完整的会话管理能力——按角色过滤消息、关键字搜索、批量导入历史记录、
+     以及一个ConversationRegistry类,演示"一个类统一管理一批ConversationHistory对象"
+     这种更高一层的组织方式。
+
+知识范围说明:
+    本文件严格限定在今天(Day8上篇)已学的面向对象知识范围内——属性、方法、
+    __init__构造方法、实例方法、类方法、静态方法。不使用继承、不使用魔术方法
+    (__str__/__repr__/__eq__等)、不使用@property装饰器,这些都是Day9(下篇)
+    才会正式学习的内容。今天先把"类与类之间怎么协作"这件事,在不引入继承的
+    前提下,尽量往深处扎一步。
+"""
+
+from datetime import datetime
+
+
+class ChatMessage:
+    """
+    表示一条对话消息(与chat_message_v3_validated.py中的版本逻辑一致,
+    这里重新定义一遍是为了保持本文件可以独立运行,不依赖跨文件import——
+    模块与包的正式用法要到Day10才系统学习)。
+    """
+
+    ALLOWED_ROLES = ("system", "user", "assistant")
+    MAX_CONTENT_LENGTH = 4000
+
+    total_created = 0
+    role_counter = {"system": 0, "user": 0, "assistant": 0}
+
+    def __init__(self, role, content):
+        """
+        构造方法。
+        :param role: 消息角色,必须是ALLOWED_ROLES之一
+        :param content: 消息内容,非空字符串,长度不超过MAX_CONTENT_LENGTH
+        """
+        if not ChatMessage.is_valid_role(role):
+            raise ValueError(f"role必须是{ChatMessage.ALLOWED_ROLES}之一,但收到的是:{role!r}")
+        if not isinstance(content, str):
+            raise TypeError(f"content必须是字符串类型,但收到的是:{type(content).__name__}")
+        if len(content.strip()) == 0:
+            raise ValueError("content不能为空,或者不能只包含空白字符")
+        if len(content) > ChatMessage.MAX_CONTENT_LENGTH:
+            raise ValueError(f"content长度超过最大限制{ChatMessage.MAX_CONTENT_LENGTH}")
+
+        self.role = role
+        self.content = content
+        self.timestamp = datetime.now()
+        self.token_count = ChatMessage.estimate_tokens(content)
+
+        ChatMessage.total_created += 1
+        ChatMessage.role_counter[self.role] += 1
+
+    def to_dict(self):
+        """转换为API需要的最小字段字典。"""
+        return {"role": self.role, "content": self.content}
+
+    def preview(self, max_len=30):
+        """返回内容摘要。"""
+        if len(self.content) <= max_len:
+            return f"[{self.role}] {self.content}"
+        return f"[{self.role}] {self.content[:max_len]}..."
+
+    @classmethod
+    def system_message(cls, content):
+        """快捷创建一条role=system的消息。"""
+        return cls(role="system", content=content)
+
+    @classmethod
+    def user_message(cls, content):
+        """快捷创建一条role=user的消息。"""
+        return cls(role="user", content=content)
+
+    @classmethod
+    def assistant_message(cls, content):
+        """快捷创建一条role=assistant的消息。"""
+        return cls(role="assistant", content=content)
+
+    @classmethod
+    def from_dict(cls, data):
+        """从字典还原出一个ChatMessage实例。"""
+        return cls(role=data["role"], content=data["content"])
+
+    @staticmethod
+    def estimate_tokens(text):
+        """对文本做粗略的token数量估算(教学简化版)。"""
+        chinese_char_count = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+        other_char_count = len(text) - chinese_char_count
+        return chinese_char_count + other_char_count // 4
+
+    @staticmethod
+    def is_valid_role(role):
+        """判断一个role字符串是否合法。"""
+        return role in ChatMessage.ALLOWED_ROLES
+
+
+class ConversationHistory:
+    """
+    对话历史管理器,负责统一管理一个会话内的所有ChatMessage对象,
+    并在雏形版本(只有add_message/to_api_messages/total_tokens/last_n_messages)
+    的基础上,补充过滤、搜索、批量导入等更贴近真实使用场景的能力。
+    """
+
+    def __init__(self, session_id):
+        """
+        构造方法。
+        :param session_id: 会话标识字符串,不能为空
+        """
+        if not isinstance(session_id, str) or session_id.strip() == "":
+            raise ValueError("session_id必须是非空字符串")
+        self.session_id = session_id
+        self.messages = []
+        # 记录这个会话对象本身是什么时候被创建的,方便未来做会话生命周期管理
+        self.created_at = datetime.now()
+
+    def add_message(self, message):
+        """
+        向会话历史中追加一条消息。
+        :param message: 一个ChatMessage实例
+        """
+        if not isinstance(message, ChatMessage):
+            raise TypeError(f"add_message只接受ChatMessage实例,但收到的是:{type(message).__name__}")
+        self.messages.append(message)
+
+    def add_many(self, messages):
+        """
+        批量追加多条消息,内部逐条复用add_message的校验逻辑,
+        保证批量导入和单条添加遵守完全相同的规则,不会出现"批量导入绕过了校验"的漏洞。
+        :param messages: ChatMessage实例组成的列表(或元组等可迭代对象)
+        :return: 实际成功追加的消息数量
+        """
+        count = 0
+        for m in messages:
+            self.add_message(m)
+            count += 1
+        return count
+
+    def import_from_dict_list(self, dict_list):
+        """
+        从一组字典(比如从JSON文件读出来的历史记录)批量还原并导入消息。
+        每个字典会先经过ChatMessage.from_dict()还原成正式对象,复用其中的完整校验逻辑,
+        任何一条数据不合法,都会在还原阶段就被立即发现,而不是被"悄悄接受"进历史记录。
+        :param dict_list: 字典组成的列表,每个字典形如{"role": ..., "content": ...}
+        :return: 成功导入的消息数量
+        """
+        restored_messages = [ChatMessage.from_dict(d) for d in dict_list]
+        return self.add_many(restored_messages)
+
+    def to_api_messages(self):
+        """把整个对话历史转换成可以直接传给大模型API的messages列表。"""
+        return [m.to_dict() for m in self.messages]
+
+    def total_tokens(self):
+        """统计整个会话历史目前累计消耗的估算token总数。"""
+        return sum(m.token_count for m in self.messages)
+
+    def last_n_messages(self, n=5):
+        """返回最近的n条消息。"""
+        if n <= 0:
+            return []
+        return self.messages[-n:]
+
+    def filter_by_role(self, role):
+        """
+        筛选出会话历史中,角色为指定role的全部消息。
+        典型使用场景:只想统计"用户实际问了多少个问题",或者只想回放"AI说过的话"。
+        :param role: 目标角色
+        :return: ChatMessage对象组成的列表(可能为空)
+        """
+        return [m for m in self.messages if m.role == role]
+
+    def search_by_keyword(self, keyword):
+        """
+        在整个会话历史里,按关键字搜索content中包含该关键字的全部消息。
+        :param keyword: 搜索关键字
+        :return: 匹配到的ChatMessage对象组成的列表
+        """
+        if not keyword:
+            return []
+        return [m for m in self.messages if keyword in m.content]
+
+    def count_by_role(self):
+        """
+        统计会话历史中,各个角色分别发送了多少条消息。
+        :return: 形如{"system": 1, "user": 3, "assistant": 3}的字典
+        """
+        stats = {"system": 0, "user": 0, "assistant": 0}
+        for m in self.messages:
+            stats[m.role] += 1
+        return stats
+
+    def clear(self):
+        """
+        清空当前会话的全部消息,但保留session_id和created_at不变
+        (对应用户在真实产品里点击"清空对话"这个操作,不等于"删除整个会话记录")。
+        :return: 清空前的消息数量
+        """
+        cleared_count = len(self.messages)
+        self.messages = []
+        return cleared_count
+
+    def is_empty(self):
+        """判断当前会话历史是否为空(尚未产生任何消息)。"""
+        return len(self.messages) == 0
+
+
+class ConversationRegistry:
+    """
+    会话注册表:统一管理多个ConversationHistory对象,按session_id索引。
+    这是"一个类管理一批另一个类的对象,而这批对象自己又各自管理一批更小的对象"
+    的三层结构演示——ConversationRegistry管ConversationHistory,
+    ConversationHistory管ChatMessage,层层组织,而不是把所有数据摊平堆在一起。
+    """
+
+    def __init__(self):
+        """构造方法,初始化一个空的会话注册表。"""
+        # 用字典而不是列表存储,因为需要通过session_id这个"有意义的标签"
+        # 去快速定位某个具体会话,而不是通过"第几个会话"这种位置信息去访问
+        self.sessions = {}
+
+    def get_or_create(self, session_id):
+        """
+        获取指定session_id对应的会话历史;如果这个会话此前从未创建过,
+        自动新建一个空的ConversationHistory并注册进来。
+
+        设计意图:
+            这种"有就拿来用,没有就顺手创建"的模式,在很多需要"懒加载"的场景里
+            非常常见,能避免调用者每次都要先判断"这个会话存在吗"再决定
+            "创建还是获取",把这层判断统一封装在这一个方法里。
+        :param session_id: 会话标识
+        :return: 对应的ConversationHistory对象
+        """
+        if session_id not in self.sessions:
+            self.sessions[session_id] = ConversationHistory(session_id=session_id)
+        return self.sessions[session_id]
+
+    def remove_session(self, session_id):
+        """
+        移除指定的会话记录(彻底删除,不同于ConversationHistory.clear()只清空消息)。
+        :param session_id: 要移除的会话标识
+        :return: 是否成功移除(如果本来就不存在,返回False)
+        """
+        if session_id in self.sessions:
+            del self.sessions[session_id]
+            return True
+        return False
+
+    def total_session_count(self):
+        """返回当前注册表中一共管理了多少个会话。"""
+        return len(self.sessions)
+
+    def total_message_count_across_sessions(self):
+        """统计所有会话累计产生了多少条消息,用于全局监控。"""
+        return sum(len(history.messages) for history in self.sessions.values())
+
+    def find_sessions_with_keyword(self, keyword):
+        """
+        找出所有"至少有一条消息包含指定关键字"的会话id列表,
+        典型使用场景:客服系统里按关键字排查"哪些用户问过退款相关的问题"。
+        :param keyword: 搜索关键字
+        :return: session_id组成的列表
+        """
+        matched_session_ids = []
+        for session_id, history in self.sessions.items():
+            if history.search_by_keyword(keyword):
+                matched_session_ids.append(session_id)
+        return matched_session_ids
+
+
+def _run_self_check():
+    """自测函数,验证ConversationHistory扩展能力与ConversationRegistry的基本功能。"""
+    ChatMessage.total_created = 0
+    ChatMessage.role_counter = {"system": 0, "user": 0, "assistant": 0}
+
+    # 1. 基本的add_message与过滤功能
+    history = ConversationHistory(session_id="s001")
+    history.add_message(ChatMessage.system_message("你是助手"))
+    history.add_message(ChatMessage.user_message("苍穹支持哪些模型"))
+    history.add_message(ChatMessage.assistant_message("支持DeepSeek和通义千问"))
+    history.add_message(ChatMessage.user_message("能不能私有化部署"))
+
+    assert len(history.filter_by_role("user")) == 2
+    assert len(history.filter_by_role("system")) == 1
+
+    # 2. 关键字搜索
+    matched = history.search_by_keyword("私有化")
+    assert len(matched) == 1
+    assert matched[0].role == "user"
+
+    # 3. 角色统计
+    stats = history.count_by_role()
+    assert stats == {"system": 1, "user": 2, "assistant": 1}
+
+    # 4. session_id为空应该被拒绝
+    try:
+        ConversationHistory(session_id="")
+        assert False, "预期应该抛出ValueError"
+    except ValueError:
+        pass
+
+    # 5. 批量导入
+    history2 = ConversationHistory(session_id="s002")
+    imported_count = history2.import_from_dict_list([
+        {"role": "user", "content": "你好"},
+        {"role": "assistant", "content": "你好,有什么可以帮你"},
+    ])
+    assert imported_count == 2
+    assert len(history2.messages) == 2
+
+    # 6. clear()应该清空消息但保留session_id
+    cleared = history2.clear()
+    assert cleared == 2
+    assert history2.is_empty() is True
+    assert history2.session_id == "s002"
+
+    # 7. ConversationRegistry的懒加载获取
+    registry = ConversationRegistry()
+    assert registry.total_session_count() == 0
+
+    h1 = registry.get_or_create("user-A")
+    h1.add_message(ChatMessage.user_message("查询订单状态"))
+    h2 = registry.get_or_create("user-B")
+    h2.add_message(ChatMessage.user_message("申请退款"))
+    h1_again = registry.get_or_create("user-A")   # 应该拿到同一个对象,不是新建的
+
+    assert h1 is h1_again, "重复get_or_create同一个session_id应该返回同一个对象"
+    assert registry.total_session_count() == 2
+    assert registry.total_message_count_across_sessions() == 2
+
+    # 8. 按关键字跨会话搜索
+    matched_sessions = registry.find_sessions_with_keyword("退款")
+    assert matched_sessions == ["user-B"]
+
+    # 9. 移除会话
+    removed = registry.remove_session("user-A")
+    assert removed is True
+    assert registry.total_session_count() == 1
+    removed_again = registry.remove_session("user-A")   # 已经被移除了,再移除一次
+    assert removed_again is False
+
+    print("conversation_history_extended.py 自测全部通过")
+
+
+if __name__ == "__main__":
+    _run_self_check()
+
+    print("\n----- 演示:用ConversationRegistry管理多个客服会话 -----")
+    registry = ConversationRegistry()
+
+    session_a = registry.get_or_create("customer-1001")
+    session_a.add_message(ChatMessage.system_message("你是海纳制造集团的客服助手"))
+    session_a.add_message(ChatMessage.user_message("我的订单什么时候发货"))
+    session_a.add_message(ChatMessage.assistant_message("您的订单预计明天发货"))
+
+    session_b = registry.get_or_create("customer-1002")
+    session_b.add_message(ChatMessage.system_message("你是海纳制造集团的客服助手"))
+    session_b.add_message(ChatMessage.user_message("发货能不能加急"))
+
+    print(f"当前共有 {registry.total_session_count()} 个活跃会话")
+    print(f"累计消息数:{registry.total_message_count_across_sessions()}")
+
+    print("\n包含‘发货’关键字的会话:", registry.find_sessions_with_keyword("发货"))
+
+    print("\ncustomer-1001的对话记录:")
+    for m in session_a.messages:
+        print(" ", m.preview(max_len=20))
+    print("按角色统计:", session_a.count_by_role())
+```
+
+### 文件8:`badge_management_system.py` —— 工牌管理系统扩展版
+
+> 这份代码脱胎于课后作业第4题的`Badge`类,陈铭觉得单独一个`Badge`类展示力有限,于是仿照通讯录项目"从单条记录到一整套管理系统"的思路,把它扩展成了一个小型的"工牌管理系统"——不仅能创建工牌,还能按部门分类、按姓名搜索、批量注册新员工、统计各部门人数。他特意在文件顶部写了一条注释,提醒自己(也提醒未来读这份代码的人):这里故意没有使用继承,尽管"实习生工牌""正式员工工牌"看起来很适合用继承来表达,但那是明天才学的内容,今天先用"一个字段区分类型"的朴素方式实现同样的业务需求,明天学完继承之后,可以对比着重构一遍,直观感受两种实现方式的差异。
+
+```python
+"""
+文件名:badge_management_system.py
+作用:在课后作业Badge类的基础上,扩展成一个小型工牌管理系统,
+     补充部门管理、批量注册、按条件搜索、部门人数统计等功能。
+
+知识范围说明:
+    本文件依然严格限定在今天(Day8上篇)的知识范围内。"实习生工牌"和
+    "正式员工工牌"这种听起来很适合用继承表达的场景,今天故意用一个普通的
+    departmen字段加以区分,而不是设计成两个不同的子类——这是有意的教学处理,
+    等明天学完继承,建议大家把这份代码重构一遍,对比体会两种写法的差异。
+"""
+
+
+class Badge:
+    """
+    表示一枚员工工牌,包含姓名、工号、部门,工号格式统一为"CQ-三位数字"。
+    """
+
+    _next_id_number = 101   # 类属性:记录下一个将被分配的工号数字部分
+
+    VALID_DEPARTMENTS = ("技术部", "产品部", "市场部", "行政部", "人力资源部")
+
+    def __init__(self, employee_name, employee_id, department="技术部"):
+        """
+        构造方法。
+        :param employee_name: 员工姓名,不能为空
+        :param employee_id: 工号,必须符合"CQ-三位数字"格式
+        :param department: 所属部门,必须是VALID_DEPARTMENTS之一,默认"技术部"
+        """
+        if not employee_name or not employee_name.strip():
+            raise ValueError("employee_name不能为空")
+        if not Badge.is_valid_id(employee_id):
+            raise ValueError(f"employee_id格式不合法,应为'CQ-三位数字'的形式,但收到的是:{employee_id!r}")
+        if department not in Badge.VALID_DEPARTMENTS:
+            raise ValueError(f"department必须是{Badge.VALID_DEPARTMENTS}之一,但收到的是:{department!r}")
+
+        self.employee_name = employee_name
+        self.employee_id = employee_id
+        self.department = department
+        # is_active表示这枚工牌当前是否有效,员工离职后工牌应该被停用而不是被删除,
+        # 这样历史记录(比如"这个人以前在哪个部门")依然能被追溯查询
+        self.is_active = True
+
+    def display(self):
+        """返回工牌的展示文本,形如'工牌:陈铭(CQ-101) [技术部]'。"""
+        status = "" if self.is_active else "(已停用)"
+        return f"工牌:{self.employee_name}({self.employee_id}) [{self.department}]{status}"
+
+    def deactivate(self):
+        """
+        停用这枚工牌(模拟员工离职场景),不真正删除这条记录。
+        :return: 如果这枚工牌本来就已经是停用状态,返回False;否则停用并返回True
+        """
+        if not self.is_active:
+            return False
+        self.is_active = False
+        return True
+
+    def reactivate(self):
+        """重新启用一枚已停用的工牌(模拟员工返聘/转正等场景)。"""
+        if self.is_active:
+            return False
+        self.is_active = True
+        return True
+
+    @classmethod
+    def from_next_id(cls, employee_name, department="技术部"):
+        """
+        自动分配下一个工号并创建一个Badge对象,调用者不需要手动指定工号。
+        :param employee_name: 员工姓名
+        :param department: 所属部门
+        :return: 新创建的Badge实例
+        """
+        new_id = f"CQ-{cls._next_id_number}"
+        cls._next_id_number += 1
+        return cls(employee_name=employee_name, employee_id=new_id, department=department)
+
+    @classmethod
+    def reset_id_counter(cls, start_from=101):
+        """重置工号计数器,主要用于测试场景,避免多次测试之间互相干扰编号结果。"""
+        cls._next_id_number = start_from
+
+    @staticmethod
+    def is_valid_id(employee_id):
+        """判断一个字符串是否是合法的工号格式:CQ- 加三位数字。"""
+        if not isinstance(employee_id, str):
+            return False
+        if not employee_id.startswith("CQ-"):
+            return False
+        number_part = employee_id[3:]
+        return len(number_part) == 3 and number_part.isdigit()
+
+
+class BadgeRegistry:
+    """
+    工牌注册管理中心,统一管理全公司所有已发放的Badge对象,
+    提供批量注册、按姓名搜索、按部门统计等企业内部管理场景常见的功能。
+    """
+
+    def __init__(self, company_name):
+        """
+        构造方法。
+        :param company_name: 公司名称,仅用于展示,不参与业务逻辑
+        """
+        self.company_name = company_name
+        # 用列表保存全部工牌(而不是字典),因为查询场景更偏向"遍历筛选"
+        # (按部门/按姓名模糊搜索),不是"根据一个确定的键做精确定位",
+        # 这一点和ConversationRegistry用字典存储的设计考量刚好形成对比,
+        # 说明"用列表还是用字典"要看具体的访问模式,而不是一刀切固定用哪一种
+        self.badges = []
+
+    def register_new_employee(self, employee_name, department="技术部"):
+        """
+        为一名新员工注册工牌(自动分配工号)并加入管理中心。
+        :param employee_name: 员工姓名
+        :param department: 所属部门
+        :return: 新创建的Badge实例
+        """
+        new_badge = Badge.from_next_id(employee_name, department=department)
+        self.badges.append(new_badge)
+        return new_badge
+
+    def register_batch(self, employee_info_list):
+        """
+        批量注册一批新员工,employee_info_list中每一项是(姓名, 部门)的二元组。
+        :param employee_info_list: [(姓名, 部门), ...] 形式的列表
+        :return: 新创建的Badge对象组成的列表
+        """
+        new_badges = []
+        for employee_name, department in employee_info_list:
+            new_badges.append(self.register_new_employee(employee_name, department))
+        return new_badges
+
+    def find_by_name(self, employee_name):
+        """
+        按姓名精确查找工牌(可能有同名员工,因此返回列表而不是单个结果)。
+        :param employee_name: 员工姓名
+        :return: 匹配到的Badge对象组成的列表
+        """
+        return [b for b in self.badges if b.employee_name == employee_name]
+
+    def find_by_id(self, employee_id):
+        """
+        按工号精确查找工牌(工号具有唯一性,理论上最多匹配到一条记录)。
+        :param employee_id: 工号
+        :return: 匹配到的Badge对象,找不到则返回None
+        """
+        for b in self.badges:
+            if b.employee_id == employee_id:
+                return b
+        return None
+
+    def find_by_department(self, department):
+        """
+        查找指定部门的全部工牌(不区分是否停用)。
+        :param department: 部门名称
+        :return: 匹配到的Badge对象组成的列表
+        """
+        return [b for b in self.badges if b.department == department]
+
+    def find_active_badges(self):
+        """返回全部当前处于启用状态的工牌。"""
+        return [b for b in self.badges if b.is_active]
+
+    def count_by_department(self):
+        """
+        统计各部门当前的（启用状态的）员工人数。
+        :return: 形如{"技术部": 3, "产品部": 1, ...}的字典
+        """
+        stats = {department: 0 for department in Badge.VALID_DEPARTMENTS}
+        for b in self.badges:
+            if b.is_active:
+                stats[b.department] += 1
+        return stats
+
+    def total_active_count(self):
+        """返回当前处于启用状态的员工总人数。"""
+        return len(self.find_active_badges())
+
+    def deactivate_by_id(self, employee_id):
+        """
+        根据工号停用一枚工牌(模拟员工离职)。
+        :param employee_id: 工号
+        :return: 是否成功停用(找不到该工号,或工牌本来就已停用,均返回False)
+        """
+        badge = self.find_by_id(employee_id)
+        if badge is None:
+            return False
+        return badge.deactivate()
+
+
+def _run_self_check():
+    """自测函数,验证Badge和BadgeRegistry的核心功能。"""
+    Badge.reset_id_counter(start_from=101)
+
+    # 1. 基本创建与校验
+    badge1 = Badge(employee_name="陈铭", employee_id="CQ-107", department="技术部")
+    assert badge1.display() == "工牌:陈铭(CQ-107) [技术部]"
+
+    try:
+        Badge(employee_name="", employee_id="CQ-108")
+        assert False, "预期应该抛出ValueError(姓名为空)"
+    except ValueError:
+        pass
+
+    try:
+        Badge(employee_name="测试", employee_id="不合法工号")
+        assert False, "预期应该抛出ValueError(工号格式不对)"
+    except ValueError:
+        pass
+
+    try:
+        Badge(employee_name="测试", employee_id="CQ-109", department="不存在的部门")
+        assert False, "预期应该抛出ValueError(部门不合法)"
+    except ValueError:
+        pass
+
+    # 2. 停用与重新启用
+    assert badge1.deactivate() is True
+    assert badge1.is_active is False
+    assert badge1.deactivate() is False   # 已经停用,再次停用应该返回False
+    assert badge1.reactivate() is True
+    assert badge1.is_active is True
+
+    # 3. BadgeRegistry批量注册与搜索
+    Badge.reset_id_counter(start_from=201)
+    registry = BadgeRegistry(company_name="蓬远科技")
+
+    registry.register_batch([
+        ("陈铭", "技术部"),
+        ("苏梦", "技术部"),
+        ("韩露", "产品部"),
+        ("张凡", "技术部"),
+        ("林悦", "产品部"),
+    ])
+
+    assert registry.total_active_count() == 5
+    tech_dept_badges = registry.find_by_department("技术部")
+    assert len(tech_dept_badges) == 3
+
+    found = registry.find_by_name("韩露")
+    assert len(found) == 1
+    assert found[0].department == "产品部"
+
+    stats = registry.count_by_department()
+    assert stats["技术部"] == 3
+    assert stats["产品部"] == 2
+    assert stats["市场部"] == 0
+
+    # 4. 按id查找与停用
+    chen_ming_id = registry.find_by_name("陈铭")[0].employee_id
+    found_by_id = registry.find_by_id(chen_ming_id)
+    assert found_by_id.employee_name == "陈铭"
+
+    deactivate_result = registry.deactivate_by_id(chen_ming_id)
+    assert deactivate_result is True
+    assert registry.total_active_count() == 4   # 陈铭被停用后,启用总数应该减少
+
+    stats_after_deactivate = registry.count_by_department()
+    assert stats_after_deactivate["技术部"] == 2   # 陈铭停用后,技术部启用人数应该减少
+
+    # 5. 查找不存在的工号或姓名,应该安全返回空结果,不报错
+    assert registry.find_by_id("CQ-999") is None
+    assert registry.find_by_name("不存在的人") == []
+    assert registry.deactivate_by_id("CQ-999") is False
+
+    print("badge_management_system.py 自测全部通过")
+
+
+if __name__ == "__main__":
+    _run_self_check()
+
+    print("\n----- 演示:蓬远科技新人训练营工牌注册 -----")
+    Badge.reset_id_counter(start_from=101)
+    registry = BadgeRegistry(company_name="蓬远科技")
+
+    new_hires = registry.register_batch([
+        ("陈铭", "技术部"),
+        ("苏梦", "技术部"),
+        ("韩露", "产品部"),
+        ("张凡", "技术部"),
+    ])
+
+    print(f"{registry.company_name} 本批次新员工工牌:")
+    for badge in new_hires:
+        print(" ", badge.display())
+
+    print("\n各部门在职人数统计:", registry.count_by_department())
+
+    print("\n模拟张凡离职:")
+    zhangfan_id = registry.find_by_name("张凡")[0].employee_id
+    registry.deactivate_by_id(zhangfan_id)
+    print("离职处理后,张凡工牌状态:", registry.find_by_id(zhangfan_id).display())
+    print("更新后各部门在职人数统计:", registry.count_by_department())
+```
+
+### 文件9:`day08_extended_selfcheck.py` —— 今日新增代码综合自检脚本
+
+```python
+"""
+文件名:day08_extended_selfcheck.py
+作用:对今天新增的conversation_history_extended.py和badge_management_system.py
+     做一次更细致的边界情况自检,补充这两个文件内部_run_self_check()还没有
+     覆盖到的一些边界场景,并汇总打印统一的测试报告,风格延续Day7的自检脚本。
+
+知识范围说明:
+    本文件同样严格限定在今天已学的面向对象知识范围内,没有引入任何
+    Day9及以后才会讲解的语法(继承、魔术方法、property装饰器、异常处理体系等,
+    除了沿用之前已经被允许使用的raise/try/except基础写法)。
+"""
+
+
+class ChatMessage:
+    """(与conversation_history_extended.py中的版本逻辑一致,独立复制一份便于本文件单独运行)"""
+
+    ALLOWED_ROLES = ("system", "user", "assistant")
+    MAX_CONTENT_LENGTH = 4000
+    total_created = 0
+    role_counter = {"system": 0, "user": 0, "assistant": 0}
+
+    def __init__(self, role, content):
+        if not ChatMessage.is_valid_role(role):
+            raise ValueError(f"role必须是{ChatMessage.ALLOWED_ROLES}之一,但收到的是:{role!r}")
+        if not isinstance(content, str):
+            raise TypeError(f"content必须是字符串类型,但收到的是:{type(content).__name__}")
+        if len(content.strip()) == 0:
+            raise ValueError("content不能为空")
+        if len(content) > ChatMessage.MAX_CONTENT_LENGTH:
+            raise ValueError("content超长")
+        self.role = role
+        self.content = content
+        ChatMessage.total_created += 1
+        ChatMessage.role_counter[self.role] += 1
+
+    def to_dict(self):
+        return {"role": self.role, "content": self.content}
+
+    @classmethod
+    def user_message(cls, content):
+        return cls(role="user", content=content)
+
+    @classmethod
+    def assistant_message(cls, content):
+        return cls(role="assistant", content=content)
+
+    @classmethod
+    def system_message(cls, content):
+        return cls(role="system", content=content)
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(role=data["role"], content=data["content"])
+
+    @staticmethod
+    def is_valid_role(role):
+        return role in ChatMessage.ALLOWED_ROLES
+
+
+class ConversationHistory:
+    """(逻辑与conversation_history_extended.py中的版本一致)"""
+
+    def __init__(self, session_id):
+        if not isinstance(session_id, str) or session_id.strip() == "":
+            raise ValueError("session_id必须是非空字符串")
+        self.session_id = session_id
+        self.messages = []
+
+    def add_message(self, message):
+        if not isinstance(message, ChatMessage):
+            raise TypeError("add_message只接受ChatMessage实例")
+        self.messages.append(message)
+
+    def filter_by_role(self, role):
+        return [m for m in self.messages if m.role == role]
+
+    def search_by_keyword(self, keyword):
+        if not keyword:
+            return []
+        return [m for m in self.messages if keyword in m.content]
+
+    def count_by_role(self):
+        stats = {"system": 0, "user": 0, "assistant": 0}
+        for m in self.messages:
+            stats[m.role] += 1
+        return stats
+
+    def clear(self):
+        cleared_count = len(self.messages)
+        self.messages = []
+        return cleared_count
+
+    def is_empty(self):
+        return len(self.messages) == 0
+
+
+class Badge:
+    """(逻辑与badge_management_system.py中的版本一致)"""
+
+    _next_id_number = 101
+    VALID_DEPARTMENTS = ("技术部", "产品部", "市场部", "行政部", "人力资源部")
+
+    def __init__(self, employee_name, employee_id, department="技术部"):
+        if not employee_name or not employee_name.strip():
+            raise ValueError("employee_name不能为空")
+        if not Badge.is_valid_id(employee_id):
+            raise ValueError("employee_id格式不合法")
+        if department not in Badge.VALID_DEPARTMENTS:
+            raise ValueError("department不合法")
+        self.employee_name = employee_name
+        self.employee_id = employee_id
+        self.department = department
+        self.is_active = True
+
+    def deactivate(self):
+        if not self.is_active:
+            return False
+        self.is_active = False
+        return True
+
+    def reactivate(self):
+        if self.is_active:
+            return False
+        self.is_active = True
+        return True
+
+    @classmethod
+    def from_next_id(cls, employee_name, department="技术部"):
+        new_id = f"CQ-{cls._next_id_number}"
+        cls._next_id_number += 1
+        return cls(employee_name=employee_name, employee_id=new_id, department=department)
+
+    @classmethod
+    def reset_id_counter(cls, start_from=101):
+        cls._next_id_number = start_from
+
+    @staticmethod
+    def is_valid_id(employee_id):
+        if not isinstance(employee_id, str):
+            return False
+        if not employee_id.startswith("CQ-"):
+            return False
+        number_part = employee_id[3:]
+        return len(number_part) == 3 and number_part.isdigit()
+
+
+# ============================================================
+# 测试用例
+# ============================================================
+
+def test_conversation_history_empty_search_returns_empty():
+    """测试1:空关键字搜索应该返回空列表,而不是报错或返回全部消息。"""
+    history = ConversationHistory(session_id="t1")
+    history.add_message(ChatMessage.user_message("你好"))
+    result = history.search_by_keyword("")
+    assert result == [], "空关键字搜索应该返回空列表"
+    print("测试1通过:空关键字搜索的边界情况处理符合预期。")
+
+
+def test_conversation_history_filter_role_on_empty_history():
+    """测试2:对一个还没有任何消息的会话做角色过滤,应该安全返回空列表。"""
+    history = ConversationHistory(session_id="t2")
+    assert history.filter_by_role("user") == []
+    assert history.is_empty() is True
+    print("测试2通过:空会话历史的过滤操作安全返回空结果。")
+
+
+def test_conversation_history_clear_on_already_empty():
+    """测试3:对已经是空的会话调用clear(),不应该报错,返回值应该是0。"""
+    history = ConversationHistory(session_id="t3")
+    result = history.clear()
+    assert result == 0
+    print("测试3通过:对空会话调用clear()安全返回0,不报错。")
+
+
+def test_conversation_history_rejects_non_chatmessage():
+    """测试4:add_message应该拒绝任何非ChatMessage类型的输入,包括看起来很像的字典。"""
+    history = ConversationHistory(session_id="t4")
+    fake_message_as_dict = {"role": "user", "content": "我是一个伪装的字典"}
+    try:
+        history.add_message(fake_message_as_dict)
+        assert False, "预期应该抛出TypeError"
+    except TypeError:
+        pass
+    print("测试4通过:add_message正确拒绝了非ChatMessage类型的输入。")
+
+
+def test_conversation_history_count_by_role_all_zero_when_empty():
+    """测试5:空会话的角色统计,三个角色的计数都应该是0,而不是缺失某个键。"""
+    history = ConversationHistory(session_id="t5")
+    stats = history.count_by_role()
+    assert stats == {"system": 0, "user": 0, "assistant": 0}
+    print("测试5通过:空会话的角色统计字典结构完整,数值均为0。")
+
+
+def test_badge_deactivate_reactivate_cycle():
+    """测试6:反复停用/启用一枚工牌,状态应该正确切换,重复操作应该被安全拒绝。"""
+    Badge.reset_id_counter(start_from=301)
+    badge = Badge.from_next_id("测试员工", department="行政部")
+
+    assert badge.is_active is True
+    assert badge.deactivate() is True
+    assert badge.deactivate() is False   # 已经停用,不能再停用一次
+    assert badge.reactivate() is True
+    assert badge.reactivate() is False   # 已经启用,不能再启用一次
+    print("测试6通过:工牌停用/启用状态切换的边界情况处理正确。")
+
+
+def test_badge_id_format_edge_cases():
+    """测试7:工号格式校验的若干边界情况——位数不对、前缀不对、包含非数字字符。"""
+    assert Badge.is_valid_id("CQ-101") is True
+    assert Badge.is_valid_id("CQ-1") is False       # 位数不足
+    assert Badge.is_valid_id("CQ-10111") is False   # 位数超出
+    assert Badge.is_valid_id("cq-101") is False     # 前缀大小写不匹配(严格区分大小写)
+    assert Badge.is_valid_id("CQ-10a") is False     # 包含非数字字符
+    assert Badge.is_valid_id("") is False           # 空字符串
+    assert Badge.is_valid_id(101) is False          # 传入的根本不是字符串
+    print("测试7通过:工号格式校验的多种边界情况均处理正确。")
+
+
+def test_badge_name_with_only_whitespace_rejected():
+    """测试8:姓名如果只包含空白字符(比如全是空格),也应该被视为无效姓名而拒绝。"""
+    try:
+        Badge(employee_name="   ", employee_id="CQ-401")
+        assert False, "预期应该抛出ValueError"
+    except ValueError:
+        pass
+    print("测试8通过:纯空白字符的姓名被正确识别为无效输入。")
+
+
+def test_chatmessage_from_dict_missing_field_raises_keyerror():
+    """测试9:from_dict在字典缺少必要字段时,应该抛出KeyError,而不是静默创建出异常对象。"""
+    try:
+        ChatMessage.from_dict({"role": "user"})   # 缺少content字段
+        assert False, "预期应该抛出KeyError"
+    except KeyError:
+        pass
+    print("测试9通过:from_dict正确暴露了缺失字段的问题,而不是默默兜底。")
+
+
+def test_chatmessage_role_counter_accumulates_correctly_across_instances():
+    """测试10:多次创建不同角色的消息后,role_counter类属性应该正确累加。"""
+    ChatMessage.total_created = 0
+    ChatMessage.role_counter = {"system": 0, "user": 0, "assistant": 0}
+
+    ChatMessage.system_message("提示词")
+    ChatMessage.user_message("问题1")
+    ChatMessage.user_message("问题2")
+    ChatMessage.assistant_message("回答1")
+
+    assert ChatMessage.role_counter == {"system": 1, "user": 2, "assistant": 1}
+    assert ChatMessage.total_created == 4
+    print("测试10通过:跨多个实例的类属性累加统计符合预期。")
+
+
+def run_all_day08_extended_checks():
+    """依次运行今天新增的全部10个测试用例,统计并打印通过情况。"""
+    all_tests = [
+        test_conversation_history_empty_search_returns_empty,
+        test_conversation_history_filter_role_on_empty_history,
+        test_conversation_history_clear_on_already_empty,
+        test_conversation_history_rejects_non_chatmessage,
+        test_conversation_history_count_by_role_all_zero_when_empty,
+        test_badge_deactivate_reactivate_cycle,
+        test_badge_id_format_edge_cases,
+        test_badge_name_with_only_whitespace_rejected,
+        test_chatmessage_from_dict_missing_field_raises_keyerror,
+        test_chatmessage_role_counter_accumulates_correctly_across_instances,
+    ]
+
+    passed_count = 0
+    failed_tests = []
+
+    print("开始执行Day8新增代码的综合边界情况自检……\n")
+
+    for test_func in all_tests:
+        try:
+            test_func()
+            passed_count += 1
+        except AssertionError as e:
+            failed_tests.append((test_func.__name__, str(e)))
+            print(f"测试失败:{test_func.__name__} —— {e}")
+
+    print("\n" + "=" * 50)
+    print(f"测试完成:共{len(all_tests)}项,通过{passed_count}项,失败{len(failed_tests)}项。")
+    if not failed_tests:
+        print("全部测试通过!")
+    print("=" * 50)
+
+
+if __name__ == "__main__":
+    run_all_day08_extended_checks()
+```
+
 ---
 
 ## 今日复盘
