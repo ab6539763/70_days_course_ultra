@@ -2135,6 +2135,1020 @@ if __name__ == "__main__":
 
 老王肯定了这个提炼:"这正是软件测试里一个很基础但很重要的概念,叫‘测试替身’(Test Double),`_FakeEmbeddings`就是其中一种,专门叫‘Fake对象’——用一个行为可预测、不依赖真实外部服务的简化实现,替代真实依赖,专门用来验证‘调用这个依赖的那部分代码逻辑’是不是正确,而不是去验证‘这个依赖本身’是不是正确。这个思路,不管你以后用在Embedding模型、数据库,还是第三方支付接口的测试上,都是通用的。"
 
+### 加练:把林悦提过的"生产监控"先搭个雏形,顺手把张凡的HyDE均值向量猜想跑一遍实验
+
+十一份检查点全部跑通之后,时间还没到21点,陈铭翻回自己笔记本里记的两处"暂时没写进代码"的地方——一处是上午答疑里老王说的那三个监控指标(改写前后检索结果重合度、改写生成失败率、最终用户满意度),当时老王说"今天的代码,重点是把‘查询改写能不能提升命中率’这一个核心问题讲透彻,还没有涉及生产环境监控这一层",但也说"你们现在只需要在心里先给这件事留一个位置"；另一处是下午张凡关于"HyDE生成多份假设文档取平均向量"的猜想,老王当时的回答是"这只是一个直觉上的推演,必须要用实验数据去验证,不能停留在‘听起来有道理’的阶段就当作结论"。陈铭想,这两处"留白",与其等到真的要用的时候现场手忙脚乱,不如趁着今天的代码还在脑子里热着,先动手写一版能跑起来的雏形——哪怕只覆盖监控指标里"能靠代码直接算出来"的前两项(重合度、失败率,第三项"用户满意度"确实要等真实用户反馈,今天没法造),哪怕HyDE均值向量的实验样本量小到不足以下结论,先把"工具"和"跑通一次的流程"准备好,比空谈"以后要做"更有意义。他把这个想法发到项目群里,老王回复:"可以,但记住,今天写的监控代码,是‘为将来留一个可以扩展的骨架’,不是‘今天就要做出一套完整的监控系统’,别把加练的时间预算用超了,笔试也要留时间复习。"
+
+#### 加练文件一:`query_rewrite_monitor.py` —— 查询改写生产监控雏形
+
+```python
+# -*- coding: utf-8 -*-
+"""
+文件名:query_rewrite_monitor.py
+作者:陈铭
+说明:
+    查询改写生产监控雏形,对应上午答疑里老王提到的三个监控指标中,
+    能够仅靠代码自动计算的前两项:
+    1. 改写前后检索结果重合度——如果绝大多数改写问题,最终检索到的
+       文本块和原始问题检索到的几乎完全一样,说明这次改写"白改了"。
+    2. 改写生成失败率——网络异常、返回空内容、解析失败等各种情况
+       的发生比例,一旦突然升高,往往意味着上游Prompt或模型本身出问题。
+    第三个指标"最终用户满意度/人工复核准确率",依赖真实用户反馈,
+    今天的教学环境没有真实用户,这一项只在数据结构里预留字段,
+    不在本模块里实现采集逻辑,留给"Sprint4·交付与运维"阶段展开。
+
+    设计说明:
+    这不是一套完整的监控系统(没有告警、没有可视化、没有持久化存储),
+    只是一个"骨架"——用一个轻量的QueryRewriteMonitor类,包装在
+    query_rewriter.py和multi_query_retriever.py的调用外面,记录每一次
+    调用的关键指标,提供一个get_summary()方法把当前累计的统计数据
+    汇总输出。真实生产环境接入时,持久化存储、告警阈值、可视化面板
+    这几块,应该分别对接公司已有的监控基础设施(比如Prometheus、
+    ELK这类工具),不需要在这个雏形上硬造轮子。
+
+    知识点回顾:
+    - Day16学的异常处理与日志记录规范,这里延续同样的"分类记录异常"思路。
+    - 今天上午答疑里老王讲的三个监控指标的设计动机。
+"""
+
+import statistics
+import time
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+def _fingerprint_documents(documents):
+    """
+    把一组检索结果Document对象,转换成一个可比较的"内容指纹集合"
+    (基于page_content本身,不考虑排序顺序),用于计算两组检索结果
+    之间的重合度。
+    :param documents: Document对象列表
+    :return: 由page_content组成的集合
+    """
+    return {doc.page_content.strip() for doc in documents}
+
+
+def calculate_overlap_ratio(original_documents, rewritten_documents):
+    """
+    计算"改写后检索结果"相对"原始问题检索结果"的重合比例。
+
+    计算方式:重合的文本块数量 / 原始检索结果的文本块总数量。
+    取值范围[0, 1]——值越接近1,说明改写后检索到的内容跟原始问题
+    检索到的几乎一样,改写本身没有带来任何增量信息;值越接近0,
+    说明改写确实检索到了原始问题没有覆盖到的新内容,是"有效改写"
+    的一个初步信号(注意:重合度低不代表新增内容一定是"更相关"的
+    内容,这里只是一个粗略的观察性指标,不是判断改写好坏的唯一标准)。
+
+    :param original_documents: 原始问题的检索结果(Document列表)
+    :param rewritten_documents: 改写(或Multi-Query合并后)的检索结果
+    :return: 重合比例(浮点数),原始检索结果为空时返回0.0避免除零错误
+    """
+    original_set = _fingerprint_documents(original_documents)
+    rewritten_set = _fingerprint_documents(rewritten_documents)
+
+    if not original_set:
+        return 0.0
+
+    overlap_count = len(original_set & rewritten_set)
+    return overlap_count / len(original_set)
+
+
+@dataclass
+class RewriteCallRecord:
+    """
+    单次查询改写调用的监控记录。
+
+    属性:
+        question: 本次调用的原始问题
+        succeeded: 改写是否成功生成(未抛出异常、且结果非空)
+        overlap_ratio: 改写后检索结果相对原始检索结果的重合度
+            (仅当succeeded为True且提供了检索结果对比时才有值,否则为None)
+        elapsed_seconds: 本次改写调用的耗时(秒)
+        error_message: 如果失败,记录失败原因;成功时为None
+        user_satisfaction_placeholder: 预留字段,今天不采集真实数据,
+            仅用于说明"未来这个字段会存放什么",默认为None
+    """
+
+    question: str
+    succeeded: bool
+    overlap_ratio: Optional[float] = None
+    elapsed_seconds: float = 0.0
+    error_message: Optional[str] = None
+    user_satisfaction_placeholder: Optional[float] = None
+
+
+class QueryRewriteMonitor:
+    """
+    查询改写生产监控雏形。以"装饰式包装"的方式,记录每一次改写调用的
+    关键指标,不侵入query_rewriter.py和multi_query_retriever.py原有的
+    实现逻辑——这是一个刻意的设计取舍,监控代码和业务代码分离,
+    未来如果要替换监控后端(比如接入公司统一的监控平台),
+    只需要改这一个模块,不需要动业务代码。
+    """
+
+    def __init__(self):
+        self._records = []
+
+    def record_rewrite_call(
+        self,
+        question,
+        rewrite_func,
+        original_retriever=None,
+        rewritten_retriever=None,
+    ):
+        """
+        执行一次查询改写调用,并自动记录监控数据。
+
+        :param question: 用户原始问题
+        :param rewrite_func: 一个无参数的可调用对象(通常用lambda或
+                              functools.partial包装好改写函数及其参数),
+                              调用后应返回改写问题集合与最终合并的检索结果,
+                              具体形式见下方combine_and_monitor()的用法示例
+        :param original_retriever: 可选,用于计算重合度的"原始问题检索器"
+        :param rewritten_retriever: 可选,用于计算重合度的"改写后检索器"
+        :return: rewrite_func()的原始返回值(监控逻辑不改变原有调用结果)
+        """
+        start_time = time.time()
+        try:
+            result = rewrite_func()
+            elapsed = time.time() - start_time
+
+            overlap_ratio = None
+            if original_retriever is not None and rewritten_retriever is not None:
+                original_docs = original_retriever.invoke(question)
+                rewritten_docs = rewritten_retriever.invoke(question)
+                overlap_ratio = calculate_overlap_ratio(original_docs, rewritten_docs)
+
+            self._records.append(
+                RewriteCallRecord(
+                    question=question,
+                    succeeded=True,
+                    overlap_ratio=overlap_ratio,
+                    elapsed_seconds=round(elapsed, 3),
+                )
+            )
+            return result
+        except Exception as exc:  # noqa: BLE001 监控层需要捕获任意异常并记录,不能让监控本身导致业务中断
+            elapsed = time.time() - start_time
+            self._records.append(
+                RewriteCallRecord(
+                    question=question,
+                    succeeded=False,
+                    elapsed_seconds=round(elapsed, 3),
+                    error_message=str(exc),
+                )
+            )
+            raise
+
+    def get_summary(self):
+        """
+        汇总当前累计的全部调用记录,输出监控概览。
+        :return: 包含关键统计信息的字典
+        """
+        total_calls = len(self._records)
+        if total_calls == 0:
+            return {
+                "total_calls": 0,
+                "failure_rate": 0.0,
+                "average_overlap_ratio": None,
+                "average_elapsed_seconds": 0.0,
+                "low_value_rewrite_questions": [],
+            }
+
+        failed_records = [r for r in self._records if not r.succeeded]
+        failure_rate = len(failed_records) / total_calls
+
+        overlap_values = [
+            r.overlap_ratio for r in self._records if r.overlap_ratio is not None
+        ]
+        average_overlap_ratio = (
+            round(statistics.mean(overlap_values), 4) if overlap_values else None
+        )
+
+        average_elapsed = round(
+            statistics.mean(r.elapsed_seconds for r in self._records), 3
+        )
+
+        # "低价值改写"预警清单:重合度超过0.9的改写调用,大概率是"改写了但没起作用",
+        # 值得人工抽样复核,判断是否需要调整改写Prompt或者干脆对这类问题跳过改写。
+        low_value_questions = [
+            r.question for r in self._records
+            if r.overlap_ratio is not None and r.overlap_ratio > 0.9
+        ]
+
+        return {
+            "total_calls": total_calls,
+            "failure_rate": round(failure_rate, 4),
+            "average_overlap_ratio": average_overlap_ratio,
+            "average_elapsed_seconds": average_elapsed,
+            "low_value_rewrite_questions": low_value_questions,
+        }
+
+    def print_summary_report(self):
+        """打印一份人类可读的监控概览报告,方便课堂演示与日常巡检查看。"""
+        summary = self.get_summary()
+        print("=" * 56)
+        print("查询改写生产监控概览(雏形版,不含用户满意度采集)")
+        print("=" * 56)
+        print(f"累计调用次数:{summary['total_calls']}")
+        print(f"改写生成失败率:{summary['failure_rate'] * 100:.1f}%")
+        if summary["average_overlap_ratio"] is not None:
+            print(f"平均检索结果重合度:{summary['average_overlap_ratio'] * 100:.1f}%")
+        print(f"平均单次调用耗时:{summary['average_elapsed_seconds']}秒")
+        if summary["low_value_rewrite_questions"]:
+            print("疑似低价值改写(重合度>90%,建议人工抽样复核):")
+            for q in summary["low_value_rewrite_questions"]:
+                print(f"  - {q}")
+        print("=" * 56)
+
+
+if __name__ == "__main__":
+    # 演示:用假的改写函数模拟"部分成功、部分失败、部分改写价值不高"的场景,
+    # 验证监控逻辑本身是否正确统计,不涉及真实的LLM/Embedding调用。
+    class _FakeRetrieverAlwaysSame:
+        """模拟一个"改写前后检索结果完全一样"的检索器,用于制造高重合度场景。"""
+
+        def invoke(self, question):
+            from langchain_core.documents import Document
+
+            return [Document(page_content="固定不变的检索结果A")]
+
+    class _FakeRetrieverDifferent:
+        """模拟一个"改写后检索到了新内容"的检索器,用于制造低重合度场景。"""
+
+        def invoke(self, question):
+            from langchain_core.documents import Document
+
+            return [Document(page_content="改写后才检索到的新内容B")]
+
+    monitor = QueryRewriteMonitor()
+
+    # 场景一:改写成功,但重合度很高(疑似低价值改写)
+    monitor.record_rewrite_call(
+        question="设备保养周期是多久",
+        rewrite_func=lambda: "改写成功(演示)",
+        original_retriever=_FakeRetrieverAlwaysSame(),
+        rewritten_retriever=_FakeRetrieverAlwaysSame(),
+    )
+
+    # 场景二:改写成功,重合度较低(有效改写)
+    monitor.record_rewrite_call(
+        question="设备型号变更之后,是不是要重新做一次安全评估?",
+        rewrite_func=lambda: "改写成功(演示)",
+        original_retriever=_FakeRetrieverAlwaysSame(),
+        rewritten_retriever=_FakeRetrieverDifferent(),
+    )
+
+    # 场景三:改写调用失败
+    def _failing_rewrite():
+        raise ConnectionError("模拟网络异常")
+
+    try:
+        monitor.record_rewrite_call(question="模拟一次失败调用", rewrite_func=_failing_rewrite)
+    except ConnectionError:
+        pass  # 演示脚本里预期会失败,这里吞掉异常,继续往下跑,不影响后面的汇总演示
+
+    monitor.print_summary_report()
+```
+
+#### 加练文件二:`hyde_multi_hypothesis.py` —— HyDE多假设文档取平均向量的实验实现
+
+```python
+# -*- coding: utf-8 -*-
+"""
+文件名:hyde_multi_hypothesis.py
+作者:陈铭
+说明:
+    针对下午张凡提出的猜想——"如果HyDE生成多份假设文档,取平均向量,
+    效果会不会比只生成一份更好"——今天先写一版能跑起来的实验实现,
+    不追求得出一个"放之四海而皆准"的最终结论(样本量、测试题量都太小,
+    今天没法下结论),只是把"这个猜想能不能被量化验证"这件事,
+    从"课后思考题"往前推进一步,变成"有代码、有实验脚本、能跑出数字"
+    的状态,给以后真正需要验证这个方向时省下重新搭架子的时间。
+
+    实现思路:
+    在hyde_retriever.py的基础上扩展——不再只生成一份假设文档,
+    而是并行生成N份(N由HYDE_NUM_HYPOTHESES控制,今天的正文代码
+    默认值是1,这里的实验版本会显式传入更大的数值做对比),
+    对每一份分别计算Embedding向量,再对这N个向量按维度取算术平均,
+    得到一个"平均向量",用这个平均向量去检索,而不是像正文版本那样
+    只用单一一份假设文档的向量。
+
+    知识点回顾:
+    - 今天课堂笔记里讲的HyDE核心原理(用"文档形式"匹配"文档形式")。
+    - Day31学的对照实验设计思路,今天延续"同一测试问题、同一评估标准,
+      只改变一个自变量(假设文档份数)"的控制变量法。
+"""
+
+from hyde_retriever import generate_hypothetical_document
+
+
+def _average_vectors(vectors):
+    """
+    对一组等长的向量,按维度计算算术平均值,得到一个新的平均向量。
+    :param vectors: 向量列表(每个向量是浮点数列表),要求长度均相同
+    :return: 平均向量(浮点数列表)
+    """
+    if not vectors:
+        raise ValueError("传入的向量列表不能为空")
+
+    dimension = len(vectors[0])
+    for v in vectors:
+        if len(v) != dimension:
+            raise ValueError("所有向量的维度必须一致,才能计算平均向量")
+
+    sums = [0.0] * dimension
+    for vector in vectors:
+        for i, value in enumerate(vector):
+            sums[i] += value
+
+    return [total / len(vectors) for total in sums]
+
+
+class MultiHypothesisHydeRetriever:
+    """
+    多假设文档HyDE检索器(实验版)。
+
+    与hyde_retriever.py中HydeRetriever的区别:HydeRetriever只生成一份
+    假设文档,本类可以配置生成num_hypotheses份,分别计算Embedding向量,
+    取平均向量后再检索。当num_hypotheses=1时,行为应当与HydeRetriever
+    完全一致(这一点会在下面的单元测试里专门验证,确保"退化到单份"
+    这个边界情况不会引入额外的bug)。
+    """
+
+    def __init__(self, vectorstore, embeddings, llm, top_k=5, num_hypotheses=3, fallback_retriever=None):
+        """
+        :param vectorstore: 已经写好数据的Chroma向量库实例
+        :param embeddings: 与vectorstore使用同一套Embedding模型的Embeddings实例
+        :param llm: 用于生成假设性文档的ChatModel
+        :param top_k: 检索返回数量
+        :param num_hypotheses: 生成的假设文档份数(实验的核心自变量)
+        :param fallback_retriever: 兜底检索器,当全部假设文档生成均失败时使用
+        """
+        self.vectorstore = vectorstore
+        self.embeddings = embeddings
+        self.llm = llm
+        self.top_k = top_k
+        self.num_hypotheses = num_hypotheses
+        self.fallback_retriever = fallback_retriever
+
+    def _generate_all_hypotheses(self, question):
+        """
+        生成num_hypotheses份假设文档,单份生成失败时跳过(不让一次失败
+        拖垮整体实验),全部失败时返回空列表,交给调用方决定是否兜底。
+        :param question: 用户问题
+        :return: 成功生成的假设文档字符串列表(长度可能小于num_hypotheses)
+        """
+        hypotheses = []
+        for i in range(self.num_hypotheses):
+            try:
+                hypothesis = generate_hypothetical_document(self.llm, question)
+                if hypothesis:
+                    hypotheses.append(hypothesis)
+            except Exception as exc:  # noqa: BLE001 单份失败不影响其余份数的生成
+                print(f"[MultiHypothesisHyDE] 第{i + 1}份假设文档生成失败:{exc}")
+        return hypotheses
+
+    def invoke(self, question):
+        """
+        执行一次多假设文档HyDE检索:生成N份假设文档 -> 分别计算Embedding
+        向量 -> 取平均向量 -> 用平均向量检索真实文档。
+        :param question: 用户问题
+        :return: Document对象列表
+        """
+        hypotheses = self._generate_all_hypotheses(question)
+
+        if not hypotheses:
+            print("[MultiHypothesisHyDE] 全部假设文档生成失败,已自动降级为普通检索。")
+            if self.fallback_retriever is not None:
+                return self.fallback_retriever.invoke(question)
+            raise RuntimeError("假设文档生成全部失败,且未配置兜底检索器")
+
+        hypothesis_vectors = [self.embeddings.embed_query(h) for h in hypotheses]
+        averaged_vector = _average_vectors(hypothesis_vectors)
+
+        results = self.vectorstore.similarity_search_by_vector(
+            embedding=averaged_vector,
+            k=self.top_k,
+        )
+
+        for doc in results:
+            doc.metadata["retrieved_via"] = "hyde_multi_hypothesis"
+            doc.metadata["hyde_hypothesis_count"] = len(hypotheses)
+
+        return results
+
+
+def run_single_vs_multi_hypothesis_experiment(question, vectorstore, embeddings, llm, top_k=5):
+    """
+    针对单个测试问题,对比"只生成1份假设文档"与"生成3份假设文档取平均向量"
+    两种方式的检索结果,输出简明对比,供课堂演示与后续正式实验参考。
+
+    :param question: 测试问题
+    :param vectorstore: 向量库实例
+    :param embeddings: Embeddings实例
+    :param llm: 用于生成假设文档的ChatModel
+    :param top_k: 检索返回数量
+    :return: 包含两组检索结果预览的字典
+    """
+    single_retriever = MultiHypothesisHydeRetriever(
+        vectorstore=vectorstore, embeddings=embeddings, llm=llm, top_k=top_k, num_hypotheses=1
+    )
+    multi_retriever = MultiHypothesisHydeRetriever(
+        vectorstore=vectorstore, embeddings=embeddings, llm=llm, top_k=top_k, num_hypotheses=3
+    )
+
+    single_results = single_retriever.invoke(question)
+    multi_results = multi_retriever.invoke(question)
+
+    single_previews = [doc.page_content[:60].replace("\n", " ") for doc in single_results]
+    multi_previews = [doc.page_content[:60].replace("\n", " ") for doc in multi_results]
+
+    return {
+        "question": question,
+        "single_hypothesis_results": single_previews,
+        "multi_hypothesis_results": multi_previews,
+        "results_identical": single_previews == multi_previews,
+    }
+
+
+if __name__ == "__main__":
+    from advanced_rag_config import (
+        BASELINE_CHUNK_SIZE,
+        BASELINE_EMBEDDING_MODEL,
+        get_llm,
+    )
+    from embedding_factory import build_embedding_model
+    from ingest import get_retriever, ingest
+    import experiment_config as day31_cfg
+    from langchain_chroma import Chroma
+
+    demo_llm = get_llm(temperature=0.3)
+    demo_embeddings = build_embedding_model(BASELINE_EMBEDDING_MODEL)
+    collection_name = ingest(BASELINE_CHUNK_SIZE, BASELINE_EMBEDDING_MODEL)
+    demo_vectorstore = Chroma(
+        collection_name=collection_name,
+        embedding_function=demo_embeddings,
+        persist_directory=day31_cfg.CHROMA_PERSIST_DIR,
+    )
+
+    demo_question = "设备型号变更之后,是不是要重新做一次安全评估?"
+    comparison = run_single_vs_multi_hypothesis_experiment(
+        demo_question, demo_vectorstore, demo_embeddings, demo_llm
+    )
+
+    print(f"测试问题:{comparison['question']}")
+    print(f"单份假设文档检索结果:{comparison['single_hypothesis_results']}")
+    print(f"三份假设文档均值检索结果:{comparison['multi_hypothesis_results']}")
+    print(f"两组结果是否完全一致:{comparison['results_identical']}")
+    print("\n提醒:今天只是验证了实验代码本身能跑通,样本量是1道题,")
+    print("不足以支撑'哪种方式更好'的结论,后续需要用完整的10题测试集")
+    print("跑多轮实验,并结合模型调用成本一起权衡,才能得出可靠的结论。")
+```
+
+#### 加练文件三:`combined_retriever.py` —— Multi-Query与HyDE组合检索的生产级实现
+
+```python
+# -*- coding: utf-8 -*-
+"""
+文件名:combined_retriever.py
+作者:陈铭
+说明:
+    今天课后作业第7题里已经写过一版"组合Multi-Query和HyDE"的参考答案,
+    但那版本是针对作业场景简化过的独立函数,今天加练把它升级成一个
+    符合正文RetrieverAdapter调用惯例的正式检索器类,补上作业版本里
+    没有覆盖的几个工程细节:异常隔离(一路失败不影响另一路)、
+    命中频次与"双路命中"标记的元数据写入、以及可以直接接入
+    enhanced_rag_pipeline.py的统一invoke接口。
+
+    设计取舍说明(与课堂笔记的呼应):
+    老王在讲架构图的时候明确说过,今天的实验"要求Multi-Query和HyDE
+    在同一次实验里二选一使用,不强行叠加",这是为了保证效果可以被
+    单独归因;但张凡在架构图讨论环节也确认过,"技术上理论上可以叠加"。
+    今天的加练代码,正是把"理论上可以叠加"这句话变成一份可以直接运行、
+    可以直接接入生产流水线的实现,供以后如果团队决定要在生产环境启用
+    "叠加模式"时直接使用,不需要再从作业答案现场改造。
+
+    知识点回顾:
+    - 今天课后作业第7题的组合去重排序思路。
+    - Day30学的"面向接口设计",这里CombinedRetriever对外暴露统一的
+      invoke(question)方法,与MultiQueryRetriever、HydeRetriever、
+      普通Retriever保持完全一致的调用方式。
+"""
+
+
+class CombinedRetriever:
+    """
+    Multi-Query与HyDE组合检索器(生产级实现)。
+
+    工作流程:同时执行Multi-Query检索和HyDE检索(两路互相独立、
+    互不影响,任意一路异常都不会导致另一路的结果丢失) -> 合并去重 ->
+    按"是否同时被两路检索到"作为首要排序依据,频次/耗时等辅助信息
+    写入metadata -> 截断到final_top_n篇返回。
+    """
+
+    def __init__(self, multi_query_retriever, hyde_retriever, final_top_n=6):
+        """
+        :param multi_query_retriever: 已配置好的MultiQueryRetriever实例
+        :param hyde_retriever: 已配置好的HydeRetriever实例(内部应当已经
+                                配置了自己的fallback_retriever,组合检索器
+                                不重复处理HyDE自身的降级逻辑)
+        :param final_top_n: 最终返回的文本块数量上限
+        """
+        self.multi_query_retriever = multi_query_retriever
+        self.hyde_retriever = hyde_retriever
+        self.final_top_n = final_top_n
+
+    def _safe_invoke(self, retriever, question, retriever_name):
+        """
+        安全地调用某一路检索器,捕获异常并返回空列表,保证"一路失败,
+        不影响另一路继续工作"这个异常隔离原则得到落实。
+        :param retriever: 检索器实例
+        :param question: 用户问题
+        :param retriever_name: 检索器名称(用于日志打印,便于排查是哪一路出的问题)
+        :return: Document对象列表,失败时返回空列表
+        """
+        try:
+            return retriever.invoke(question)
+        except Exception as exc:  # noqa: BLE001 组合检索器的顶层异常隔离,防止一路故障拖垮整体
+            print(f"[CombinedRetriever] {retriever_name}检索失败,已跳过该路结果:{exc}")
+            return []
+
+    def invoke(self, question):
+        """
+        执行一次组合检索:并行(逻辑上,不是真正的多线程并行)执行
+        Multi-Query与HyDE两路检索,合并去重后按"双路命中优先"排序。
+        :param question: 用户问题
+        :return: 合并排序截断后的Document对象列表
+        """
+        multi_query_docs = self._safe_invoke(self.multi_query_retriever, question, "Multi-Query")
+        hyde_docs = self._safe_invoke(self.hyde_retriever, question, "HyDE")
+
+        content_to_document = {}
+        content_in_multi_query = set()
+        content_in_hyde = set()
+        first_seen_order = []
+
+        for doc in multi_query_docs:
+            key = doc.page_content.strip()
+            content_in_multi_query.add(key)
+            if key not in content_to_document:
+                content_to_document[key] = doc
+                first_seen_order.append(key)
+
+        for doc in hyde_docs:
+            key = doc.page_content.strip()
+            content_in_hyde.add(key)
+            if key not in content_to_document:
+                content_to_document[key] = doc
+                first_seen_order.append(key)
+
+        def sort_key(key):
+            both_hit = key in content_in_multi_query and key in content_in_hyde
+            return 0 if both_hit else 1
+
+        sorted_keys = sorted(first_seen_order, key=sort_key)
+
+        merged_documents = []
+        for key in sorted_keys:
+            doc = content_to_document[key]
+            doc.metadata["combined_retrieval_source"] = (
+                "multi_query+hyde" if key in content_in_multi_query and key in content_in_hyde
+                else ("multi_query" if key in content_in_multi_query else "hyde")
+            )
+            merged_documents.append(doc)
+
+        return merged_documents[: self.final_top_n]
+
+
+def build_combined_retriever(base_retriever, llm, fallback_retriever=None, **kwargs):
+    """
+    组合检索器的构建入口函数,内部自动构建好Multi-Query和HyDE两路检索器,
+    再包装成CombinedRetriever实例返回,方便调用方不需要关心内部两路
+    检索器各自的构建细节。
+
+    :param base_retriever: 底层普通向量检索器(会被复用为Multi-Query的
+                            base_retriever,同时也可以作为HyDE的兜底检索器)
+    :param llm: 用于生成改写问题/假设文档的ChatModel
+    :param fallback_retriever: HyDE降级用的兜底检索器,不传则复用base_retriever
+    :param kwargs: 其他传递给CombinedRetriever的可选配置(如final_top_n)
+    :return: 配置好的CombinedRetriever实例
+    """
+    from hyde_retriever import HydeRetriever
+    from multi_query_retriever import build_multi_query_retriever
+
+    multi_query_retriever = build_multi_query_retriever(base_retriever, llm)
+    hyde_retriever = HydeRetriever(
+        vectorstore=base_retriever.vectorstore if hasattr(base_retriever, "vectorstore") else None,
+        embeddings=base_retriever.embeddings if hasattr(base_retriever, "embeddings") else None,
+        llm=llm,
+        fallback_retriever=fallback_retriever or base_retriever,
+    )
+
+    return CombinedRetriever(multi_query_retriever, hyde_retriever, **kwargs)
+
+
+if __name__ == "__main__":
+    from langchain_core.documents import Document
+
+    class _MockRetriever:
+        """演示脚本专用的Mock检索器,行为与单元测试中的定义保持一致。"""
+
+        def __init__(self, fixed_documents, should_fail=False):
+            self._fixed_documents = fixed_documents
+            self._should_fail = should_fail
+
+        def invoke(self, question):
+            if self._should_fail:
+                raise ConnectionError("模拟检索失败")
+            return self._fixed_documents
+
+    doc_shared = Document(page_content="工艺变更控制程序相关内容(双路命中)")
+    doc_mq_only = Document(page_content="仅Multi-Query检索到的内容")
+    doc_hyde_only = Document(page_content="仅HyDE检索到的内容")
+
+    combined = CombinedRetriever(
+        multi_query_retriever=_MockRetriever([doc_shared, doc_mq_only]),
+        hyde_retriever=_MockRetriever([doc_shared, doc_hyde_only]),
+        final_top_n=5,
+    )
+
+    results = combined.invoke("演示问题")
+    print("组合检索结果(双路命中优先):")
+    for doc in results:
+        print(f"  - {doc.page_content} [来源:{doc.metadata.get('combined_retrieval_source')}]")
+```
+
+#### 加练文件四:三份新模块的pytest单元测试
+
+```python
+# -*- coding: utf-8 -*-
+"""
+文件名:tests/test_query_rewrite_monitor.py
+说明:query_rewrite_monitor.py 的单元测试,验证重合度计算、
+失败率统计、低价值改写预警清单等核心逻辑。
+"""
+
+import pytest
+from langchain_core.documents import Document
+
+from query_rewrite_monitor import QueryRewriteMonitor, calculate_overlap_ratio
+
+
+def _make_doc(content):
+    return Document(page_content=content)
+
+
+def test_calculate_overlap_ratio_fully_identical():
+    """当两组检索结果完全一样时,重合度应为1.0。"""
+    original = [_make_doc("内容A"), _make_doc("内容B")]
+    rewritten = [_make_doc("内容A"), _make_doc("内容B")]
+    assert calculate_overlap_ratio(original, rewritten) == 1.0
+
+
+def test_calculate_overlap_ratio_fully_different():
+    """当两组检索结果完全不同时,重合度应为0.0。"""
+    original = [_make_doc("内容A")]
+    rewritten = [_make_doc("内容C")]
+    assert calculate_overlap_ratio(original, rewritten) == 0.0
+
+
+def test_calculate_overlap_ratio_partial():
+    """当两组检索结果部分重叠时,重合度应正确反映重叠比例。"""
+    original = [_make_doc("内容A"), _make_doc("内容B")]
+    rewritten = [_make_doc("内容A"), _make_doc("内容C")]
+    # 原始结果2条,其中1条("内容A")在改写结果中也出现,重合度=1/2=0.5
+    assert calculate_overlap_ratio(original, rewritten) == 0.5
+
+
+def test_calculate_overlap_ratio_empty_original_returns_zero():
+    """原始检索结果为空时,不应抛出除零异常,应返回0.0。"""
+    assert calculate_overlap_ratio([], [_make_doc("内容A")]) == 0.0
+
+
+def test_monitor_records_successful_call_without_overlap():
+    """不提供检索器对比参数时,应仍能正常记录成功调用,overlap_ratio为None。"""
+    monitor = QueryRewriteMonitor()
+    result = monitor.record_rewrite_call(question="测试问题", rewrite_func=lambda: "成功结果")
+
+    assert result == "成功结果"
+    summary = monitor.get_summary()
+    assert summary["total_calls"] == 1
+    assert summary["failure_rate"] == 0.0
+    assert summary["average_overlap_ratio"] is None
+
+
+def test_monitor_records_failed_call_and_reraises():
+    """调用失败时,应记录失败原因,并把原始异常重新抛出给调用方。"""
+    monitor = QueryRewriteMonitor()
+
+    def _failing():
+        raise TimeoutError("模拟超时")
+
+    with pytest.raises(TimeoutError):
+        monitor.record_rewrite_call(question="测试问题", rewrite_func=_failing)
+
+    summary = monitor.get_summary()
+    assert summary["total_calls"] == 1
+    assert summary["failure_rate"] == 1.0
+
+
+def test_monitor_flags_low_value_rewrite():
+    """重合度超过0.9的调用,应被列入低价值改写预警清单。"""
+    monitor = QueryRewriteMonitor()
+
+    class _SameRetriever:
+        def invoke(self, question):
+            return [_make_doc("完全一样的内容")]
+
+    monitor.record_rewrite_call(
+        question="没有实际变化的改写问题",
+        rewrite_func=lambda: "结果",
+        original_retriever=_SameRetriever(),
+        rewritten_retriever=_SameRetriever(),
+    )
+
+    summary = monitor.get_summary()
+    assert "没有实际变化的改写问题" in summary["low_value_rewrite_questions"]
+
+
+def test_monitor_summary_on_empty_records():
+    """尚未记录任何调用时,get_summary应返回合理的默认值,不抛出异常。"""
+    monitor = QueryRewriteMonitor()
+    summary = monitor.get_summary()
+    assert summary["total_calls"] == 0
+    assert summary["failure_rate"] == 0.0
+    assert summary["low_value_rewrite_questions"] == []
+```
+
+```python
+# -*- coding: utf-8 -*-
+"""
+文件名:tests/test_hyde_multi_hypothesis.py
+说明:hyde_multi_hypothesis.py 的单元测试,验证平均向量计算逻辑,
+以及"单份假设文档退化场景"下的行为一致性。
+"""
+
+import pytest
+from langchain_core.documents import Document
+
+from hyde_multi_hypothesis import MultiHypothesisHydeRetriever, _average_vectors
+
+
+def test_average_vectors_simple_case():
+    """两个简单向量的平均值应按维度正确计算。"""
+    result = _average_vectors([[1.0, 2.0, 3.0], [3.0, 4.0, 5.0]])
+    assert result == [2.0, 3.0, 4.0]
+
+
+def test_average_vectors_single_vector_returns_itself():
+    """只有一个向量时,平均向量应与原向量完全一致。"""
+    result = _average_vectors([[0.5, 0.5]])
+    assert result == [0.5, 0.5]
+
+
+def test_average_vectors_raises_on_empty_input():
+    """传入空列表时,应抛出明确的异常,而不是返回一个无意义的结果。"""
+    with pytest.raises(ValueError):
+        _average_vectors([])
+
+
+def test_average_vectors_raises_on_dimension_mismatch():
+    """向量维度不一致时,应抛出异常,防止静默产生错误结果。"""
+    with pytest.raises(ValueError):
+        _average_vectors([[1.0, 2.0], [1.0, 2.0, 3.0]])
+
+
+class _FakeLLMAlwaysReturns:
+    """测试专用的假LLM,固定返回预设的假设文档文本,不涉及真实模型调用。"""
+
+    def __init__(self, fixed_text):
+        self._fixed_text = fixed_text
+
+    def invoke(self, prompt_value):
+        class _FakeResponse:
+            content = self._fixed_text
+
+        return _FakeResponse()
+
+
+class _FakeEmbeddingsFixedVector:
+    """测试专用的假Embeddings,任何文本都返回同一个固定向量,方便验证平均逻辑。"""
+
+    def __init__(self, vector):
+        self._vector = vector
+
+    def embed_query(self, text):
+        return self._vector
+
+
+class _FakeVectorstoreRecordsQuery:
+    """测试专用的假向量库,记录传入的检索向量,并返回固定的Document列表。"""
+
+    def __init__(self, documents_to_return):
+        self.last_query_vector = None
+        self._documents_to_return = documents_to_return
+
+    def similarity_search_by_vector(self, embedding, k):
+        self.last_query_vector = embedding
+        return self._documents_to_return[:k]
+
+
+def test_multi_hypothesis_retriever_uses_averaged_vector():
+    """当生成多份假设文档时,检索器应使用这些向量的平均值去调用向量库检索。"""
+    from unittest.mock import patch
+
+    fake_documents = [Document(page_content="检索结果1")]
+    fake_vectorstore = _FakeVectorstoreRecordsQuery(fake_documents)
+    fake_embeddings = _FakeEmbeddingsFixedVector([1.0, 1.0])  # 每份假设文档向量都一样
+
+    retriever = MultiHypothesisHydeRetriever(
+        vectorstore=fake_vectorstore,
+        embeddings=fake_embeddings,
+        llm=_FakeLLMAlwaysReturns("固定的假设文档文本"),
+        top_k=1,
+        num_hypotheses=3,
+    )
+
+    with patch(
+        "hyde_multi_hypothesis.generate_hypothetical_document",
+        return_value="固定的假设文档文本",
+    ):
+        results = retriever.invoke("测试问题")
+
+    assert results == fake_documents
+    # 三份完全相同的向量[1.0, 1.0]取平均,结果应仍是[1.0, 1.0]
+    assert fake_vectorstore.last_query_vector == [1.0, 1.0]
+
+
+def test_multi_hypothesis_retriever_falls_back_when_all_generation_fails():
+    """当全部假设文档生成都失败时,应自动降级为兜底检索器。"""
+    from unittest.mock import patch
+
+    fallback_documents = [Document(page_content="兜底检索结果")]
+
+    class _FallbackRetriever:
+        def invoke(self, question):
+            return fallback_documents
+
+    retriever = MultiHypothesisHydeRetriever(
+        vectorstore=_FakeVectorstoreRecordsQuery([]),
+        embeddings=_FakeEmbeddingsFixedVector([1.0, 0.0]),
+        llm=_FakeLLMAlwaysReturns(""),
+        num_hypotheses=2,
+        fallback_retriever=_FallbackRetriever(),
+    )
+
+    with patch(
+        "hyde_multi_hypothesis.generate_hypothetical_document",
+        side_effect=RuntimeError("模拟生成失败"),
+    ):
+        results = retriever.invoke("测试问题")
+
+    assert results == fallback_documents
+
+
+def test_multi_hypothesis_retriever_raises_without_fallback_when_all_fail():
+    """全部假设文档生成失败且未配置兜底检索器时,应抛出明确异常,而不是静默返回空结果。"""
+    from unittest.mock import patch
+
+    retriever = MultiHypothesisHydeRetriever(
+        vectorstore=_FakeVectorstoreRecordsQuery([]),
+        embeddings=_FakeEmbeddingsFixedVector([1.0, 0.0]),
+        llm=_FakeLLMAlwaysReturns(""),
+        num_hypotheses=2,
+        fallback_retriever=None,
+    )
+
+    with patch(
+        "hyde_multi_hypothesis.generate_hypothetical_document",
+        side_effect=RuntimeError("模拟生成失败"),
+    ):
+        with pytest.raises(RuntimeError):
+            retriever.invoke("测试问题")
+```
+
+```python
+# -*- coding: utf-8 -*-
+"""
+文件名:tests/test_combined_retriever.py
+说明:combined_retriever.py 的单元测试,验证双路命中优先排序、
+异常隔离(一路失败不影响另一路)、以及最终截断逻辑。
+"""
+
+from langchain_core.documents import Document
+
+from combined_retriever import CombinedRetriever
+
+
+class _MockRetriever:
+    """测试专用的Mock检索器,可以配置固定返回结果,或者模拟调用失败。"""
+
+    def __init__(self, fixed_documents=None, should_fail=False):
+        self._fixed_documents = fixed_documents or []
+        self._should_fail = should_fail
+
+    def invoke(self, question):
+        if self._should_fail:
+            raise ConnectionError("模拟检索失败")
+        return self._fixed_documents
+
+
+def test_combined_retriever_prioritizes_double_hit_documents():
+    """同时被Multi-Query和HyDE两路检索到的文本块,应排在结果最前面。"""
+    doc_shared = Document(page_content="双路命中内容")
+    doc_mq_only = Document(page_content="仅MQ命中内容")
+    doc_hyde_only = Document(page_content="仅HyDE命中内容")
+
+    combined = CombinedRetriever(
+        multi_query_retriever=_MockRetriever([doc_shared, doc_mq_only]),
+        hyde_retriever=_MockRetriever([doc_shared, doc_hyde_only]),
+        final_top_n=10,
+    )
+
+    results = combined.invoke("测试问题")
+
+    assert results[0].page_content == "双路命中内容"
+    assert results[0].metadata["combined_retrieval_source"] == "multi_query+hyde"
+    remaining_contents = {doc.page_content for doc in results[1:]}
+    assert remaining_contents == {"仅MQ命中内容", "仅HyDE命中内容"}
+
+
+def test_combined_retriever_truncates_to_final_top_n():
+    """结果数量超过final_top_n时,应正确截断。"""
+    docs = [Document(page_content=f"内容{i}") for i in range(5)]
+
+    combined = CombinedRetriever(
+        multi_query_retriever=_MockRetriever(docs),
+        hyde_retriever=_MockRetriever([]),
+        final_top_n=3,
+    )
+
+    results = combined.invoke("测试问题")
+    assert len(results) == 3
+
+
+def test_combined_retriever_isolates_multi_query_failure():
+    """Multi-Query这一路调用失败时,应仍能正常返回HyDE这一路的结果,不整体失败。"""
+    doc_from_hyde = Document(page_content="来自HyDE的内容")
+
+    combined = CombinedRetriever(
+        multi_query_retriever=_MockRetriever(should_fail=True),
+        hyde_retriever=_MockRetriever([doc_from_hyde]),
+        final_top_n=5,
+    )
+
+    results = combined.invoke("测试问题")
+    assert len(results) == 1
+    assert results[0].page_content == "来自HyDE的内容"
+    assert results[0].metadata["combined_retrieval_source"] == "hyde"
+
+
+def test_combined_retriever_isolates_hyde_failure():
+    """HyDE这一路调用失败时,应仍能正常返回Multi-Query这一路的结果,不整体失败。"""
+    doc_from_mq = Document(page_content="来自Multi-Query的内容")
+
+    combined = CombinedRetriever(
+        multi_query_retriever=_MockRetriever([doc_from_mq]),
+        hyde_retriever=_MockRetriever(should_fail=True),
+        final_top_n=5,
+    )
+
+    results = combined.invoke("测试问题")
+    assert len(results) == 1
+    assert results[0].page_content == "来自Multi-Query的内容"
+    assert results[0].metadata["combined_retrieval_source"] == "multi_query"
+
+
+def test_combined_retriever_returns_empty_when_both_fail():
+    """两路都失败时,应返回空列表,而不是抛出异常导致整个问答流程崩溃。"""
+    combined = CombinedRetriever(
+        multi_query_retriever=_MockRetriever(should_fail=True),
+        hyde_retriever=_MockRetriever(should_fail=True),
+        final_top_n=5,
+    )
+
+    results = combined.invoke("测试问题")
+    assert results == []
+
+
+def test_combined_retriever_preserves_first_seen_order_for_single_hit_documents():
+    """对于只被一路命中的文本块,应保留各自路径内部原有的先后顺序(稳定排序)。"""
+    doc_mq_first = Document(page_content="MQ第一条")
+    doc_mq_second = Document(page_content="MQ第二条")
+
+    combined = CombinedRetriever(
+        multi_query_retriever=_MockRetriever([doc_mq_first, doc_mq_second]),
+        hyde_retriever=_MockRetriever([]),
+        final_top_n=5,
+    )
+
+    results = combined.invoke("测试问题")
+    assert [doc.page_content for doc in results] == ["MQ第一条", "MQ第二条"]
+```
+
+晚上十点半左右,四份加练文件的单元测试全部跑通,陈铭把`query_rewrite_monitor.py`的演示脚本单独跑了一遍,看着终端里打印出的"疑似低价值改写"清单,想起林悦当时提这个监控指标时的原话——"如果查询改写这套东西真的用到生产环境里,我们怎么知道它到底有没有在‘帮倒忙’"——他觉得,今晚这几百行代码,虽然离一套真正的生产监控系统还差得很远,但至少把"怎么知道"这件事,从一句抽象的疑问,变成了一个可以直接跑出数字的具体工具。他把这几份文件和一句总结发到群里:"监控指标和HyDE均值向量都先搭了个能跑的骨架,细节肯定还有很多没考虑到的地方,明天有空再一起看看。"老王只回复了一个字:"好。"陈铭把这个"好"字截图存进了资料夹,笑着想,这大概是老王今天说过的最短的一句话。
+
 ---
 
 ## 今日复盘
