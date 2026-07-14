@@ -2074,6 +2074,1063 @@ if __name__ == "__main__":
     _self_check()
 ```
 
+### 加练:把今天留下的四个"明确的改造点"先动手做一遍
+
+晚自习代码互检结束、老王讲完"分层解耦"的总结之后,时间还剩下一个多小时,陈铭翻回今天笔记本里记的几处"老王明确说过、但今天没有时间展开写"的地方,数了一下,一共四处:一是上午张凡问的"逻辑并行和物理并行的区别",老王当时的原话是"如果未来要真正压缩响应延迟,可以用异步编程或者多线程";二是下午作业第2题里那个"CNC-102-XY"新格式编号,参考答案只给了思路,没有真的把正则表达式和测试用例写出来;三是作业第5题的`enable_bm25`/`enable_vector`开关,参考答案同样只给了改造思路,没有真的落地成可以运行的代码,而且赵磊在飞书群里特别强调过"降级模式不要做成静默降级";四是上午张凡问过的"BM25索引要不要支持增量更新",老王当时说"今天先不展开,但提醒大家记在心里"。陈铭把这四条整理成一个清单发到群里,问老王要不要趁着记忆还新鲜,今晚先动手写一遍。老王的回复很简短:"可以,但四个一起上工作量不小,写不完就先写完能跑的,别硬撑到很晚,明天的量化评估才是正戏。"陈铭想了想,决定四个都先搭一个可以跑起来的版本,哪怕细节还有粗糙的地方,先把"骨架"立起来,总比什么都没有、明天临时抱佛脚要好。
+
+#### 加练文件一:`async_hybrid_search.py` —— 把"逻辑并行"变成真正的"物理并行"
+
+```python
+"""
+async_hybrid_search.py
+
+苍穹RAG检索引擎层 · 混合检索模块 · 异步并行检索改造
+
+设计动机:
+今天上午张凡提过一个问题——BM25检索和向量检索在逻辑上互不依赖,
+但今天的_child_search方法里是顺序调用的(先跑完BM25再跑向量检索),
+这意味着两路检索的耗时是"相加"关系,不是"取较大值"关系。
+老王当时给出的方向是"用asyncio或者多线程改造成真正的物理并行",
+这个模块就是把这句话落地成一份可以跑起来、可以量化对比"改造前后
+到底快了多少"的代码,不是纯粹停留在"听起来应该会快"的猜测层面。
+
+实现思路:
+用Python的asyncio.gather,把BM25检索和向量检索分别包装成
+异步函数并发执行——BM25本身是纯CPU计算(不涉及网络IO),严格来说
+asyncio对纯CPU任务的并发效果有限(GIL的存在,单线程内的asyncio
+并不能让两段CPU密集代码真正同时跑在不同的CPU核心上),所以这里
+额外提供了一个基于ThreadPoolExecutor的版本,通过run_in_executor
+把BM25检索放到独立的线程里执行,才能真正利用到多核CPU的并行能力,
+这也是今天课堂笔记里反复强调的"分层实现、每层都要验证"这条原则
+在性能优化场景下的具体体现——不能只满足于"代码里用了async关键字",
+要用实测数据证明确实达到了物理并行的效果。
+
+知识点回顾:
+- 今天架构图讨论环节,老王讲的"逻辑并行"与"物理并行"的区别。
+- Day16学过的异常处理规范,这里延续"任意一路异常不拖垮另一路"的思路。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import Callable, List, Optional, Tuple
+
+logger = logging.getLogger("cangqiong.rag.async_hybrid")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s")
+    )
+    logger.addHandler(_handler)
+
+
+@dataclass
+class ParallelSearchResult:
+    """
+    一次并行检索的完整结果,包含两路各自的检索结果与耗时,
+    方便直接对比"串行调用"与"并行调用"的实际耗时差异。
+    """
+
+    bm25_results: List[Tuple[str, float, dict]] = field(default_factory=list)
+    vector_results: List[Tuple[str, float, dict]] = field(default_factory=list)
+    bm25_elapsed_ms: float = 0.0
+    vector_elapsed_ms: float = 0.0
+    total_elapsed_ms: float = 0.0
+    bm25_error: Optional[str] = None
+    vector_error: Optional[str] = None
+
+
+class AsyncHybridSearcher:
+    """
+    异步并行混合检索器:把BM25检索(通过线程池实现真正的物理并行)
+    与向量检索(假设本身是IO密集型的远程API调用,天然适合asyncio)
+    同时发起,谁先完成不影响另一路继续执行,两路都完成之后统一返回。
+
+    典型用法:
+        searcher = AsyncHybridSearcher(bm25_search_fn, vector_search_fn)
+        result = asyncio.run(searcher.search("XJ-3200A报警代码E07", top_k=20))
+    """
+
+    def __init__(
+        self,
+        bm25_search_fn: Callable[[str, int], List[Tuple[str, float, dict]]],
+        vector_search_fn: Callable[[str, int], List[Tuple[str, float, dict]]],
+        max_workers: int = 2,
+    ) -> None:
+        """
+        :param bm25_search_fn: 同步的BM25检索函数,签名 (query, top_k) -> 结果列表
+        :param vector_search_fn: 同步的向量检索函数,签名同上(真实项目里如果
+            向量检索本身是异步的远程API调用,可以直接用async def改写,
+            这里为了跟今天已有的同步实现保持兼容,统一用线程池包装成异步)
+        :param max_workers: 线程池最大线程数,今天场景下两路检索各占一个线程即可
+        """
+        self.bm25_search_fn = bm25_search_fn
+        self.vector_search_fn = vector_search_fn
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+
+    async def _run_bm25(self, query: str, top_k: int) -> Tuple[List[Tuple[str, float, dict]], float, Optional[str]]:
+        """在独立线程中执行BM25检索,捕获异常并记录耗时,不让异常直接向上抛出中断另一路。"""
+        loop = asyncio.get_event_loop()
+        start = time.time()
+        error_message = None
+        results: List[Tuple[str, float, dict]] = []
+        try:
+            results = await loop.run_in_executor(self._executor, self.bm25_search_fn, query, top_k)
+        except Exception as exc:  # noqa: BLE001 单路异常隔离,保证另一路不受影响
+            error_message = str(exc)
+            logger.error("BM25检索异常:%s", exc)
+        elapsed_ms = (time.time() - start) * 1000
+        return results, elapsed_ms, error_message
+
+    async def _run_vector(self, query: str, top_k: int) -> Tuple[List[Tuple[str, float, dict]], float, Optional[str]]:
+        """在独立线程中执行向量检索,捕获异常并记录耗时。"""
+        loop = asyncio.get_event_loop()
+        start = time.time()
+        error_message = None
+        results: List[Tuple[str, float, dict]] = []
+        try:
+            results = await loop.run_in_executor(self._executor, self.vector_search_fn, query, top_k)
+        except Exception as exc:  # noqa: BLE001
+            error_message = str(exc)
+            logger.error("向量检索异常:%s", exc)
+        elapsed_ms = (time.time() - start) * 1000
+        return results, elapsed_ms, error_message
+
+    async def search(self, query: str, top_k: int = 20) -> ParallelSearchResult:
+        """
+        并发执行BM25检索与向量检索,两路互不阻塞对方,全部完成后统一返回。
+        :param query: 查询文本
+        :param top_k: 各路检索各自的召回数量
+        :return: ParallelSearchResult,包含两路结果、各自耗时、总耗时
+        """
+        total_start = time.time()
+
+        bm25_task = asyncio.create_task(self._run_bm25(query, top_k))
+        vector_task = asyncio.create_task(self._run_vector(query, top_k))
+
+        (bm25_results, bm25_elapsed, bm25_error), (vector_results, vector_elapsed, vector_error) = await asyncio.gather(
+            bm25_task, vector_task
+        )
+
+        total_elapsed = (time.time() - total_start) * 1000
+
+        return ParallelSearchResult(
+            bm25_results=bm25_results,
+            vector_results=vector_results,
+            bm25_elapsed_ms=round(bm25_elapsed, 2),
+            vector_elapsed_ms=round(vector_elapsed, 2),
+            total_elapsed_ms=round(total_elapsed, 2),
+            bm25_error=bm25_error,
+            vector_error=vector_error,
+        )
+
+    def close(self) -> None:
+        """释放线程池资源,流水线关闭时应当调用,避免线程池线程无限期挂起。"""
+        self._executor.shutdown(wait=True)
+
+
+def run_sequential_search(
+    bm25_search_fn: Callable[[str, int], List[Tuple[str, float, dict]]],
+    vector_search_fn: Callable[[str, int], List[Tuple[str, float, dict]]],
+    query: str,
+    top_k: int = 20,
+) -> ParallelSearchResult:
+    """
+    今天课堂代码里原本的"串行调用"版本,专门保留下来作为对照,
+    方便量化对比"改造成物理并行之后,到底快了多少"。
+    """
+    total_start = time.time()
+
+    t0 = time.time()
+    bm25_results = bm25_search_fn(query, top_k)
+    bm25_elapsed = (time.time() - t0) * 1000
+
+    t1 = time.time()
+    vector_results = vector_search_fn(query, top_k)
+    vector_elapsed = (time.time() - t1) * 1000
+
+    total_elapsed = (time.time() - total_start) * 1000
+
+    return ParallelSearchResult(
+        bm25_results=bm25_results,
+        vector_results=vector_results,
+        bm25_elapsed_ms=round(bm25_elapsed, 2),
+        vector_elapsed_ms=round(vector_elapsed, 2),
+        total_elapsed_ms=round(total_elapsed, 2),
+    )
+
+
+if __name__ == "__main__":
+    # 自检:用两个人为加了sleep延迟的假检索函数,模拟"检索本身有一定耗时"的场景,
+    # 验证并行版本的总耗时确实明显低于串行版本的耗时之和(而不是接近两者相加)。
+    def _fake_bm25_search(query: str, top_k: int) -> List[Tuple[str, float, dict]]:
+        time.sleep(0.1)  # 模拟BM25检索本身的计算耗时
+        return [("doc_bm25_1", 5.0, {"source": "假数据"})]
+
+    def _fake_vector_search(query: str, top_k: int) -> List[Tuple[str, float, dict]]:
+        time.sleep(0.1)  # 模拟向量检索本身的计算耗时
+        return [("doc_vec_1", 0.9, {"source": "假数据"})]
+
+    sequential_result = run_sequential_search(_fake_bm25_search, _fake_vector_search, "测试查询")
+    print(f"[串行] 总耗时约 {sequential_result.total_elapsed_ms:.1f} 毫秒(预期接近200毫秒)")
+
+    searcher = AsyncHybridSearcher(_fake_bm25_search, _fake_vector_search)
+    parallel_result = asyncio.run(searcher.search("测试查询"))
+    searcher.close()
+    print(f"[并行] 总耗时约 {parallel_result.total_elapsed_ms:.1f} 毫秒(预期接近100毫秒,而不是200毫秒)")
+
+    assert parallel_result.total_elapsed_ms < sequential_result.total_elapsed_ms * 0.7, (
+        "并行版本的耗时应明显低于串行版本,改造未达到预期效果"
+    )
+    print("[自检通过] 物理并行改造确实带来了耗时的实质性下降,不是‘用了async关键字但没有真并行’的伪改造")
+```
+
+#### 加练文件二:`device_code_extended.py` —— 支持多段式设备编号格式(呼应作业第2题)
+
+```python
+"""
+device_code_extended.py
+
+苍穹RAG检索引擎层 · BM25模块补充 · 扩展设备编号识别规则
+
+设计动机:
+下午作业第2题里已经分析过,今天课堂代码里的DEVICE_CODE_PATTERN
+只能识别"字母(可选连字符)数字(可选字母后缀)"这种一段式结构,
+遇到客户提到的"CNC-102-XY"这种"设备类型-三位数字-两位字母"的
+三段式结构(中间多了一个连字符分隔数字段和字母段),就识别不出来。
+参考答案里给出的思路是扩展正则表达式,今晚把这个思路真的写成
+可以运行、可以测试的代码,而不是只停留在文字描述层面。
+
+同时,这个模块也顺便验证了作业第2题末尾提到的"规则复杂度变高之后,
+应该考虑转向命名实体识别模型"这条延伸思考——这里用一个简化的
+"规则清单可插拔"设计,展示"如果客户还有第三种、第四种新格式,
+应该怎么在不推翻现有代码的情况下,增量扩展识别能力",为将来
+真的需要升级到NER模型时,提供一个自然的迁移路径(NER模型的输出
+接口,可以设计成跟这里的extract_device_codes函数完全一致,
+上层调用代码不需要感知底层是正则规则还是模型推理)。
+"""
+
+from __future__ import annotations
+
+import re
+from typing import List, Pattern
+
+
+# 每一条正则规则对应一种已知的设备编号格式,新增格式时只需要往这个
+# 列表里追加一条新的正则,不需要改动extract_device_codes函数本身的逻辑,
+# 这是"开闭原则"(对扩展开放、对修改关闭)在正则规则场景下的具体应用。
+DEVICE_CODE_PATTERNS: List[Pattern[str]] = [
+    # 格式一(今天课堂已有):字母(可选连字符)数字(可选字母后缀),如 XJ-3200A、YK500
+    re.compile(r"[A-Z]{1,4}-?\d{3,5}[A-Z]{0,2}"),
+    # 格式二(今晚新增,呼应作业第2题):字母-三位数字-一到三位字母,如 CNC-102-XY
+    re.compile(r"[A-Z]{1,4}-\d{3}-[A-Z]{1,3}"),
+    # 格式三(今晚新增,预留给未来可能出现的、带年份批次信息的编号,如 TC-8800-2024)
+    re.compile(r"[A-Z]{1,4}-\d{3,5}-\d{4}"),
+]
+
+
+def extract_device_codes_extended(text: str) -> List[str]:
+    """
+    使用全部已注册的设备编号识别规则,从文本中提取所有疑似设备型号编号,
+    并去重(保留首次出现的顺序)。
+
+    :param text: 原始文本
+    :return: 识别出的设备编号列表(已去重、已过滤重叠子串)
+
+    关于"重叠子串"的说明:
+    多条正则规则同时生效时,同一段文本可能被不同规则各自匹配出一部分
+    (比如"CNC-102-XY"这个三段式编号,一段式规则会先匹配出"CNC-102"这个
+    前缀片段,三段式规则才会匹配出完整的"CNC-102-XY")。如果不做处理,
+    结果里会同时出现"CNC-102"和"CNC-102-XY"这种一长一短、互为子串的
+    重复信息,对下游BM25分词保护和展示都是噪音。这里在去重之后,额外
+    做一次"子串过滤"——如果某个匹配结果,是另一个匹配结果的严格子串,
+    就认为后者信息量更完整,只保留更长的那个。
+    """
+    raw_matches: List[str] = []
+    for pattern in DEVICE_CODE_PATTERNS:
+        raw_matches.extend(pattern.findall(text))
+
+    unique_matches = list(dict.fromkeys(raw_matches))  # 保留首次出现顺序的去重
+
+    found: List[str] = []
+    for candidate in unique_matches:
+        is_substring_of_another = any(
+            candidate != other and candidate in other for other in unique_matches
+        )
+        if not is_substring_of_another:
+            found.append(candidate)
+    return found
+
+
+def register_new_pattern(pattern_str: str) -> None:
+    """
+    向规则清单中注册一条新的设备编号识别正则,供后续客户提出新格式时,
+    不需要修改这个文件本身的代码,只需要在系统启动时调用一次这个函数
+    (比如从一份可配置的规则清单文件里读取并注册),就能扩展识别能力。
+
+    :param pattern_str: 正则表达式字符串
+    """
+    compiled = re.compile(pattern_str)
+    DEVICE_CODE_PATTERNS.append(compiled)
+
+
+if __name__ == "__main__":
+    # 自检点1:验证今天课堂已有的一段式格式依然能被正确识别(不能因为新增规则而破坏旧功能)
+    codes_1 = extract_device_codes_extended("XJ-3200A的报警代码E07是什么意思")
+    assert "XJ-3200A" in codes_1, f"一段式格式识别失效,实际结果: {codes_1}"
+    print("[自检通过] 一段式格式(XJ-3200A)依然能被正确识别:", codes_1)
+
+    # 自检点2:验证今晚新增的三段式格式能被正确识别
+    codes_2 = extract_device_codes_extended("CNC-102-XY这台设备最近老是报警,怎么排查")
+    assert "CNC-102-XY" in codes_2, f"三段式格式识别失败,实际结果: {codes_2}"
+    print("[自检通过] 三段式格式(CNC-102-XY)能被正确识别:", codes_2)
+
+    # 自检点3:验证同一段文本里同时出现两种格式时,两种都能被识别到
+    mixed_text = "XJ-3200A和CNC-102-XY这两台设备,哪个的保养周期更短?"
+    codes_3 = extract_device_codes_extended(mixed_text)
+    assert "XJ-3200A" in codes_3 and "CNC-102-XY" in codes_3, f"混合格式识别不完整,实际结果: {codes_3}"
+    print("[自检通过] 混合格式文本中,两种编号均被正确识别:", codes_3)
+
+    # 自检点4:验证动态注册新规则的能力(模拟客户提出第四种全新格式的场景)
+    register_new_pattern(r"设备编号[:：]\s*[A-Z0-9-]+")
+    codes_4 = extract_device_codes_extended("设备编号:ABC-999-Z 出现异常")
+    assert any("设备编号" in c for c in codes_4), f"动态注册的新规则未生效,实际结果: {codes_4}"
+    print("[自检通过] 动态注册新的识别规则后,新格式也能被正确识别:", codes_4)
+```
+
+#### 加练文件三:`degradable_pipeline.py` —— 可配置降级 + 不做静默降级
+
+```python
+"""
+degradable_pipeline.py
+
+苍穹RAG检索引擎层 · 增强RAG流水线补充 · 显式降级模式
+
+设计动机:
+下午作业第5题的参考答案里,已经给出了给EnhancedRAGConfig新增
+enable_bm25、enable_vector两个开关的思路,但参考答案止步于"改动思路",
+没有真正落地成可以运行的代码。今晚把这个思路做完整,并且额外补上
+一条今天需求评审环节赵磊提的书面意见——"降级模式不要做成静默降级,
+系统日志里必须清晰地记录本次请求因为XX组件不可用、已降级为YY模式"。
+这个模块专门演示"检测到某一路检索组件异常时,如何自动降级,并且
+让降级这件事在日志和返回结果里都清晰可见,不是表面上看起来一切
+正常、但实际上悄悄少用了某个环节"。
+
+知识点回顾:
+- 今天PRD"可回退性"这条非功能需求。
+- 赵磊在飞书群补充的书面意见,已经被归档进PRD评审记录。
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from typing import Callable, List, Optional, Tuple
+
+logger = logging.getLogger("cangqiong.rag.degradable_pipeline")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s")
+    )
+    logger.addHandler(_handler)
+
+
+@dataclass
+class DegradableRetrievalConfig:
+    """
+    支持显式开关与自动降级的混合检索配置。
+
+    属性:
+        enable_bm25: 是否启用BM25检索这一路(呼应作业第5题)
+        enable_vector: 是否启用向量检索这一路(呼应作业第5题)
+        auto_degrade_on_error: 当某一路检索抛出异常时,是否自动关闭该路、
+            降级为仅使用另一路继续提供服务,而不是让整个请求直接失败
+    """
+
+    enable_bm25: bool = True
+    enable_vector: bool = True
+    auto_degrade_on_error: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.enable_bm25 and not self.enable_vector:
+            raise ValueError(
+                "enable_bm25和enable_vector不能同时为False,"
+                "混合检索至少需要保留一路才能正常工作"
+            )
+
+
+@dataclass
+class DegradationEvent:
+    """
+    单次降级事件的完整记录,严格遵循赵磊提出的"不做静默降级"要求——
+    任何一次降级,都必须留下一条包含"哪个组件、什么原因、降级成什么模式"
+    三要素齐全的记录,而不是仅仅在内部悄悄跳过某一步。
+    """
+
+    component: str          # 出问题的组件名称,如"bm25"、"vector"
+    reason: str              # 触发降级的具体原因(异常信息)
+    degraded_to: str         # 降级之后实际采用的模式
+    query: str                # 触发本次降级的查询文本,方便事后追溯定位
+
+
+class DegradableHybridRetriever:
+    """
+    支持显式开关与自动降级的混合检索器。
+
+    与今天课堂代码`_child_search`方法的区别:本类在每一路检索调用外面
+    包了一层显式的开关判断和异常捕获,任意一路组件不可用时,不会让
+    整个检索请求失败,而是自动降级为仅使用另一路,并且把每一次降级
+    都记录成一条结构化的DegradationEvent,可以直接输出到日志系统,
+    也可以被上层监控代码统一收集统计,而不是让降级行为"隐身"在代码内部。
+    """
+
+    def __init__(
+        self,
+        bm25_search_fn: Callable[[str, int], List[Tuple[str, float, dict]]],
+        vector_search_fn: Callable[[str, int], List[Tuple[str, float, dict]]],
+        config: Optional[DegradableRetrievalConfig] = None,
+    ) -> None:
+        self.bm25_search_fn = bm25_search_fn
+        self.vector_search_fn = vector_search_fn
+        self.config = config or DegradableRetrievalConfig()
+        self.degradation_events: List[DegradationEvent] = []
+
+    def _log_degradation(self, component: str, reason: str, degraded_to: str, query: str) -> None:
+        """
+        记录一次降级事件,同时立刻写入日志(不做静默处理)。
+        这里刻意把"记录到内存列表"和"写入日志"两件事都做了,
+        前者方便单元测试直接断言,后者才是真正生产环境依赖的可观测手段。
+        """
+        event = DegradationEvent(component=component, reason=reason, degraded_to=degraded_to, query=query)
+        self.degradation_events.append(event)
+        logger.warning(
+            "[降级告警] 组件=%s 异常原因=%s 已降级为=%s 触发查询=%s",
+            component, reason, degraded_to, query,
+        )
+
+    def search(self, query: str, top_k: int = 20) -> Tuple[List[Tuple[str, float, dict]], List[Tuple[str, float, dict]]]:
+        """
+        执行一次带自动降级能力的混合检索。
+
+        :return: (bm25_results, vector_results),某一路被关闭或自动降级时,
+            对应位置返回空列表,调用方(比如RRF融合模块)天然兼容空列表输入,
+            不需要额外的特殊处理。
+        """
+        bm25_results: List[Tuple[str, float, dict]] = []
+        vector_results: List[Tuple[str, float, dict]] = []
+
+        if self.config.enable_bm25:
+            try:
+                bm25_results = self.bm25_search_fn(query, top_k)
+            except Exception as exc:  # noqa: BLE001 组件级异常隔离
+                if self.config.auto_degrade_on_error:
+                    self._log_degradation(
+                        component="bm25", reason=str(exc), degraded_to="仅向量检索", query=query
+                    )
+                else:
+                    raise
+        else:
+            logger.info("BM25检索已被配置显式关闭(enable_bm25=False),查询=%s", query)
+
+        if self.config.enable_vector:
+            try:
+                vector_results = self.vector_search_fn(query, top_k)
+            except Exception as exc:  # noqa: BLE001
+                if self.config.auto_degrade_on_error:
+                    self._log_degradation(
+                        component="vector", reason=str(exc), degraded_to="仅BM25检索", query=query
+                    )
+                else:
+                    raise
+        else:
+            logger.info("向量检索已被配置显式关闭(enable_vector=False),查询=%s", query)
+
+        if not bm25_results and not vector_results:
+            logger.error("本次查询两路检索均未返回结果,查询=%s", query)
+
+        return bm25_results, vector_results
+
+    def get_degradation_summary(self) -> dict:
+        """汇总当前累计的降级事件统计,供运维监控面板直接展示。"""
+        component_counts: dict = {}
+        for event in self.degradation_events:
+            component_counts[event.component] = component_counts.get(event.component, 0) + 1
+        return {
+            "total_degradation_count": len(self.degradation_events),
+            "degradation_by_component": component_counts,
+        }
+
+
+if __name__ == "__main__":
+    def _healthy_bm25(query: str, top_k: int):
+        return [("doc_bm25", 5.0, {"source": "正常"})]
+
+    def _failing_vector(query: str, top_k: int):
+        raise ConnectionError("模拟向量检索服务临时不可用")
+
+    retriever = DegradableHybridRetriever(_healthy_bm25, _failing_vector)
+    bm25_res, vector_res = retriever.search("XJ-3200A报警代码E07")
+
+    assert bm25_res, "BM25这一路应正常返回结果"
+    assert vector_res == [], "向量检索异常时应降级为空列表,而不是让整个请求失败"
+    assert len(retriever.degradation_events) == 1, "应记录一条降级事件"
+    assert retriever.degradation_events[0].component == "vector"
+    print("[自检通过] 向量检索异常时正确降级为仅BM25检索,且降级事件被完整记录,不是静默降级")
+    print("降级统计汇总:", retriever.get_degradation_summary())
+
+    # 验证enable_bm25和enable_vector同时为False时会主动报错,而不是静默产生空候选池
+    try:
+        DegradableRetrievalConfig(enable_bm25=False, enable_vector=False)
+        raise AssertionError("应当抛出ValueError,但没有抛出")
+    except ValueError as exc:
+        print(f"[自检通过] 两路检索同时关闭时正确抛出配置错误:{exc}")
+```
+
+#### 加练文件四:`bm25_incremental_index.py` —— BM25索引的增量更新
+
+```python
+"""
+bm25_incremental_index.py
+
+苍穹RAG检索引擎层 · BM25模块补充 · 增量索引更新
+
+设计动机:
+今天上午张凡提过一个问题——海纳集团的设备手册会持续更新,如果每次
+只新增了一篇文档,也要把整个BM25索引重新构建一遍吗?老王当时的
+回答是"今天这版实现是全量重建的思路,增量更新属于进阶工程优化,
+今天先不展开"。今晚趁着白天的实现细节还清楚,先写一版增量更新的
+雏形,核心是搞清楚"新增一篇文档之后,哪些统计量必须重算、哪些
+可以直接累加",而不是想当然地假设"增量更新"就是"只处理新文档
+那么简单"。
+
+关键难点:
+BM25的IDF依赖"文档总数"和"每个词出现在多少篇文档里"这两个全局
+统计量,新增一篇文档之后,这两个全局统计量都会发生变化,所以IDF
+不能像"文档的词频"那样简单地做局部累加,必须重新计算——但重新
+计算IDF的成本,远低于"重新对全部文档做一遍分词"的成本,增量更新
+省下来的,主要是"重复分词已经处理过的旧文档"这部分开销,而不是
+"完全不需要重新计算任何统计量"。这也是本模块最想讲清楚的一点:
+所谓"增量更新",往往不是字面意义上的"只做增量的那一小部分工作",
+而是"把能够复用的部分尽量复用,把不能不重算的部分依然照常重算"。
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from collections import defaultdict
+from typing import Dict, List, Sequence, Tuple
+
+from bm25_retriever import BM25Config, BM25Document, protect_and_tokenize
+
+logger = logging.getLogger("cangqiong.rag.bm25_incremental")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s")
+    )
+    logger.addHandler(_handler)
+
+
+class IncrementalBM25Index:
+    """
+    支持增量添加文档的BM25索引。
+
+    与今天课堂代码`ChineseBM25Retriever`的区别:课堂版本每次调用
+    build_index()都会对全部文档重新分词、重新统计;本类把"新增文档
+    的分词与词频统计"和"全局IDF的重新计算"拆成两个独立步骤——
+    add_documents_incrementally()只对新增的这一批文档做分词和词频统计
+    (复用已有文档的分词结果,不重复劳动),而_recompute_idf()仍然
+    需要基于最新的文档总数和词的文档频率重新算一遍IDF,这一步无法避免,
+    但相比"重新对所有文档分词"已经是明显的性能提升。
+    """
+
+    def __init__(self, config: BM25Config | None = None) -> None:
+        self.config = config or BM25Config()
+        self._documents: List[BM25Document] = []
+        self._term_freq: List[dict] = []
+        self._doc_len: List[int] = []
+        self._doc_freq: Dict[str, int] = defaultdict(int)
+        self._idf: Dict[str, float] = {}
+        self._avg_doc_len: float = 0.0
+
+    def add_documents_incrementally(self, documents: Sequence[Tuple[str, str, dict]]) -> None:
+        """
+        增量添加一批新文档:只对这批新文档执行分词与词频统计,
+        不触碰已有文档的分词结果,随后统一触发一次IDF重算。
+
+        :param documents: (doc_id, raw_text, metadata) 三元组列表
+        """
+        if not documents:
+            logger.info("本次增量更新未提供任何新文档,跳过")
+            return
+
+        new_doc_count = 0
+        for doc_id, raw_text, metadata in documents:
+            tokens = protect_and_tokenize(raw_text)
+            term_freq: dict = defaultdict(int)
+            for tok in tokens:
+                term_freq[tok] += 1
+
+            self._documents.append(BM25Document(doc_id=doc_id, tokens=tokens, raw_text=raw_text, metadata=metadata))
+            self._term_freq.append(term_freq)
+            self._doc_len.append(len(tokens))
+
+            for tok in term_freq.keys():
+                self._doc_freq[tok] += 1
+
+            new_doc_count += 1
+
+        self._recompute_idf()
+        logger.info(
+            "增量更新完成:新增文档数=%d,索引文档总数=%d,已重新计算全局IDF",
+            new_doc_count, len(self._documents),
+        )
+
+    def _recompute_idf(self) -> None:
+        """
+        重新计算全部词的IDF值。
+
+        这一步无法基于"增量"避免——新增文档改变了文档总数(N)和每个词的
+        文档频率(df),这两个量是IDF公式的核心输入,即便只新增了一篇文档,
+        理论上词表里每一个已存在的词的IDF值都可能发生细微变化,
+        必须重新遍历一次_doc_freq字典整体重算,但这个操作本身只涉及
+        "词表规模"次的浮点数运算,不涉及重新分词,开销远小于全量重建。
+        """
+        n_docs = len(self._documents)
+        self._avg_doc_len = sum(self._doc_len) / n_docs if n_docs else 0.0
+
+        self._idf = {}
+        for term, df in self._doc_freq.items():
+            idf = math.log((n_docs - df + 0.5) / (df + 0.5) + 1)
+            self._idf[term] = idf
+
+    def search(self, query: str, top_k: int = 10) -> List[Tuple[str, float, dict]]:
+        """
+        执行BM25检索,算法逻辑与今天课堂代码的_score方法完全一致,
+        这里为了模块自完整性重新实现一遍,真实项目集成时应当抽取
+        公共的打分逻辑,避免两处代码重复维护(这也是留给后续正式
+        合并进主代码库时需要处理的一个技术债)。
+        """
+        if not self._documents:
+            return []
+
+        query_tokens = protect_and_tokenize(query)
+        if not query_tokens:
+            return []
+
+        k1, b = self.config.k1, self.config.b
+        scored: List[Tuple[int, float]] = []
+
+        for idx in range(len(self._documents)):
+            doc_len = self._doc_len[idx]
+            term_freq = self._term_freq[idx]
+            score = 0.0
+            for term in query_tokens:
+                if term not in term_freq:
+                    continue
+                tf = term_freq[term]
+                idf = self._idf.get(term, 0.0)
+                denom = tf + k1 * (1 - b + b * doc_len / (self._avg_doc_len or 1.0))
+                score += idf * (tf * (k1 + 1)) / denom
+            if score > 0:
+                scored.append((idx, score))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        results = []
+        for idx, score in scored[:top_k]:
+            doc = self._documents[idx]
+            results.append((doc.doc_id, score, doc.metadata))
+        return results
+
+    @property
+    def document_count(self) -> int:
+        """当前索引中的文档总数,方便测试和监控直接读取。"""
+        return len(self._documents)
+
+
+if __name__ == "__main__":
+    index = IncrementalBM25Index()
+
+    # 第一批:先索引两篇文档
+    index.add_documents_incrementally([
+        ("doc_001", "XJ-3200A数控加工中心报警代码E07表示主轴温度过高,应立即停机检查冷却系统。", {"source": "操作规程.pdf"}),
+        ("doc_002", "YK-500系列冲压设备保养周期为月度、季度、年度三级保养制度。", {"source": "保养手册.pdf"}),
+    ])
+    print(f"第一批索引完成,文档总数={index.document_count}")
+
+    results_before = index.search("XJ-3200A报警代码E07")
+    print("新增前检索XJ-3200A相关问题,结果数量:", len(results_before))
+
+    # 第二批:增量新增一篇新文档,验证不需要重新处理前两篇文档,索引依然正确
+    # 注意这篇新文档只谈XJ-3300B,不重复提及XJ-3200A,避免关键词交叉污染,
+    # 这样才能干净地验证"旧文档的检索排序不会被新文档意外打乱"这件事。
+    index.add_documents_incrementally([
+        ("doc_003", "XJ-3300B型号的报警代码E07代表进给轴伺服异常,处理方式为检查驱动器接线端子是否牢固。", {"source": "操作规程.pdf"}),
+    ])
+    print(f"增量新增后,文档总数={index.document_count}(预期为3)")
+
+    assert index.document_count == 3, "增量更新后文档总数应为3"
+
+    results_after = index.search("XJ-3200A报警代码E07")
+    assert results_after, "增量更新后检索结果不应为空"
+    assert results_after[0][0] == "doc_001", f"预期doc_001依然排第一,实际: {results_after}"
+    print("[自检通过] 增量更新后,旧文档的检索结果依然正确、排序未被破坏")
+
+    results_new = index.search("XJ-3300B报警代码E07")
+    result_doc_ids = [doc_id for doc_id, _score, _meta in results_new]
+    assert "doc_003" in result_doc_ids, f"预期能检索到新增的doc_003,实际: {results_new}"
+    # 说明:doc_001和doc_003都包含"报警代码E07"这几个共同词,单纯从这几个词
+    # 本身不足以让doc_003排到绝对第一,但"XJ-3300B"作为一个稀有的设备编号token
+    # (只出现在doc_003里),已经足以保证doc_003能够被正确检索到、进入候选结果,
+    # 这才是这里真正要验证的点——新增文档"可被检索到",不强求它排名一定最靠前,
+    # 排名的精细调整,是Rerank环节该做的事,不是BM25这一层该负责的事。
+    print(f"[自检通过] 增量新增的文档能够被正确检索到(排名第{result_doc_ids.index('doc_003') + 1}),IDF已基于最新文档总数重新计算")
+```
+
+#### 加练文件五:四份加练模块的pytest单元测试
+
+```python
+# -*- coding: utf-8 -*-
+"""
+文件名:tests/test_async_hybrid_search.py
+说明:async_hybrid_search.py 的单元测试,验证异步并行检索的
+异常隔离能力与耗时统计的正确性。
+"""
+
+import asyncio
+import time
+
+import pytest
+
+from async_hybrid_search import AsyncHybridSearcher, run_sequential_search
+
+
+def test_parallel_search_isolates_bm25_failure():
+    """BM25这一路失败时,向量检索这一路应仍能正常返回结果,不受影响。"""
+
+    def _failing_bm25(query, top_k):
+        raise RuntimeError("模拟BM25索引损坏")
+
+    def _healthy_vector(query, top_k):
+        return [("doc_v", 0.9, {})]
+
+    searcher = AsyncHybridSearcher(_failing_bm25, _healthy_vector)
+    result = asyncio.run(searcher.search("测试问题"))
+    searcher.close()
+
+    assert result.bm25_results == []
+    assert result.bm25_error is not None
+    assert result.vector_results == [("doc_v", 0.9, {})]
+    assert result.vector_error is None
+
+
+def test_parallel_search_isolates_vector_failure():
+    """向量检索这一路失败时,BM25这一路应仍能正常返回结果,不受影响。"""
+
+    def _healthy_bm25(query, top_k):
+        return [("doc_b", 5.0, {})]
+
+    def _failing_vector(query, top_k):
+        raise TimeoutError("模拟向量检索超时")
+
+    searcher = AsyncHybridSearcher(_healthy_bm25, _failing_vector)
+    result = asyncio.run(searcher.search("测试问题"))
+    searcher.close()
+
+    assert result.bm25_results == [("doc_b", 5.0, {})]
+    assert result.vector_results == []
+    assert result.vector_error is not None
+
+
+def test_parallel_search_records_elapsed_time():
+    """并行检索应正确记录两路各自的耗时,以及总耗时。"""
+
+    def _slow_bm25(query, top_k):
+        time.sleep(0.05)
+        return [("doc_b", 5.0, {})]
+
+    def _slow_vector(query, top_k):
+        time.sleep(0.05)
+        return [("doc_v", 0.9, {})]
+
+    searcher = AsyncHybridSearcher(_slow_bm25, _slow_vector)
+    result = asyncio.run(searcher.search("测试问题"))
+    searcher.close()
+
+    assert result.bm25_elapsed_ms >= 40
+    assert result.vector_elapsed_ms >= 40
+    # 并行执行时,总耗时应明显小于两路耗时相加(串行才会接近相加)
+    assert result.total_elapsed_ms < result.bm25_elapsed_ms + result.vector_elapsed_ms
+
+
+def test_sequential_search_baseline_matches_expected_behavior():
+    """串行检索函数应正确返回两路结果,作为并行版本的行为对照基线。"""
+
+    def _bm25(query, top_k):
+        return [("doc_b", 5.0, {})]
+
+    def _vector(query, top_k):
+        return [("doc_v", 0.9, {})]
+
+    result = run_sequential_search(_bm25, _vector, "测试问题")
+    assert result.bm25_results == [("doc_b", 5.0, {})]
+    assert result.vector_results == [("doc_v", 0.9, {})]
+```
+
+```python
+# -*- coding: utf-8 -*-
+"""
+文件名:tests/test_device_code_extended.py
+说明:device_code_extended.py 的单元测试,验证多段式设备编号
+识别规则的正确性与可扩展性。
+"""
+
+from device_code_extended import DEVICE_CODE_PATTERNS, extract_device_codes_extended, register_new_pattern
+
+
+def test_extract_original_one_segment_format():
+    """今天课堂已有的一段式格式,加入新规则之后依然应能正确识别。"""
+    codes = extract_device_codes_extended("XJ-3200A的报警代码E07是什么意思")
+    assert "XJ-3200A" in codes
+
+
+def test_extract_new_three_segment_format():
+    """新增的三段式格式(设备类型-三位数字-字母后缀)应能被正确识别。"""
+    codes = extract_device_codes_extended("CNC-102-XY这台设备最近老是报警")
+    assert "CNC-102-XY" in codes
+
+
+def test_extract_mixed_formats_in_same_text():
+    """同一段文本里同时出现两种不同格式的编号,两者都应被识别到,互不干扰。"""
+    text = "XJ-3200A和CNC-102-XY,哪个的保养周期更短?"
+    codes = extract_device_codes_extended(text)
+    assert "XJ-3200A" in codes
+    assert "CNC-102-XY" in codes
+
+
+def test_extract_returns_empty_for_text_without_codes():
+    """完全不包含任何设备编号的文本,应返回空列表,而不是误报。"""
+    codes = extract_device_codes_extended("今天天气怎么样,适合出门吗")
+    assert codes == []
+
+
+def test_extract_deduplicates_repeated_codes():
+    """同一个编号在文本中重复出现多次时,结果应去重,只保留一份。"""
+    text = "XJ-3200A报警了,请问XJ-3200A的报警代码E07具体是什么意思"
+    codes = extract_device_codes_extended(text)
+    assert codes.count("XJ-3200A") == 1
+
+
+def test_register_new_pattern_extends_recognition_capability():
+    """动态注册新规则之后,应能识别此前无法识别的全新格式,且不影响已有规则。"""
+    pattern_count_before = len(DEVICE_CODE_PATTERNS)
+    register_new_pattern(r"型号编号[:：]\s*[A-Z0-9-]+")
+
+    assert len(DEVICE_CODE_PATTERNS) == pattern_count_before + 1
+
+    codes = extract_device_codes_extended("型号编号:ZZZ-777-Q 出现故障")
+    assert any("型号编号" in c for c in codes)
+
+    # 验证注册新规则之后,旧规则依然生效
+    old_codes = extract_device_codes_extended("XJ-3200A依然能被识别")
+    assert "XJ-3200A" in old_codes
+```
+
+```python
+# -*- coding: utf-8 -*-
+"""
+文件名:tests/test_degradable_pipeline.py
+说明:degradable_pipeline.py 的单元测试,验证显式降级、
+禁止静默降级、以及双路同时关闭时的报错逻辑。
+"""
+
+import pytest
+
+from degradable_pipeline import DegradableHybridRetriever, DegradableRetrievalConfig
+
+
+def test_config_rejects_both_disabled():
+    """enable_bm25和enable_vector同时为False时,应在构造阶段就抛出异常。"""
+    with pytest.raises(ValueError):
+        DegradableRetrievalConfig(enable_bm25=False, enable_vector=False)
+
+
+def test_config_allows_disabling_one_side():
+    """只关闭一路时,应能正常构造配置对象,不抛出异常。"""
+    config = DegradableRetrievalConfig(enable_bm25=False, enable_vector=True)
+    assert config.enable_bm25 is False
+    assert config.enable_vector is True
+
+
+def test_retriever_respects_explicit_disable_switch():
+    """显式关闭某一路检索时,该路不应被调用,返回结果应为空列表。"""
+    call_log = []
+
+    def _bm25(query, top_k):
+        call_log.append("bm25")
+        return [("doc_b", 5.0, {})]
+
+    def _vector(query, top_k):
+        call_log.append("vector")
+        return [("doc_v", 0.9, {})]
+
+    config = DegradableRetrievalConfig(enable_bm25=False, enable_vector=True)
+    retriever = DegradableHybridRetriever(_bm25, _vector, config=config)
+    bm25_res, vector_res = retriever.search("测试问题")
+
+    assert "bm25" not in call_log
+    assert "vector" in call_log
+    assert bm25_res == []
+    assert vector_res == [("doc_v", 0.9, {})]
+
+
+def test_retriever_auto_degrades_and_records_event_on_failure():
+    """某一路检索抛出异常时,应自动降级为另一路,并记录一条完整的降级事件。"""
+
+    def _failing_bm25(query, top_k):
+        raise RuntimeError("模拟BM25索引文件损坏")
+
+    def _healthy_vector(query, top_k):
+        return [("doc_v", 0.9, {})]
+
+    retriever = DegradableHybridRetriever(_failing_bm25, _healthy_vector)
+    bm25_res, vector_res = retriever.search("XJ-3200A报警代码E07")
+
+    assert bm25_res == []
+    assert vector_res == [("doc_v", 0.9, {})]
+    assert len(retriever.degradation_events) == 1
+
+    event = retriever.degradation_events[0]
+    assert event.component == "bm25"
+    assert "索引文件损坏" in event.reason
+    assert event.degraded_to == "仅向量检索"
+    assert event.query == "XJ-3200A报警代码E07"
+
+
+def test_retriever_raises_when_auto_degrade_disabled():
+    """当auto_degrade_on_error为False时,某一路异常应直接向上抛出,不做静默降级。"""
+
+    def _failing_bm25(query, top_k):
+        raise RuntimeError("模拟异常")
+
+    def _healthy_vector(query, top_k):
+        return [("doc_v", 0.9, {})]
+
+    config = DegradableRetrievalConfig(auto_degrade_on_error=False)
+    retriever = DegradableHybridRetriever(_failing_bm25, _healthy_vector, config=config)
+
+    with pytest.raises(RuntimeError):
+        retriever.search("测试问题")
+
+
+def test_degradation_summary_counts_by_component():
+    """降级统计汇总应正确按组件分类计数。"""
+
+    def _failing_bm25(query, top_k):
+        raise RuntimeError("模拟异常")
+
+    def _healthy_vector(query, top_k):
+        return [("doc_v", 0.9, {})]
+
+    retriever = DegradableHybridRetriever(_failing_bm25, _healthy_vector)
+    retriever.search("问题一")
+    retriever.search("问题二")
+
+    summary = retriever.get_degradation_summary()
+    assert summary["total_degradation_count"] == 2
+    assert summary["degradation_by_component"]["bm25"] == 2
+```
+
+```python
+# -*- coding: utf-8 -*-
+"""
+文件名:tests/test_bm25_incremental_index.py
+说明:bm25_incremental_index.py 的单元测试,验证增量更新后
+旧文档检索结果保持稳定,新文档能被正确检索到,IDF正确重算。
+"""
+
+from bm25_incremental_index import IncrementalBM25Index
+
+
+def test_incremental_add_increases_document_count():
+    """每次增量添加文档后,文档总数应正确累加。"""
+    index = IncrementalBM25Index()
+    index.add_documents_incrementally([("doc_1", "第一篇测试文档内容", {})])
+    assert index.document_count == 1
+
+    index.add_documents_incrementally([("doc_2", "第二篇测试文档内容", {})])
+    assert index.document_count == 2
+
+
+def test_incremental_add_does_not_break_existing_document_search():
+    """增量新增文档后,旧文档的检索结果应保持正确,不应被破坏。"""
+    index = IncrementalBM25Index()
+    index.add_documents_incrementally([
+        ("doc_001", "XJ-3200A报警代码E07表示主轴温度过高,应立即停机检查冷却系统。", {"source": "规程A"}),
+    ])
+
+    results_before = index.search("XJ-3200A报警代码E07")
+    assert results_before and results_before[0][0] == "doc_001"
+
+    index.add_documents_incrementally([
+        ("doc_002", "YK-500保养周期说明,与XJ-3200A无关的内容。", {"source": "规程B"}),
+    ])
+
+    results_after = index.search("XJ-3200A报警代码E07")
+    assert results_after and results_after[0][0] == "doc_001", "增量更新后旧文档检索结果应保持稳定"
+
+
+def test_incremental_add_makes_new_document_searchable():
+    """增量新增的文档,应立即可以被检索到,不需要额外的重建步骤。"""
+    index = IncrementalBM25Index()
+    index.add_documents_incrementally([("doc_001", "已有的旧文档内容", {})])
+    index.add_documents_incrementally([
+        ("doc_002", "XJ-3300B型号的报警代码E07代表进给轴伺服异常", {"source": "规程C"}),
+    ])
+
+    results = index.search("XJ-3300B报警代码E07")
+    assert results and results[0][0] == "doc_002"
+
+
+def test_incremental_add_with_empty_batch_is_noop():
+    """传入空的文档列表时,不应报错,文档总数应保持不变。"""
+    index = IncrementalBM25Index()
+    index.add_documents_incrementally([("doc_1", "内容", {})])
+    index.add_documents_incrementally([])
+    assert index.document_count == 1
+
+
+def test_incremental_idf_reflects_updated_document_frequency():
+    """新增文档改变了某个词的文档频率之后,IDF应被正确重新计算,
+    体现在:一个词如果从"只出现在1篇文档"变成"出现在2篇文档",
+    它对应的IDF应该下降(信息量下降)。"""
+    index = IncrementalBM25Index()
+    index.add_documents_incrementally([("doc_1", "报警代码E07说明", {})])
+    idf_before = index._idf.get("报警", 0.0)
+
+    index.add_documents_incrementally([("doc_2", "报警灯闪烁处理方法", {})])
+    idf_after = index._idf.get("报警", 0.0)
+
+    assert idf_after < idf_before, "报警一词的文档频率增加后,IDF应相应下降"
+
+
+def test_search_on_empty_index_returns_empty_list():
+    """尚未添加任何文档时执行检索,应返回空列表,不应抛出异常。"""
+    index = IncrementalBM25Index()
+    assert index.search("任意查询") == []
+```
+
+晚上十一点左右,四份加练模块和对应的单元测试全部跑通,陈铭把`async_hybrid_search.py`的自检结果截图存了下来——串行版本总耗时约200毫秒,并行版本压到了刚过100毫秒,跟预期几乎完全吻合。他把这几份代码和一句总结发到项目群里:"上午张凡问的并行、下午作业里的编号格式扩展和检索开关、还有上午张凡问的索引增量更新,今晚都先搭了个能跑的版本,细节肯定还有很多可以打磨的地方,主要是想把‘明确说过要做但今天没时间做’的这几件事,先跑通一遍。"老王过了几分钟回复:"没有要求你们必须加练到这个程度,但愿意在‘明确留白的地方’主动往前走一步,这个习惯比这几段代码本身更值得肯定。早点休息,明天量化评估的信息量不会比今天少。"
+
 ---
 
 ## 今日复盘
