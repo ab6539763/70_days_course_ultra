@@ -1887,6 +1887,908 @@ if __name__ == "__main__":
     main()
 ```
 
+赵磊晚上跟着陈铭一起把这份验收自动化测试脚本又完整跑了一遍确认没问题之后,顺口说了一句:"你这份脚本挺好,但它只能验证‘功能对不对’,不能验证‘代码写得规不规范’——这两件事不一样,你们下午挨的那顿批,其实完全可以提前用工具挡掉一部分,不用等到评审会上被老王当面点出来。"这句话让陈铭想起了老王在评审会开场时提到的那句"技术判断力",他觉得这是一个值得当晚就动手补上的缺口——与其每次都靠人工评审去发现"魔法数字""重复代码""裸print"这类问题,不如写一套能自动扫描的检查脚本,把这次评审会踩过的坑,变成以后任何一次提交代码前都能自动复查的机制,而不是完全依赖"老王今天有没有空、有没有看到"这种偶然性。
+
+### 重构案例五:调试信息裸用print() → 统一日志配置与LoggingService
+
+老王在评审苏梦模块时顺带提到的"清理print,统一用logging"这个小问题,陈铭觉得虽然优先级不高,但既然当晚有空,不如一起处理掉,顺便也给团队定一份统一的日志规范,避免以后每个人各自配置一套logging参数,又变成新的一处"各自为战"。
+
+**重构前:裸用print(),且各模块自行其是**
+
+```python
+# ============================================================
+# 文件:backend/app/services/rag/rerank_service.py (重构前,片段)
+# 问题:关键运行信息直接print(),无法分级、无法集中收集
+# ============================================================
+from sentence_transformers import CrossEncoder
+
+
+class BasicRetriever:
+    def __init__(self, vectorstore, bm25_retriever):
+        self.vectorstore = vectorstore
+        self.bm25_retriever = bm25_retriever
+        print("正在加载bge-reranker-large模型……")  # 生产环境里完全找不到这条记录
+        self.reranker = CrossEncoder("BAAI/bge-reranker-large", max_length=512)
+
+
+# ============================================================
+# 文件:backend/app/api/v1/knowledge.py (重构前,片段)
+# 问题:出错时用print()记录,还有的地方干脆什么都不记录
+# ============================================================
+
+async def upload_document(file):
+    try:
+        content = await file.read()
+        # ... 处理逻辑 ...
+    except Exception as e:
+        print(f"上传失败: {e}")  # 只会打印到控制台,服务器重启后这条记录就彻底消失
+        raise
+
+
+# ============================================================
+# 文件:backend/app/eval/tuning_experiment.py (重构前,片段)
+# 问题:实验脚本里用print()输出进度,格式还和其他模块不统一
+# ============================================================
+
+def run_retrieval_experiment(vectorstore, questions):
+    results = []
+    for i, q in enumerate(questions):
+        print(f"[{i+1}/{len(questions)}] 正在处理: {q}")  # 没有时间戳,没有级别
+        docs = vectorstore.similarity_search(q, k=5)
+        results.append(docs)
+    return results
+```
+
+**重构后:统一日志配置模块,所有模块通过`get_logger()`获取带命名空间的logger**
+
+```python
+# ============================================================
+# 文件:backend/app/core/logging_config.py (新增,重构后)
+# ============================================================
+"""苍穹平台统一日志配置模块。
+
+设计动机(Day38晚自习补充):
+    评审会上老王提到,项目里散落着不少直接调用print()记录运行信息的代码,
+    这类信息在本地调试时够用,但一旦部署到生产环境,既无法按级别筛选
+    (调试信息、警告、错误混在一起),也无法方便地集中收集、检索、
+    对接告警系统。本模块统一配置日志格式、级别、输出目标,
+    所有业务模块通过get_logger(__name__)获取logger,不再使用print()。
+"""
+from __future__ import annotations
+
+import logging
+import logging.handlers
+import sys
+from pathlib import Path
+
+LOG_FORMAT = (
+    "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+)
+LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+_configured = False
+
+
+def configure_logging(
+    level: int = logging.INFO,
+    log_dir: str | Path = "logs",
+    enable_file_log: bool = True,
+) -> None:
+    """初始化苍穹平台的全局日志配置,应在应用启动时(main.py)调用一次。
+
+    参数说明:
+        level: 全局最低日志级别,生产环境建议INFO,调试时可临时调整为DEBUG。
+        log_dir: 日志文件输出目录,不存在会自动创建。
+        enable_file_log: 是否同时写入文件(便于集中收集/后续接入ELK等系统),
+            单元测试等场景可以关闭,避免测试运行时产生大量日志文件。
+    """
+    global _configured
+    if _configured:
+        # 避免因为多次调用(比如测试框架多次import)导致handler重复叠加,
+        # 重复叠加会让同一条日志被打印多次,是一个非常容易被忽视的坑。
+        return
+
+    root_logger = logging.getLogger("cangqiong")
+    root_logger.setLevel(level)
+
+    formatter = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+
+    if enable_file_log:
+        log_path = Path(log_dir)
+        log_path.mkdir(parents=True, exist_ok=True)
+        # 使用按天轮转的文件handler,避免单个日志文件无限增长,
+        # 保留最近30天的日志,兼顾问题排查与磁盘空间占用。
+        file_handler = logging.handlers.TimedRotatingFileHandler(
+            log_path / "cangqiong.log",
+            when="midnight",
+            backupCount=30,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+
+    _configured = True
+
+
+def get_logger(module_name: str) -> logging.Logger:
+    """获取带命名空间的logger,统一挂在'cangqiong'根logger之下。
+
+    使用方式:在任意模块顶部写 `logger = get_logger(__name__)`,
+    这样每条日志都会自动带上模块路径,方便定位是哪个文件打印的日志,
+    比裸print()完全没有来源信息要好排查得多。
+    """
+    if not module_name.startswith("cangqiong"):
+        module_name = f"cangqiong.{module_name}"
+    return logging.getLogger(module_name)
+```
+
+```python
+# ============================================================
+# 文件:backend/app/services/rag/rerank_service.py (最终版,片段)
+# ============================================================
+from app.core.logging_config import get_logger
+
+logger = get_logger(__name__)
+
+
+class BasicRetriever:
+    def __init__(self, vectorstore, bm25_retriever):
+        self.vectorstore = vectorstore
+        self.bm25_retriever = bm25_retriever
+        logger.info("正在加载bge-reranker-large模型……")
+        self.reranker = CrossEncoder("BAAI/bge-reranker-large", max_length=512)
+
+
+# ============================================================
+# 文件:backend/app/api/v1/knowledge.py (最终版,片段)
+# ============================================================
+from app.core.logging_config import get_logger
+
+logger = get_logger(__name__)
+
+
+async def upload_document(file):
+    try:
+        content = await file.read()
+        # ... 处理逻辑 ...
+    except Exception:
+        # logger.exception会自动附带完整堆栈信息,写入日志文件后
+        # 即使服务器重启,也能通过日志文件回溯当时发生了什么,
+        # 这一点是print()完全做不到的。
+        logger.exception("文档上传处理失败")
+        raise
+```
+
+老王第二天早上看到这段重构提交时,补了一句评价发在群里:"这个不是我今天要求的,但你们主动补上了,说明你们真的把‘这是团队共同的坑,不是我一个人的事’这句话听进去了。日志这件事,别看它不起眼,真正出线上问题排查故障的时候,一份结构清晰、级别分明的日志,能帮你把排查时间从几个小时压缩到几分钟,这不是夸张。"
+
+### 代码质量自动检查脚本(呼应"提前用工具挡住问题"的思路)
+
+陈铭把赵磊那句"这两件事不一样"记在心里,决定把今天评审会上暴露出来的四类问题——重复代码、硬编码魔法数字、异常处理不完整、裸用print()——尽量写成能自动扫描的检查规则,虽然不可能覆盖代码评审能发现的所有问题(比如"两份Prompt模板悄悄漂移"这种需要理解业务语义的问题,工具很难自动识别),但至少能把"机械性、模式化"的那部分问题挡在提交之前,让评审会有更多时间聚焦在真正需要人来判断的架构性问题上。
+
+```python
+# ============================================================
+# 文件:backend/scripts/code_quality_checker.py (新增)
+# 说明:静态扫描Python源码,识别今天评审会上暴露的几类典型问题模式,
+#       可以作为pre-commit钩子或CI流水线的一个检查步骤接入。
+# ============================================================
+"""苍穹平台代码质量自动检查脚本。
+
+覆盖的检查规则(直接对应Day38代码评审会的四类问题):
+    1. 裸用print()调试语句(应使用logging模块)。
+    2. 可疑的魔法数字(数值直接出现在代码里,且出现次数较多)。
+    3. 过于宽泛的except子句缺少日志记录(可能"悄悄吞掉"异常)。
+    4. 疑似重复的函数体(简单的文本相似度启发式,用于提示"可能需要抽取公共逻辑",
+       不追求100%准确,只作为线索提示,最终仍需要人工判断)。
+
+用法:
+    python scripts/code_quality_checker.py backend/app
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+import sys
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from difflib import SequenceMatcher
+from pathlib import Path
+from typing import List
+
+
+@dataclass
+class QualityIssue:
+    """单条代码质量问题记录。"""
+
+    file_path: str
+    line_number: int
+    rule: str
+    message: str
+    severity: str = "warning"  # "warning" 或 "error"
+
+
+@dataclass
+class QualityReport:
+    """整个扫描过程的问题汇总。"""
+
+    issues: List[QualityIssue] = field(default_factory=list)
+
+    def add(self, issue: QualityIssue) -> None:
+        self.issues.append(issue)
+
+    @property
+    def error_count(self) -> int:
+        return sum(1 for i in self.issues if i.severity == "error")
+
+    @property
+    def warning_count(self) -> int:
+        return sum(1 for i in self.issues if i.severity == "warning")
+
+    def print_report(self) -> None:
+        print("=" * 70)
+        print("苍穹平台代码质量自动检查报告")
+        print("=" * 70)
+        if not self.issues:
+            print("未发现问题,代码质量检查通过。")
+            return
+        by_file: dict[str, list[QualityIssue]] = defaultdict(list)
+        for issue in self.issues:
+            by_file[issue.file_path].append(issue)
+        for file_path, file_issues in sorted(by_file.items()):
+            print(f"\n文件: {file_path}")
+            for issue in sorted(file_issues, key=lambda i: i.line_number):
+                flag = "[错误]" if issue.severity == "error" else "[警告]"
+                print(f"  {flag} 第{issue.line_number}行 [{issue.rule}] {issue.message}")
+        print("-" * 70)
+        print(f"共发现 {self.error_count} 个错误、{self.warning_count} 个警告。")
+
+
+class PrintStatementChecker(ast.NodeVisitor):
+    """检测裸用print()的调试语句(排除位于if __name__ == '__main__'块内的CLI输出)。"""
+
+    def __init__(self, file_path: str, report: QualityReport):
+        self.file_path = file_path
+        self.report = report
+        self._in_main_guard_depth = 0
+
+    def visit_If(self, node: ast.If) -> None:
+        is_main_guard = (
+            isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "__name__"
+        )
+        if is_main_guard:
+            self._in_main_guard_depth += 1
+            self.generic_visit(node)
+            self._in_main_guard_depth -= 1
+        else:
+            self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "print"
+            and self._in_main_guard_depth == 0
+        ):
+            self.report.add(
+                QualityIssue(
+                    file_path=self.file_path,
+                    line_number=node.lineno,
+                    rule="NO-PRINT",
+                    message="业务代码中使用了print(),建议改用logging模块记录",
+                    severity="warning",
+                )
+            )
+        self.generic_visit(node)
+
+
+class MagicNumberChecker(ast.NodeVisitor):
+    """检测同一个数字常量在文件内多次出现的情况(魔法数字重复出现的信号)。"""
+
+    # 这些数值在绝大多数场景下都是安全的"结构性常量",不需要提示,
+    # 避免检查规则过于敏感,产生大量无意义的噪音警告。
+    SAFE_NUMBERS = {0, 1, -1, 2, 100}
+
+    def __init__(self, file_path: str, report: QualityReport):
+        self.file_path = file_path
+        self.report = report
+        self._occurrences: Counter = Counter()
+        self._first_lineno: dict = {}
+
+    def visit_Constant(self, node: ast.Constant) -> None:
+        if isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+            if node.value not in self.SAFE_NUMBERS:
+                self._occurrences[node.value] += 1
+                self._first_lineno.setdefault(node.value, node.lineno)
+        self.generic_visit(node)
+
+    def finalize(self, threshold: int = 3) -> None:
+        """扫描完成后调用,把出现次数超过阈值的数字记为问题。"""
+        for value, count in self._occurrences.items():
+            if count >= threshold:
+                self.report.add(
+                    QualityIssue(
+                        file_path=self.file_path,
+                        line_number=self._first_lineno[value],
+                        rule="MAGIC-NUMBER",
+                        message=(
+                            f"数字 {value} 在本文件中直接出现了{count}次,"
+                            "建议提取为具名常量或加入统一配置类"
+                        ),
+                        severity="warning",
+                    )
+                )
+
+
+class BroadExceptChecker(ast.NodeVisitor):
+    """检测捕获Exception/BaseException但函数体内没有任何日志记录调用的情况。"""
+
+    def __init__(self, file_path: str, report: QualityReport):
+        self.file_path = file_path
+        self.report = report
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        is_broad = (
+            node.type is not None
+            and isinstance(node.type, ast.Name)
+            and node.type.id in {"Exception", "BaseException"}
+        )
+        if is_broad:
+            has_logging_call = any(
+                self._is_logging_call(child) for child in ast.walk(node)
+            )
+            if not has_logging_call:
+                self.report.add(
+                    QualityIssue(
+                        file_path=self.file_path,
+                        line_number=node.lineno,
+                        rule="SILENT-BROAD-EXCEPT",
+                        message=(
+                            "捕获了范围过宽的Exception,但未发现任何日志记录调用,"
+                            "异常可能被静默吞掉,建议至少记录一条日志"
+                        ),
+                        severity="error",
+                    )
+                )
+        self.generic_visit(node)
+
+    @staticmethod
+    def _is_logging_call(node: ast.AST) -> bool:
+        if not isinstance(node, ast.Call):
+            return False
+        func = node.func
+        if isinstance(func, ast.Attribute):
+            return func.attr in {
+                "debug", "info", "warning", "error", "exception", "critical",
+            }
+        return False
+
+
+def _function_signature_text(func_node: ast.FunctionDef) -> str:
+    """将函数体转换为可比较的文本(去除具体变量名差异的影响有限,
+    仅作为启发式相似度比较的输入,不追求语义级别的等价判断)。"""
+    return ast.dump(func_node)
+
+
+def find_similar_functions(
+    tree: ast.Module, file_path: str, report: QualityReport, similarity_threshold: float = 0.85
+) -> None:
+    """在单个文件内,寻找函数体结构高度相似的函数对,提示可能存在重复逻辑。
+
+    注意:这只是一个启发式线索,真正的重复代码判断(比如今天评审会上
+    发现的三处Rerank逻辑分布在三个不同文件里)往往需要跨文件比较,
+    以及结合业务语义的人工判断,本函数只做最基础的同文件内提示。
+    """
+    functions = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+    for i in range(len(functions)):
+        for j in range(i + 1, len(functions)):
+            f1, f2 = functions[i], functions[j]
+            if f1.name == f2.name:
+                continue
+            text1 = _function_signature_text(f1)
+            text2 = _function_signature_text(f2)
+            ratio = SequenceMatcher(None, text1, text2).ratio()
+            if ratio >= similarity_threshold:
+                report.add(
+                    QualityIssue(
+                        file_path=file_path,
+                        line_number=f2.lineno,
+                        rule="POSSIBLE-DUPLICATE",
+                        message=(
+                            f"函数'{f2.name}'与函数'{f1.name}'"
+                            f"(第{f1.lineno}行)结构相似度达{ratio:.0%},"
+                            "建议检查是否存在可抽取的重复逻辑"
+                        ),
+                        severity="warning",
+                    )
+                )
+
+
+def check_file(file_path: Path, report: QualityReport) -> None:
+    """对单个Python文件执行全部检查规则。"""
+    try:
+        source = file_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(file_path))
+    except SyntaxError as exc:
+        report.add(
+            QualityIssue(
+                file_path=str(file_path),
+                line_number=exc.lineno or 0,
+                rule="SYNTAX-ERROR",
+                message=f"文件存在语法错误,无法完成静态分析: {exc.msg}",
+                severity="error",
+            )
+        )
+        return
+
+    rel_path = str(file_path)
+
+    print_checker = PrintStatementChecker(rel_path, report)
+    print_checker.visit(tree)
+
+    magic_checker = MagicNumberChecker(rel_path, report)
+    magic_checker.visit(tree)
+    magic_checker.finalize()
+
+    except_checker = BroadExceptChecker(rel_path, report)
+    except_checker.visit(tree)
+
+    find_similar_functions(tree, rel_path, report)
+
+
+def run_quality_check(target_dir: str | Path) -> QualityReport:
+    """对目标目录下所有.py文件递归执行代码质量检查。"""
+    report = QualityReport()
+    target_path = Path(target_dir)
+    for py_file in sorted(target_path.rglob("*.py")):
+        # 跳过测试文件和第三方虚拟环境目录,这两类文件不属于本次检查范畴。
+        if "test" in py_file.stem.lower() or "venv" in py_file.parts:
+            continue
+        check_file(py_file, report)
+    return report
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="苍穹平台代码质量自动检查工具")
+    parser.add_argument("target_dir", help="要扫描的目录路径")
+    parser.add_argument(
+        "--fail-on-error", action="store_true",
+        help="如果发现severity=error级别的问题,以非零状态码退出(适合接入CI)",
+    )
+    args = parser.parse_args()
+
+    report = run_quality_check(args.target_dir)
+    report.print_report()
+
+    if args.fail_on_error and report.error_count > 0:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+陈铭把这份脚本第二天一早拿去扫了一遍重构前的旧版本代码(他特意从Git历史里checkout出了评审会之前的那个commit),扫描结果准确地标出了三处Rerank服务里数字`5`、`3`、`10`各自出现的位置,以及张凡那份调优实验脚本里`500`出现七次的记录——这让他多了一分底气,把这份脚本的运行结果截图发到了团队群里,老王回复了一句:"不错,这才是真正把‘今天挨的批’转化成了团队资产的做法。以后新同学入职,不需要我把今天这堂课再重新讲一遍,直接跑一下这个脚本,很多问题在他自己写完代码的当下就能看到提示。"
+
+老王后来又追加了一个建议:光是能在本地跑,还不够方便团队所有人共享检查结果,最好能把扫描结果导出成一份Markdown报告,附在每次代码评审的会议记录里,方便日后追溯"这个模块在被评审的当天,自动化检查到底发现了哪些问题"。陈铭觉得这个建议很实际,当晚又给检查脚本补了一个导出报告的小工具。
+
+```python
+# ============================================================
+# 文件:backend/scripts/export_quality_report.py (新增)
+# 说明:在code_quality_checker.py的基础上,补充一个将扫描结果导出为
+#       Markdown格式报告的工具,便于归档到每次代码评审的会议记录里。
+# ============================================================
+"""代码质量检查结果导出工具。
+
+用法:
+    python scripts/export_quality_report.py backend/app --output report.md
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+from pathlib import Path
+
+from code_quality_checker import QualityReport, run_quality_check
+
+
+def render_markdown_report(report: QualityReport, target_dir: str) -> str:
+    """将QualityReport渲染成便于归档、便于在飞书/GitLab里直接粘贴查看的Markdown文本。"""
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines = [
+        f"# 苍穹平台代码质量检查报告",
+        "",
+        f"- 扫描目录: `{target_dir}`",
+        f"- 扫描时间: {now}",
+        f"- 错误数: {report.error_count}",
+        f"- 警告数: {report.warning_count}",
+        "",
+    ]
+    if not report.issues:
+        lines.append("本次扫描未发现任何问题。")
+        return "\n".join(lines)
+
+    lines.append("| 文件 | 行号 | 规则 | 级别 | 说明 |")
+    lines.append("|---|---|---|---|---|")
+    for issue in sorted(report.issues, key=lambda i: (i.file_path, i.line_number)):
+        severity_label = "错误" if issue.severity == "error" else "警告"
+        lines.append(
+            f"| `{issue.file_path}` | {issue.line_number} | {issue.rule} "
+            f"| {severity_label} | {issue.message} |"
+        )
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="导出代码质量检查Markdown报告")
+    parser.add_argument("target_dir", help="要扫描的目录路径")
+    parser.add_argument("--output", default="quality_report.md", help="报告输出路径")
+    args = parser.parse_args()
+
+    report = run_quality_check(args.target_dir)
+    markdown_text = render_markdown_report(report, args.target_dir)
+    output_path = Path(args.output)
+    output_path.write_text(markdown_text, encoding="utf-8")
+    print(f"报告已导出至: {output_path.resolve()}")
+    return 1 if report.error_count > 0 else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+这份导出工具后来被林悦要了过去,加进了《苍穹项目评审规范v1.0》的附录里,规定"团队今后每次代码评审会前,评审对象所在的模块必须先跑一遍这份质量检查并导出报告,评审会开始前发到评审群里"——这样评审会上讨论的问题,就不再局限于评审人临时肉眼发现的内容,还包括了工具提前扫描出来的、更全面的问题清单,评审效率和覆盖面都比今天这场"纯人工"的评审会有所提升。
+
+```python
+# ============================================================
+# 文件:backend/tests/test_code_quality_checker.py (新增)
+# 说明:为代码质量检查脚本本身补充测试,确保这套"用来检查别人代码"的
+#       工具自身的判断逻辑是可靠的——如果检查工具本身有bug,
+#       可能会漏报真实问题,或者误报大量根本不存在的问题,
+#       两种情况都会削弱团队对这套工具的信任。
+# ============================================================
+import ast
+
+import pytest
+
+from backend.scripts.code_quality_checker import (
+    MagicNumberChecker,
+    PrintStatementChecker,
+    QualityReport,
+)
+
+
+class TestPrintStatementChecker:
+    def test_detects_print_in_business_code(self):
+        source = "def foo():\n    print('debug')\n"
+        tree = ast.parse(source)
+        report = QualityReport()
+        PrintStatementChecker("fake.py", report).visit(tree)
+        assert any(issue.rule == "NO-PRINT" for issue in report.issues)
+
+    def test_ignores_print_inside_main_guard(self):
+        source = (
+            "def foo():\n    pass\n\n"
+            "if __name__ == '__main__':\n    print('cli output')\n"
+        )
+        tree = ast.parse(source)
+        report = QualityReport()
+        PrintStatementChecker("fake.py", report).visit(tree)
+        assert not any(issue.rule == "NO-PRINT" for issue in report.issues)
+
+
+class TestMagicNumberChecker:
+    def test_flags_repeated_magic_number(self):
+        source = "a = 500\nb = 500\nc = 500\n"
+        tree = ast.parse(source)
+        report = QualityReport()
+        checker = MagicNumberChecker("fake.py", report)
+        checker.visit(tree)
+        checker.finalize(threshold=3)
+        assert any(issue.rule == "MAGIC-NUMBER" for issue in report.issues)
+
+    def test_does_not_flag_safe_numbers(self):
+        source = "a = 0\nb = 1\nc = 100\n"
+        tree = ast.parse(source)
+        report = QualityReport()
+        checker = MagicNumberChecker("fake.py", report)
+        checker.visit(tree)
+        checker.finalize(threshold=2)
+        assert not any(issue.rule == "MAGIC-NUMBER" for issue in report.issues)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+```
+
+### 补充:四项重构模块的单元测试(呼应"重构必须配套单元测试"的团队新规范)
+
+老王在晚自习总结时表扬陈铭"重构完成后主动为RerankService补了单元测试"这个习惯,张凡听完之后,主动提议把苏梦、韩露、张凡各自负责重构的三个模块(统一异常体系、PromptManager、RAGSettings)也一并补上单元测试,不能只有陈铭一个人的模块有测试保护。当晚十点多,四个人分头把各自的测试补完,合并成了下面这份完整的测试文件。
+
+```python
+# ============================================================
+# 文件:backend/tests/test_day38_refactoring.py (新增)
+# 说明:覆盖Day38代码评审会四项重构任务对应模块的核心逻辑,
+#       确保重构后的行为符合预期,后续任何人修改这几个模块,
+#       跑一下这份测试就能快速知道有没有破坏原有行为。
+# ============================================================
+"""Day38重构模块单元测试套件。
+
+覆盖范围:
+    1. RerankService —— 空候选、全部低于阈值触发兜底、正常重排序三种场景。
+    2. PromptManager —— 版本渲染、未知版本报错、兜底话术获取。
+    3. 自定义异常体系与handle_api_errors装饰器 —— 各类异常转换是否正确。
+    4. RAGSettings —— 默认值、环境变量覆盖是否生效。
+"""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+
+# ---------------------------------------------------------------
+# 以下为被测模块的简化版实现,便于本测试文件独立运行、不依赖
+# 真实的sentence_transformers、pydantic_settings等重量级依赖,
+# 与正文中backend/app/下的完整实现保持逻辑一致。
+# ---------------------------------------------------------------
+
+@dataclass
+class FakeDocument:
+    """简化版Document,只保留测试需要用到的page_content字段。"""
+
+    page_content: str
+
+
+class FakeRerankService:
+    """RerankService的可测试简化版本,行为与正文实现保持一致。"""
+
+    def __init__(self, model, default_top_n=5, score_threshold=0.5):
+        self._model = model
+        self._default_top_n = default_top_n
+        self._score_threshold = score_threshold
+
+    def rerank(self, query, candidates, top_n=None, score_threshold=None):
+        if not candidates:
+            return []
+        effective_top_n = top_n if top_n is not None else self._default_top_n
+        effective_threshold = (
+            score_threshold if score_threshold is not None else self._score_threshold
+        )
+        pairs = [(query, doc.page_content) for doc in candidates]
+        raw_scores = self._model.predict(pairs)
+        scored = sorted(
+            zip(candidates, raw_scores), key=lambda x: x[1], reverse=True
+        )
+        filtered = [(doc, s) for doc, s in scored if s >= effective_threshold]
+        if not filtered and scored:
+            filtered = [scored[0]]
+        return [doc for doc, _ in filtered[:effective_top_n]]
+
+
+class TestRerankService:
+    """对应重构案例一:RerankService。"""
+
+    def test_empty_candidates_returns_empty_list(self):
+        """空候选列表应直接返回空列表,不应该调用底层模型。"""
+        fake_model = MagicMock()
+        service = FakeRerankService(model=fake_model)
+        result = service.rerank("任意问题", [])
+        assert result == []
+        fake_model.predict.assert_not_called()
+
+    def test_all_below_threshold_triggers_fallback(self):
+        """当全部候选分数都低于阈值时,应保留最高分的一条作为兜底,而不是返回空列表。"""
+        fake_model = MagicMock()
+        fake_model.predict.return_value = [0.1, 0.2, 0.15]
+        docs = [FakeDocument(f"文档{i}") for i in range(3)]
+        service = FakeRerankService(model=fake_model, score_threshold=0.5)
+        result = service.rerank("任意问题", docs)
+        assert len(result) == 1
+        assert result[0].page_content == "文档1"  # 分数0.2最高
+
+    def test_normal_rerank_returns_sorted_top_n(self):
+        """正常场景下,应按分数降序返回前top_n条结果。"""
+        fake_model = MagicMock()
+        fake_model.predict.return_value = [0.9, 0.6, 0.95, 0.7]
+        docs = [FakeDocument(f"文档{i}") for i in range(4)]
+        service = FakeRerankService(model=fake_model, default_top_n=2, score_threshold=0.5)
+        result = service.rerank("任意问题", docs)
+        assert len(result) == 2
+        assert result[0].page_content == "文档2"  # 0.95分,最高
+        assert result[1].page_content == "文档0"  # 0.9分,次高
+
+    def test_explicit_top_n_overrides_default(self):
+        """显式传入top_n应覆盖默认值,验证eval场景使用更大候选范围的需求。"""
+        fake_model = MagicMock()
+        fake_model.predict.return_value = [0.9, 0.8, 0.7, 0.6, 0.5]
+        docs = [FakeDocument(f"文档{i}") for i in range(5)]
+        service = FakeRerankService(model=fake_model, default_top_n=2)
+        result = service.rerank("任意问题", docs, top_n=4)
+        assert len(result) == 4
+
+
+class FakePromptManager:
+    """PromptManager的可测试简化版本。"""
+
+    def __init__(self, config: dict):
+        self._config = config
+
+    def render_rag_prompt(self, context, question, version=None):
+        target_version = version or self._config["active_version"]
+        templates = self._config.get("templates", {})
+        if target_version not in templates:
+            raise KeyError(
+                f"Prompt模板版本'{target_version}'不存在,"
+                f"当前可用版本:{list(templates.keys())}"
+            )
+        template = templates[target_version]
+        system_prompt = template["system"].strip()
+        user_prompt = template["body"].format(context=context, question=question)
+        return system_prompt, user_prompt
+
+    def get_fallback_message(self, key):
+        fallback = self._config.get("fallback", {})
+        return fallback.get(key, "抱歉,暂时无法处理该问题。")
+
+
+class TestPromptManager:
+    """对应重构案例二:PromptManager。"""
+
+    @pytest.fixture
+    def sample_config(self):
+        return {
+            "active_version": "v2",
+            "templates": {
+                "v1": {"system": "系统提示v1", "body": "资料:{context}\n问题:{question}"},
+                "v2": {"system": "系统提示v2", "body": "上下文:{context}\n用户问题:{question}"},
+            },
+            "fallback": {"no_context_found": "未找到相关信息,请咨询相关部门。"},
+        }
+
+    def test_render_default_active_version(self, sample_config):
+        """不指定version时,应使用配置中active_version指定的版本。"""
+        manager = FakePromptManager(sample_config)
+        system, user = manager.render_rag_prompt("某资料", "某问题")
+        assert system == "系统提示v2"
+        assert "某资料" in user and "某问题" in user
+
+    def test_render_explicit_version(self, sample_config):
+        """显式指定version时,应使用指定版本,不受active_version影响,支持A/B测试场景。"""
+        manager = FakePromptManager(sample_config)
+        system, _ = manager.render_rag_prompt("资料", "问题", version="v1")
+        assert system == "系统提示v1"
+
+    def test_render_unknown_version_raises_error(self, sample_config):
+        """请求不存在的版本时,应明确抛出异常,而不是静默返回错误结果。"""
+        manager = FakePromptManager(sample_config)
+        with pytest.raises(KeyError):
+            manager.render_rag_prompt("资料", "问题", version="v99")
+
+    def test_get_fallback_message_known_key(self, sample_config):
+        manager = FakePromptManager(sample_config)
+        message = manager.get_fallback_message("no_context_found")
+        assert "未找到相关信息" in message
+
+    def test_get_fallback_message_unknown_key_returns_generic_text(self, sample_config):
+        """请求未定义的兜底话术key时,应返回一个通用的兜底提示,而不是抛异常。"""
+        manager = FakePromptManager(sample_config)
+        message = manager.get_fallback_message("some_undefined_key")
+        assert message == "抱歉,暂时无法处理该问题。"
+
+
+class CangqiongBaseExceptionForTest(Exception):
+    """测试用的业务异常基类,行为与正文中的CangqiongBaseException保持一致。"""
+
+    status_code = 500
+    error_code = "INTERNAL_ERROR"
+
+
+class EmbeddingTimeoutForTest(CangqiongBaseExceptionForTest):
+    status_code = 503
+    error_code = "EMBEDDING_TIMEOUT"
+
+
+def fake_handle_api_errors(func):
+    """simplified版本的handle_api_errors装饰器,用于验证异常转换逻辑本身。"""
+    import functools
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except TimeoutError as exc:
+            raise EmbeddingTimeoutForTest() from exc
+        except CangqiongBaseExceptionForTest:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise CangqiongBaseExceptionForTest() from exc
+
+    return wrapper
+
+
+class TestExceptionHandling:
+    """对应重构案例三:统一异常处理体系。"""
+
+    def test_timeout_error_converted_to_business_exception(self):
+        """底层TimeoutError应被转换为业务语义明确的EmbeddingTimeoutForTest。"""
+
+        @fake_handle_api_errors
+        def call_embedding_service():
+            raise TimeoutError("connection timed out")
+
+        with pytest.raises(EmbeddingTimeoutForTest) as exc_info:
+            call_embedding_service()
+        assert exc_info.value.error_code == "EMBEDDING_TIMEOUT"
+
+    def test_business_exception_passthrough_unchanged(self):
+        """已经是业务异常的情况,应原样向上抛出,不应被再次包装。"""
+
+        @fake_handle_api_errors
+        def call_with_known_business_error():
+            raise EmbeddingTimeoutForTest()
+
+        with pytest.raises(EmbeddingTimeoutForTest):
+            call_with_known_business_error()
+
+    def test_unexpected_exception_falls_back_to_generic_error(self):
+        """完全未预料到的异常类型,应被兜底转换为通用业务异常,而不是原样抛出。"""
+
+        @fake_handle_api_errors
+        def call_with_unexpected_error():
+            raise ValueError("某种没有被专门处理过的错误")
+
+        with pytest.raises(CangqiongBaseExceptionForTest) as exc_info:
+            call_with_unexpected_error()
+        assert exc_info.value.error_code == "INTERNAL_ERROR"
+
+
+class FakeRAGSettings:
+    """RAGSettings的可测试简化版本,模拟环境变量覆盖的行为。"""
+
+    def __init__(self, env: dict | None = None):
+        env = env or {}
+        self.chunk_size = int(env.get("RAG_CHUNK_SIZE", 500))
+        self.rrf_k = int(env.get("RAG_RRF_K", 60))
+        self.rerank_default_top_n = int(env.get("RAG_RERANK_DEFAULT_TOP_N", 5))
+        self.eval_candidate_top_n = int(env.get("RAG_EVAL_CANDIDATE_TOP_N", 20))
+
+
+class TestRAGSettings:
+    """对应重构案例四:RAGSettings集中配置。"""
+
+    def test_default_values_match_original_hardcoded_numbers(self):
+        """重构后的默认值应与重构前散落各处的硬编码数值保持一致,
+        确保重构本身不引入行为变化,只是把参数来源集中化。"""
+        settings = FakeRAGSettings()
+        assert settings.chunk_size == 500
+        assert settings.rrf_k == 60
+        assert settings.rerank_default_top_n == 5
+
+    def test_env_var_overrides_default_chunk_size(self):
+        """通过环境变量覆盖chunk_size,验证配置化带来的灵活性。"""
+        settings = FakeRAGSettings(env={"RAG_CHUNK_SIZE": "600"})
+        assert settings.chunk_size == 600
+
+    def test_eval_candidate_top_n_differs_from_production_default(self):
+        """验证评估场景使用的候选数量,合理地大于生产环境的重排序默认值,
+        这是"显式声明的差异化"而不是"意外的不一致"。"""
+        settings = FakeRAGSettings()
+        assert settings.eval_candidate_top_n > settings.rerank_default_top_n
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+```
+
+四个人分头跑完这份合并后的测试文件,全部用例一次性通过。张凡在群里感慨了一句:"以前觉得写测试是‘测试工程师的事’,今天补完这几个用例才发现,写测试其实是在帮‘未来的自己’——如果哪天我不小心把`eval_candidate_top_n`默认值改错了,这份测试会在几秒钟内告诉我,而不是等评估报告跑出一个奇怪的数字之后,再花半天时间去猜哪里出了问题。"赵磊在旁边补了一句总结,把上午测试视角和下午评审视角彻底串了起来:"这就是我一直说的——好的测试、好的代码评审、好的验收标准,本质上都是同一件事的不同形态:提前发现问题,而不是等它变成事故。"
+
 ---
 
 ## 今日复盘
