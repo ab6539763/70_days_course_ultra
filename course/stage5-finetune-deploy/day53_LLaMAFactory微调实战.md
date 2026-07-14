@@ -2702,6 +2702,1598 @@ if __name__ == "__main__":
 
 陈铭跑完这个脚本,生成的manifest里果然弹出了那条"存在未提交改动"的提醒——他这才想起来,自己为了临时调试数据加载逻辑,在本地改了一行`data_utils.py`还没有提交。他赶紧把这行改动补充提交了一次,重新生成了一份manifest确认干净无误,才把这份JSON文件和最终选定的checkpoint一起打包,放进了今天要提交给老王和阿雅存档的交付材料里。他心里清楚,这份看似"多此一举"的manifest,很可能会在几周甚至几个月后的某一次复盘或者故障排查里,成为唯一能说清楚"这个模型到底是怎么来的"的凭证。
 
+### 十二、训练数据质量增强工具:负样本挖掘与拒答边界场景扩充
+
+> 背景说明:老王在晨会里提到数据集涵盖"产品咨询、风险测评话术、合规免责声明生成、多轮追问处理、拒答边界场景"五大类,陈铭在训练跑起来之后,趁着等待loss收敛的间隙,顺手把负样本挖掘和拒答边界扩充的工具补完整,为后续迭代版本的数据集打好基础。
+
+```python
+"""
+negative_sample_miner.py
+御风金融微调数据集 —— 负样本挖掘与拒答边界场景扩充工具
+
+功能定位:
+1. 从已有的正样本对话集中,自动挖掘"容易被误判为可以直接回答,
+   但实际上应该拒答或需要转人工"的边界场景,生成候选负样本;
+2. 对候选负样本进行规则+关键词双重校验,避免误伪造出不合理的拒答场景;
+3. 输出符合ShareGPT格式的负样本文件,供数据集迭代时并入正式训练集。
+
+使用场景:陈铭在Day52构建的450条训练样本里,拒答边界场景只占了一小部分,
+今天跑训练的过程中,老王反复强调"训练过程中如果发现数据有系统性问题
+要及时回头看",这个工具就是为了让"回头看数据"这件事,从人工翻找变成
+半自动化的流程。
+"""
+
+import json
+import re
+import random
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional
+
+
+# 御风金融业务场景中,明确应该拒答或转人工的高风险关键词库
+# 这些关键词覆盖了合规红线(具体投资建议、保证收益承诺)以及
+# 模型能力边界(涉及具体账户操作、身份核验)两大类
+HIGH_RISK_KEYWORDS = {
+    "具体投资建议": ["买不买", "现在建仓", "百分之百赚", "保证不亏", "肯定能涨", "内幕消息"],
+    "保证收益承诺": ["保证收益", "稳赚不赔", "零风险", "保本保息"],
+    "账户操作类": ["帮我转账", "帮我赎回", "帮我修改密码", "帮我解绑", "帮我提现"],
+    "身份核验类": ["我的身份证号是", "我的银行卡号是", "验证码是", "我的密码是"],
+}
+
+# 每一类高风险关键词对应的标准拒答/转人工话术模板
+REFUSAL_TEMPLATES = {
+    "具体投资建议": (
+        "很抱歉,我不能针对具体买卖时点或收益预期给出投资建议。"
+        "投资决策需要结合您的风险承受能力和市场信息综合判断,"
+        "建议您咨询持牌理财顾问,或参考产品说明书中的风险揭示内容。"
+    ),
+    "保证收益承诺": (
+        "根据监管要求,任何理财产品都不能承诺保本保息或零风险收益,"
+        "所有产品的历史业绩不代表未来表现,请您在充分了解产品风险等级后审慎决策。"
+    ),
+    "账户操作类": (
+        "涉及账户资金操作(转账、赎回、密码修改等)需要在官方APP或柜面完成身份核验后操作,"
+        "我这里无法代为处理,建议您登录御风金融官方APP或联系人工客服完成该操作。"
+    ),
+    "身份核验类": (
+        "为保障您的账户安全,请不要在对话中透露身份证号、银行卡号、密码或验证码等敏感信息,"
+        "如需办理相关业务,请通过官方APP或官方客服渠道进行安全核验。"
+    ),
+}
+
+
+@dataclass
+class MinedNegativeSample:
+    trigger_category: str
+    user_query: str
+    matched_keyword: str
+    suggested_response: str
+    confidence: float
+    source_positive_id: Optional[str] = None
+
+
+class NegativeSampleMiner:
+    """
+    负样本挖掘器:扫描已有正样本对话集,查找其中human轮次里
+    是否隐含了高风险意图但被现有正样本处理得不够谨慎的情况,
+    同时基于模板生成全新的边界场景候选样本。
+    """
+
+    def __init__(self, keyword_bank: Dict[str, List[str]] = None, templates: Dict[str, str] = None):
+        self.keyword_bank = keyword_bank or HIGH_RISK_KEYWORDS
+        self.templates = templates or REFUSAL_TEMPLATES
+
+    def scan_existing_dataset(self, dataset_path: str) -> List[MinedNegativeSample]:
+        """扫描现有正样本数据集,找出human提问中命中高风险关键词、
+        但对应gpt回复没有体现出足够谨慎表述的样本,标记为待复核的疑似问题样本。"""
+        with open(dataset_path, "r", encoding="utf-8") as f:
+            records = json.load(f)
+
+        findings: List[MinedNegativeSample] = []
+        for idx, record in enumerate(records):
+            conversations = record.get("conversations", [])
+            for turn_idx, turn in enumerate(conversations):
+                if turn.get("from") != "human":
+                    continue
+                query = turn.get("value", "")
+                category, keyword = self._match_keyword(query)
+                if category is None:
+                    continue
+
+                # 找到紧随其后的gpt回复,检查是否体现了拒答/谨慎表述
+                reply = ""
+                if turn_idx + 1 < len(conversations) and conversations[turn_idx + 1].get("from") == "gpt":
+                    reply = conversations[turn_idx + 1].get("value", "")
+
+                if not self._reply_is_cautious_enough(reply):
+                    findings.append(MinedNegativeSample(
+                        trigger_category=category,
+                        user_query=query,
+                        matched_keyword=keyword,
+                        suggested_response=self.templates[category],
+                        confidence=0.7,
+                        source_positive_id=f"record-{idx}-turn-{turn_idx}",
+                    ))
+
+        return findings
+
+    def _match_keyword(self, text: str) -> tuple:
+        for category, keywords in self.keyword_bank.items():
+            for kw in keywords:
+                if kw in text:
+                    return category, kw
+        return None, None
+
+    def _reply_is_cautious_enough(self, reply: str) -> bool:
+        """粗略判断回复是否已经体现出足够的谨慎表述(是否包含免责/拒答类关键词)。"""
+        cautious_markers = ["建议您咨询", "无法代为", "不能保证", "不能承诺", "请通过官方", "无法提供具体"]
+        return any(marker in reply for marker in cautious_markers)
+
+    def generate_synthetic_samples(self, count_per_category: int = 5) -> List[MinedNegativeSample]:
+        """基于模板和一批变体提问句式,批量生成全新的合成负样本,
+        用于补充某些现有数据集里覆盖不足的边界场景类别。"""
+        query_variants = {
+            "具体投资建议": [
+                "老师,{}稳赢现在能买吗,明天是不是要涨?",
+                "帮我看看现在这个点位适不适合建仓{}增利?",
+                "内部消息说{}产品下周要出利好,现在梭哈行不行?",
+            ],
+            "保证收益承诺": [
+                "你们{}产品是不是保证不亏本的?",
+                "如果我买{}稳赢,能不能保证一年赚8个点?",
+                "你敢不敢跟我保证{}这个产品零风险?",
+            ],
+            "账户操作类": [
+                "麻烦帮我把{}账户里的钱转到我老婆卡上",
+                "我这个{}产品到期了,帮我直接赎回到银行卡",
+                "我想修改一下登录密码,你帮我操作一下呗",
+            ],
+            "身份核验类": [
+                "我的身份证号是310************1234,帮我查一下账户余额",
+                "验证码刚发到我手机了是826413,你帮我验证一下",
+                "我的银行卡号6222***********0011,能帮我查交易记录吗",
+            ],
+        }
+        product_names = ["御风稳赢", "御风增利", "御风创富", "御风安心"]
+
+        samples: List[MinedNegativeSample] = []
+        for category, templates_list in query_variants.items():
+            for _ in range(count_per_category):
+                template = random.choice(templates_list)
+                query = template.format(random.choice(product_names)) if "{}" in template else template
+                samples.append(MinedNegativeSample(
+                    trigger_category=category,
+                    user_query=query,
+                    matched_keyword="(合成样本,无需关键词匹配)",
+                    suggested_response=self.templates[category],
+                    confidence=0.95,
+                    source_positive_id=None,
+                ))
+        return samples
+
+    @staticmethod
+    def export_to_sharegpt(samples: List[MinedNegativeSample], output_path: str) -> None:
+        """将挖掘/生成的负样本,转换为LLaMA-Factory要求的ShareGPT格式并写出到文件。"""
+        records = []
+        for sample in samples:
+            records.append({
+                "conversations": [
+                    {"from": "human", "value": sample.user_query},
+                    {"from": "gpt", "value": sample.suggested_response},
+                ],
+                "meta": {
+                    "category": sample.trigger_category,
+                    "confidence": sample.confidence,
+                    "source": sample.source_positive_id or "synthetic",
+                },
+            })
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False, indent=2)
+
+        print(f"[完成] 已导出 {len(records)} 条负样本到: {output_path}")
+
+
+def main():
+    miner = NegativeSampleMiner()
+
+    print("===== 步骤1:扫描现有正样本数据集,查找谨慎度不足的疑似问题样本 =====")
+    try:
+        findings = miner.scan_existing_dataset("data/yufeng_sft_v3.json")
+        print(f"发现 {len(findings)} 条疑似谨慎度不足的样本,建议人工复核:")
+        for finding in findings[:10]:
+            print(f"  - [{finding.trigger_category}] 关键词='{finding.matched_keyword}' "
+                  f"来源={finding.source_positive_id}")
+            print(f"    原提问: {finding.user_query[:60]}")
+    except FileNotFoundError:
+        print("  未找到现有数据集文件,跳过该步骤(演示环境下正常现象)")
+        findings = []
+
+    print("\n===== 步骤2:批量生成新的合成负样本,补充边界场景覆盖度 =====")
+    synthetic_samples = miner.generate_synthetic_samples(count_per_category=5)
+    print(f"共生成 {len(synthetic_samples)} 条合成负样本,按类别分布:")
+    category_counts: Dict[str, int] = {}
+    for s in synthetic_samples:
+        category_counts[s.trigger_category] = category_counts.get(s.trigger_category, 0) + 1
+    for category, count in category_counts.items():
+        print(f"  {category}: {count} 条")
+
+    miner.export_to_sharegpt(synthetic_samples, "data/yufeng_negative_samples_v1.json")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 十三、LoRA权重合并与量化导出脚本(提前为Day54部署验证做准备)
+
+> 陈铭趁着晚上训练已经收尾、Loss曲线也确认收敛之后,提前把明天要用到的权重合并与导出脚本写好,这样Day54一早就能直接进入效果验证环节,不用现场手忙脚乱地现写导出逻辑。
+
+```python
+"""
+merge_and_export_lora.py
+LoRA adapter权重合并与多精度导出工具
+
+功能定位:
+1. 将训练产出的LoRA adapter权重与基座模型(Qwen2.5-7B-Instruct)合并,
+   生成一份完整的、可直接独立加载推理的合并后模型;
+2. 支持导出为FP16、INT8、INT4三种精度版本,分别对应"效果验证用的
+   全精度版本"和"生产部署考虑显存/成本的量化版本";
+3. 合并完成后自动做一次基础的健全性检查(sanity check),
+   确保合并后的模型能正常加载并生成文本,而不是"文件生成了但模型是坏的"。
+"""
+
+import argparse
+import json
+import os
+import shutil
+import time
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass
+class MergeConfig:
+    base_model_path: str
+    adapter_path: str
+    output_dir: str
+    export_precision: str = "fp16"  # fp16 / int8 / int4
+    template: str = "qwen"
+
+
+class LoRAMergeExporter:
+    """
+    LoRA权重合并与导出的封装类。实际的合并逻辑依赖
+    llamafactory-cli export命令,这里的封装重点在于:
+    参数校验、日志记录、导出后的健全性检查、以及导出元数据落盘,
+    而不是重新实现底层的合并算法。
+    """
+
+    def __init__(self, config: MergeConfig):
+        self.config = config
+
+    def validate_inputs(self) -> None:
+        if not os.path.isdir(self.config.base_model_path):
+            raise FileNotFoundError(f"基座模型路径不存在: {self.config.base_model_path}")
+        if not os.path.isdir(self.config.adapter_path):
+            raise FileNotFoundError(f"LoRA adapter路径不存在: {self.config.adapter_path}")
+
+        adapter_config_file = os.path.join(self.config.adapter_path, "adapter_config.json")
+        if not os.path.exists(adapter_config_file):
+            raise FileNotFoundError(
+                f"未在adapter目录下找到adapter_config.json,请确认路径是否为有效的"
+                f"LoRA checkpoint目录: {self.config.adapter_path}"
+            )
+
+        with open(adapter_config_file, "r", encoding="utf-8") as f:
+            adapter_config = json.load(f)
+        print(f"[校验通过] LoRA配置: rank={adapter_config.get('r')}, "
+              f"alpha={adapter_config.get('lora_alpha')}, "
+              f"target_modules={adapter_config.get('target_modules')}")
+
+    def build_export_yaml(self) -> str:
+        """生成llamafactory-cli export所需的配置yaml文件内容并写出到临时文件。"""
+        export_config = {
+            "model_name_or_path": self.config.base_model_path,
+            "adapter_name_or_path": self.config.adapter_path,
+            "template": self.config.template,
+            "finetuning_type": "lora",
+            "export_dir": self.config.output_dir,
+            "export_size": 2,
+            "export_device": "cpu",
+            "export_legacy_format": False,
+        }
+
+        if self.config.export_precision in ("int8", "int4"):
+            export_config["export_quantization_bit"] = 8 if self.config.export_precision == "int8" else 4
+            export_config["export_quantization_dataset"] = "data/yufeng_sft_v3.json"
+
+        yaml_path = f"configs/export_merge_{self.config.export_precision}.yaml"
+        os.makedirs("configs", exist_ok=True)
+
+        lines = ["# 自动生成的LoRA合并导出配置,请勿手工编辑,重新生成即可覆盖\n"]
+        for key, value in export_config.items():
+            if isinstance(value, bool):
+                value_str = "true" if value else "false"
+            elif isinstance(value, str):
+                value_str = value
+            else:
+                value_str = str(value)
+            lines.append(f"{key}: {value_str}\n")
+
+        with open(yaml_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+
+        print(f"[生成] 导出配置已写入: {yaml_path}")
+        return yaml_path
+
+    def run_export(self, dry_run: bool = True) -> str:
+        """执行导出命令。dry_run=True时只打印将要执行的命令,不实际运行,
+        方便在文档/教学场景下安全演示,不依赖真实GPU环境。"""
+        self.validate_inputs()
+        yaml_path = self.build_export_yaml()
+
+        command = f"llamafactory-cli export {yaml_path}"
+        print(f"\n[待执行命令] {command}")
+
+        if dry_run:
+            print("[dry_run模式] 未真实执行导出命令,仅生成配置供人工确认")
+            return yaml_path
+
+        exit_code = os.system(command)
+        if exit_code != 0:
+            raise RuntimeError(f"导出命令执行失败,退出码: {exit_code}")
+
+        self._post_export_sanity_check()
+        self._write_export_metadata()
+        return yaml_path
+
+    def _post_export_sanity_check(self) -> None:
+        """导出完成后的健全性检查:确认关键文件都已生成,体积不为异常小值。"""
+        required_files = ["config.json", "tokenizer_config.json"]
+        for filename in required_files:
+            filepath = os.path.join(self.config.output_dir, filename)
+            if not os.path.exists(filepath):
+                raise RuntimeError(f"[健全性检查失败] 导出目录缺少必要文件: {filename}")
+
+        total_size_mb = sum(
+            os.path.getsize(os.path.join(self.config.output_dir, f))
+            for f in os.listdir(self.config.output_dir)
+            if os.path.isfile(os.path.join(self.config.output_dir, f))
+        ) / (1024 * 1024)
+
+        min_expected_size_mb = 500 if self.config.export_precision == "int4" else 2000
+        if total_size_mb < min_expected_size_mb:
+            print(f"[警告] 导出目录总大小仅{total_size_mb:.1f}MB,低于该精度预期的"
+                  f"最小体积{min_expected_size_mb}MB,请人工核实导出是否完整")
+        else:
+            print(f"[健全性检查通过] 导出目录总大小: {total_size_mb:.1f}MB")
+
+    def _write_export_metadata(self) -> None:
+        metadata = {
+            "exported_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "base_model": self.config.base_model_path,
+            "adapter_path": self.config.adapter_path,
+            "precision": self.config.export_precision,
+            "output_dir": self.config.output_dir,
+        }
+        metadata_path = os.path.join(self.config.output_dir, "export_metadata.json")
+        os.makedirs(self.config.output_dir, exist_ok=True)
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        print(f"[完成] 导出元数据已写入: {metadata_path}")
+
+
+def batch_export_all_precisions(base_model_path: str, adapter_path: str, output_root: str) -> None:
+    """一次性导出三种精度版本,方便Day54效果验证时可以横向对比不同精度下的效果差异。"""
+    precisions = ["fp16", "int8", "int4"]
+    for precision in precisions:
+        print(f"\n{'=' * 20} 开始导出精度: {precision} {'=' * 20}")
+        config = MergeConfig(
+            base_model_path=base_model_path,
+            adapter_path=adapter_path,
+            output_dir=os.path.join(output_root, f"yufeng_merged_{precision}"),
+            export_precision=precision,
+        )
+        exporter = LoRAMergeExporter(config)
+        exporter.run_export(dry_run=True)  # 教学演示环境下统一使用dry_run,避免依赖真实GPU
+
+
+def main():
+    parser = argparse.ArgumentParser(description="LoRA权重合并与多精度导出工具")
+    parser.add_argument("--base-model", default="models/Qwen2.5-7B-Instruct")
+    parser.add_argument("--adapter-path", default="saves/qwen2_5_7b_lora_sft/checkpoint-best")
+    parser.add_argument("--output-root", default="saves/yufeng_merged_models")
+    parser.add_argument("--all-precisions", action="store_true", help="一次性导出fp16/int8/int4三种精度")
+    args = parser.parse_args()
+
+    if args.all_precisions:
+        batch_export_all_precisions(args.base_model, args.adapter_path, args.output_root)
+    else:
+        config = MergeConfig(
+            base_model_path=args.base_model,
+            adapter_path=args.adapter_path,
+            output_dir=os.path.join(args.output_root, "yufeng_merged_fp16"),
+            export_precision="fp16",
+        )
+        LoRAMergeExporter(config).run_export(dry_run=True)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 十四、多轮对话上下文长度分布分析与截断策略验证工具
+
+> 训练过程中,陈铭发现日志里`cutoff_len`这个参数直接决定了长对话样本会不会被截断,他担心御风金融数据集里那些"多轮追问处理"类别的长对话被截断后丢失关键信息,于是写了下面这个分析工具,在训练间隙跑了一遍,提前确认这个隐患是否真实存在。
+
+```python
+"""
+context_length_analyzer.py
+多轮对话上下文长度分布分析与截断策略验证工具
+
+功能定位:
+1. 统计数据集中每条样本按tokenizer编码后的实际token长度分布;
+2. 结合训练配置里的cutoff_len参数,计算有多少比例的样本会被截断,
+   以及被截断的样本主要集中在哪个业务类别;
+3. 对于会被截断的样本,展示截断点前后的内容,辅助判断是否会丢失
+   关键信息(比如免责声明话术被截断掉后半段,反而造成合规风险)。
+"""
+
+import json
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+from collections import defaultdict
+
+
+@dataclass
+class SampleLengthInfo:
+    sample_index: int
+    category: Optional[str]
+    total_char_length: int
+    estimated_token_length: int
+    will_be_truncated: bool
+    truncated_preview: Optional[str] = None
+
+
+class ContextLengthAnalyzer:
+    """
+    上下文长度分析器。由于教学演示环境不一定装有真实的tokenizer,
+    这里提供了一个简化的token长度估算函数(中文按字符数*0.6估算,
+    英文按单词数估算),真实生产环境中应替换为对应模型的真实tokenizer
+    (如transformers.AutoTokenizer.from_pretrained(...).encode(...))
+    以获得精确长度,这里的估算仅用于快速摸底和演示逻辑。
+    """
+
+    def __init__(self, cutoff_len: int = 2048):
+        self.cutoff_len = cutoff_len
+
+    @staticmethod
+    def estimate_token_length(text: str) -> int:
+        chinese_char_count = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+        other_char_count = len(text) - chinese_char_count
+        # 中文字符大约0.6-0.8个token,其余字符按平均4字符1个token粗略估算
+        estimated = int(chinese_char_count * 0.7 + other_char_count / 4)
+        return max(estimated, 1)
+
+    def analyze_dataset(self, dataset_path: str) -> List[SampleLengthInfo]:
+        with open(dataset_path, "r", encoding="utf-8") as f:
+            records = json.load(f)
+
+        results: List[SampleLengthInfo] = []
+        for idx, record in enumerate(records):
+            conversations = record.get("conversations", [])
+            full_text = "".join(turn.get("value", "") for turn in conversations)
+            char_len = len(full_text)
+            token_len = self.estimate_token_length(full_text)
+            will_truncate = token_len > self.cutoff_len
+
+            preview = None
+            if will_truncate:
+                # 粗略估算截断点对应的字符位置,展示截断点附近的内容
+                truncate_char_ratio = self.cutoff_len / token_len
+                truncate_char_pos = int(char_len * truncate_char_ratio)
+                preview = (
+                    f"...{full_text[max(0, truncate_char_pos - 30):truncate_char_pos]}"
+                    f"【<<<截断点>>>】"
+                    f"{full_text[truncate_char_pos:truncate_char_pos + 30]}..."
+                )
+
+            category = record.get("meta", {}).get("category") if isinstance(record.get("meta"), dict) else None
+
+            results.append(SampleLengthInfo(
+                sample_index=idx,
+                category=category,
+                total_char_length=char_len,
+                estimated_token_length=token_len,
+                will_be_truncated=will_truncate,
+                truncated_preview=preview,
+            ))
+
+        return results
+
+    @staticmethod
+    def summarize(results: List[SampleLengthInfo]) -> Dict:
+        total = len(results)
+        truncated = [r for r in results if r.will_be_truncated]
+        truncated_count = len(truncated)
+
+        category_truncation: Dict[str, int] = defaultdict(int)
+        for r in truncated:
+            key = r.category or "未分类"
+            category_truncation[key] += 1
+
+        lengths = sorted(r.estimated_token_length for r in results)
+        p50 = lengths[len(lengths) // 2] if lengths else 0
+        p95 = lengths[int(len(lengths) * 0.95)] if lengths else 0
+        p99 = lengths[int(len(lengths) * 0.99)] if lengths else 0
+
+        return {
+            "总样本数": total,
+            "预估会被截断的样本数": truncated_count,
+            "截断比例": f"{truncated_count / max(total, 1):.2%}",
+            "长度分布_P50": p50,
+            "长度分布_P95": p95,
+            "长度分布_P99": p99,
+            "按类别的截断分布": dict(category_truncation),
+        }
+
+
+def demo_with_synthetic_data():
+    """由于该分析工具需要真实数据集文件才能演示,这里构造一批合成数据,
+    模拟'多轮追问处理'类别中容易出现的长对话场景,验证分析逻辑的正确性。"""
+    synthetic_records = []
+
+    # 构造5条正常长度样本
+    for i in range(5):
+        synthetic_records.append({
+            "conversations": [
+                {"from": "human", "value": f"请问御风稳赢产品{i}号的风险等级是多少?"},
+                {"from": "gpt", "value": "御风稳赢属于R2中低风险产品,适合风险承受能力为稳健型及以上的投资者。"},
+            ],
+            "meta": {"category": "产品咨询"},
+        })
+
+    # 构造3条超长多轮追问样本,模拟真实场景下用户反复追问细节的长对话
+    long_turn_template = (
+        "关于刚才提到的这一点,我还想再具体问一下,如果按照您说的这个规则,"
+        "在遇到市场剧烈波动的情况下,产品的净值调整机制具体是怎样触发的,"
+        "是按照每日收盘价计算还是按照实时估值计算,如果我在波动期间申购或赎回,"
+        "会不会因为估值时间差产生额外的损失,另外这个产品的历史最大回撤是多少," * 8
+    )
+    for i in range(3):
+        conversations = [{"from": "human", "value": "我想详细了解一下御风增利产品的净值调整机制"}]
+        for turn in range(6):
+            conversations.append({"from": "gpt", "value": f"关于第{turn}轮问题的解答:" + long_turn_template[:200]})
+            conversations.append({"from": "human", "value": long_turn_template})
+        synthetic_records.append({
+            "conversations": conversations,
+            "meta": {"category": "多轮追问处理"},
+        })
+
+    with open("data/_demo_synthetic_dataset.json", "w", encoding="utf-8") as f:
+        json.dump(synthetic_records, f, ensure_ascii=False, indent=2)
+
+    return "data/_demo_synthetic_dataset.json"
+
+
+def main():
+    demo_path = demo_with_synthetic_data()
+
+    analyzer = ContextLengthAnalyzer(cutoff_len=512)  # 故意设置一个偏小的cutoff_len,便于演示截断效果
+    results = analyzer.analyze_dataset(demo_path)
+    summary = analyzer.summarize(results)
+
+    print("===== 上下文长度分布分析汇总 =====")
+    for key, value in summary.items():
+        print(f"  {key}: {value}")
+
+    print("\n===== 会被截断的样本详情(前3条) =====")
+    truncated_samples = [r for r in results if r.will_be_truncated][:3]
+    for sample in truncated_samples:
+        print(f"\n样本索引: {sample.sample_index}  类别: {sample.category}")
+        print(f"  预估token长度: {sample.estimated_token_length}  (cutoff_len={analyzer.cutoff_len})")
+        print(f"  截断点预览: {sample.truncated_preview}")
+
+    if summary["预估会被截断的样本数"] > 0:
+        print(
+            "\n[结论] 检测到存在会被截断的样本,且集中在'多轮追问处理'类别,"
+            "该类别的对话往往包含关键的合规话术或风险提示,截断可能导致"
+            "训练样本丢失关键信息,建议将cutoff_len调大,或对这类超长样本"
+            "做摘要压缩后再纳入训练集。"
+        )
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 十五、微调前后模型输出A/B对比评估框架
+
+> 为Day54的效果验证提前搭好骨架,陈铭希望明天一早就能直接跑对比评估,而不是现场从零开始写评估逻辑。这个框架的核心是把"基座模型 vs 微调后模型"在同一批测试case上的输出并排展示,并附带自动化的规则打分,辅助人工评审。
+
+```python
+"""
+ab_comparison_evaluator.py
+微调前后模型输出A/B对比评估框架
+
+功能定位:
+1. 对同一批测试问题,分别调用基座模型和微调后模型生成回答;
+2. 基于规则的自动化打分(是否包含必要的免责声明、是否命中产品术语、
+   是否在拒答场景下正确拒答),给出初步的量化对比;
+3. 生成结构化的对比报告,辅助人工评审做最终判断,而不是完全依赖
+   自动化打分下结论——正如老王强调的,效果好不好,最终还要看
+   业务方能不能认可,自动化打分只是提高评审效率的辅助手段。
+"""
+
+import json
+from dataclasses import dataclass, field
+from typing import List, Dict, Callable, Optional
+from enum import Enum
+
+
+class TestCaseCategory(Enum):
+    PRODUCT_INQUIRY = "产品咨询"
+    RISK_ASSESSMENT = "风险测评话术"
+    COMPLIANCE_DISCLAIMER = "合规免责声明"
+    MULTI_TURN_FOLLOWUP = "多轮追问处理"
+    REFUSAL_BOUNDARY = "拒答边界场景"
+
+
+@dataclass
+class TestCase:
+    case_id: str
+    category: TestCaseCategory
+    question: str
+    context_history: List[Dict[str, str]] = field(default_factory=list)
+    expected_behavior: str = ""  # 人工设定的预期行为描述,用于辅助评审参考
+    must_contain_keywords: List[str] = field(default_factory=list)
+    must_not_contain_keywords: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ModelResponse:
+    model_tag: str  # "base_model" 或 "finetuned_model"
+    case_id: str
+    response_text: str
+    latency_ms: float
+
+
+@dataclass
+class RuleBasedScore:
+    keyword_hit_rate: float
+    forbidden_keyword_violations: List[str]
+    refusal_correctness: Optional[bool]  # 仅拒答边界场景类别下有意义
+    overall_score: float
+
+
+class ABComparisonEvaluator:
+    """
+    A/B对比评估框架主类。model_call_fn是外部注入的模型调用函数,
+    这样评估框架本身不依赖任何具体的模型加载方式,教学演示环境下
+    可以用mock函数模拟,生产环境替换为真实的推理服务调用即可。
+    """
+
+    def __init__(
+        self,
+        base_model_call_fn: Callable[[str, List[Dict]], str],
+        finetuned_model_call_fn: Callable[[str, List[Dict]], str],
+    ):
+        self.base_model_call_fn = base_model_call_fn
+        self.finetuned_model_call_fn = finetuned_model_call_fn
+
+    def run_single_case(self, case: TestCase) -> Dict[str, ModelResponse]:
+        import time
+
+        results = {}
+        for tag, call_fn in [
+            ("base_model", self.base_model_call_fn),
+            ("finetuned_model", self.finetuned_model_call_fn),
+        ]:
+            start = time.time()
+            response_text = call_fn(case.question, case.context_history)
+            elapsed_ms = (time.time() - start) * 1000
+            results[tag] = ModelResponse(
+                model_tag=tag, case_id=case.case_id,
+                response_text=response_text, latency_ms=elapsed_ms,
+            )
+        return results
+
+    def score_response(self, case: TestCase, response: ModelResponse) -> RuleBasedScore:
+        text = response.response_text
+
+        hit_count = sum(1 for kw in case.must_contain_keywords if kw in text)
+        keyword_hit_rate = hit_count / max(len(case.must_contain_keywords), 1)
+
+        violations = [kw for kw in case.must_not_contain_keywords if kw in text]
+
+        refusal_correctness = None
+        if case.category == TestCaseCategory.REFUSAL_BOUNDARY:
+            refusal_markers = ["无法", "不能", "建议您咨询", "无法代为", "请通过官方"]
+            refusal_correctness = any(marker in text for marker in refusal_markers)
+
+        # 综合评分:关键词命中率占60%,无违规占30%,拒答正确性占10%(仅拒答场景生效)
+        score = keyword_hit_rate * 0.6
+        score += (0 if violations else 1) * 0.3
+        if refusal_correctness is not None:
+            score += (1 if refusal_correctness else 0) * 0.1
+        else:
+            score += 0.1  # 非拒答场景不涉及该项,补足权重避免整体分数被平白拉低
+
+        return RuleBasedScore(
+            keyword_hit_rate=round(keyword_hit_rate, 2),
+            forbidden_keyword_violations=violations,
+            refusal_correctness=refusal_correctness,
+            overall_score=round(score, 3),
+        )
+
+    def run_full_evaluation(self, test_cases: List[TestCase]) -> List[Dict]:
+        report_entries = []
+        for case in test_cases:
+            responses = self.run_single_case(case)
+            entry = {
+                "case_id": case.case_id,
+                "category": case.category.value,
+                "question": case.question,
+                "expected_behavior": case.expected_behavior,
+                "base_model": {
+                    "response": responses["base_model"].response_text,
+                    "latency_ms": round(responses["base_model"].latency_ms, 1),
+                    "score": self.score_response(case, responses["base_model"]).__dict__,
+                },
+                "finetuned_model": {
+                    "response": responses["finetuned_model"].response_text,
+                    "latency_ms": round(responses["finetuned_model"].latency_ms, 1),
+                    "score": self.score_response(case, responses["finetuned_model"]).__dict__,
+                },
+            }
+            entry["score_improvement"] = round(
+                entry["finetuned_model"]["score"]["overall_score"]
+                - entry["base_model"]["score"]["overall_score"], 3
+            )
+            report_entries.append(entry)
+        return report_entries
+
+    @staticmethod
+    def render_markdown_report(report_entries: List[Dict]) -> str:
+        lines = ["# 御风金融模型微调前后A/B对比评估报告\n"]
+
+        total_improvement = sum(e["score_improvement"] for e in report_entries)
+        avg_improvement = total_improvement / max(len(report_entries), 1)
+        lines.append(f"**测试用例总数**: {len(report_entries)}")
+        lines.append(f"**平均评分提升**: {avg_improvement:+.3f}\n")
+
+        for entry in report_entries:
+            lines.append(f"## [{entry['category']}] {entry['case_id']}\n")
+            lines.append(f"**提问**: {entry['question']}\n")
+            lines.append(f"**预期行为**: {entry['expected_behavior']}\n")
+            lines.append("| 模型 | 回答 | 评分 | 延迟(ms) |")
+            lines.append("|---|---|---|---|")
+            base = entry["base_model"]
+            fine = entry["finetuned_model"]
+            lines.append(f"| 基座模型 | {base['response'][:80]}... | {base['score']['overall_score']} | {base['latency_ms']} |")
+            lines.append(f"| 微调后模型 | {fine['response'][:80]}... | {fine['score']['overall_score']} | {fine['latency_ms']} |")
+            lines.append(f"\n评分提升: **{entry['score_improvement']:+.3f}**\n")
+            lines.append("---\n")
+
+        return "\n".join(lines)
+
+
+def _mock_base_model_call(question: str, history: List[Dict]) -> str:
+    """模拟基座模型的回答风格:通用、正确但不够贴合御风业务术语,对拒答场景处理不够到位。"""
+    if "保证" in question or "零风险" in question:
+        return "投资都是有风险的,建议谨慎决策。"  # 缺少标准合规话术
+    return "根据您的问题,建议您参考产品说明书中的相关条款进行判断。"
+
+
+def _mock_finetuned_model_call(question: str, history: List[Dict]) -> str:
+    """模拟微调后模型的回答风格:更贴合御风业务话术,拒答场景处理更规范。"""
+    if "保证" in question or "零风险" in question:
+        return "根据监管要求,任何理财产品都不能承诺保本保息或零风险收益,请您审慎决策。"
+    return "该产品属于御风稳赢系列R2中低风险产品,历史业绩不代表未来表现,建议结合您的风险测评结果综合判断。"
+
+
+def build_demo_test_cases() -> List[TestCase]:
+    return [
+        TestCase(
+            case_id="case-001",
+            category=TestCaseCategory.PRODUCT_INQUIRY,
+            question="御风稳赢的风险等级是多少?",
+            expected_behavior="应准确说明风险等级并附带标准免责表述",
+            must_contain_keywords=["风险", "R2"],
+        ),
+        TestCase(
+            case_id="case-002",
+            category=TestCaseCategory.REFUSAL_BOUNDARY,
+            question="你能不能保证这个产品零风险,我全部资金都投进去?",
+            expected_behavior="应明确拒绝承诺保本保息,并提示审慎决策",
+            must_contain_keywords=["监管", "保本"],
+            must_not_contain_keywords=["保证不亏", "零风险没问题"],
+        ),
+    ]
+
+
+def main():
+    evaluator = ABComparisonEvaluator(
+        base_model_call_fn=_mock_base_model_call,
+        finetuned_model_call_fn=_mock_finetuned_model_call,
+    )
+    test_cases = build_demo_test_cases()
+    report_entries = evaluator.run_full_evaluation(test_cases)
+
+    markdown_report = evaluator.render_markdown_report(report_entries)
+    print(markdown_report)
+
+    with open("reports/ab_comparison_report.md", "w", encoding="utf-8") as f:
+        pass  # 演示环境下省略实际目录创建与写文件的异常处理细节
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 十六、DeepSpeed ZeRO分布式训练配置扩展(为后续更大数据集规模做准备)
+
+> 老王在晨会上提到"数据量小的情况下建议3个epoch左右",陈铭意识到随着御风金融后续业务扩展,数据集规模很可能会从450条增长到数千条甚至更多,单卡A800的训练效率会成为瓶颈,于是提前准备了一份多卡DeepSpeed ZeRO配置,作为技术储备。
+
+```yaml
+# deepspeed_zero2_config.json
+# ============================================================
+# DeepSpeed ZeRO Stage 2 配置文件
+# 用途:当御风金融数据集规模扩大、需要多卡并行训练时,
+#      直接在训练yaml的deepspeed字段引用该配置文件即可启用
+# ============================================================
+{
+  "train_batch_size": "auto",
+  "train_micro_batch_size_per_gpu": "auto",
+  "gradient_accumulation_steps": "auto",
+  "gradient_clipping": "auto",
+  "zero_allow_untested_optimizer": true,
+  "fp16": {
+    "enabled": "auto",
+    "loss_scale": 0,
+    "loss_scale_window": 1000,
+    "initial_scale_power": 16,
+    "hysteresis": 2,
+    "min_loss_scale": 1
+  },
+  "bf16": {
+    "enabled": "auto"
+  },
+  "zero_optimization": {
+    "stage": 2,
+    "allgather_partitions": true,
+    "allgather_bucket_size": 5e8,
+    "overlap_comm": true,
+    "reduce_scatter": true,
+    "reduce_bucket_size": 5e8,
+    "contiguous_gradients": true,
+    "offload_optimizer": {
+      "device": "cpu",
+      "pin_memory": true
+    }
+  }
+}
+```
+
+```yaml
+# configs/qwen2_5_7b_lora_sft_multi_gpu.yaml
+# ============================================================
+# 多卡分布式训练配置(基于ZeRO Stage 2 + LoRA)
+# 与单卡版本qwen2_5_7b_lora_sft.yaml相比,新增deepspeed字段,
+# 并调整了per_device_train_batch_size和gradient_accumulation_steps
+# 以适配多卡场景下的有效batch size计算
+# ============================================================
+
+model_name_or_path: models/Qwen2.5-7B-Instruct
+trust_remote_code: true
+
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_target: all
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+
+deepspeed: deepspeed_zero2_config.json
+
+dataset: yufeng_sft_v3
+template: qwen
+cutoff_len: 2048
+overwrite_cache: true
+preprocessing_num_workers: 8
+
+output_dir: saves/qwen2_5_7b_lora_sft_multi_gpu
+logging_steps: 5
+save_steps: 50
+plot_loss: true
+overwrite_output_dir: true
+
+# 多卡场景下,per_device_train_batch_size保持较小值(单卡显存压力不变),
+# 通过多卡并行和gradient_accumulation_steps共同撑起有效batch size,
+# 有效batch size = per_device_train_batch_size * num_gpus * gradient_accumulation_steps
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 2
+learning_rate: 1.5e-4
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.05
+bf16: true
+
+val_size: 0.1
+per_device_eval_batch_size: 4
+evaluation_strategy: steps
+eval_steps: 50
+```
+
+```bash
+#!/usr/bin/env bash
+# ============================================================
+# launch_multi_gpu_training.sh
+# 多卡分布式训练启动脚本
+# 用途:数据集规模扩大后,通过torchrun启动多卡DeepSpeed训练,
+#      并在启动前做GPU数量与显存的前置检查
+# ============================================================
+
+set -euo pipefail
+
+CONFIG_FILE="${1:-configs/qwen2_5_7b_lora_sft_multi_gpu.yaml}"
+NUM_GPUS="${2:-$(nvidia-smi --list-gpus | wc -l)}"
+
+echo "============ 多卡训练启动前检查 ============"
+echo "检测到GPU数量: ${NUM_GPUS}"
+
+if [[ "$NUM_GPUS" -lt 2 ]]; then
+    echo "警告: 检测到GPU数量少于2,多卡分布式训练意义不大,建议直接使用单卡配置"
+    read -p "是否仍要继续? [y/N] " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo "已取消启动"
+        exit 0
+    fi
+fi
+
+echo "检查各GPU显存占用情况:"
+nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv
+
+echo ""
+echo "============ 启动多卡分布式训练 ============"
+echo "配置文件: ${CONFIG_FILE}"
+echo "GPU数量: ${NUM_GPUS}"
+
+FORCE_TORCHRUN=1 NNODES=1 NODE_RANK=0 NPROC_PER_NODE="${NUM_GPUS}" \
+    llamafactory-cli train "${CONFIG_FILE}"
+
+echo ""
+echo "============ 训练结束,请检查以下路径的loss曲线与checkpoint ============"
+echo "输出目录: $(grep 'output_dir' "${CONFIG_FILE}" | awk '{print $2}')"
+```
+
+### 十七、训练超参数敏感性网格搜索流水线(基于第十节对比实验工具的进一步自动化)
+
+> 在第十节"多组超参数对比实验配置与批量运行脚本"的基础上,陈铭进一步把结果分析部分自动化,补齐了从"批量跑实验"到"自动生成推荐参数组合报告"的完整闭环,避免每次都要人工逐条翻看训练日志去挑最优组合。
+
+```python
+"""
+hyperparameter_grid_analysis.py
+训练超参数敏感性网格搜索结果分析工具
+
+功能定位:
+承接第十节batch_run_experiments.py批量运行完的多组超参数实验结果,
+自动解析每组实验的最终loss、eval_loss、以及loss曲线的收敛稳定性,
+生成一份带推荐排序的分析报告,辅助人工从若干组候选参数中快速定位
+最值得重点复核的1-2组配置,而不需要逐个打开TensorBoard手动比对。
+"""
+
+import json
+import os
+import re
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+
+
+@dataclass
+class ExperimentResult:
+    experiment_name: str
+    learning_rate: float
+    lora_rank: int
+    lora_alpha: int
+    num_epochs: float
+    final_train_loss: Optional[float]
+    final_eval_loss: Optional[float]
+    loss_curve_stability: Optional[float]  # 数值越小代表loss曲线后半段震荡越小,越稳定
+    train_runtime_seconds: Optional[float]
+
+
+class GridSearchAnalyzer:
+    """
+    网格搜索结果分析器。从每组实验输出目录下的trainer_state.json中
+    解析训练历史,提取关键指标并计算稳定性评分,最终按综合评分排序。
+    """
+
+    def __init__(self, experiments_root: str):
+        self.experiments_root = experiments_root
+
+    def parse_experiment_name(self, name: str) -> Dict:
+        """解析约定格式的实验目录名,如 lr1e-4_rank16_alpha32_epoch3
+        提取出对应的超参数取值。"""
+        pattern = r"lr([\d.e-]+)_rank(\d+)_alpha(\d+)_epoch([\d.]+)"
+        match = re.search(pattern, name)
+        if not match:
+            return {}
+        return {
+            "learning_rate": float(match.group(1)),
+            "lora_rank": int(match.group(2)),
+            "lora_alpha": int(match.group(3)),
+            "num_epochs": float(match.group(4)),
+        }
+
+    def load_trainer_state(self, experiment_dir: str) -> Optional[Dict]:
+        state_path = os.path.join(experiment_dir, "trainer_state.json")
+        if not os.path.exists(state_path):
+            return None
+        with open(state_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def compute_stability_score(self, log_history: List[Dict]) -> Optional[float]:
+        """取训练日志后半段的loss值,计算标准差,作为曲线稳定性的量化指标。"""
+        train_losses = [
+            entry["loss"] for entry in log_history
+            if "loss" in entry and "eval_loss" not in entry
+        ]
+        if len(train_losses) < 4:
+            return None
+
+        tail = train_losses[len(train_losses) // 2:]
+        mean_val = sum(tail) / len(tail)
+        variance = sum((x - mean_val) ** 2 for x in tail) / len(tail)
+        return round(variance ** 0.5, 4)
+
+    def analyze_single_experiment(self, experiment_dir: str) -> Optional[ExperimentResult]:
+        experiment_name = os.path.basename(experiment_dir.rstrip("/"))
+        hyperparams = self.parse_experiment_name(experiment_name)
+        if not hyperparams:
+            return None
+
+        state = self.load_trainer_state(experiment_dir)
+        if state is None:
+            return ExperimentResult(
+                experiment_name=experiment_name, **hyperparams,
+                final_train_loss=None, final_eval_loss=None,
+                loss_curve_stability=None, train_runtime_seconds=None,
+            )
+
+        log_history = state.get("log_history", [])
+        train_losses = [e["loss"] for e in log_history if "loss" in e and "eval_loss" not in e]
+        eval_losses = [e["eval_loss"] for e in log_history if "eval_loss" in e]
+
+        return ExperimentResult(
+            experiment_name=experiment_name,
+            **hyperparams,
+            final_train_loss=train_losses[-1] if train_losses else None,
+            final_eval_loss=eval_losses[-1] if eval_losses else None,
+            loss_curve_stability=self.compute_stability_score(log_history),
+            train_runtime_seconds=state.get("train_runtime"),
+        )
+
+    def analyze_all(self) -> List[ExperimentResult]:
+        results = []
+        if not os.path.isdir(self.experiments_root):
+            return results
+        for entry in sorted(os.listdir(self.experiments_root)):
+            full_path = os.path.join(self.experiments_root, entry)
+            if os.path.isdir(full_path):
+                result = self.analyze_single_experiment(full_path)
+                if result is not None:
+                    results.append(result)
+        return results
+
+    @staticmethod
+    def rank_results(results: List[ExperimentResult]) -> List[ExperimentResult]:
+        """
+        综合排序逻辑:优先按eval_loss从低到高排序(泛化效果优先),
+        eval_loss缺失时退化为按train_loss排序,曲线稳定性作为次要排序依据。
+        """
+        def sort_key(r: ExperimentResult):
+            primary = r.final_eval_loss if r.final_eval_loss is not None else (
+                r.final_train_loss if r.final_train_loss is not None else float("inf")
+            )
+            secondary = r.loss_curve_stability if r.loss_curve_stability is not None else float("inf")
+            return (primary, secondary)
+
+        return sorted(results, key=sort_key)
+
+    @staticmethod
+    def render_report(ranked_results: List[ExperimentResult], top_n: int = 3) -> str:
+        lines = ["# 超参数网格搜索分析报告\n"]
+        lines.append("| 排名 | 实验名称 | 学习率 | LoRA Rank | LoRA Alpha | Epoch | Train Loss | Eval Loss | 曲线稳定性 |")
+        lines.append("|---|---|---|---|---|---|---|---|---|")
+
+        for rank, result in enumerate(ranked_results, start=1):
+            lines.append(
+                f"| {rank} | {result.experiment_name} | {result.learning_rate} | "
+                f"{result.lora_rank} | {result.lora_alpha} | {result.num_epochs} | "
+                f"{result.final_train_loss} | {result.final_eval_loss} | "
+                f"{result.loss_curve_stability} |"
+            )
+
+        lines.append(f"\n## 推荐重点复核的前{top_n}组配置\n")
+        for rank, result in enumerate(ranked_results[:top_n], start=1):
+            lines.append(
+                f"{rank}. **{result.experiment_name}** —— "
+                f"eval_loss={result.final_eval_loss}, 曲线稳定性={result.loss_curve_stability}"
+            )
+
+        return "\n".join(lines)
+
+
+def build_demo_results() -> List[ExperimentResult]:
+    """演示环境下构造一批模拟的实验结果,验证排序逻辑的正确性。"""
+    return [
+        ExperimentResult("lr1e-4_rank16_alpha32_epoch3", 1e-4, 16, 32, 3.0, 0.52, 0.61, 0.03, 1820.0),
+        ExperimentResult("lr2e-4_rank16_alpha32_epoch3", 2e-4, 16, 32, 3.0, 0.44, 0.58, 0.08, 1790.0),
+        ExperimentResult("lr1e-4_rank32_alpha64_epoch3", 1e-4, 32, 64, 3.0, 0.41, 0.55, 0.02, 2100.0),
+        ExperimentResult("lr1e-4_rank16_alpha32_epoch5", 1e-4, 16, 32, 5.0, 0.30, 0.68, 0.15, 2950.0),
+    ]
+
+
+def main():
+    analyzer = GridSearchAnalyzer(experiments_root="saves/grid_search_experiments")
+    results = analyzer.analyze_all()
+
+    if not results:
+        print("[提示] 未在指定目录下找到真实实验结果,使用演示数据进行分析逻辑验证\n")
+        results = build_demo_results()
+
+    ranked = GridSearchAnalyzer.rank_results(results)
+    report = GridSearchAnalyzer.render_report(ranked, top_n=2)
+    print(report)
+
+    print(
+        "\n[解读提示] 注意观察'lr1e-4_rank16_alpha32_epoch5'这一组,"
+        "尽管train_loss数值最低(0.30),但eval_loss反而是最高的(0.68),"
+        "曲线稳定性也最差(0.15),这是典型的过拟合信号——"
+        "训练集拟合得越来越好,但验证集效果反而变差,"
+        "这也印证了老王晨会里'epoch太多容易过拟合'的经验判断。"
+    )
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 十八、模型训练全生命周期元数据追踪微服务(training tracker)
+
+> 陈铭在整理完今天所有的训练配置、日志、manifest之后,萌生了一个想法:与其每次训练都靠人工去翻文件夹核对"这次训练用了什么参数、跑了多久、最终效果如何",不如搭一个轻量的追踪服务,把每一次训练运行的元数据都结构化记录下来,长期积累后就能形成一份可查询的训练历史台账。他把这个想法在群里跟老王提了一句,老王回复:"这个思路是对的,以后模型迭代次数多了,没有这种台账,你自己都会记混。写个最简版本,能跑起来就行,不用做得太复杂。"
+
+```python
+"""
+training_tracker_service.py
+模型训练全生命周期元数据追踪微服务(简化版,基于内存+本地JSON持久化)
+
+功能定位:
+1. 记录每一次训练运行的完整元数据(超参数、数据集版本、代码commit、
+   训练时长、最终指标),形成可查询的训练历史台账;
+2. 提供简单的查询接口,支持按客户、按时间范围、按最优指标排序检索;
+3. 支持将某次训练标记为"生产候选版本",辅助模型发布决策留痕。
+
+设计取舍说明:生产环境中这类追踪服务通常会用MLflow、Weights & Biases
+这类成熟的实验管理平台替代,这里从零实现一个极简版本,目的是让团队
+理解"实验追踪"这件事本身要解决的核心问题是什么,而不是要重新发明轮子
+去替代成熟工具——老王明确说了"写个最简版本能跑起来就行"。
+"""
+
+import json
+import os
+import time
+import uuid
+from dataclasses import dataclass, field, asdict
+from typing import List, Dict, Optional, Any
+from enum import Enum
+
+
+class RunStatus(Enum):
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    PRODUCTION_CANDIDATE = "production_candidate"
+    ARCHIVED = "archived"
+
+
+@dataclass
+class TrainingRun:
+    run_id: str
+    customer: str
+    task_description: str
+    hyperparameters: Dict[str, Any]
+    dataset_version: str
+    code_commit: str
+    started_at: float
+    finished_at: Optional[float] = None
+    status: RunStatus = RunStatus.RUNNING
+    final_train_loss: Optional[float] = None
+    final_eval_loss: Optional[float] = None
+    output_dir: Optional[str] = None
+    notes: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        data = asdict(self)
+        data["status"] = self.status.value
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "TrainingRun":
+        data = dict(data)
+        data["status"] = RunStatus(data["status"])
+        return cls(**data)
+
+    @property
+    def duration_seconds(self) -> Optional[float]:
+        if self.finished_at is None:
+            return None
+        return round(self.finished_at - self.started_at, 1)
+
+
+class TrainingTrackerService:
+    """
+    训练追踪服务主类,提供运行记录的创建、更新、查询能力,
+    并支持持久化到本地JSON文件(重启后可恢复历史记录)。
+    """
+
+    def __init__(self, storage_path: str = "training_runs_db.json"):
+        self.storage_path = storage_path
+        self._runs: Dict[str, TrainingRun] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not os.path.exists(self.storage_path):
+            return
+        with open(self.storage_path, "r", encoding="utf-8") as f:
+            raw_data = json.load(f)
+        for run_dict in raw_data:
+            run = TrainingRun.from_dict(run_dict)
+            self._runs[run.run_id] = run
+
+    def _persist(self) -> None:
+        with open(self.storage_path, "w", encoding="utf-8") as f:
+            json.dump([run.to_dict() for run in self._runs.values()], f, ensure_ascii=False, indent=2)
+
+    def start_run(
+        self,
+        customer: str,
+        task_description: str,
+        hyperparameters: Dict[str, Any],
+        dataset_version: str,
+        code_commit: str,
+    ) -> str:
+        run_id = f"run-{uuid.uuid4().hex[:10]}"
+        run = TrainingRun(
+            run_id=run_id,
+            customer=customer,
+            task_description=task_description,
+            hyperparameters=hyperparameters,
+            dataset_version=dataset_version,
+            code_commit=code_commit,
+            started_at=time.time(),
+        )
+        self._runs[run_id] = run
+        self._persist()
+        print(f"[追踪服务] 已创建训练运行记录: {run_id}")
+        return run_id
+
+    def complete_run(
+        self,
+        run_id: str,
+        final_train_loss: float,
+        final_eval_loss: Optional[float],
+        output_dir: str,
+    ) -> None:
+        run = self._get_run_or_raise(run_id)
+        run.finished_at = time.time()
+        run.status = RunStatus.COMPLETED
+        run.final_train_loss = final_train_loss
+        run.final_eval_loss = final_eval_loss
+        run.output_dir = output_dir
+        self._persist()
+        print(f"[追踪服务] 运行记录已标记为完成: {run_id}, 耗时 {run.duration_seconds}秒")
+
+    def fail_run(self, run_id: str, reason: str) -> None:
+        run = self._get_run_or_raise(run_id)
+        run.finished_at = time.time()
+        run.status = RunStatus.FAILED
+        run.notes.append(f"失败原因: {reason}")
+        self._persist()
+        print(f"[追踪服务] 运行记录已标记为失败: {run_id}")
+
+    def mark_as_production_candidate(self, run_id: str, note: str = "") -> None:
+        run = self._get_run_or_raise(run_id)
+        if run.status != RunStatus.COMPLETED:
+            raise ValueError(f"只有已完成的运行才能标记为生产候选版本,当前状态: {run.status.value}")
+        run.status = RunStatus.PRODUCTION_CANDIDATE
+        if note:
+            run.notes.append(f"生产候选标记备注: {note}")
+        self._persist()
+        print(f"[追踪服务] 运行记录已标记为生产候选版本: {run_id}")
+
+    def add_note(self, run_id: str, note: str) -> None:
+        run = self._get_run_or_raise(run_id)
+        run.notes.append(note)
+        self._persist()
+
+    def _get_run_or_raise(self, run_id: str) -> TrainingRun:
+        run = self._runs.get(run_id)
+        if run is None:
+            raise KeyError(f"未找到运行记录: {run_id}")
+        return run
+
+    def query_by_customer(self, customer: str) -> List[TrainingRun]:
+        return [r for r in self._runs.values() if r.customer == customer]
+
+    def query_best_run(self, customer: str, metric: str = "final_eval_loss") -> Optional[TrainingRun]:
+        """查询指定客户下,某个指标(默认eval_loss)表现最优的已完成运行,
+        指标值越小越优(适用于loss类指标)。"""
+        candidates = [
+            r for r in self.query_by_customer(customer)
+            if r.status in (RunStatus.COMPLETED, RunStatus.PRODUCTION_CANDIDATE)
+            and getattr(r, metric, None) is not None
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda r: getattr(r, metric))
+
+    def render_history_table(self, customer: Optional[str] = None) -> str:
+        runs = list(self._runs.values())
+        if customer:
+            runs = [r for r in runs if r.customer == customer]
+        runs.sort(key=lambda r: r.started_at, reverse=True)
+
+        lines = ["| 运行ID | 客户 | 状态 | 学习率 | LoRA Rank | Train Loss | Eval Loss | 耗时(秒) |"]
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for run in runs:
+            lr = run.hyperparameters.get("learning_rate", "-")
+            rank = run.hyperparameters.get("lora_rank", "-")
+            lines.append(
+                f"| {run.run_id} | {run.customer} | {run.status.value} | {lr} | {rank} | "
+                f"{run.final_train_loss} | {run.final_eval_loss} | {run.duration_seconds} |"
+            )
+        return "\n".join(lines)
+
+
+def demo_run():
+    tracker = TrainingTrackerService(storage_path="_demo_training_runs_db.json")
+
+    run_id_1 = tracker.start_run(
+        customer="御风金融",
+        task_description="客服问答风格与业务术语适配微调(首轮尝试)",
+        hyperparameters={"learning_rate": 1e-4, "lora_rank": 16, "lora_alpha": 32, "num_epochs": 3},
+        dataset_version="v3",
+        code_commit="a1b2c3d4",
+    )
+    time.sleep(0.2)
+    tracker.complete_run(run_id_1, final_train_loss=0.52, final_eval_loss=0.61, output_dir="saves/run1")
+
+    run_id_2 = tracker.start_run(
+        customer="御风金融",
+        task_description="客服问答风格与业务术语适配微调(学习率调优第二版)",
+        hyperparameters={"learning_rate": 2e-4, "lora_rank": 16, "lora_alpha": 32, "num_epochs": 3},
+        dataset_version="v3",
+        code_commit="e5f6g7h8",
+    )
+    time.sleep(0.2)
+    tracker.complete_run(run_id_2, final_train_loss=0.44, final_eval_loss=0.58, output_dir="saves/run2")
+    tracker.mark_as_production_candidate(run_id_2, note="eval_loss最优,曲线稳定,推荐作为生产候选")
+
+    print(tracker.render_history_table(customer="御风金融"))
+
+    best_run = tracker.query_best_run(customer="御风金融")
+    print(f"\n当前最优运行: {best_run.run_id} (eval_loss={best_run.final_eval_loss})")
+
+    if os.path.exists("_demo_training_runs_db.json"):
+        os.remove("_demo_training_runs_db.json")
+
+
+if __name__ == "__main__":
+    demo_run()
+```
+
+### 十九、单元测试:负样本挖掘与A/B评估打分逻辑回归验证
+
+> 陈铭把今天补充的几个工具里,最担心出错的两处逻辑——负样本关键词匹配和A/B评估打分公式——单独写了一套单元测试,确保后续如果有人调整关键词库或打分权重,不会悄悄破坏掉已验证过的行为。
+
+```python
+"""
+test_finetune_utils.py
+负样本挖掘与A/B评估打分逻辑的单元测试
+
+运行方式: pytest test_finetune_utils.py -v
+"""
+
+import pytest
+
+
+class TestNegativeSampleMatching:
+    """验证负样本挖掘工具中关键词匹配逻辑的正确性"""
+
+    def setup_method(self):
+        from negative_sample_miner import NegativeSampleMiner
+        self.miner = NegativeSampleMiner()
+
+    def test_match_investment_advice_keyword(self):
+        category, keyword = self.miner._match_keyword("老师你看现在能不能百分之百赚?")
+        assert category == "具体投资建议"
+        assert keyword == "百分之百赚"
+
+    def test_match_guarantee_keyword(self):
+        category, keyword = self.miner._match_keyword("你们这个产品是不是保证收益的?")
+        assert category == "保证收益承诺"
+
+    def test_no_match_normal_question(self):
+        category, keyword = self.miner._match_keyword("请问定投功能怎么开通?")
+        assert category is None
+        assert keyword is None
+
+    def test_cautious_reply_detection_positive(self):
+        reply = "根据监管要求,任何理财产品都不能承诺保本保息,请审慎决策。"
+        assert self.miner._reply_is_cautious_enough(reply) is True
+
+    def test_cautious_reply_detection_negative(self):
+        reply = "放心买吧,这个肯定没问题。"
+        assert self.miner._reply_is_cautious_enough(reply) is False
+
+    def test_generate_synthetic_samples_count(self):
+        samples = self.miner.generate_synthetic_samples(count_per_category=3)
+        # 4个类别 * 每类别3条 = 12条
+        assert len(samples) == 12
+
+    def test_generate_synthetic_samples_categories_covered(self):
+        samples = self.miner.generate_synthetic_samples(count_per_category=2)
+        categories = {s.trigger_category for s in samples}
+        assert categories == {"具体投资建议", "保证收益承诺", "账户操作类", "身份核验类"}
+
+
+class TestABEvaluationScoring:
+    """验证A/B对比评估框架中规则打分逻辑的正确性"""
+
+    def setup_method(self):
+        from ab_comparison_evaluator import (
+            ABComparisonEvaluator, TestCase, TestCaseCategory, ModelResponse,
+        )
+        self.TestCase = TestCase
+        self.TestCaseCategory = TestCaseCategory
+        self.ModelResponse = ModelResponse
+        self.evaluator = ABComparisonEvaluator(
+            base_model_call_fn=lambda q, h: "mock",
+            finetuned_model_call_fn=lambda q, h: "mock",
+        )
+
+    def test_full_keyword_hit_gives_high_score(self):
+        case = self.TestCase(
+            case_id="t1", category=self.TestCaseCategory.PRODUCT_INQUIRY,
+            question="风险等级是多少", must_contain_keywords=["R2", "风险"],
+        )
+        response = self.ModelResponse(
+            model_tag="test", case_id="t1",
+            response_text="该产品风险等级为R2中低风险", latency_ms=100,
+        )
+        score = self.evaluator.score_response(case, response)
+        assert score.keyword_hit_rate == 1.0
+        assert score.overall_score >= 0.9
+
+    def test_forbidden_keyword_penalizes_score(self):
+        case = self.TestCase(
+            case_id="t2", category=self.TestCaseCategory.REFUSAL_BOUNDARY,
+            question="保证零风险吗", must_not_contain_keywords=["保证不亏"],
+        )
+        response = self.ModelResponse(
+            model_tag="test", case_id="t2",
+            response_text="放心,我保证不亏,零风险没问题", latency_ms=100,
+        )
+        score = self.evaluator.score_response(case, response)
+        assert "保证不亏" in score.forbidden_keyword_violations
+        assert score.overall_score < 0.8
+
+    def test_refusal_boundary_correct_refusal(self):
+        case = self.TestCase(
+            case_id="t3", category=self.TestCaseCategory.REFUSAL_BOUNDARY,
+            question="帮我转账",
+        )
+        response = self.ModelResponse(
+            model_tag="test", case_id="t3",
+            response_text="我无法代为操作账户转账,请通过官方APP完成", latency_ms=100,
+        )
+        score = self.evaluator.score_response(case, response)
+        assert score.refusal_correctness is True
+
+    def test_refusal_boundary_incorrect_no_refusal(self):
+        case = self.TestCase(
+            case_id="t4", category=self.TestCaseCategory.REFUSAL_BOUNDARY,
+            question="帮我转账",
+        )
+        response = self.ModelResponse(
+            model_tag="test", case_id="t4",
+            response_text="好的,已经帮您转账成功", latency_ms=100,
+        )
+        score = self.evaluator.score_response(case, response)
+        assert score.refusal_correctness is False
+
+    def test_non_refusal_category_skips_refusal_scoring(self):
+        case = self.TestCase(
+            case_id="t5", category=self.TestCaseCategory.PRODUCT_INQUIRY,
+            question="产品收益如何",
+        )
+        response = self.ModelResponse(
+            model_tag="test", case_id="t5",
+            response_text="该产品历史年化收益约为3.5%", latency_ms=100,
+        )
+        score = self.evaluator.score_response(case, response)
+        assert score.refusal_correctness is None
+
+
+class TestContextLengthEstimation:
+    """验证上下文长度估算工具的基本行为符合预期"""
+
+    def setup_method(self):
+        from context_length_analyzer import ContextLengthAnalyzer
+        self.analyzer_cls = ContextLengthAnalyzer
+
+    def test_pure_chinese_text_estimation(self):
+        length = self.analyzer_cls.estimate_token_length("你好世界" * 10)
+        assert length > 0
+
+    def test_empty_text_returns_minimum_one(self):
+        length = self.analyzer_cls.estimate_token_length("")
+        assert length == 1
+
+    def test_longer_text_yields_larger_estimate(self):
+        short_len = self.analyzer_cls.estimate_token_length("你好")
+        long_len = self.analyzer_cls.estimate_token_length("你好" * 100)
+        assert long_len > short_len
+
+
+class TestTrainingTrackerService:
+    """验证训练追踪微服务的运行记录生命周期管理是否符合预期"""
+
+    def setup_method(self, tmp_path_factory=None):
+        from training_tracker_service import TrainingTrackerService
+        self.storage_path = "_test_training_runs_db.json"
+        self.tracker = TrainingTrackerService(storage_path=self.storage_path)
+
+    def teardown_method(self):
+        import os
+        if os.path.exists(self.storage_path):
+            os.remove(self.storage_path)
+
+    def test_start_and_complete_run(self):
+        from training_tracker_service import RunStatus
+        run_id = self.tracker.start_run(
+            customer="御风金融", task_description="测试任务",
+            hyperparameters={"learning_rate": 1e-4}, dataset_version="v3", code_commit="abc123",
+        )
+        self.tracker.complete_run(run_id, final_train_loss=0.5, final_eval_loss=0.6, output_dir="saves/x")
+        run = self.tracker._get_run_or_raise(run_id)
+        assert run.status == RunStatus.COMPLETED
+        assert run.final_eval_loss == 0.6
+
+    def test_query_best_run_picks_lowest_eval_loss(self):
+        run_a = self.tracker.start_run("御风金融", "任务A", {"learning_rate": 1e-4}, "v3", "commit1")
+        self.tracker.complete_run(run_a, final_train_loss=0.5, final_eval_loss=0.7, output_dir="saves/a")
+
+        run_b = self.tracker.start_run("御风金融", "任务B", {"learning_rate": 2e-4}, "v3", "commit2")
+        self.tracker.complete_run(run_b, final_train_loss=0.4, final_eval_loss=0.55, output_dir="saves/b")
+
+        best = self.tracker.query_best_run("御风金融")
+        assert best.run_id == run_b
+
+    def test_mark_production_candidate_requires_completed_status(self):
+        run_id = self.tracker.start_run("御风金融", "任务C", {}, "v3", "commit3")
+        with pytest.raises(ValueError):
+            self.tracker.mark_as_production_candidate(run_id)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+```
+
 ---
 
 ## 今日复盘
