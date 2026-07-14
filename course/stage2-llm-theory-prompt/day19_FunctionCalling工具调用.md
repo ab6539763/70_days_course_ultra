@@ -2296,6 +2296,1222 @@ if __name__ == "__main__":
 
 赵磊(今天没有亲临现场,但看到群里转发的这份demo记录后)顺手回了一句,带着他一贯的测试工程师式挑刺:"场景四这个回答挺好,但我更好奇——如果我问一个订单号不存在的场景,它会不会老老实实地说'查不到',还是硬编一个假状态出来糊弄我?"老王把这个问题转给了陈铭,让他当场补测一次。陈铭在CLI里输入"查一下订单CQ99999999999的状态",运行结果里,`query_order`工具正确抛出了`OrderNotFoundError`,`dispatch_tool_call`把这个错误信息转换成了一条`{"error": "未找到订单号为'CQ99999999999'的订单,请确认订单号是否正确。"}`的`tool`消息回传给模型,模型基于这条"失败反馈",给出的最终回答是"抱歉,没有查到订单号为CQ99999999999的记录,请您确认一下订单号是否正确,或者提供一下您的姓名,我可以帮您按姓名查询一下"——没有编造任何不存在的状态,而且还主动给出了一个替代方案(按姓名查询)。赵磊看完补测结果,在群里回了一个"OK"的表情,顺带说了一句:"这个'诚实地承认查不到,而不是硬编'的行为,以后接真实客户系统,是我验收的第一条硬性标准,今天这个demo算是提前证明了这条路是走得通的。"
 
+晚自习原本到这里就该收工,但张凡在群里追问了午饭时老王提过的"汇率转换工具设计小测验"——他中午随手写了一版,想请老王看看思路对不对。老王看完之后,顺势把这件事变成了今晚最后一段加练:"既然你已经动手了,那咱们就把它做成一个能真正接进注册表的工具,顺便再补几个今天课堂上提过、但没时间落地的点——多工具并行执行、成本统计、还有对`arguments`更严格的Schema级校验。这几块不算今天的必修内容,但都是'今天讲过原理、但代码还没写'的地方,趁着记忆还热,今晚一并补上。"于是四人各自认领了一块,陈铭把最终版本汇总整理成了下面这几个新文件。
+
+### 二十、`tools/currency_tool.py` —— 汇率转换工具(承接午饭小测验)
+
+张凡设计的原始版本,`description`写得比较随意,老王指出了两个问题——一是没有像`get_weather`的`date`参数那样,用`enum`把货币代码限制在支持范围内,模型完全可能自己编一个不存在的货币代码;二是没有考虑"金额为负数"这种明显不合理的输入。陈铭吸收了这两条意见,整理出了最终版本。
+
+```python
+"""
+tools/currency_tool.py —— 汇率转换工具
+
+设计定位与get_weather类似,属于"依赖外部数据源"这一类工具——
+真实生产环境里,汇率应该来自实时更新的第三方汇率接口,今天为了保证
+教学演示的确定性与可复现性,依然使用一份静态的汇率表模拟数据源,
+但工具的Schema定义、参数校验、异常处理规范,和接入真实汇率API时
+应该完全一致,以后只需要替换EXCHANGE_RATE_TABLE的数据来源即可。
+"""
+
+from typing import Dict
+
+from exceptions import ToolExecutionError
+
+# 静态汇率表:以人民币(CNY)为基准货币,1单位基准货币兑换成对应货币的数量。
+# 今天的教学场景里,这份表格是固定的,保证每次调用结果都完全一致,
+# 便于自检脚本做回归验证——生产环境应该替换为定期从真实汇率接口刷新的缓存数据。
+_EXCHANGE_RATE_TABLE_VS_CNY: Dict[str, float] = {
+    "CNY": 1.0,
+    "USD": 0.14,
+    "EUR": 0.13,
+    "JPY": 20.5,
+    "HKD": 1.09,
+    "GBP": 0.11,
+}
+
+SUPPORTED_CURRENCIES = tuple(sorted(_EXCHANGE_RATE_TABLE_VS_CNY.keys()))
+
+
+def convert_currency(amount: float, from_currency: str, to_currency: str) -> dict:
+    """
+    在两种货币之间做换算,基于静态汇率表(今天的模拟数据源)。
+
+    参数:
+        amount: 待换算的金额,必须是非负数
+        from_currency: 原始货币代码,如"CNY"、"USD"
+        to_currency: 目标货币代码
+
+    返回:
+        一个包含换算详情的字典,字段设计参考get_weather的风格——
+        既包含最终结果,也包含足够的上下文字段,方便模型生成更自然的回答。
+
+    异常:
+        ToolExecutionError: 金额为负数,或者货币代码不在支持范围内
+    """
+    if amount < 0:
+        raise ToolExecutionError(f"金额不能为负数,收到的amount为{amount},请检查输入。")
+
+    from_code = from_currency.strip().upper()
+    to_code = to_currency.strip().upper()
+
+    if from_code not in _EXCHANGE_RATE_TABLE_VS_CNY:
+        raise ToolExecutionError(
+            f"不支持的原始货币代码'{from_currency}',"
+            f"当前支持的货币代码有:{'、'.join(SUPPORTED_CURRENCIES)}。"
+        )
+    if to_code not in _EXCHANGE_RATE_TABLE_VS_CNY:
+        raise ToolExecutionError(
+            f"不支持的目标货币代码'{to_currency}',"
+            f"当前支持的货币代码有:{'、'.join(SUPPORTED_CURRENCIES)}。"
+        )
+
+    # 换算思路:先把金额统一折算成基准货币CNY,再从CNY折算成目标货币,
+    # 这样只需要维护一份"对CNY的汇率表",不需要维护任意两种货币之间的两两组合。
+    amount_in_cny = amount / _EXCHANGE_RATE_TABLE_VS_CNY[from_code]
+    converted_amount = amount_in_cny * _EXCHANGE_RATE_TABLE_VS_CNY[to_code]
+
+    return {
+        "original_amount": amount,
+        "from_currency": from_code,
+        "to_currency": to_code,
+        "converted_amount": round(converted_amount, 4),
+        "rate_note": "汇率数据来自内部模拟数据源,仅用于教学演示,非实时真实汇率。",
+    }
+
+
+CURRENCY_CONVERT_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "convert_currency",
+        "description": (
+            "在两种货币之间进行金额换算,例如把人民币换算成美元、"
+            "把日元换算成欧元。当用户的问题涉及'多少钱换算成另一种货币'"
+            "或者'这笔钱相当于多少美元/欧元'时,应当调用此工具,"
+            "而不要凭自己记忆里的汇率信息直接给出答案(汇率会随时间变化,"
+            "记忆里的数字很可能已经过时)。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "amount": {
+                    "type": "number",
+                    "description": "待换算的金额,必须是非负数",
+                },
+                "from_currency": {
+                    "type": "string",
+                    "enum": list(SUPPORTED_CURRENCIES),
+                    "description": "原始货币的ISO代码,如CNY、USD、EUR、JPY、HKD、GBP",
+                },
+                "to_currency": {
+                    "type": "string",
+                    "enum": list(SUPPORTED_CURRENCIES),
+                    "description": "目标货币的ISO代码,取值范围与from_currency一致",
+                },
+            },
+            "required": ["amount", "from_currency", "to_currency"],
+        },
+    },
+}
+```
+
+老王看完这个版本,特别认可`rate_note`这个字段的设计:"这一步很多人会漏掉——工具返回的数据里,主动告诉模型'这是模拟数据,不是实时真实汇率',这样模型在组织最终回答的时候,才有可能主动提醒用户'以上汇率仅供参考'。这不是多此一举,真实场景里,如果咱们接的是一个免费的、更新频率较低的汇率接口,同样应该在返回结果里带上数据更新时间之类的元信息,让最终呈现给用户的回答里,能够体现出这份数据的'新鲜程度',而不是让用户误以为这是一个绝对精确的实时数字。"
+
+### 二十一、`tools/inventory_tool.py` —— 模拟库存查询工具
+
+苏梦提出了另一个业务场景:"如果客户问'这个产品还有没有库存,能不能加急发货',这属不属于今天讲的第三类工具(连接企业内部系统)?"老王认可这个思路,让她顺手把这个工具也补齐,进一步验证"新增一个工具,只需要写Schema、写执行函数、加一行注册"这条可扩展性承诺是不是真的立得住。
+
+```python
+"""
+tools/inventory_tool.py —— 模拟库存查询工具
+
+与tools/db_tool.py的订单查询类似,属于"连接企业内部系统"这一类工具,
+今天用一份内存字典模拟真实的ERP/库存管理系统数据,未来接入真实系统时,
+只需要把_INVENTORY_DATA替换成真实的数据库查询逻辑,
+query_inventory函数对外的参数结构和返回结构应当保持不变,
+这样依赖它的Schema定义和上层调用代码都不需要跟着改动。
+"""
+
+from typing import Dict, Optional
+
+from exceptions import ToolExecutionError
+
+# 模拟库存数据:key是产品SKU编码,value是该产品的库存详情。
+_INVENTORY_DATA: Dict[str, dict] = {
+    "SKU-CQ-STD-001": {
+        "product_name": "苍穹企业级智能体中台 · 标准版年度授权",
+        "stock_quantity": 128,
+        "warehouse": "北京仓",
+        "supports_expedited_shipping": True,
+    },
+    "SKU-CQ-DEV-002": {
+        "product_name": "苍穹企业级智能体中台 · 开发者体验套餐",
+        "stock_quantity": 0,
+        "warehouse": "上海仓",
+        "supports_expedited_shipping": False,
+    },
+    "SKU-CQ-PRO-003": {
+        "product_name": "苍穹企业级智能体中台 · 专业版年度授权",
+        "stock_quantity": 42,
+        "warehouse": "广州仓",
+        "supports_expedited_shipping": True,
+    },
+}
+
+# 支持按产品名称的关键字模糊匹配到对应SKU,方便用户不需要精确记住SKU编码。
+_PRODUCT_NAME_TO_SKU: Dict[str, str] = {
+    detail["product_name"]: sku for sku, detail in _INVENTORY_DATA.items()
+}
+
+
+def query_inventory(sku: Optional[str] = None, product_name_keyword: Optional[str] = None) -> dict:
+    """
+    查询指定产品的库存情况,支持按精确SKU或者产品名称关键字查询。
+
+    参数:
+        sku: 产品SKU编码,精确匹配
+        product_name_keyword: 产品名称中的关键字,支持模糊匹配(只要产品名称
+            包含这个关键字就算命中),sku和product_name_keyword至少提供一个
+
+    返回:
+        库存详情字典,包含产品名称、库存数量、所在仓库、是否支持加急发货
+
+    异常:
+        ToolExecutionError: 两个参数都未提供,或者根据给定条件查不到任何匹配的产品
+    """
+    if not sku and not product_name_keyword:
+        raise ToolExecutionError("sku和product_name_keyword至少需要提供一个,才能进行库存查询。")
+
+    if sku:
+        detail = _INVENTORY_DATA.get(sku)
+        if detail is None:
+            raise ToolExecutionError(f"未找到SKU为'{sku}'的产品库存记录,请确认SKU是否正确。")
+        return {"sku": sku, **detail}
+
+    matched_skus = [
+        matched_sku
+        for matched_sku, detail in _INVENTORY_DATA.items()
+        if product_name_keyword in detail["product_name"]
+    ]
+    if not matched_skus:
+        raise ToolExecutionError(
+            f"未找到产品名称包含'{product_name_keyword}'的库存记录,请确认关键字是否正确。"
+        )
+    return {
+        "matched_products": [
+            {"sku": matched_sku, **_INVENTORY_DATA[matched_sku]} for matched_sku in matched_skus
+        ]
+    }
+
+
+INVENTORY_QUERY_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "query_inventory",
+        "description": (
+            "查询苍穹平台某个产品的当前库存数量、所在仓库、是否支持加急发货。"
+            "当用户询问'还有没有货'、'能不能加急发货'、'这个产品什么时候能到货'"
+            "这类涉及库存和发货能力的问题时,应当调用此工具获取真实库存数据,"
+            "不要凭空猜测库存是否充足。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sku": {
+                    "type": "string",
+                    "description": "产品的SKU编码,如果用户提供了明确的SKU,优先使用此参数精确查询",
+                },
+                "product_name_keyword": {
+                    "type": "string",
+                    "description": "产品名称中的关键字,例如'标准版'、'专业版',用于模糊匹配产品",
+                },
+            },
+            "required": [],
+        },
+    },
+}
+```
+
+### 二十二、`extended_tool_registry.py` —— 扩展注册表(验证"三步接入新工具"的可扩展性承诺)
+
+老王要求这一步不能直接改`tool_registry.py`——他的理由是:"我想让你们亲眼验证一遍需求文档里F4那条'新增一个工具只需要三步、不需要改动核心循环代码'的可扩展性承诺,最有说服力的方式,就是完全不碰`agent_core.py`和`tool_registry.py`里原有的任何一行代码,只新增一个文件,把新工具接进去,今天的所有回归测试应该还能全部通过。"
+
+```python
+"""
+extended_tool_registry.py —— 工具注册表的扩展示例
+
+这个文件完全不修改tool_registry.py里已有的任何代码,
+而是复用其中的RegisteredTool数据结构和已有的TOOL_REGISTRY字典,
+在此基础上追加两个新工具(汇率转换、库存查询),
+用于验证今天需求文档F4条"新增工具只需三步"的可扩展性承诺:
+
+    第一步:写Schema(见tools/currency_tool.py、tools/inventory_tool.py)
+    第二步:写执行函数(同上)
+    第三步:在下面这一处,把Schema和函数绑定进注册表
+
+agent_core.py调用工具的方式,始终是"传入tools列表 + 按名字查注册表分发执行",
+只要注册表里的内容更新了,agent_core.py不需要任何改动就能自动支持新工具。
+"""
+
+from typing import Any, Dict, List
+
+from tool_registry import TOOL_REGISTRY, RegisteredTool, dispatch_tool_call as _dispatch_original
+from tools.currency_tool import CURRENCY_CONVERT_TOOL_SCHEMA, convert_currency
+from tools.inventory_tool import INVENTORY_QUERY_TOOL_SCHEMA, query_inventory
+from tool_schemas import ALL_TOOL_SCHEMAS
+
+
+def _build_extended_registry() -> Dict[str, RegisteredTool]:
+    """
+    以原有的TOOL_REGISTRY为基础,追加两个新工具,构造出一份新的注册表。
+
+    这里特意用字典的浅拷贝(dict(...))而不是直接修改原字典,
+    是为了保证"引入扩展注册表"这件事,对原有的tool_registry模块
+    没有任何副作用——如果某处代码依然在使用原始的TOOL_REGISTRY,
+    它的行为不会因为这个扩展文件的引入而发生任何改变。
+    """
+    extended = dict(TOOL_REGISTRY)
+    extended["convert_currency"] = RegisteredTool(
+        schema=CURRENCY_CONVERT_TOOL_SCHEMA, handler=convert_currency
+    )
+    extended["query_inventory"] = RegisteredTool(
+        schema=INVENTORY_QUERY_TOOL_SCHEMA, handler=query_inventory
+    )
+    return extended
+
+
+EXTENDED_TOOL_REGISTRY: Dict[str, RegisteredTool] = _build_extended_registry()
+
+EXTENDED_ALL_SCHEMAS: List[Dict[str, Any]] = list(ALL_TOOL_SCHEMAS) + [
+    CURRENCY_CONVERT_TOOL_SCHEMA,
+    INVENTORY_QUERY_TOOL_SCHEMA,
+]
+
+
+def dispatch_tool_call_extended(tool_name: str, arguments_json: str) -> str:
+    """
+    扩展版的调度入口:如果是原有的三个工具,直接复用tool_registry.py里
+    验证过的原始dispatch_tool_call逻辑(保证行为完全一致,不重复实现);
+    如果是新增的两个工具,走本文件里基于EXTENDED_TOOL_REGISTRY的分发逻辑。
+    """
+    if tool_name in TOOL_REGISTRY:
+        return _dispatch_original(tool_name, arguments_json)
+
+    import json
+
+    from exceptions import ToolArgumentError, ToolExecutionError
+
+    registered = EXTENDED_TOOL_REGISTRY.get(tool_name)
+    if registered is None:
+        return json.dumps({"error": f"工具'{tool_name}'未注册,无法执行。"}, ensure_ascii=False)
+
+    try:
+        arguments = json.loads(arguments_json) if arguments_json else {}
+    except (json.JSONDecodeError, TypeError) as exc:
+        return json.dumps(
+            {"error": f"工具'{tool_name}'的参数解析失败:{exc}"}, ensure_ascii=False
+        )
+
+    try:
+        result = registered.handler(**arguments)
+    except TypeError as exc:
+        return json.dumps({"error": f"调用工具'{tool_name}'时参数不匹配:{exc}"}, ensure_ascii=False)
+    except ToolExecutionError as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+    if isinstance(result, (dict, list)):
+        return json.dumps(result, ensure_ascii=False)
+    return json.dumps({"result": result}, ensure_ascii=False)
+
+
+if __name__ == "__main__":
+    import json
+
+    print("扩展后已注册工具:", "、".join(EXTENDED_TOOL_REGISTRY.keys()))
+    print(dispatch_tool_call_extended(
+        "convert_currency", json.dumps({"amount": 1000, "from_currency": "CNY", "to_currency": "USD"})
+    ))
+    print(dispatch_tool_call_extended(
+        "query_inventory", json.dumps({"product_name_keyword": "标准版"})
+    ))
+    # 验证原有工具依然可以通过扩展入口正常调用,行为与原始dispatch_tool_call完全一致
+    print(dispatch_tool_call_extended("get_weather", json.dumps({"city": "北京"})))
+```
+
+四人一起验证了一遍——`self_check.py`原有的24项检查全部照常通过,同时新增的两个工具也能通过`dispatch_tool_call_extended`正确调用,`agent_core.py`没有改动一行。老王看完结果,评价道:"这才是'可扩展性'这个词该有的样子——不是嘴上说'架构支持扩展',是真的拿一次新增需求去试一遍,试出来发现原有代码真的可以一行不改。"
+
+### 二十三、`parallel_executor.py`—— 多工具的并行执行(呼应课堂笔记"多工具编排的两种模式")
+
+上午课堂笔记里提到"并行"和"串行"两种编排模式,但今天`agent_core.py`目前的实现,对同一轮里的多个`tool_calls`,依然是用一个`for`循环顺序执行的——这在工具执行本身很快(比如今天的模拟数据源)的时候没什么影响,但老王指出,如果某个工具的执行涉及真实的网络请求(比如真的调用第三方天气API),多个工具顺序执行的耗时会直接叠加,应该考虑并行执行。
+
+```python
+"""
+parallel_executor.py —— 多工具调用的并行执行封装
+
+今天agent_core.py里对同一轮的多个tool_calls,是用for循环顺序执行的,
+这份文件提供一个可选的并行执行版本,使用concurrent.futures.ThreadPoolExecutor
+同时发起多个工具调用,尤其适合"工具执行本身涉及网络I/O"的场景
+(今天的模拟数据源本身几乎不耗时,但真实接入第三方API之后,
+串行执行的耗时会随着工具数量线性增长,并行执行则接近取最长的那一个)。
+
+设计上特意保留了两个版本(串行run_tool_calls_sequential与并行
+run_tool_calls_parallel),方便在课堂上直接对比两者的耗时差异,
+也方便在真实项目中按需选择——如果工具之间的执行存在业务上的先后依赖
+(比如后一个工具需要用到前一个工具的结果),就不能简单地改成并行执行,
+这一点在下面的文档字符串里也做了明确提示。
+"""
+
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Callable, Dict, List, NamedTuple
+
+
+class ToolCallRequest(NamedTuple):
+    """一次工具调用请求的最小结构,与真实的tool_calls[i]字段保持一一对应。"""
+
+    call_id: str
+    tool_name: str
+    arguments_json: str
+
+
+class ToolCallOutcome(NamedTuple):
+    """一次工具调用执行完成后的结果,包含耗时信息便于性能分析。"""
+
+    call_id: str
+    tool_name: str
+    result_json: str
+    elapsed_seconds: float
+
+
+def run_tool_calls_sequential(
+    requests: List[ToolCallRequest],
+    dispatcher: Callable[[str, str], str],
+) -> List[ToolCallOutcome]:
+    """
+    按顺序依次执行多个工具调用请求,作为耗时对比的基线版本。
+
+    参数:
+        requests: 待执行的工具调用请求列表
+        dispatcher: 实际执行单次工具调用的函数,签名与
+            tool_registry.dispatch_tool_call保持一致
+    """
+    outcomes: List[ToolCallOutcome] = []
+    for request in requests:
+        start = time.perf_counter()
+        result_json = dispatcher(request.tool_name, request.arguments_json)
+        elapsed = time.perf_counter() - start
+        outcomes.append(
+            ToolCallOutcome(
+                call_id=request.call_id,
+                tool_name=request.tool_name,
+                result_json=result_json,
+                elapsed_seconds=elapsed,
+            )
+        )
+    return outcomes
+
+
+def run_tool_calls_parallel(
+    requests: List[ToolCallRequest],
+    dispatcher: Callable[[str, str], str],
+    max_workers: int = 4,
+) -> List[ToolCallOutcome]:
+    """
+    并行执行多个工具调用请求,使用线程池而不是asyncio协程——
+    因为今天的工具执行函数(safe_calculate、get_weather、query_order等)
+    都是同步阻塞的普通函数,没有改写成async def,线程池可以直接复用现有代码,
+    不需要把所有工具函数都重写成协程版本。
+
+    重要提示:只有当多个工具调用之间"互不依赖对方的执行结果"时,
+    才适合使用这个并行版本。如果业务逻辑要求"先查订单、再根据订单里的
+    收货城市去查天气",这种存在先后依赖关系的场景,不能简单地改成并行执行,
+    应该拆分成两轮独立的调用轮次(这也是agent_core.py设计成"多轮循环"
+    而不是"一轮执行完所有工具"的原因之一)。
+
+    参数:
+        requests: 待执行的工具调用请求列表
+        dispatcher: 实际执行单次工具调用的函数
+        max_workers: 线程池的最大并发数,不需要设置得比请求数量还大
+    """
+    outcomes: List[ToolCallOutcome] = []
+    effective_workers = min(max_workers, max(1, len(requests)))
+
+    with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+        future_to_request: Dict[Any, ToolCallRequest] = {}
+        for request in requests:
+            future = executor.submit(dispatcher, request.tool_name, request.arguments_json)
+            future_to_request[future] = request
+
+        start_times: Dict[Any, float] = {future: time.perf_counter() for future in future_to_request}
+
+        for future in as_completed(future_to_request):
+            request = future_to_request[future]
+            result_json = future.result()
+            elapsed = time.perf_counter() - start_times[future]
+            outcomes.append(
+                ToolCallOutcome(
+                    call_id=request.call_id,
+                    tool_name=request.tool_name,
+                    result_json=result_json,
+                    elapsed_seconds=elapsed,
+                )
+            )
+
+    # as_completed不保证返回顺序与提交顺序一致,这里按原始请求顺序重新排列,
+    # 保证调用方后续把结果对应回tool_call_id时,顺序是可预期、可读的。
+    order_index = {request.call_id: index for index, request in enumerate(requests)}
+    outcomes.sort(key=lambda outcome: order_index[outcome.call_id])
+    return outcomes
+
+
+def _simulate_slow_tool(tool_name: str, arguments_json: str) -> str:
+    """用固定延迟模拟一次"涉及真实网络I/O"的工具调用,用于耗时对比演示。"""
+    time.sleep(0.5)
+    return f'{{"tool": "{tool_name}", "arguments": {arguments_json}}}'
+
+
+if __name__ == "__main__":
+    demo_requests = [
+        ToolCallRequest(call_id="call_1", tool_name="get_weather", arguments_json='{"city": "北京"}'),
+        ToolCallRequest(call_id="call_2", tool_name="get_weather", arguments_json='{"city": "上海"}'),
+        ToolCallRequest(call_id="call_3", tool_name="get_weather", arguments_json='{"city": "广州"}'),
+    ]
+
+    start = time.perf_counter()
+    run_tool_calls_sequential(demo_requests, _simulate_slow_tool)
+    sequential_elapsed = time.perf_counter() - start
+
+    start = time.perf_counter()
+    run_tool_calls_parallel(demo_requests, _simulate_slow_tool)
+    parallel_elapsed = time.perf_counter() - start
+
+    print(f"串行执行3个模拟耗时0.5秒的工具调用,总耗时约: {sequential_elapsed:.2f}秒")
+    print(f"并行执行同样的3个工具调用,总耗时约: {parallel_elapsed:.2f}秒")
+```
+
+张凡跑完这份demo,自己心算了一下:"串行大概1.5秒,并行大概0.5秒左右,跟我预期的差不多。"老王补充了一句容易被忽视的边界情况:"你们注意,今天的三个工具本身都是纯本地计算或者读内存字典,几乎不耗时,所以`agent_core.py`现在用串行`for`循环,性能上完全没问题,不需要现在就把这个并行版本接进正式的核心循环——这份文件的价值,是让你们提前理解'什么时候应该考虑并行执行工具'这件事的判断依据(工具本身有I/O耗时、工具之间无依赖关系),而不是不分场景地到处引入并发,平添复杂度。"
+
+### 二十四、`cost_tracker.py` —— 成本感知小工具(承接课堂笔记"5.5")
+
+课堂笔记提到"一次用户提问,往往对应至少两次模型API调用",林悦在晨会上也提醒过"接真实工具时要考虑成本"。老王要求今晚把这个"点到但没落地"的想法,写成一个真正能用的小工具,后续可以直接接进`agent_core.py`的循环里做累计统计。
+
+```python
+"""
+cost_tracker.py —— 模型调用成本统计小工具
+
+Function Calling场景下,一次用户提问经常对应多次模型API调用
+(每一轮工具调用循环都要重新请求一次模型),这意味着成本和延迟都会
+比普通的单轮对话高出不少。这个模块提供一个轻量的成本统计器,
+按DeepSeek官方定价(今天写入的价格为教学时点的参考价格,
+实际计费请以服务商官网当时公示的价格为准),把每一轮的token用量
+换算成大致的人民币成本,并支持累计统计一整个会话/一整天的总花费,
+为后续苍穹平台"模型调用成本看板"这类运营功能积累最初的实现思路。
+"""
+
+from dataclasses import dataclass, field
+from typing import List
+
+
+# 教学参考价格,单位:元/千token(实际数字请以服务商官网当时公示的价格为准,
+# 这里选用一组便于估算的近似数字,重点是让大家理解计算方式,不是记住具体价格)
+_PRICE_PER_THOUSAND_INPUT_TOKENS_CNY = 0.001
+_PRICE_PER_THOUSAND_OUTPUT_TOKENS_CNY = 0.002
+
+
+@dataclass
+class RoundCostRecord:
+    """一轮模型调用的用量与成本记录。"""
+
+    round_index: int
+    input_tokens: int
+    output_tokens: int
+    estimated_cost_cny: float
+
+
+@dataclass
+class CostTracker:
+    """
+    跨多轮调用的成本累计统计器。
+
+    使用方式:每次调用完模型API之后,把这次响应里的usage信息喂给
+    record_round方法,循环结束后调用get_summary获取整体统计。
+    """
+
+    records: List[RoundCostRecord] = field(default_factory=list)
+
+    def record_round(self, input_tokens: int, output_tokens: int) -> RoundCostRecord:
+        """
+        记录一轮模型调用的token用量,并据此估算这一轮的花费。
+
+        参数:
+            input_tokens: 这一轮请求的输入token数(来自response.usage.prompt_tokens)
+            output_tokens: 这一轮请求的输出token数(来自response.usage.completion_tokens)
+        """
+        estimated_cost = (
+            input_tokens / 1000 * _PRICE_PER_THOUSAND_INPUT_TOKENS_CNY
+            + output_tokens / 1000 * _PRICE_PER_THOUSAND_OUTPUT_TOKENS_CNY
+        )
+        record = RoundCostRecord(
+            round_index=len(self.records) + 1,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            estimated_cost_cny=round(estimated_cost, 6),
+        )
+        self.records.append(record)
+        return record
+
+    def get_total_cost(self) -> float:
+        """返回目前累计的估算总成本(人民币元)。"""
+        return round(sum(record.estimated_cost_cny for record in self.records), 6)
+
+    def get_total_tokens(self) -> int:
+        """返回目前累计的输入输出token总量。"""
+        return sum(record.input_tokens + record.output_tokens for record in self.records)
+
+    def get_summary(self) -> str:
+        """生成一段人类可读的成本汇总说明,可以直接打印到终端或写进日志。"""
+        lines = [f"本次对话共进行了{len(self.records)}轮模型调用:"]
+        for record in self.records:
+            lines.append(
+                f"  第{record.round_index}轮:输入{record.input_tokens}token,"
+                f"输出{record.output_tokens}token,"
+                f"预估花费{record.estimated_cost_cny:.6f}元"
+            )
+        lines.append(
+            f"累计token用量:{self.get_total_tokens()},"
+            f"累计预估花费:{self.get_total_cost():.6f}元"
+        )
+        return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    tracker = CostTracker()
+    # 模拟"北京天气+算数学题"这个复合问题触发的两轮模型调用用量
+    tracker.record_round(input_tokens=420, output_tokens=35)
+    tracker.record_round(input_tokens=610, output_tokens=98)
+
+    print(tracker.get_summary())
+```
+
+林悦看到这个小工具的输出格式,提了一个产品侧的期待:"如果以后每一次用户对话结束,都能把这份汇总数据存下来,按天、按客户汇总一下,咱们就能算出'苍穹平台每天在模型调用上到底花了多少钱',这个数字对咱们后续给客户报价、核算利润空间,是非常关键的一个输入。"老王把这条记进了后续待办:"今天先把单次统计的逻辑打好,存储和报表汇总,等真正接入正式的会话数据库之后再一起做。"
+
+### 二十五、`tool_call_validator.py` —— 对`arguments`的Schema级校验
+
+课堂笔记提到,`arguments`字段本身只是一段字符串,`json.loads()`只能保证"这是一段合法的JSON",不能保证"这份JSON里的字段,符合Schema里`required`和每个属性`type`/`enum`的约束"。今天`tool_registry.py`里的`dispatch_tool_call`,主要依赖Python函数签名本身的`TypeError`来兜底参数不匹配的情况,但这种兜底比较"事后"——韩露提出,能不能在真正调用函数之前,就先按照Schema的要求做一遍更明确的校验,拒绝原因也能给得更具体。
+
+```python
+"""
+tool_call_validator.py —— 基于工具Schema的参数校验模块
+
+今天的tool_registry.dispatch_tool_call,主要靠Python函数调用时天然抛出的
+TypeError来捕获"参数不匹配"的问题,这种方式简单可靠,但报错信息对模型
+不够友好(TypeError的原始文本通常是英文的、面向开发者而不是面向"看得懂
+的下一轮对话"的措辞)。
+
+这个模块提供一层更主动的校验:在真正调用工具函数之前,依据这个工具的
+JSON Schema定义(必填字段、类型、enum可选值),对解析出来的参数字典
+做一次显式检查,校验不通过时,给出更清楚、更适合直接回传给模型的错误说明,
+帮助模型在下一轮更容易"自我修正"。
+
+这个模块今天先独立存在、可以单独测试,是否要把它接入
+tool_registry.dispatch_tool_call的主流程,留给大家在课后作业里思考——
+课堂笔记里提到过,今天的循环本身已经具备"执行失败->拿到反馈->下一轮
+自我修正"的能力,这层更明确的校验,会让这种自我修正更容易成功。
+"""
+
+from typing import Any, Dict, List
+
+from exceptions import ToolArgumentError
+
+
+_TYPE_NAME_MAP = {
+    "string": str,
+    "number": (int, float),
+    "integer": int,
+    "boolean": bool,
+    "object": dict,
+    "array": list,
+}
+
+
+def validate_arguments_against_schema(tool_schema: Dict[str, Any], arguments: Dict[str, Any]) -> None:
+    """
+    依据工具的JSON Schema定义,校验一份已经解析好的参数字典是否合法。
+
+    参数:
+        tool_schema: 形如{"type": "function", "function": {...}}的完整工具Schema
+        arguments: 已经通过json.loads()解析出来的参数字典
+
+    异常:
+        ToolArgumentError: 校验不通过时抛出,错误信息里会说明具体是哪个字段、
+            出于什么原因不合法,方便这条信息作为tool消息回传给模型时,
+            模型能够据此在下一轮生成更正确的调用请求。
+    """
+    parameters_schema = tool_schema["function"].get("parameters", {})
+    properties: Dict[str, Any] = parameters_schema.get("properties", {})
+    required_fields: List[str] = parameters_schema.get("required", [])
+
+    missing_fields = [field for field in required_fields if field not in arguments]
+    if missing_fields:
+        raise ToolArgumentError(
+            f"缺少必填参数:{', '.join(missing_fields)}。"
+            f"该工具要求的必填参数为:{', '.join(required_fields) or '(无)'}。"
+        )
+
+    for field_name, field_value in arguments.items():
+        field_schema = properties.get(field_name)
+        if field_schema is None:
+            # Schema里没有声明的字段,今天选择"宽松放行"而不是直接拒绝——
+            # 因为部分模型在极少数情况下会附带一些无害的多余字段,
+            # 严格拒绝反而可能让本来能正常执行的调用被误伤。
+            continue
+
+        expected_enum = field_schema.get("enum")
+        if expected_enum is not None and field_value not in expected_enum:
+            raise ToolArgumentError(
+                f"参数'{field_name}'的取值'{field_value}'不在允许范围内,"
+                f"允许的取值为:{', '.join(str(v) for v in expected_enum)}。"
+            )
+
+        expected_type_name = field_schema.get("type")
+        expected_python_type = _TYPE_NAME_MAP.get(expected_type_name)
+        if expected_python_type is not None and not isinstance(field_value, expected_python_type):
+            raise ToolArgumentError(
+                f"参数'{field_name}'的类型不正确,期望类型为'{expected_type_name}',"
+                f"实际收到的值为{field_value!r}(Python类型:{type(field_value).__name__})。"
+            )
+
+
+def build_schema_lookup(all_schemas: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """把工具Schema列表,转换成按工具名索引的字典,方便按名字快速取出对应Schema。"""
+    return {schema["function"]["name"]: schema for schema in all_schemas}
+
+
+if __name__ == "__main__":
+    from tool_schemas import WEATHER_TOOL_SCHEMA
+
+    print("场景1:缺少必填参数city")
+    try:
+        validate_arguments_against_schema(WEATHER_TOOL_SCHEMA, {})
+    except ToolArgumentError as exc:
+        print(f"  校验失败(符合预期):{exc}")
+
+    print("\n场景2:date参数取值不在enum允许范围内")
+    try:
+        validate_arguments_against_schema(
+            WEATHER_TOOL_SCHEMA, {"city": "北京", "date": "下周三"}
+        )
+    except ToolArgumentError as exc:
+        print(f"  校验失败(符合预期):{exc}")
+
+    print("\n场景3:合法参数,应当顺利通过校验")
+    validate_arguments_against_schema(WEATHER_TOOL_SCHEMA, {"city": "北京", "date": "today"})
+    print("  校验通过(符合预期)")
+```
+
+老王看完这个模块的输出,认可了它的价值,但也明确划了一条边界:"这个校验层,补上的是'类型和取值范围'这一级别的检查,它检查不出更深层的业务合法性问题——比如`city`字段类型是字符串、也没有enum限制,一个'火星'这样的字符串,在Schema层面完全合法,校验会放行,但实际执行的时候`get_weather`还是会因为'不支持的城市'抛出`ToolExecutionError`。这提醒我们,Schema校验和工具内部的业务校验,永远是两道独立的关卡,不能指望有了这一层,就不需要工具函数内部继续做自己的业务合法性检查了。"
+
+### 二十六、新增模块的配套测试
+
+```python
+"""
+tests/test_extended_tools_and_utilities.py
+
+针对今晚新增的五个模块(currency_tool、inventory_tool、extended_tool_registry、
+parallel_executor、cost_tracker)的单元测试。风格延续self_check.py——
+不依赖真实网络请求,只验证纯本地的逻辑正确性。
+"""
+
+import json
+import os
+import sys
+
+os.environ.setdefault("DEEPSEEK_API_KEY", "self-check-placeholder-key")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from exceptions import ToolArgumentError, ToolExecutionError
+from tools.currency_tool import convert_currency
+from tools.inventory_tool import query_inventory
+from extended_tool_registry import dispatch_tool_call_extended
+from parallel_executor import ToolCallRequest, run_tool_calls_parallel, run_tool_calls_sequential
+from cost_tracker import CostTracker
+from tool_call_validator import validate_arguments_against_schema
+from tool_schemas import WEATHER_TOOL_SCHEMA
+
+
+class TestCurrencyTool:
+    """汇率转换工具的行为验证。"""
+
+    def test_cny_to_usd_conversion_is_correct(self):
+        result = convert_currency(1000, "CNY", "USD")
+        assert result["converted_amount"] == 140.0
+
+    def test_negative_amount_raises_error(self):
+        try:
+            convert_currency(-100, "CNY", "USD")
+            assert False, "应当抛出ToolExecutionError"
+        except ToolExecutionError:
+            pass
+
+    def test_unsupported_currency_raises_error(self):
+        try:
+            convert_currency(100, "CNY", "XYZ")
+            assert False, "应当抛出ToolExecutionError"
+        except ToolExecutionError:
+            pass
+
+
+class TestInventoryTool:
+    """库存查询工具的行为验证。"""
+
+    def test_query_by_exact_sku(self):
+        result = query_inventory(sku="SKU-CQ-STD-001")
+        assert result["stock_quantity"] == 128
+
+    def test_query_by_keyword_matches_expected_product(self):
+        result = query_inventory(product_name_keyword="专业版")
+        assert len(result["matched_products"]) == 1
+        assert result["matched_products"][0]["sku"] == "SKU-CQ-PRO-003"
+
+    def test_no_parameters_raises_error(self):
+        try:
+            query_inventory()
+            assert False, "应当抛出ToolExecutionError"
+        except ToolExecutionError:
+            pass
+
+
+class TestExtendedToolRegistry:
+    """扩展注册表的调度验证,包括新旧工具是否都能正常工作。"""
+
+    def test_new_tool_currency_works_through_extended_dispatch(self):
+        result_str = dispatch_tool_call_extended(
+            "convert_currency",
+            json.dumps({"amount": 500, "from_currency": "CNY", "to_currency": "EUR"}),
+        )
+        result = json.loads(result_str)
+        assert result["converted_amount"] == 65.0
+
+    def test_original_tool_still_works_through_extended_dispatch(self):
+        result_str = dispatch_tool_call_extended("calculate", json.dumps({"expression": "6*7"}))
+        result = json.loads(result_str)
+        assert result["result"] == 42
+
+
+class TestParallelExecutor:
+    """并行/串行执行器的结果一致性验证。"""
+
+    @staticmethod
+    def _echo_dispatcher(tool_name: str, arguments_json: str) -> str:
+        return json.dumps({"tool": tool_name, "arguments": json.loads(arguments_json)})
+
+    def test_parallel_and_sequential_produce_same_results(self):
+        requests = [
+            ToolCallRequest("call_1", "get_weather", '{"city": "北京"}'),
+            ToolCallRequest("call_2", "get_weather", '{"city": "上海"}'),
+        ]
+        sequential_results = run_tool_calls_sequential(requests, self._echo_dispatcher)
+        parallel_results = run_tool_calls_parallel(requests, self._echo_dispatcher)
+
+        sequential_payloads = [r.result_json for r in sequential_results]
+        parallel_payloads = [r.result_json for r in parallel_results]
+        assert sequential_payloads == parallel_payloads
+
+    def test_parallel_results_preserve_original_order(self):
+        requests = [
+            ToolCallRequest(f"call_{i}", "get_weather", f'{{"city": "城市{i}"}}')
+            for i in range(5)
+        ]
+        results = run_tool_calls_parallel(requests, self._echo_dispatcher, max_workers=3)
+        assert [r.call_id for r in results] == [f"call_{i}" for i in range(5)]
+
+
+class TestCostTracker:
+    """成本统计器的累计计算验证。"""
+
+    def test_total_cost_accumulates_across_rounds(self):
+        tracker = CostTracker()
+        tracker.record_round(input_tokens=1000, output_tokens=1000)
+        tracker.record_round(input_tokens=1000, output_tokens=1000)
+
+        assert tracker.get_total_tokens() == 4000
+        assert tracker.get_total_cost() > 0
+
+    def test_summary_contains_round_count(self):
+        tracker = CostTracker()
+        tracker.record_round(input_tokens=100, output_tokens=50)
+        summary = tracker.get_summary()
+        assert "共进行了1轮模型调用" in summary
+
+
+class TestToolCallValidator:
+    """Schema级参数校验器的行为验证。"""
+
+    def test_missing_required_field_raises_error(self):
+        try:
+            validate_arguments_against_schema(WEATHER_TOOL_SCHEMA, {})
+            assert False, "应当抛出ToolArgumentError"
+        except ToolArgumentError:
+            pass
+
+    def test_invalid_enum_value_raises_error(self):
+        try:
+            validate_arguments_against_schema(
+                WEATHER_TOOL_SCHEMA, {"city": "北京", "date": "随便哪天"}
+            )
+            assert False, "应当抛出ToolArgumentError"
+        except ToolArgumentError:
+            pass
+
+    def test_valid_arguments_pass_without_error(self):
+        validate_arguments_against_schema(WEATHER_TOOL_SCHEMA, {"city": "北京", "date": "today"})
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__, "-v"]))
+```
+
+四位培训生把这份测试跑通之后,已经将近21点半,准备收尾的时候,韩露又提了最后一个问题:"这些工具调用现在都是跑完就结束了,万一以后客户投诉说'某次自动退款是不是有问题',咱们连这次调用到底传了什么参数、返回了什么结果都查不到,这算不算一个隐患?"老王觉得这个问题问得很好,决定趁大家还没散,把这个"事后可追溯"的能力也一并补上——毕竟`tool_permission_guard.py`已经在Day18补过"事前拦截",今天正好补上对应的"事后留痕"这一半。
+
+### 二十七、`tool_execution_audit_logger.py` —— 工具调用执行留痕
+
+```python
+"""
+tool_execution_audit_logger.py —— 工具调用执行留痕模块
+
+韩露提出的问题很有代表性:今天的agent_core.py执行完一次工具调用,
+处理完这一轮的结果就往下走了,除了终端上一闪而过的print输出,
+没有任何持久化的记录。一旦未来某个工具(比如真实接入的退款、下单类工具)
+出现争议,排查"当时到底传了什么参数、模型为什么会这样调用、执行结果是什么",
+将无从下手。
+
+这个模块提供一个轻量的执行留痕器,把每一次工具调用的完整上下文
+(调用发生的时间、本轮所在的对话、工具名、原始参数字符串、执行结果、
+是否成功、耗时)追加写入一份JSONL格式的日志文件,思路与Day18的
+security_audit_log.jsonl完全一致——用最简单的可追加、可离线分析的
+存储方式,把\"事后能不能查清楚\"这件事,变成\"从一开始就具备\"的能力,
+而不是等出了问题才想起来要补。
+"""
+
+import json
+import time
+import uuid
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+
+@dataclass
+class ToolExecutionAuditRecord:
+    """一次工具调用执行的完整留痕记录。"""
+
+    record_id: str
+    conversation_id: str
+    round_index: int
+    tool_name: str
+    tool_call_id: str
+    arguments_json: str
+    result_json: str
+    is_success: bool
+    error_message: Optional[str]
+    elapsed_seconds: float
+    happened_at: str = field(default_factory=lambda: datetime.now().isoformat())
+
+
+class ToolExecutionAuditLogger:
+    """
+    工具调用执行留痕器。
+
+    使用方式:每次执行完一次工具调用(无论成功还是失败),都调用一次
+    log_execution方法,记录会被立即追加写入日志文件——这里选择\"立即写入\"
+    而不是\"先攒在内存里、程序退出前统一写入\",是因为一旦程序异常崩溃,
+    留在内存里还没落盘的记录就永久丢失了,而恰恰是\"程序异常崩溃前的
+    最后几次调用\"往往是最值得排查的。
+    """
+
+    def __init__(self, log_file_path: str = "tool_execution_audit.jsonl") -> None:
+        self.log_file_path = Path(log_file_path)
+        self.log_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def log_execution(
+        self,
+        conversation_id: str,
+        round_index: int,
+        tool_name: str,
+        tool_call_id: str,
+        arguments_json: str,
+        result_json: str,
+        is_success: bool,
+        elapsed_seconds: float,
+        error_message: Optional[str] = None,
+    ) -> ToolExecutionAuditRecord:
+        """记录一次工具调用执行的完整上下文,并立即追加写入日志文件。"""
+        record = ToolExecutionAuditRecord(
+            record_id=str(uuid.uuid4()),
+            conversation_id=conversation_id,
+            round_index=round_index,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            arguments_json=arguments_json,
+            result_json=result_json,
+            is_success=is_success,
+            error_message=error_message,
+            elapsed_seconds=round(elapsed_seconds, 6),
+        )
+        with open(self.log_file_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(asdict(record), ensure_ascii=False) + "\n")
+        return record
+
+    def query_by_conversation(self, conversation_id: str) -> List[Dict[str, Any]]:
+        """按会话ID查询该会话内所有的工具调用留痕记录,按发生时间排序。"""
+        if not self.log_file_path.exists():
+            return []
+        matched: List[Dict[str, Any]] = []
+        with open(self.log_file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("conversation_id") == conversation_id:
+                    matched.append(entry)
+        matched.sort(key=lambda entry: entry.get("happened_at", ""))
+        return matched
+
+    def query_failures(self, tool_name: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        查询所有执行失败的记录,可选按工具名过滤。
+
+        这个方法主要用于排查"某个工具是不是最近失败率突然升高",
+        是运维巡检时最常用的一类查询。
+        """
+        if not self.log_file_path.exists():
+            return []
+        failures: List[Dict[str, Any]] = []
+        with open(self.log_file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("is_success"):
+                    continue
+                if tool_name is not None and entry.get("tool_name") != tool_name:
+                    continue
+                failures.append(entry)
+        return failures
+
+    def compute_tool_reliability_summary(self) -> Dict[str, Dict[str, Any]]:
+        """
+        按工具名统计调用次数、成功次数、失败次数、平均耗时,
+        用于生成"各工具健康度"的巡检报表。
+        """
+        if not self.log_file_path.exists():
+            return {}
+
+        totals: Dict[str, Dict[str, Any]] = {}
+        with open(self.log_file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                tool_name = entry.get("tool_name", "未知工具")
+                bucket = totals.setdefault(
+                    tool_name,
+                    {"total_calls": 0, "success_calls": 0, "failure_calls": 0, "total_elapsed_seconds": 0.0},
+                )
+                bucket["total_calls"] += 1
+                if entry.get("is_success"):
+                    bucket["success_calls"] += 1
+                else:
+                    bucket["failure_calls"] += 1
+                bucket["total_elapsed_seconds"] += entry.get("elapsed_seconds", 0.0)
+
+        summary: Dict[str, Dict[str, Any]] = {}
+        for tool_name, bucket in totals.items():
+            total_calls = bucket["total_calls"]
+            summary[tool_name] = {
+                "total_calls": total_calls,
+                "success_calls": bucket["success_calls"],
+                "failure_calls": bucket["failure_calls"],
+                "success_rate": round(bucket["success_calls"] / total_calls, 4) if total_calls else 0.0,
+                "average_elapsed_seconds": round(bucket["total_elapsed_seconds"] / total_calls, 6)
+                if total_calls
+                else 0.0,
+            }
+        return summary
+
+
+def instrument_dispatcher_with_audit_logging(
+    dispatcher,
+    audit_logger: ToolExecutionAuditLogger,
+    conversation_id: str,
+    round_index: int,
+):
+    """
+    用装饰器思路,把任意一个"调度函数"包装成带留痕能力的版本,
+    而不需要在tool_registry.dispatch_tool_call内部侵入式地加日志代码。
+
+    这个函数返回一个新的可调用对象,签名与原始dispatcher保持一致
+    (tool_name, arguments_json) -> result_json,agent_core.py里
+    只需要把原来直接调用dispatch_tool_call的地方,替换成调用这个
+    包装后的版本,就能自动获得执行留痕能力,不需要改动dispatch_tool_call
+    本身的任何实现细节——这也是"装饰器/包装器模式"在企业级代码里
+    常见的用法:给已有能力叠加一层横切关注点(留痕、监控、限流等),
+    同时保持原有代码不被侵入式修改。
+    """
+
+    def wrapped_dispatcher(tool_name: str, arguments_json: str) -> str:
+        start = time.perf_counter()
+        error_message: Optional[str] = None
+        is_success = True
+        try:
+            result_json = dispatcher(tool_name, arguments_json)
+            parsed_result = json.loads(result_json) if result_json else {}
+            if isinstance(parsed_result, dict) and "error" in parsed_result:
+                is_success = False
+                error_message = str(parsed_result["error"])
+        except Exception as exc:  # noqa: BLE001 —— 留痕器需要捕获任意异常,保证记录一定被写入
+            is_success = False
+            error_message = str(exc)
+            result_json = json.dumps({"error": error_message}, ensure_ascii=False)
+        elapsed = time.perf_counter() - start
+
+        audit_logger.log_execution(
+            conversation_id=conversation_id,
+            round_index=round_index,
+            tool_name=tool_name,
+            tool_call_id=f"{tool_name}-{uuid.uuid4().hex[:8]}",
+            arguments_json=arguments_json,
+            result_json=result_json,
+            is_success=is_success,
+            elapsed_seconds=elapsed,
+            error_message=error_message,
+        )
+        return result_json
+
+    return wrapped_dispatcher
+
+
+if __name__ == "__main__":
+    import tempfile
+
+    from tool_registry import dispatch_tool_call
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        log_path = str(Path(tmp_dir) / "tool_execution_audit.jsonl")
+        audit_logger = ToolExecutionAuditLogger(log_file_path=log_path)
+
+        instrumented = instrument_dispatcher_with_audit_logging(
+            dispatch_tool_call, audit_logger, conversation_id="demo-conv-001", round_index=1
+        )
+
+        print("场景1:正常调用,应当留下一条成功记录")
+        instrumented("get_weather", json.dumps({"city": "北京"}))
+
+        print("场景2:参数错误,应当留下一条失败记录")
+        instrumented("calculate", json.dumps({"expression": "1/0"}))
+
+        print("\n查询本次会话的全部留痕记录:")
+        for entry in audit_logger.query_by_conversation("demo-conv-001"):
+            print(f"  [{entry['tool_name']}] 成功={entry['is_success']} 耗时={entry['elapsed_seconds']}秒")
+
+        print("\n各工具的可靠性汇总:")
+        for tool_name, stats in audit_logger.compute_tool_reliability_summary().items():
+            print(f"  {tool_name}: 成功率={stats['success_rate']:.0%}, 平均耗时={stats['average_elapsed_seconds']}秒")
+```
+
+老王看完这份留痕器的输出,补充了一条运维视角的提醒:"这份日志目前只是写在本地文件里,真实生产环境要考虑写入集中式的日志系统(比如ELK或者云厂商的日志服务),否则一旦这台机器出问题,连留痕数据本身都保不住,失去了它存在的意义。但今天的重点不是选型某个具体的日志系统,而是先把'该记录什么字段、该支持哪些排查查询'这件事想清楚——存储介质换成什么,后续都是可以替换的实现细节。"
+
+配套的测试补在了`tests/test_extended_tools_and_utilities.py`的末尾:
+
+```python
+class TestToolExecutionAuditLogger:
+    """工具调用执行留痕器的行为验证。"""
+
+    def test_log_execution_and_query_by_conversation(self, tmp_path):
+        from tool_execution_audit_logger import ToolExecutionAuditLogger
+
+        log_path = str(tmp_path / "audit.jsonl")
+        audit_logger = ToolExecutionAuditLogger(log_file_path=log_path)
+
+        audit_logger.log_execution(
+            conversation_id="conv-a",
+            round_index=1,
+            tool_name="get_weather",
+            tool_call_id="call_1",
+            arguments_json='{"city": "北京"}',
+            result_json='{"city": "北京", "condition": "晴"}',
+            is_success=True,
+            elapsed_seconds=0.01,
+        )
+        audit_logger.log_execution(
+            conversation_id="conv-b",
+            round_index=1,
+            tool_name="calculate",
+            tool_call_id="call_2",
+            arguments_json='{"expression": "1/0"}',
+            result_json='{"error": "除零错误"}',
+            is_success=False,
+            elapsed_seconds=0.02,
+            error_message="除零错误",
+        )
+
+        conv_a_records = audit_logger.query_by_conversation("conv-a")
+        assert len(conv_a_records) == 1
+        assert conv_a_records[0]["tool_name"] == "get_weather"
+
+    def test_query_failures_filters_by_tool_name(self, tmp_path):
+        from tool_execution_audit_logger import ToolExecutionAuditLogger
+
+        log_path = str(tmp_path / "audit.jsonl")
+        audit_logger = ToolExecutionAuditLogger(log_file_path=log_path)
+
+        audit_logger.log_execution(
+            conversation_id="conv-a", round_index=1, tool_name="calculate", tool_call_id="c1",
+            arguments_json="{}", result_json='{"error": "x"}', is_success=False, elapsed_seconds=0.01,
+        )
+        audit_logger.log_execution(
+            conversation_id="conv-a", round_index=2, tool_name="get_weather", tool_call_id="c2",
+            arguments_json="{}", result_json='{"result": "ok"}', is_success=True, elapsed_seconds=0.01,
+        )
+
+        failures = audit_logger.query_failures(tool_name="calculate")
+        assert len(failures) == 1
+        assert failures[0]["tool_name"] == "calculate"
+
+    def test_reliability_summary_computes_success_rate(self, tmp_path):
+        from tool_execution_audit_logger import ToolExecutionAuditLogger
+
+        log_path = str(tmp_path / "audit.jsonl")
+        audit_logger = ToolExecutionAuditLogger(log_file_path=log_path)
+
+        for is_success in (True, True, False):
+            audit_logger.log_execution(
+                conversation_id="conv-a", round_index=1, tool_name="get_weather", tool_call_id="c",
+                arguments_json="{}", result_json="{}", is_success=is_success, elapsed_seconds=0.1,
+            )
+
+        summary = audit_logger.compute_tool_reliability_summary()
+        assert summary["get_weather"]["total_calls"] == 3
+        assert summary["get_weather"]["success_rate"] == 0.6667 or round(summary["get_weather"]["success_rate"], 2) == 0.67
+```
+
+四人一起把新增的测试跑通,已经将近22点。老王在群里最后确认了一遍:"今天的正式任务书F1到F9全部完成,晚自习额外补的这六块,不算硬性任务,但都补在了'今天课堂讲过原理、代码还没跟上'的缺口上,这是一个很好的习惯——发现自己讲清楚了道理但代码没落地,不要拖到'以后再说',趁热乎补上。"他停顿了一下,又补了一句:"当然,前提是不能影响明天的状态,都早点休息。"
+
 ---
 
 ## 今日复盘
