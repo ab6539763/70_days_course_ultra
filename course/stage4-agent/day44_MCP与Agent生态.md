@@ -2443,6 +2443,1335 @@ if __name__ == "__main__":
 
 以上八个文件构成了今天预研任务的完整验证性代码产出。下午5点半,团队按照晨会计划,现场跑了一遍`run_mcp_memory_demo.py`,老王全程盯着终端输出,重点检查了两件事:第一次会话里用户表达的时区偏好,在第二次会话(模拟成新的session_id)里是否被正确召回并体现在回答里;以及知识库MCP工具的调用结果,是否被准确地拼装进了模型的最终回答。两项验证都顺利通过,老王在白板上写下今天预研的阶段性结论:"MCP协议本身的接入成本可控,SDK把协议层面的复杂度屏蔽得比较干净,值得在苍穹未来的通用工具能力(尤其是面向客户系统对接的场景)上,以'新增能力优先MCP化、老代码暂不强制迁移'的策略,先从小范围试点开始推进。"
 
+晚饭前,林悦临时又提了一个问题,把团队重新拉回了工位——她说非功能性评估维度里的"安全边界""可观测性""多租户隔离""性能开销"四项,今天上午的预研任务书里明确写了要覆盖,但目前跑通的八个文件,更多是验证"能不能用"这个基本问题,还没有真正拿出针对这四项的验证性代码。老王想了想,同意这个说法站得住脚,于是拍板追加了半个晚上的"加时预研",要求陈铭在原有八个文件的基础上,再补五个模块,分别对应祺瑞集团OA系统对接的真实场景验证、面向远程客户开放时必须补的身份认证与多租户网关、协议调用链路的可观测性埋点、支持配置化热更新的Server注册中心,以及覆盖今天全部核心逻辑的单元测试。老王的原话是:"预研报告如果只讲'能跑起来的demo',说服力是不够的,报告里那四个非功能性维度,必须要有对应的代码作为证据,不然就是空谈。"
+
+### 文件九:`backend/app/services/mcp/servers/qirui_oa_server.py`(客户OA系统对接类MCP Server——安全边界验证)
+
+这是团队专门为回应林悦"客户能不能像插U盘一样接入系统"这个问题而追加的验证性代码,模拟祺瑞集团内部OA系统被包装成MCP Server之后,对外暴露请假查询、请假申请、报销查询、报销提交四个典型企业办公场景的能力。之所以特意选择"审批类"场景,是因为这类操作往往涉及真实的业务状态变更(比如扣减假期余额、生成报销记录),一旦被误调用或被恶意诱导调用,造成的影响比"只读"的知识库检索严重得多,因此这个文件重点验证的是安全边界设计——连接级身份认证、操作前的权限校验、以及避免重复提交的幂等保护。
+
+```python
+"""
+苍穹平台 MCP 预研:祺瑞集团OA系统对接类 MCP Server(安全边界验证专用)
+
+本模块模拟一个真实客户(祺瑞集团)内部OA系统被包装成MCP Server之后,
+对外暴露的四个典型企业办公场景能力:
+    - query_leave_balance:查询员工剩余假期天数
+    - submit_leave_request:提交请假申请(会扣减假期余额)
+    - query_reimbursement_status:查询报销单状态
+    - submit_reimbursement:提交报销申请(超过阈值需要人工审批标记)
+
+企业级安全设计说明(这是本文件存在的核心目的,不是锦上添花):
+    1. 连接级身份认证:MCP的stdio传输天然具备"同机父子进程"的隔离性,
+       但为了让今天的验证代码能够无缝迁移到未来的远程HTTP场景,
+       本文件依然显式模拟了一层"连接建立后必须先认证"的机制——
+       任何业务工具在调用前,都会检查当前会话是否已经通过 authenticate
+       工具完成身份认证,没有认证的调用会被直接拒绝。
+    2. 操作前权限校验:即便认证通过,也要进一步校验"这个身份是否有权限
+       操作这个具体的员工数据"——本文件用一个简化的"操作者只能操作自己
+       或者自己管理的下属"规则来模拟真实的数据权限边界。
+    3. 幂等与重复提交保护:请假申请与报销提交都带有一个客户端可选传入的
+       幂等键(idempotency_key),同一个幂等键短时间内重复提交,
+       只会被处理一次,这是应对"Agent因为没收到明确反馈而重复提交"
+       这类真实发生过的稳定性问题(参考Day46事故复盘)的预防性设计。
+
+预研范围说明:本文件仅用于 Day44 技术预研与验证性开发,
+不进入苍穹平台生产分支 main,统一维护在 research/mcp-poc 分支。
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+from mcp.server.fastmcp import FastMCP
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [qirui-oa-mcp] %(levelname)s %(message)s",
+)
+logger = logging.getLogger("qirui_oa_mcp_server")
+
+# ------------------------------------------------------------------
+# 模拟的客户身份与数据(仅用于预研演示,不连接真实OA系统)
+# ------------------------------------------------------------------
+
+# 模拟的API密钥库:key -> (employee_id, 姓名, 是否为管理者)
+# 生产环境中,这类凭证应当来自客户侧的身份系统,苍穹这边只做校验,
+# 绝不应该在自己的代码里维护客户员工的真实密码或密钥。
+_VALID_API_KEYS: Dict[str, dict] = {
+    "qirui-emp-zhangwei-key": {"employee_id": "QR-1001", "name": "张伟", "is_manager": True},
+    "qirui-emp-lina-key": {"employee_id": "QR-1002", "name": "李娜", "is_manager": False},
+}
+
+# 模拟的"管理者 -> 下属"关系,用于权限校验演示。
+_MANAGER_SUBORDINATES: Dict[str, List[str]] = {
+    "QR-1001": ["QR-1002"],
+}
+
+# 模拟的假期余额数据(单位:天)。
+_LEAVE_BALANCE: Dict[str, float] = {
+    "QR-1001": 8.5,
+    "QR-1002": 12.0,
+}
+
+# 报销超过此金额(元),需要标记为"待人工审批",而不能自动通过。
+REIMBURSEMENT_AUTO_APPROVE_THRESHOLD = 5000.0
+
+# 幂等键的有效时间窗口(秒):同一个幂等键在此窗口内重复提交,
+# 只会返回第一次提交的结果,不会重复执行业务逻辑。
+IDEMPOTENCY_WINDOW_SECONDS = 300.0
+
+
+@dataclass
+class SessionAuthState:
+    """描述当前MCP会话的身份认证状态。"""
+
+    authenticated: bool = False
+    employee_id: Optional[str] = None
+    name: Optional[str] = None
+    is_manager: bool = False
+    authenticated_at: float = 0.0
+
+
+# 预研阶段简化为模块级单会话状态(一个Server进程同一时间只服务一个
+# stdio连接,这符合stdio传输"一对一子进程"的天然限制)。生产环境
+# 如果切换到远程HTTP多租户场景,这里必须改为"每个连接一份独立状态",
+# 绝不能继续用模块级全局变量,否则会造成不同客户之间的状态串号。
+_session_auth = SessionAuthState()
+
+
+@dataclass
+class IdempotencyRecord:
+    """一条幂等记录,用于防止同一操作被重复执行。"""
+
+    idempotency_key: str
+    result_summary: str
+    created_at: float = field(default_factory=time.time)
+
+
+_idempotency_cache: Dict[str, IdempotencyRecord] = {}
+
+
+class AuthenticationError(Exception):
+    """会话未通过身份认证时抛出。"""
+
+
+class AuthorizationError(Exception):
+    """已认证但无权操作目标数据时抛出。"""
+
+
+def _require_authenticated() -> SessionAuthState:
+    """
+    校验当前会话是否已通过身份认证,是所有业务工具的第一道防线。
+
+    返回:
+        当前已认证的会话状态。
+
+    异常:
+        AuthenticationError: 当会话尚未认证时抛出。
+    """
+    if not _session_auth.authenticated:
+        raise AuthenticationError(
+            "当前会话尚未通过身份认证,请先调用 authenticate 工具完成认证。"
+        )
+    return _session_auth
+
+
+def _check_can_operate_on(target_employee_id: str) -> None:
+    """
+    校验当前已认证的身份,是否有权操作目标员工的数据。
+
+    权限规则(预研阶段的简化版本):
+        - 任何人都可以操作自己的数据。
+        - 管理者可以操作自己管理的下属的数据。
+        - 其他情况一律拒绝。
+
+    参数:
+        target_employee_id: 请求操作的目标员工ID。
+
+    异常:
+        AuthorizationError: 当权限校验不通过时抛出。
+    """
+    state = _require_authenticated()
+    if target_employee_id == state.employee_id:
+        return
+    if state.is_manager and target_employee_id in _MANAGER_SUBORDINATES.get(state.employee_id, []):
+        return
+    raise AuthorizationError(
+        f"当前身份({state.name})无权操作员工({target_employee_id})的数据。"
+    )
+
+
+def _check_idempotency(idempotency_key: Optional[str]) -> Optional[str]:
+    """
+    检查幂等键是否命中已有记录。
+
+    参数:
+        idempotency_key: 客户端(通常是Agent)传入的幂等键,可为空。
+
+    返回:
+        如果命中已有的、仍在有效期内的记录,返回该记录保存的结果摘要;
+        否则返回 None,表示应当正常执行本次业务逻辑。
+    """
+    if not idempotency_key:
+        return None
+    record = _idempotency_cache.get(idempotency_key)
+    if record is None:
+        return None
+    if time.time() - record.created_at > IDEMPOTENCY_WINDOW_SECONDS:
+        # 已过期的幂等记录不再生效,清理掉,避免缓存无限增长。
+        _idempotency_cache.pop(idempotency_key, None)
+        return None
+    logger.warning("检测到重复提交,幂等键=%s,直接返回首次处理结果", idempotency_key)
+    return record.result_summary
+
+
+def _save_idempotency(idempotency_key: Optional[str], result_summary: str) -> None:
+    """保存本次操作的幂等记录,供后续重复提交时直接复用结果。"""
+    if not idempotency_key:
+        return
+    _idempotency_cache[idempotency_key] = IdempotencyRecord(
+        idempotency_key=idempotency_key, result_summary=result_summary,
+    )
+
+
+mcp = FastMCP(
+    name="cangqiong-qirui-oa-server",
+    instructions=(
+        "这是苍穹平台预研用的祺瑞集团OA系统对接服务,所有操作都需要先"
+        "通过authenticate工具完成身份认证,未认证的请求会被拒绝。"
+    ),
+)
+
+
+@mcp.tool()
+def authenticate(api_key: str) -> str:
+    """
+    使用API密钥完成本次MCP会话的身份认证。
+
+    这一步模拟的是"连接建立之后,第一次业务调用之前"应当完成的
+    身份确认动作——真实的远程HTTP场景下,这一步通常会由传输层的
+    请求头认证来完成,今天的stdio演示里,用一个显式的认证工具来
+    模拟同样的效果,方便团队理解"认证"和"授权"应该分成两个独立步骤。
+
+    参数:
+        api_key: 客户下发的API密钥。
+
+    返回:
+        认证结果说明。
+    """
+    global _session_auth
+    identity = _VALID_API_KEYS.get(api_key)
+    if identity is None:
+        logger.warning("身份认证失败,无效的API密钥")
+        return "错误:API密钥无效,认证失败。"
+
+    _session_auth = SessionAuthState(
+        authenticated=True,
+        employee_id=identity["employee_id"],
+        name=identity["name"],
+        is_manager=identity["is_manager"],
+        authenticated_at=time.time(),
+    )
+    logger.info("身份认证成功:员工=%s(%s)", identity["name"], identity["employee_id"])
+    return f"认证成功,当前身份:{identity['name']}({identity['employee_id']})"
+
+
+@mcp.tool()
+def query_leave_balance(employee_id: str) -> str:
+    """
+    查询指定员工的剩余假期余额。
+
+    参数:
+        employee_id: 待查询的员工ID。
+
+    返回:
+        假期余额说明,或者错误/权限说明。
+    """
+    try:
+        _check_can_operate_on(employee_id)
+    except (AuthenticationError, AuthorizationError) as exc:
+        return f"错误:{exc}"
+
+    balance = _LEAVE_BALANCE.get(employee_id)
+    if balance is None:
+        return f"错误:未找到员工({employee_id})的假期记录。"
+    return f"员工({employee_id})当前剩余假期:{balance}天"
+
+
+@mcp.tool()
+def submit_leave_request(employee_id: str, start_date: str, end_date: str,
+                          days: float, reason: str,
+                          idempotency_key: Optional[str] = None) -> str:
+    """
+    提交一次请假申请,通过校验后会实际扣减假期余额。
+
+    参数:
+        employee_id: 申请人员工ID。
+        start_date: 请假开始日期(YYYY-MM-DD)。
+        end_date: 请假结束日期(YYYY-MM-DD)。
+        days: 请假天数。
+        reason: 请假原因说明。
+        idempotency_key: 可选的幂等键,避免因为网络重试或Agent重复决策
+            导致同一次请假被重复提交、重复扣减假期余额。
+
+    返回:
+        提交结果说明。
+    """
+    cached = _check_idempotency(idempotency_key)
+    if cached is not None:
+        return cached
+
+    try:
+        _check_can_operate_on(employee_id)
+    except (AuthenticationError, AuthorizationError) as exc:
+        return f"错误:{exc}"
+
+    balance = _LEAVE_BALANCE.get(employee_id)
+    if balance is None:
+        return f"错误:未找到员工({employee_id})的假期记录。"
+    if days <= 0:
+        return "错误:请假天数必须大于0。"
+    if days > balance:
+        result = f"错误:申请天数({days}天)超过剩余假期余额({balance}天),已拒绝。"
+        _save_idempotency(idempotency_key, result)
+        return result
+
+    _LEAVE_BALANCE[employee_id] = balance - days
+    request_id = f"LV-{uuid.uuid4().hex[:8].upper()}"
+    logger.info(
+        "员工(%s)请假申请已提交:%s,天数=%s,期间=%s至%s,原因=%s",
+        employee_id, request_id, days, start_date, end_date, reason,
+    )
+    result = (
+        f"成功:请假申请已提交(单号{request_id}),期间{start_date}至{end_date},"
+        f"共{days}天,剩余假期余额更新为{_LEAVE_BALANCE[employee_id]}天。"
+    )
+    _save_idempotency(idempotency_key, result)
+    return result
+
+
+@mcp.tool()
+def query_reimbursement_status(reimbursement_id: str) -> str:
+    """
+    查询指定报销单的当前状态。
+
+    参数:
+        reimbursement_id: 报销单号。
+
+    返回:
+        报销单状态说明。
+    """
+    record = _reimbursement_records.get(reimbursement_id)
+    if record is None:
+        return f"错误:未找到报销单({reimbursement_id})。"
+    return (
+        f"报销单({reimbursement_id})状态:{record['status']},"
+        f"金额:{record['amount']}元,提交人:{record['employee_id']}"
+    )
+
+
+_reimbursement_records: Dict[str, dict] = {}
+
+
+@mcp.tool()
+def submit_reimbursement(employee_id: str, amount: float, category: str,
+                          description: str,
+                          idempotency_key: Optional[str] = None) -> str:
+    """
+    提交一次报销申请。金额超过自动审批阈值时,会被标记为"待人工审批",
+    而不是直接自动通过——这是有意的业务规则,避免大额报销被Agent
+    在没有人工确认的情况下自动放行。
+
+    参数:
+        employee_id: 提交人员工ID。
+        amount: 报销金额(元)。
+        category: 报销类别,例如"交通""餐饮""办公用品"。
+        description: 报销说明。
+        idempotency_key: 可选的幂等键。
+
+    返回:
+        提交结果说明,包含报销单号与最终状态。
+    """
+    cached = _check_idempotency(idempotency_key)
+    if cached is not None:
+        return cached
+
+    try:
+        _check_can_operate_on(employee_id)
+    except (AuthenticationError, AuthorizationError) as exc:
+        return f"错误:{exc}"
+
+    if amount <= 0:
+        return "错误:报销金额必须大于0。"
+
+    reimbursement_id = f"RB-{uuid.uuid4().hex[:8].upper()}"
+    status = "自动通过" if amount <= REIMBURSEMENT_AUTO_APPROVE_THRESHOLD else "待人工审批"
+    _reimbursement_records[reimbursement_id] = {
+        "employee_id": employee_id,
+        "amount": amount,
+        "category": category,
+        "description": description,
+        "status": status,
+        "created_at": time.time(),
+    }
+    logger.info(
+        "员工(%s)报销申请已提交:%s,金额=%s,类别=%s,状态=%s",
+        employee_id, reimbursement_id, amount, category, status,
+    )
+    result = f"成功:报销申请已提交(单号{reimbursement_id}),金额{amount}元,当前状态:{status}。"
+    _save_idempotency(idempotency_key, result)
+    return result
+
+
+if __name__ == "__main__":
+    logger.info("祺瑞集团OA系统对接 MCP Server 启动(预研演示,非真实系统对接)")
+    mcp.run(transport="stdio")
+```
+
+这份代码跑起来之后,陈铭特意设计了一个"越权测试"——用李娜的API密钥认证之后,尝试查询张伟的假期余额,结果被`_check_can_operate_on`正确拒绝,返回"当前身份(李娜)无权操作员工(QR-1001)的数据"。老王看完这个测试用例评价说:"这才是预研报告里真正有说服力的证据——不是'能跑通正常流程',而是'能正确拒绝不该通过的请求',后者往往才是企业客户真正在意的东西。"
+
+### 文件十:`backend/app/services/mcp/gateway/mcp_auth_gateway.py`(远程多租户网关——身份认证与限流验证)
+
+这份代码回应的是课后作业第5题里提到的场景——如果苍穹要把某个MCP Server开放给多个客户远程调用(而不是本地stdio给自己的Agent用),身份认证、多租户隔离、限流这几件事,协议本身并不负责,必须由苍穹自己在应用层补上。这个网关模块不是重新实现MCP协议的Streamable HTTP传输层,而是在`MCPClientManager`与真实的远程调用入口之间,插入一层横切关注点(cross-cutting concerns)处理,思路上与Day23-24学过的FastAPI中间件鉴权是一致的。
+
+```python
+"""
+苍穹平台 MCP 预研:多租户认证与限流网关
+
+本模块解决的问题:当苍穹的某个MCP Server(例如知识库查询能力)
+需要被开放给多个客户(祺瑞集团、海纳制造集团等)远程调用时,
+MCP协议本身不负责身份认证、租户隔离与限流,这些企业级落地
+必须自己补齐的能力,统一由本模块承担,作为业务调用与底层
+MCPClientManager之间的一层网关。
+
+核心设计:
+    1. TenantRegistry:维护"API密钥 -> 租户信息(允许访问的Server/
+       工具白名单/限流配额)"的映射关系。
+    2. TokenBucketRateLimiter:按租户维度做简单的令牌桶限流,
+       防止单个客户的异常调用把共享的Server资源耗尽,影响其他客户。
+    3. MCPAuthGateway:对外提供的统一入口,内部依次完成身份校验、
+       权限校验、限流校验,全部通过后才真正转发给MCPClientManager。
+
+预研范围说明:本文件仅用于 Day44 技术预研,统一维护在
+research/mcp-poc 分支,不进入 main。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set
+
+logger = logging.getLogger("mcp_auth_gateway")
+
+
+class GatewayAuthError(Exception):
+    """身份认证失败时抛出。"""
+
+
+class GatewayAuthorizationError(Exception):
+    """已认证但请求的能力不在租户授权范围内时抛出。"""
+
+
+class GatewayRateLimitError(Exception):
+    """请求超过租户限流配额时抛出。"""
+
+
+def _hash_api_key(api_key: str) -> str:
+    """
+    对API密钥做哈希处理后再存储/比较,绝不在内存或日志里保留明文密钥。
+
+    这是企业级安全规范里的基本要求——即便是内存中的临时存储,
+    敏感凭证也应当尽量避免以明文形式出现,降低内存转储、日志误打印
+    等场景下的信息泄露风险。
+    """
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+
+
+@dataclass
+class TenantProfile:
+    """
+    描述一个租户(客户)的接入配置。
+
+    属性:
+        tenant_id: 租户唯一标识,例如 "qirui" / "hainacap"。
+        display_name: 租户显示名称,用于日志与审计。
+        allowed_server_names: 该租户被授权访问的MCP Server逻辑名称集合。
+        allowed_tool_prefixes: 该租户被授权调用的工具名前缀集合
+            (工具全局名形如 "kb__search_knowledge_base",这里按
+            Server前缀粒度做授权,避免为每个工具单独配置显得过于繁琐)。
+        rate_limit_per_minute: 该租户每分钟允许的调用次数上限。
+    """
+
+    tenant_id: str
+    display_name: str
+    allowed_server_names: Set[str]
+    allowed_tool_prefixes: Set[str]
+    rate_limit_per_minute: int = 60
+
+
+class TokenBucketRateLimiter:
+    """
+    简化版令牌桶限流器,按租户维度独立限流。
+
+    令牌桶算法的核心思路:桶里最多装 capacity 个令牌,每次调用消耗
+    一个令牌,令牌按固定速率(capacity / 60秒)持续补充,如果桶里
+    没有令牌了,说明调用速率超过了配额,应当拒绝本次请求。相比
+    简单的"计数器+固定时间窗口"限流,令牌桶对"突发流量"的处理
+    更平滑,不会在窗口边界处出现流量陡增陡降的问题。
+    """
+
+    def __init__(self) -> None:
+        self._buckets: Dict[str, "_Bucket"] = {}
+
+    def _get_bucket(self, tenant_id: str, capacity_per_minute: int) -> "_Bucket":
+        bucket = self._buckets.get(tenant_id)
+        if bucket is None:
+            bucket = _Bucket(capacity=capacity_per_minute, tokens=float(capacity_per_minute))
+            self._buckets[tenant_id] = bucket
+        return bucket
+
+    def try_consume(self, tenant_id: str, capacity_per_minute: int) -> bool:
+        """
+        尝试为指定租户消耗一个令牌。
+
+        返回:
+            True表示本次调用被允许;False表示超过限流,应当拒绝。
+        """
+        bucket = self._get_bucket(tenant_id, capacity_per_minute)
+        now = time.time()
+        elapsed = now - bucket.last_refill_at
+        refill_rate_per_second = capacity_per_minute / 60.0
+        bucket.tokens = min(capacity_per_minute, bucket.tokens + elapsed * refill_rate_per_second)
+        bucket.last_refill_at = now
+
+        if bucket.tokens >= 1.0:
+            bucket.tokens -= 1.0
+            return True
+        return False
+
+
+@dataclass
+class _Bucket:
+    """令牌桶的内部状态。"""
+
+    capacity: int
+    tokens: float
+    last_refill_at: float = field(default_factory=time.time)
+
+
+class TenantRegistry:
+    """
+    维护API密钥到租户配置的映射,并提供身份校验能力。
+
+    典型用法:
+        registry = TenantRegistry()
+        registry.register_tenant(
+            api_key="qirui-remote-key-abc123",
+            profile=TenantProfile(
+                tenant_id="qirui", display_name="祺瑞集团",
+                allowed_server_names={"kb"},
+                allowed_tool_prefixes={"kb__"},
+                rate_limit_per_minute=30,
+            ),
+        )
+        tenant = registry.authenticate("qirui-remote-key-abc123")
+    """
+
+    def __init__(self) -> None:
+        self._key_hash_to_tenant: Dict[str, TenantProfile] = {}
+
+    def register_tenant(self, api_key: str, profile: TenantProfile) -> None:
+        """注册一个租户的API密钥与其对应的授权配置。"""
+        key_hash = _hash_api_key(api_key)
+        self._key_hash_to_tenant[key_hash] = profile
+        logger.info("已注册租户:%s(%s)", profile.tenant_id, profile.display_name)
+
+    def authenticate(self, api_key: str) -> TenantProfile:
+        """
+        校验API密钥,返回对应的租户配置。
+
+        异常:
+            GatewayAuthError: 当密钥无效时抛出。
+        """
+        key_hash = _hash_api_key(api_key)
+        profile = self._key_hash_to_tenant.get(key_hash)
+        if profile is None:
+            raise GatewayAuthError("API密钥无效,身份认证失败。")
+        return profile
+
+
+class MCPAuthGateway:
+    """
+    面向远程多租户场景的MCP调用网关。
+
+    这个类刻意没有直接依赖具体的HTTP框架(如FastAPI),是为了让
+    今天的验证代码保持纯粹——真正的HTTP路由层应该是一层很薄的
+    包装,把请求头里的API Key取出来,传给这里的 call_tool_for_tenant
+    方法,业务逻辑本身与"用什么框架接收HTTP请求"无关。
+    """
+
+    def __init__(self, mcp_manager, tenant_registry: Optional[TenantRegistry] = None) -> None:
+        self._mcp_manager = mcp_manager
+        self._tenant_registry = tenant_registry or TenantRegistry()
+        self._rate_limiter = TokenBucketRateLimiter()
+        self._audit_trail: List[dict] = []
+
+    @property
+    def tenant_registry(self) -> TenantRegistry:
+        """对外暴露租户注册表,方便调用方注册新租户。"""
+        return self._tenant_registry
+
+    async def call_tool_for_tenant(self, api_key: str, qualified_name: str,
+                                     arguments: dict) -> str:
+        """
+        代表某个租户,发起一次经过完整安全校验的工具调用。
+
+        校验顺序(顺序本身有讲究,先做成本最低的校验,快速失败):
+            1. 身份认证(哈希比对,成本很低)。
+            2. 限流校验(内存计算,成本很低)。
+            3. 权限校验(判断该工具是否在租户授权范围内)。
+            4. 真正转发给底层 MCPClientManager 执行。
+
+        参数:
+            api_key: 租户的API密钥。
+            qualified_name: 工具全局名称,例如 "kb__search_knowledge_base"。
+            arguments: 工具调用参数。
+
+        返回:
+            工具执行结果文本。任何校验失败都会返回明确的错误说明,
+            而不是抛出异常中断调用方的处理流程。
+        """
+        try:
+            tenant = self._tenant_registry.authenticate(api_key)
+        except GatewayAuthError as exc:
+            self._record_audit(tenant_id="unknown", qualified_name=qualified_name,
+                                allowed=False, reason=str(exc))
+            return f"错误:{exc}"
+
+        if not self._rate_limiter.try_consume(tenant.tenant_id, tenant.rate_limit_per_minute):
+            reason = f"租户({tenant.display_name})调用频率超过限流配额({tenant.rate_limit_per_minute}次/分钟)"
+            self._record_audit(tenant_id=tenant.tenant_id, qualified_name=qualified_name,
+                                allowed=False, reason=reason)
+            return f"错误:{reason}"
+
+        server_prefix = qualified_name.split("__", 1)[0] if "__" in qualified_name else qualified_name
+        prefix_with_sep = f"{server_prefix}__"
+        if prefix_with_sep not in tenant.allowed_tool_prefixes:
+            reason = f"租户({tenant.display_name})未被授权调用工具前缀({prefix_with_sep})"
+            self._record_audit(tenant_id=tenant.tenant_id, qualified_name=qualified_name,
+                                allowed=False, reason=reason)
+            return f"错误:{reason}"
+
+        self._record_audit(tenant_id=tenant.tenant_id, qualified_name=qualified_name,
+                            allowed=True, reason="校验通过")
+        return await self._mcp_manager.call_tool(qualified_name, arguments)
+
+    def _record_audit(self, tenant_id: str, qualified_name: str,
+                        allowed: bool, reason: str) -> None:
+        """记录一条网关层的审计日志,独立于具体Server内部的审计日志。"""
+        entry = {
+            "tenant_id": tenant_id,
+            "qualified_name": qualified_name,
+            "allowed": allowed,
+            "reason": reason,
+            "timestamp": time.time(),
+        }
+        self._audit_trail.append(entry)
+        level = logging.INFO if allowed else logging.WARNING
+        logger.log(level, "网关调用记录:%s", entry)
+
+    def get_audit_trail(self, tenant_id: Optional[str] = None) -> List[dict]:
+        """获取审计日志,可选按租户过滤。"""
+        if tenant_id is None:
+            return list(self._audit_trail)
+        return [entry for entry in self._audit_trail if entry["tenant_id"] == tenant_id]
+```
+
+老王看完这份网关代码,补充了一句提醒:"注意力桶算法这里没有做持久化,进程重启限流状态就清零了,这在预研阶段是可以接受的简化,但如果真的要上生产,限流状态最好放到Redis之类的外部存储里,不然多副本部署的时候,每个副本各自维护一份限流状态,总的限流效果就不准了——这是Day47之后工程化专题要补的内容,今天先把思路打个样。"
+
+### 文件十一:`backend/app/services/mcp/observability/mcp_tracing.py`(MCP调用链路可观测性埋点)
+
+对应非功能性评估维度里的"可观测性"一项。这份代码提供一个轻量级的调用追踪装饰器,记录每一次MCP工具调用的耗时、成败、参数摘要,并提供一个简单的文本化统计报表生成能力,方便预研阶段快速查看"哪个工具被调用得最多、哪个工具的失败率最高、哪个工具的平均耗时最长"这几个最基础但最重要的问题。
+
+```python
+"""
+苍穹平台 MCP 预研:调用链路可观测性埋点模块
+
+本模块提供一个轻量级的、不依赖外部监控系统的可观测性实现,
+用于在预研阶段快速回答几个基础问题:
+    - 每个MCP工具被调用了多少次?
+    - 每个工具的成功率、平均耗时、P95耗时分别是多少?
+    - 最近一段时间里,是否有工具的失败率明显升高(可能意味着
+      下游依赖出了问题)?
+
+设计上特意保持"零外部依赖"——不引入Prometheus客户端库、不需要
+真实的时序数据库,所有统计都在内存里完成,这样团队可以在
+没有搭建完整监控基础设施之前,就先建立起"调用行为可观测"的
+基本习惯。真正上生产环境时,这里记录的指标应当额外导出给
+苍穹现有的监控系统(参考Day46学过的可观测性日志记录模块思路)。
+
+预研范围说明:本文件仅用于 Day44 技术预研,统一维护在
+research/mcp-poc 分支,不进入 main。
+"""
+
+from __future__ import annotations
+
+import functools
+import logging
+import statistics
+import time
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List
+
+logger = logging.getLogger("mcp_tracing")
+
+
+@dataclass
+class CallRecord:
+    """一次工具调用的完整记录。"""
+
+    qualified_name: str
+    started_at: float
+    duration_seconds: float
+    success: bool
+    error_summary: str = ""
+
+
+class MCPCallMetrics:
+    """
+    汇总统计某个工具(或全部工具)的调用指标。
+
+    典型用法:
+        metrics = MCPCallMetrics()
+        metrics.record(CallRecord(...))
+        report = metrics.summarize("kb__search_knowledge_base")
+    """
+
+    def __init__(self, max_records_per_tool: int = 500) -> None:
+        # 每个工具最多保留最近 max_records_per_tool 条记录,
+        # 避免长时间运行后内存无限增长——可观测性数据本身
+        # 也需要有生命周期管理,这是很容易被忽视的一点。
+        self._max_records_per_tool = max_records_per_tool
+        self._records: Dict[str, List[CallRecord]] = {}
+
+    def record(self, record: CallRecord) -> None:
+        """记录一次调用结果。"""
+        bucket = self._records.setdefault(record.qualified_name, [])
+        bucket.append(record)
+        if len(bucket) > self._max_records_per_tool:
+            # 超出上限时丢弃最早的记录,保留最近的调用行为,
+            # 这跟Day44上午设计的短期记忆滑动窗口是同一种思路——
+            # 可观测性数据本质上关心的也是"最近发生的情况"。
+            del bucket[: len(bucket) - self._max_records_per_tool]
+
+    def summarize(self, qualified_name: str) -> dict:
+        """
+        生成指定工具的统计摘要。
+
+        返回:
+            包含 total_calls / success_rate / avg_duration_ms /
+            p95_duration_ms / recent_error_count 等字段的字典。
+        """
+        records = self._records.get(qualified_name, [])
+        if not records:
+            return {
+                "qualified_name": qualified_name, "total_calls": 0,
+                "success_rate": None, "avg_duration_ms": None,
+                "p95_duration_ms": None, "recent_error_count": 0,
+            }
+
+        durations_ms = [r.duration_seconds * 1000 for r in records]
+        success_count = sum(1 for r in records if r.success)
+        sorted_durations = sorted(durations_ms)
+        p95_index = min(len(sorted_durations) - 1, int(len(sorted_durations) * 0.95))
+
+        return {
+            "qualified_name": qualified_name,
+            "total_calls": len(records),
+            "success_rate": round(success_count / len(records), 4),
+            "avg_duration_ms": round(statistics.mean(durations_ms), 2),
+            "p95_duration_ms": round(sorted_durations[p95_index], 2),
+            "recent_error_count": sum(1 for r in records[-20:] if not r.success),
+        }
+
+    def summarize_all(self) -> List[dict]:
+        """生成所有已记录工具的统计摘要列表。"""
+        return [self.summarize(name) for name in self._records.keys()]
+
+    def render_text_report(self) -> str:
+        """
+        生成一份人类可读的文本报表,方便预研阶段直接打印查看,
+        不需要额外搭建可视化面板。
+        """
+        lines = ["MCP工具调用可观测性报表", "=" * 60]
+        for summary in self.summarize_all():
+            lines.append(
+                f"工具:{summary['qualified_name']}\n"
+                f"  调用次数:{summary['total_calls']}\n"
+                f"  成功率:{summary['success_rate']}\n"
+                f"  平均耗时:{summary['avg_duration_ms']}ms\n"
+                f"  P95耗时:{summary['p95_duration_ms']}ms\n"
+                f"  最近20次调用中的失败次数:{summary['recent_error_count']}"
+            )
+        return "\n".join(lines)
+
+
+# 预研阶段使用一个模块级全局实例,方便被多处代码方便地导入使用,
+# 生产环境应当结合依赖注入的方式管理这个实例的生命周期。
+global_mcp_metrics = MCPCallMetrics()
+
+
+def trace_mcp_call(func: Callable) -> Callable:
+    """
+    一个用于包装"调用MCP工具"的异步函数的装饰器,自动记录调用耗时与
+    成败结果到 global_mcp_metrics 里。
+
+    要求被装饰的函数签名形如 async def xxx(qualified_name: str,
+    arguments: dict) -> str,这与 MCPClientManager.call_tool 的签名
+    保持一致,方便直接叠加在其上使用。
+    """
+
+    @functools.wraps(func)
+    async def wrapper(self, qualified_name: str, arguments: dict, *args, **kwargs):
+        started_at = time.time()
+        success = True
+        error_summary = ""
+        try:
+            result = await func(self, qualified_name, arguments, *args, **kwargs)
+            # 部分工具即便执行没有抛异常,也可能在返回文本里携带
+            # "错误:"前缀表示业务失败,这里做一次简单的启发式判断,
+            # 让可观测性统计能够反映"业务上是否成功",而不只是
+            # "有没有抛Python异常"。
+            if isinstance(result, str) and result.startswith("错误:"):
+                success = False
+                error_summary = result[:200]
+            return result
+        except Exception as exc:  # noqa: BLE001
+            success = False
+            error_summary = str(exc)[:200]
+            raise
+        finally:
+            duration = time.time() - started_at
+            global_mcp_metrics.record(CallRecord(
+                qualified_name=qualified_name, started_at=started_at,
+                duration_seconds=duration, success=success, error_summary=error_summary,
+            ))
+            log_level = logging.INFO if success else logging.WARNING
+            logger.log(
+                log_level, "MCP调用追踪:工具=%s 耗时=%.3fs 成功=%s",
+                qualified_name, duration, success,
+            )
+
+    return wrapper
+```
+
+陈铭把这个装饰器叠加到`MCPClientManager.call_tool`方法上之后,重新跑了一遍`run_mcp_memory_demo.py`,跑完之后调用`global_mcp_metrics.render_text_report()`,终端打印出每个工具的调用次数、成功率、平均耗时——这份报表虽然简陋,但让"MCP协议调用链路是否方便记录日志、追踪调用耗时"这个原本停留在文档层面的评估维度,第一次有了具体的数据支撑。
+
+### 文件十二:`backend/app/services/mcp/registry/server_registry.py`(配置化的MCP Server注册中心)
+
+对应架构图二里提到的"苍穹内部维护MCP Server注册中心"这个过渡期设计。这份代码解决的问题是:随着MCP Server数量增多,不能继续把每个Server的连接配置硬编码在业务代码里,而是要有一个统一的、支持配置热更新的注册中心,新增一个Server只需要修改配置,不需要改动任何调用方代码。
+
+```python
+"""
+苍穹平台 MCP 预研:MCP Server 配置化注册中心
+
+本模块提供一个从配置(字典/YAML)驱动的MCP Server注册中心,
+职责包括:
+    1. 统一管理"有哪些MCP Server、每个Server如何启动、是否启用"
+       这些元信息,业务代码不应该在自己内部硬编码这些连接参数。
+    2. 支持配置热更新——当运维人员修改配置文件后,调用
+       reload_config 即可让新配置生效,不需要重启整个服务进程
+       (今天预研阶段先实现"重新解析配置生效",生产环境应结合
+       文件监听或配置中心的推送机制自动触发reload)。
+    3. 提供简单的健康检查能力,帮助判断某个已注册的Server当前
+       是否处于可用状态。
+
+这是回应林悦"新增一个MCP Server,能不能做到配置级接入"这个诉求
+的核心验证代码——如果这个注册中心设计得当,新增Server确实只需要
+在配置里加一条记录,完全不需要触碰MCPClientManager或Agent层代码。
+
+预研范围说明:本文件仅用于 Day44 技术预研,统一维护在
+research/mcp-poc 分支,不进入 main。
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+logger = logging.getLogger("mcp_server_registry")
+
+
+@dataclass
+class RegisteredServerConfig:
+    """
+    一条Server注册记录的完整配置。
+
+    属性:
+        name: Server的逻辑名称,全局唯一,用作工具名前缀。
+        transport: 传输方式,当前预研阶段支持 "stdio",
+            远期规划支持 "streamable_http"。
+        command: stdio传输下,启动Server子进程的可执行命令。
+        args: 启动命令的参数列表。
+        enabled: 是否启用,禁用的Server在 list_enabled_servers 中
+            不会返回,方便临时下线某个出问题的Server而不用删除配置。
+        owner_team: 该Server由哪个团队负责维护,用于故障排查时
+            快速定位responsible方,这是企业级多团队协作的基本要求。
+        tags: 标签列表,用于按业务域归类查询(例如"知识库"/"办公系统")。
+    """
+
+    name: str
+    transport: str
+    command: str
+    args: List[str] = field(default_factory=list)
+    enabled: bool = True
+    owner_team: str = "未指定"
+    tags: List[str] = field(default_factory=list)
+
+
+class ServerRegistryValidationError(Exception):
+    """配置校验失败时抛出。"""
+
+
+class MCPServerRegistry:
+    """
+    MCP Server 配置化注册中心。
+
+    典型用法:
+        registry = MCPServerRegistry()
+        registry.load_from_dict({
+            "servers": [
+                {"name": "fs", "transport": "stdio", "command": "python",
+                 "args": ["filesystem_server.py"], "owner_team": "Agent平台组"},
+                {"name": "kb", "transport": "stdio", "command": "python",
+                 "args": ["knowledge_base_server.py"], "owner_team": "知识库组"},
+            ]
+        })
+        enabled_configs = registry.list_enabled_servers()
+    """
+
+    _SUPPORTED_TRANSPORTS = {"stdio", "streamable_http"}
+
+    def __init__(self) -> None:
+        self._servers: Dict[str, RegisteredServerConfig] = {}
+        self._config_version: int = 0
+
+    def load_from_dict(self, config: dict) -> None:
+        """
+        从字典结构加载(或重新加载)全部Server配置。
+
+        参数:
+            config: 形如 {"servers": [{...}, {...}]} 的配置字典,
+                通常来自解析后的YAML配置文件。
+
+        异常:
+            ServerRegistryValidationError: 当配置存在明显错误
+                (缺少必填字段、名称重复、传输方式不支持)时抛出,
+                校验失败时不会更新已有的注册表状态,避免"部分生效"
+                导致的不一致问题。
+        """
+        raw_entries = config.get("servers", [])
+        new_registry: Dict[str, RegisteredServerConfig] = {}
+
+        for entry in raw_entries:
+            name = entry.get("name")
+            transport = entry.get("transport", "stdio")
+            command = entry.get("command")
+
+            if not name:
+                raise ServerRegistryValidationError("配置项缺少必填字段:name")
+            if name in new_registry:
+                raise ServerRegistryValidationError(f"Server名称重复:{name}")
+            if transport not in self._SUPPORTED_TRANSPORTS:
+                raise ServerRegistryValidationError(
+                    f"Server({name})使用了不支持的传输方式:{transport}"
+                )
+            if not command:
+                raise ServerRegistryValidationError(f"Server({name})缺少必填字段:command")
+
+            new_registry[name] = RegisteredServerConfig(
+                name=name,
+                transport=transport,
+                command=command,
+                args=list(entry.get("args", [])),
+                enabled=bool(entry.get("enabled", True)),
+                owner_team=entry.get("owner_team", "未指定"),
+                tags=list(entry.get("tags", [])),
+            )
+
+        # 全部校验通过之后,才整体替换注册表,保证"要么全部生效,
+        # 要么保持原状"的原子性语义,不会出现加载到一半失败、
+        # 导致注册表处于新旧配置混杂的中间状态。
+        self._servers = new_registry
+        self._config_version += 1
+        logger.info(
+            "MCP Server注册中心配置已刷新,当前版本号=%d,共%d个Server(启用%d个)",
+            self._config_version, len(self._servers), len(self.list_enabled_servers()),
+        )
+
+    def reload_config(self, config: dict) -> None:
+        """
+        重新加载配置的公开入口,语义上等价于 load_from_dict,
+        单独暴露这个方法名,是为了让调用方的代码读起来更贴近
+        "热更新配置"这个业务语义,而不必关心内部实现细节。
+        """
+        self.load_from_dict(config)
+
+    def list_enabled_servers(self) -> List[RegisteredServerConfig]:
+        """列出当前全部已启用的Server配置。"""
+        return [cfg for cfg in self._servers.values() if cfg.enabled]
+
+    def list_all_servers(self) -> List[RegisteredServerConfig]:
+        """列出全部Server配置,包括已禁用的(便于运维排查)。"""
+        return list(self._servers.values())
+
+    def get_server(self, name: str) -> Optional[RegisteredServerConfig]:
+        """按名称获取单个Server配置。"""
+        return self._servers.get(name)
+
+    def disable_server(self, name: str, reason: str = "") -> None:
+        """
+        临时禁用某个Server,而不需要从配置里彻底删除它。
+
+        典型场景:某个Server出现故障或者正在维护,运维人员可以
+        先临时禁用,故障恢复后重新启用,不需要走完整的配置变更流程。
+        """
+        cfg = self._servers.get(name)
+        if cfg is None:
+            logger.warning("尝试禁用不存在的Server:%s", name)
+            return
+        cfg.enabled = False
+        logger.warning("Server(%s)已被临时禁用,原因:%s", name, reason or "未说明")
+
+    def enable_server(self, name: str) -> None:
+        """重新启用某个之前被禁用的Server。"""
+        cfg = self._servers.get(name)
+        if cfg is None:
+            logger.warning("尝试启用不存在的Server:%s", name)
+            return
+        cfg.enabled = True
+        logger.info("Server(%s)已重新启用", name)
+
+    def find_by_tag(self, tag: str) -> List[RegisteredServerConfig]:
+        """按标签查找已启用的Server,便于按业务域批量接入。"""
+        return [cfg for cfg in self.list_enabled_servers() if tag in cfg.tags]
+
+
+def build_demo_registry() -> MCPServerRegistry:
+    """
+    构建一个包含今天全部预研Server的示例注册表,供其他演示脚本
+    直接复用,避免每个脚本都重复写一遍相同的配置字典。
+    """
+    registry = MCPServerRegistry()
+    registry.load_from_dict({
+        "servers": [
+            {
+                "name": "fs", "transport": "stdio", "command": "python",
+                "args": ["backend/app/services/mcp/servers/filesystem_server.py"],
+                "owner_team": "Agent平台组", "tags": ["文件系统", "通用能力"],
+            },
+            {
+                "name": "kb", "transport": "stdio", "command": "python",
+                "args": ["backend/app/services/mcp/servers/knowledge_base_server.py"],
+                "owner_team": "知识库组", "tags": ["知识库", "通用能力"],
+            },
+            {
+                "name": "qirui_oa", "transport": "stdio", "command": "python",
+                "args": ["backend/app/services/mcp/servers/qirui_oa_server.py"],
+                "owner_team": "客户对接组", "tags": ["OA系统", "客户定制"],
+            },
+        ],
+    })
+    return registry
+```
+
+老王翻看完这份代码,提了一个值得记录的问题:"你这个`disable_server`,只是把内存里的状态改成禁用,如果服务进程重启,这个临时禁用状态是不是就丢了?"陈铭想了一下,承认确实会丢——这正好暴露了"预研阶段的内存态注册中心"和"生产级的、需要持久化状态的注册中心"之间的差距,老王把这一点记进了预研报告的"已知局限"清单里,提醒团队"预研代码解决的是'思路对不对'的问题,不是'今天写的这行代码明天就能直接上生产'的问题,这两者要分清楚,不然容易给管理层传递错误的信心"。
+
+### 文件十三:`backend/tests/test_day44_mcp_and_memory.py`(单元测试:安全边界、去重逻辑与限流验证)
+
+预研任务书里要求"至少产出2个可运行的自研MCP Server"这一条,今天已经超额完成,但老王额外提出一个要求——所有涉及安全边界的逻辑(路径穿越校验、越权访问拒绝、限流生效),必须补充可自动运行的单元测试,不能只靠人工跑一次演示脚本就算验证通过,人工验证容易遗漏边界情况,也无法在后续代码变更时自动回归。
+
+```python
+"""
+苍穹平台 Day44 预研:MCP安全边界与记忆系统单元测试
+
+本测试文件覆盖今天预研代码里几个最关键的安全与正确性边界:
+    1. 文件系统MCP Server的路径穿越防护是否真正生效。
+    2. 祺瑞OA Server的越权访问是否被正确拒绝。
+    3. 认证网关的限流逻辑是否按预期工作。
+    4. 短期记忆的窗口压缩触发时机是否正确。
+    5. 长期记忆的去重合并逻辑是否正确(使用假的向量存储替代真实
+       Chroma,避免单元测试依赖外部模型下载,这是保证测试快速、
+       可重复运行的关键设计选择)。
+
+运行方式:
+    pytest backend/tests/test_day44_mcp_and_memory.py -v
+"""
+
+from __future__ import annotations
+
+import time
+from typing import List
+from unittest.mock import MagicMock
+
+import pytest
+
+from backend.app.services.mcp.servers import filesystem_server as fs_server
+from backend.app.services.mcp.servers import qirui_oa_server as oa_server
+from backend.app.services.mcp.gateway.mcp_auth_gateway import (
+    GatewayAuthError,
+    MCPAuthGateway,
+    TenantProfile,
+    TenantRegistry,
+    TokenBucketRateLimiter,
+)
+from backend.app.services.mcp.registry.server_registry import (
+    MCPServerRegistry,
+    ServerRegistryValidationError,
+)
+from backend.app.services.memory.short_term_memory import (
+    ShortTermMemory,
+    ShortTermMemoryConfig,
+)
+
+
+class TestFilesystemServerPathSecurity:
+    """校验沙箱文件系统Server的路径安全边界。"""
+
+    def test_normal_path_is_resolved_correctly(self):
+        """正常的相对路径应当被正确解析到沙箱内部,不应报错。"""
+        resolved = fs_server._resolve_safe_path("docs/readme.txt")
+        assert str(resolved).startswith(str(fs_server.SANDBOX_ROOT))
+
+    def test_path_traversal_is_rejected(self):
+        """典型的路径穿越写法必须被拒绝,这是安全底线,不允许有例外。"""
+        with pytest.raises(fs_server.PathSecurityError):
+            fs_server._resolve_safe_path("../../etc/passwd")
+
+    def test_nested_path_traversal_is_rejected(self):
+        """更隐蔽的、嵌套在合法路径中间的穿越写法,同样必须被拒绝。"""
+        with pytest.raises(fs_server.PathSecurityError):
+            fs_server._resolve_safe_path("a/b/../../../etc/passwd")
+
+    def test_write_then_read_round_trip(self, tmp_path, monkeypatch):
+        """写入后立刻读取,内容应当完全一致(基础功能回归)。"""
+        monkeypatch.setattr(fs_server, "SANDBOX_ROOT", tmp_path)
+        write_result = fs_server.write_file("greeting.txt", "苍穹MCP预研测试", overwrite=True)
+        assert "成功" in write_result
+
+        read_result = fs_server.read_file("greeting.txt")
+        assert "苍穹MCP预研测试" in read_result
+
+    def test_write_without_overwrite_flag_is_rejected(self, tmp_path, monkeypatch):
+        """已存在的文件,未显式传入overwrite=True时不允许覆盖。"""
+        monkeypatch.setattr(fs_server, "SANDBOX_ROOT", tmp_path)
+        fs_server.write_file("locked.txt", "第一次写入", overwrite=True)
+        second_write = fs_server.write_file("locked.txt", "第二次写入", overwrite=False)
+        assert "错误" in second_write
+        assert "已存在" in second_write
+
+
+class TestQiruiOAServerAuthorization:
+    """校验祺瑞OA Server的身份认证与越权保护。"""
+
+    def setup_method(self):
+        """每个测试方法执行前,重置全局会话状态,避免测试之间互相污染。"""
+        oa_server._session_auth = oa_server.SessionAuthState()
+        oa_server._idempotency_cache.clear()
+        oa_server._LEAVE_BALANCE["QR-1001"] = 8.5
+        oa_server._LEAVE_BALANCE["QR-1002"] = 12.0
+
+    def test_unauthenticated_call_is_rejected(self):
+        """未认证的会话调用任何业务工具,都应当被拒绝。"""
+        result = oa_server.query_leave_balance("QR-1001")
+        assert "错误" in result
+        assert "认证" in result
+
+    def test_authenticate_with_invalid_key_fails(self):
+        """无效的API密钥应当认证失败。"""
+        result = oa_server.authenticate("invalid-key-xyz")
+        assert "错误" in result
+
+    def test_employee_can_query_own_balance(self):
+        """员工认证后,应当能查询自己的假期余额。"""
+        oa_server.authenticate("qirui-emp-lina-key")
+        result = oa_server.query_leave_balance("QR-1002")
+        assert "12.0" in result
+
+    def test_employee_cannot_query_others_balance(self):
+        """非管理者员工,不应该能查询他人的假期余额(核心越权测试)。"""
+        oa_server.authenticate("qirui-emp-lina-key")
+        result = oa_server.query_leave_balance("QR-1001")
+        assert "错误" in result
+        assert "无权操作" in result
+
+    def test_manager_can_query_subordinate_balance(self):
+        """管理者应当能查询自己下属的假期余额。"""
+        oa_server.authenticate("qirui-emp-zhangwei-key")
+        result = oa_server.query_leave_balance("QR-1002")
+        assert "12.0" in result
+
+    def test_leave_request_deducts_balance(self):
+        """成功提交请假申请后,假期余额应当被正确扣减。"""
+        oa_server.authenticate("qirui-emp-lina-key")
+        result = oa_server.submit_leave_request(
+            "QR-1002", "2026-08-01", "2026-08-03", 2.0, "家庭事务",
+        )
+        assert "成功" in result
+        assert oa_server._LEAVE_BALANCE["QR-1002"] == 10.0
+
+    def test_leave_request_exceeding_balance_is_rejected(self):
+        """申请天数超过剩余余额时应当被拒绝,且余额不应被扣减。"""
+        oa_server.authenticate("qirui-emp-lina-key")
+        result = oa_server.submit_leave_request(
+            "QR-1002", "2026-08-01", "2026-08-20", 100.0, "长期休假",
+        )
+        assert "错误" in result
+        assert oa_server._LEAVE_BALANCE["QR-1002"] == 12.0
+
+    def test_idempotency_key_prevents_duplicate_deduction(self):
+        """相同幂等键重复提交请假申请,只应该真正扣减一次余额。"""
+        oa_server.authenticate("qirui-emp-lina-key")
+        key = "test-idem-key-001"
+        first = oa_server.submit_leave_request(
+            "QR-1002", "2026-09-01", "2026-09-02", 1.0, "个人事务", idempotency_key=key,
+        )
+        second = oa_server.submit_leave_request(
+            "QR-1002", "2026-09-01", "2026-09-02", 1.0, "个人事务", idempotency_key=key,
+        )
+        assert first == second
+        assert oa_server._LEAVE_BALANCE["QR-1002"] == 11.0
+
+    def test_large_reimbursement_requires_manual_approval(self):
+        """超过自动审批阈值的报销,状态必须是"待人工审批",不能自动通过。"""
+        oa_server.authenticate("qirui-emp-lina-key")
+        result = oa_server.submit_reimbursement(
+            "QR-1002", 8000.0, "差旅", "跨市出差住宿与交通费用",
+        )
+        assert "待人工审批" in result
+
+
+class TestMCPAuthGateway:
+    """校验多租户认证网关的鉴权与限流逻辑。"""
+
+    def _build_gateway(self, rate_limit_per_minute: int = 3) -> MCPAuthGateway:
+        fake_manager = MagicMock()
+        fake_manager.call_tool = MagicMock(return_value="模拟的工具调用结果")
+
+        registry = TenantRegistry()
+        registry.register_tenant(
+            api_key="qirui-remote-test-key",
+            profile=TenantProfile(
+                tenant_id="qirui", display_name="祺瑞集团(测试)",
+                allowed_server_names={"kb"}, allowed_tool_prefixes={"kb__"},
+                rate_limit_per_minute=rate_limit_per_minute,
+            ),
+        )
+        gateway = MCPAuthGateway(mcp_manager=fake_manager, tenant_registry=registry)
+        return gateway
+
+    @pytest.mark.asyncio
+    async def test_invalid_api_key_is_rejected(self):
+        gateway = self._build_gateway()
+        result = await gateway.call_tool_for_tenant(
+            "wrong-key", "kb__search_knowledge_base", {"query": "test"},
+        )
+        assert "错误" in result
+
+    @pytest.mark.asyncio
+    async def test_disallowed_tool_prefix_is_rejected(self):
+        gateway = self._build_gateway()
+        result = await gateway.call_tool_for_tenant(
+            "qirui-remote-test-key", "fs__read_file", {"path": "a.txt"},
+        )
+        assert "错误" in result
+        assert "未被授权" in result
+
+    @pytest.mark.asyncio
+    async def test_allowed_call_is_forwarded_to_manager(self):
+        gateway = self._build_gateway()
+        result = await gateway.call_tool_for_tenant(
+            "qirui-remote-test-key", "kb__search_knowledge_base", {"query": "test"},
+        )
+        assert result == "模拟的工具调用结果"
+
+    def test_rate_limiter_blocks_after_capacity_exhausted(self):
+        """令牌桶限流器在令牌耗尽后,应当拒绝新的请求。"""
+        limiter = TokenBucketRateLimiter()
+        allowed_results = [limiter.try_consume("qirui", 3) for _ in range(5)]
+        assert allowed_results[:3] == [True, True, True]
+        assert allowed_results[3] is False
+
+
+class TestServerRegistryConfigValidation:
+    """校验MCP Server注册中心的配置加载与校验逻辑。"""
+
+    def test_duplicate_server_name_is_rejected(self):
+        registry = MCPServerRegistry()
+        with pytest.raises(ServerRegistryValidationError):
+            registry.load_from_dict({
+                "servers": [
+                    {"name": "fs", "transport": "stdio", "command": "python"},
+                    {"name": "fs", "transport": "stdio", "command": "python2"},
+                ],
+            })
+
+    def test_unsupported_transport_is_rejected(self):
+        registry = MCPServerRegistry()
+        with pytest.raises(ServerRegistryValidationError):
+            registry.load_from_dict({
+                "servers": [{"name": "fs", "transport": "carrier_pigeon", "command": "python"}],
+            })
+
+    def test_failed_reload_does_not_corrupt_existing_state(self):
+        """加载失败时,注册表应当保持原有的有效配置,不能变成半新半旧的中间状态。"""
+        registry = MCPServerRegistry()
+        registry.load_from_dict({
+            "servers": [{"name": "fs", "transport": "stdio", "command": "python"}],
+        })
+        with pytest.raises(ServerRegistryValidationError):
+            registry.load_from_dict({
+                "servers": [{"name": "fs", "transport": "stdio", "command": "python"},
+                            {"name": "fs", "transport": "stdio", "command": "python2"}],
+            })
+        assert registry.get_server("fs") is not None
+
+
+class TestShortTermMemoryCompressionTiming:
+    """校验短期记忆窗口压缩的触发时机是否正确。"""
+
+    def test_compression_not_triggered_below_threshold(self):
+        config = ShortTermMemoryConfig(max_window_messages=8, compress_batch_size=4)
+        memory = ShortTermMemory(session_id="s1", config=config, summarizer=None)
+        for i in range(3):
+            memory.add_turn(f"用户第{i}轮提问", f"助手第{i}轮回答")
+        assert memory.window_size == 6
+        assert memory.rolling_summary == ""
+
+    def test_compression_triggered_above_threshold(self):
+        fake_summarizer = MagicMock()
+        fake_summarizer.summarize.return_value = "压缩后的摘要内容"
+        config = ShortTermMemoryConfig(max_window_messages=6, compress_batch_size=4)
+        memory = ShortTermMemory(session_id="s2", config=config, summarizer=fake_summarizer)
+        for i in range(5):
+            memory.add_turn(f"用户第{i}轮提问", f"助手第{i}轮回答")
+        assert memory.rolling_summary == "压缩后的摘要内容"
+        assert memory.window_size < 10
+        fake_summarizer.summarize.assert_called()
+```
+
+这份测试文件跑起来之后,一共18个测试用例全部通过,其中`test_employee_cannot_query_others_balance`和`test_disallowed_tool_prefix_is_rejected`这两个"验证错误的行为会被正确拒绝"的用例,是老王特意要求补充的——他在review时说了一句和Day46事故复盘里同样的话:"验证'正确的东西能跑通'只是测试的一半,验证'错误的东西会被正确拦住',才是企业级系统测试里更容易被漏掉、但价值更高的那一半。"
+
+至此,今天预研任务追加的五个补充模块(客户系统对接的安全边界验证、多租户认证网关、可观测性埋点、配置化注册中心、覆盖安全边界的单元测试),分别对应上午需求文档里"安全边界""可观测性""多租户隔离""生态成熟度"这几项非功能性评估维度,补齐了原本只停留在文档讨论层面的证据链条。晚上八点半,团队收工前,老王在预研报告的结论部分,亲自加了一句话:"以上评估基于今天验证性代码得出,细节结论可能随MCP协议本身的演进而调整,但核心判断——MCP值得在苍穹的通用工具能力上小范围试点——目前证据链是完整的。"
+
 ---
 
 ## 今日复盘
