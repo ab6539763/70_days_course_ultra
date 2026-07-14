@@ -1014,14 +1014,21 @@ from app.services.agent.multi_agent.tools import (
 # 每个角色只被要求做好一件事,不需要理解其他角色的工作细节。
 # ------------------------------------------------------------------
 
+# 用拼接方式构造"三个反引号"这个Markdown代码围栏符号,而不是在字符串里直接
+# 硬编码三个连续的反引号字符——这是为了避免这段提示词文本被写入技术文档、
+# Wiki等同样使用反引号作为代码围栏的Markdown渲染场景时,与文档自身的代码块
+# 边界符号产生冲突,导致文档渲染错乱。_extract_trailing_json的解析逻辑
+# 同样复用这个常量,保证"生成指令的格式"与"解析指令的格式"始终保持一致。
+_JSON_FENCE = "`" * 3
+
 _SEARCHER_SYSTEM_PROMPT = (
     "你是苍穹研究团队里的搜索员,唯一职责是围绕给定课题检索相关资料。\n"
     "工作要求:\n"
     "1. 只负责查找资料、整理摘要,不要做任何数据分析或结论推断,那是分析师的工作。\n"
     "2. 每次检索完成后,必须在回复的最后附上一段JSON,格式如下,不要添加多余文字:\n"
-    "```json\n"
+    f"{_JSON_FENCE}json\n"
     "{\"findings\": [{\"title\": \"...\", \"source\": \"...\", \"content\": \"...\"}]}\n"
-    "```\n"
+    f"{_JSON_FENCE}\n"
     "3. 如果一次检索结果不够充分,可以调用fetch_summary工具深挖某条来源,"
     "但不要无限重复检索同一个关键词。"
 )
@@ -1033,9 +1040,9 @@ _ANALYST_SYSTEM_PROMPT = (
     "(那是搜索员的工作),也不要负责最终报告的排版措辞(那是报告撰写员的工作)。\n"
     "2. 你必须使用extract_key_numbers、sentiment_tag等工具辅助分析,不要凭空编造数字。\n"
     "3. 分析完成后,必须在回复最后附上一段JSON,格式如下:\n"
-    "```json\n"
+    f"{_JSON_FENCE}json\n"
     "{\"analysis_report\": \"完整的分析结论文本(Markdown格式)\"}\n"
-    "```"
+    f"{_JSON_FENCE}"
 )
 
 _WRITER_SYSTEM_PROMPT = (
@@ -1046,21 +1053,21 @@ _WRITER_SYSTEM_PROMPT = (
     "2. 必须调用format_markdown_report工具生成规范格式的报告,再调用"
     "save_report_to_file工具落盘保存。\n"
     "3. 报告落盘后,必须在回复最后附上一段JSON,格式如下:\n"
-    "```json\n"
+    f"{_JSON_FENCE}json\n"
     "{\"final_report\": \"完整报告的Markdown文本\"}\n"
-    "```"
+    f"{_JSON_FENCE}"
 )
 
 
 def _extract_trailing_json(text: str) -> dict:
     """从一段模型输出的文本末尾提取JSON片段。
 
-    子Agent被要求在回复末尾附加一段```json ... ```代码块,本函数负责
-    把这段代码块解析成Python字典。如果解析失败(模型偶尔没有严格遵循格式),
-    会返回一个空字典,调用方需要自行处理"没有解析到结构化产出"的情形,
-    而不是让程序直接崩溃。
+    子Agent被要求在回复末尾附加一段由三个反引号包裹、并标注json语言的代码块,
+    本函数负责把这段代码块解析成Python字典。如果解析失败(模型偶尔没有严格
+    遵循格式),会返回一个空字典,调用方需要自行处理"没有解析到结构化产出"
+    的情形,而不是让程序直接崩溃。
     """
-    match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
+    match = re.search(_JSON_FENCE + r"json\s*(\{.*?\})\s*" + _JSON_FENCE, text, re.DOTALL)
     if not match:
         return {}
     try:
@@ -2137,6 +2144,1476 @@ def test_summarize_thread_timeline_formats_multiple_steps():
     assert "共2步" in timeline
 ```
 
+### 补充实现:规则引擎版路由决策(降低对LLM调度的单点依赖)
+
+demo在林悦面前跑通之后,老王又留了陈铭半小时,让他在原有代码基础上继续补两块东西。"你今天的supervisor_node,每一轮路由决策都要发起一次真实的LLM调用,"老王说,"平时开发调试、写单元测试的时候,这个成本你感觉不到,但你想过没有——CI流水线跑一次全量测试,如果每条测试都要真实调用一次LLM,一是慢,二是要真实的API Key才能跑,三是LLM偶尔的随机性会让测试结果不稳定。有没有办法,把'资料是不是空的''分析结论是不是明显不足'这种其实一眼就能用代码判断清楚的部分,单独拎出来,不依赖LLM也能给出正确判断?"
+
+陈铭想了想说:"这其实就是您之前反复强调的那句话——'能用确定性代码判断的事情,尽量别交给LLM去猜'吧?只不过这次不是应用在判断'某个字段有没有内容'这么简单的层面,而是要把整套路由的分支逻辑,用规则引擎的方式完整地重写一遍。"
+
+"对,"老王说,"你把这套规则引擎写成一个独立模块,不要直接替换掉supervisor_node里对LLM的调用——那样风险太大,万一规则引擎覆盖不到某个边界情况,反而会让系统变得更僵化。规则引擎更适合定位成两个用途:一是在真正调用LLM之前,先做一次'预检',遇到没有任何歧义的情况(比如round_count已经超限,比如search_findings完全是空的),直接用规则引擎的结果,省掉一次LLM调用;二是在没有真实API Key的环境下(比如CI流水线、比如新同事第一次拉取项目跑demo),完全靠规则引擎驱动整个流程跑通,让大家先看到'这套架构是怎么运作的',而不是一上来就卡在'没有配置API Key'这道门槛上。"
+
+按照这个思路,陈铭把research_team目录下又加了一个模块,并配上了一份独立的单元测试文件,专门覆盖规则引擎在各种进展组合下的分支判断顺序——这也是对课后作业第2题、第4题、第6题里讨论过的几个设计思路(结构化字段驱动路由、软提醒机制、局部循环保护)的一次集中的正式代码落地。
+
+#### 文件十二:`backend/app/services/agent/multi_agent/decision_rules.py`
+
+```python
+"""
+research_team 多Agent协作系统 —— 确定性规则路由引擎模块
+
+设计说明:
+    supervisor.py中的supervisor_node依赖LLM给出结构化路由决策,这在大多数
+    场景下表现良好,但企业级系统里,"完全依赖LLM做每一次调度判断"存在两个
+    现实问题:一是每一轮调度都要付出一次LLM调用的时延与token成本;二是
+    LLM的判断即便有结构化输出约束,也无法完全杜绝"语义层面判断错误"的情况
+    (例如资料明显已经足够,LLM却仍然判断需要退回searcher重新检索)。
+
+    本模块提供一套完全基于Python确定性逻辑的规则路由引擎,可以在两种场景下
+    发挥作用:
+        1. 作为LLM路由决策之前的"预检层"——如果规则引擎已经能给出一个
+           高置信度的判断(例如round_count已经超限、或者search_findings
+           为空这种没有任何歧义的情况),可以直接采用规则引擎的结果,
+           不需要再耗费一次LLM调用;
+        2. 作为开发、测试、演示阶段的"低成本模式"——在不具备真实API Key
+           的环境下,完全用规则引擎驱动整套协作流程跑通,便于CI流水线里
+           做集成测试而不产生真实费用,也便于新同事第一次接触这个项目时,
+           不需要先去申请API Key就能看到完整的调度流程是怎么运作的。
+
+    这是企业级Agent系统中一种常见且务实的设计模式——"LLM负责有歧义、
+    需要语义理解的判断,规则引擎负责没有歧义、可以用确定性代码表达的判断",
+    与state.py设计说明中反复强调的原则完全一致。
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal
+
+from app.services.agent.multi_agent.state import ResearchTeamState, RouteTarget
+
+# 单个环节之间"退回重做"的次数上限。这个概念比全局的round_count更细粒度——
+# 全局轮次没有超限,但如果searcher和analyst之间反复踢皮球超过这个次数,
+# 也应当被视为异常情况,强制推进到下一环节,而不是无休止地等待"资料足够充分"。
+# 这正是课后作业第6题参考答案里提到的"局部循环保护"机制的正式实现。
+MAX_STAGE_RETRIES: int = 2
+
+# 分析师被认为"资料明显不足,难以给出有效结论"的关键词特征。
+# 用简单的关键词匹配作为启发式规则,不追求语义上的完全准确,
+# 只作为规则引擎粗筛的一部分依据,真正的语义判断仍然交给LLM完成。
+_INSUFFICIENT_DATA_MARKERS: tuple[str, ...] = ("资料不足", "数据不足", "无法分析", "证据不足")
+
+# 报告撰写员产出的报告,如果字数少于这个阈值,规则引擎认为报告过于简略,
+# 应当要求报告撰写员补充展开,而不是直接判断FINISH。
+MIN_FINAL_REPORT_LENGTH: int = 60
+
+
+@dataclass
+class ProgressSignals:
+    """把state中零散的字段,归纳成一份结构化的"进展信号"快照。
+
+    这样做的好处是,后续的分支判断逻辑(decide_route_by_rules)可以完全
+    基于这份快照做纯函数式的判断,不需要反复访问原始state字典,
+    也更方便针对ProgressSignals单独写单元测试,不需要每次都构造一份
+    完整的ResearchTeamState。
+    """
+
+    findings_count: int
+    has_analysis: bool
+    analysis_looks_insufficient: bool
+    has_final_report: bool
+    final_report_length: int
+    round_count: int
+    max_rounds: int
+    searcher_retry_count: int
+    writer_retry_count: int
+
+    @property
+    def round_ratio(self) -> float:
+        """已用轮次占最大轮次的比例,用于软提醒场景。"""
+        if self.max_rounds <= 0:
+            return 1.0
+        return self.round_count / self.max_rounds
+
+    @property
+    def is_over_hard_limit(self) -> bool:
+        return self.round_count > self.max_rounds
+
+
+def compute_progress_signals(state: ResearchTeamState) -> ProgressSignals:
+    """从共享状态中提取并计算一份ProgressSignals快照。
+
+    stage_retry_counts字段不属于原始ResearchTeamState定义,这里用
+    state.get(..., {})做了向后兼容处理——即便调用方使用的还是没有
+    这个字段的老版本state,本函数也不会因为KeyError而崩溃,只是
+    退回次数统计会一直是0,不影响其他分支判断的正确性。
+    """
+    analysis_text = state.get("analysis_report", "") or ""
+    final_report = state.get("final_report", "") or ""
+    retry_counts = state.get("stage_retry_counts", {}) or {}
+
+    return ProgressSignals(
+        findings_count=len(state.get("search_findings", []) or []),
+        has_analysis=bool(analysis_text),
+        analysis_looks_insufficient=any(marker in analysis_text for marker in _INSUFFICIENT_DATA_MARKERS),
+        has_final_report=bool(final_report),
+        final_report_length=len(final_report),
+        round_count=state.get("round_count", 0),
+        max_rounds=state.get("max_rounds", 8),
+        searcher_retry_count=retry_counts.get("searcher", 0),
+        writer_retry_count=retry_counts.get("writer", 0),
+    )
+
+
+@dataclass
+class RuleDecision:
+    """规则引擎给出的一次路由判断,附带置信度与理由说明。
+
+    confidence字段刻意设计成"high"/"low"两档,而不是一个连续的浮点数——
+    企业实践中,过于精细的置信度评分往往营造出一种"看起来很科学"但
+    实际上难以校准的假象,二元的高/低置信度已经足够支撑"要不要跳过LLM
+    调用"这个具体的工程决策:只有confidence为"high"的判断,才建议直接
+    采用而跳过LLM调用;confidence为"low"的判断,建议仍然把最终决定权
+    交给LLM,规则引擎的结果只作为参考信息拼入提示词。
+    """
+
+    next: RouteTarget
+    reason: str
+    confidence: Literal["high", "low"] = "high"
+
+
+def decide_route_by_rules(signals: ProgressSignals) -> RuleDecision:
+    """基于确定性规则,推导下一步应该路由到哪个角色。
+
+    分支判断严格按照以下优先级顺序执行(优先级从高到低,前面的分支一旦
+    命中就直接返回,不再继续判断后面的分支):
+        1. 轮次硬上限保护(最高优先级,任何情况下都不能被绕过)
+        2. 完全没有搜索资料 -> searcher
+        3. 有资料但还没有分析结论 -> analyst
+        4. 分析结论看起来"资料不足",且searcher退回次数未超限 -> 退回searcher
+        5. 有分析结论但没有最终报告 -> writer
+        6. 有最终报告但字数过短,且writer退回次数未超限 -> 退回writer补充展开
+        7. 以上条件都不满足 -> FINISH
+    """
+    if signals.is_over_hard_limit:
+        return RuleDecision(
+            next="FINISH",
+            reason=f"调度轮次{signals.round_count}已超过硬上限{signals.max_rounds},强制终止。",
+            confidence="high",
+        )
+
+    if signals.findings_count == 0:
+        return RuleDecision(
+            next="searcher",
+            reason="尚未获取任何搜索资料,规则引擎判定优先派单给搜索员。",
+            confidence="high",
+        )
+
+    if not signals.has_analysis:
+        return RuleDecision(
+            next="analyst",
+            reason="已有搜索资料但尚无分析结论,规则引擎判定派单给分析师。",
+            confidence="high",
+        )
+
+    if signals.analysis_looks_insufficient and signals.searcher_retry_count < MAX_STAGE_RETRIES:
+        return RuleDecision(
+            next="searcher",
+            reason=(
+                f"分析师反馈资料不足(已退回{signals.searcher_retry_count}次,"
+                f"未超过上限{MAX_STAGE_RETRIES}次),规则引擎判定退回搜索员补充资料。"
+            ),
+            confidence="high",
+        )
+
+    if not signals.has_final_report:
+        return RuleDecision(
+            next="writer",
+            reason="已有分析结论但尚无最终报告,规则引擎判定派单给报告撰写员。",
+            confidence="high",
+        )
+
+    if signals.final_report_length < MIN_FINAL_REPORT_LENGTH and signals.writer_retry_count < MAX_STAGE_RETRIES:
+        return RuleDecision(
+            next="writer",
+            reason=(
+                f"最终报告长度仅{signals.final_report_length}字,低于阈值"
+                f"{MIN_FINAL_REPORT_LENGTH}字(已退回{signals.writer_retry_count}次),"
+                "规则引擎判定退回报告撰写员补充展开。"
+            ),
+            confidence="low",
+        )
+
+    return RuleDecision(
+        next="FINISH",
+        reason="搜索资料、分析结论、最终报告均已具备且质量达标,规则引擎判定任务完成。",
+        confidence="high",
+    )
+
+
+def build_soft_reminder_text(signals: ProgressSignals, threshold: float = 0.75) -> str:
+    """当轮次占比超过阈值时,生成一段供拼入LLM提示词的软提醒文本。
+
+    这是课后作业第4题参考答案中"软提醒机制"的正式实现版本,抽取成
+    独立函数后,既可以被supervisor.py复用,也方便单独编写单元测试,
+    不需要每次都通过完整的supervisor_node间接验证软提醒的触发时机是否正确。
+    """
+    if signals.round_ratio < threshold:
+        return ""
+    return (
+        f"\n【重要提醒】当前调度轮次为{signals.round_count},"
+        f"已达到最大允许轮次{signals.max_rounds}的{signals.round_ratio:.0%},"
+        "请尽快做出收敛性的决策,优先考虑推进到下一阶段而不是继续退回重做,"
+        "避免触发轮次上限被强制终止。"
+    )
+```
+
+#### 文件十三:`backend/tests/test_multi_agent_decision_rules.py`
+
+```python
+"""
+research_team 多Agent协作系统 —— 规则路由引擎单元测试
+
+覆盖decision_rules.py中的分支判断逻辑,确保规则引擎在各种进展组合下的
+优先级顺序与预期一致,且不依赖任何真实LLM调用或网络请求,可以在CI流水线
+中稳定、快速地运行。
+"""
+from __future__ import annotations
+
+import pytest
+
+from app.services.agent.multi_agent.decision_rules import (
+    MAX_STAGE_RETRIES,
+    MIN_FINAL_REPORT_LENGTH,
+    ProgressSignals,
+    build_soft_reminder_text,
+    compute_progress_signals,
+    decide_route_by_rules,
+)
+from app.services.agent.multi_agent.state import build_initial_state
+
+
+def _make_signals(**overrides) -> ProgressSignals:
+    """构造一份默认的ProgressSignals,方便测试用例按需覆盖个别字段,
+    不需要每次都把全部九个字段都手写一遍。
+    """
+    defaults = dict(
+        findings_count=0,
+        has_analysis=False,
+        analysis_looks_insufficient=False,
+        has_final_report=False,
+        final_report_length=0,
+        round_count=1,
+        max_rounds=8,
+        searcher_retry_count=0,
+        writer_retry_count=0,
+    )
+    defaults.update(overrides)
+    return ProgressSignals(**defaults)
+
+
+def test_hard_limit_has_highest_priority_even_when_report_ready():
+    """即便最终报告已经就位,只要轮次超过硬上限,也必须优先判定FINISH。"""
+    signals = _make_signals(
+        findings_count=3,
+        has_analysis=True,
+        has_final_report=True,
+        final_report_length=500,
+        round_count=9,
+        max_rounds=8,
+    )
+    decision = decide_route_by_rules(signals)
+    assert decision.next == "FINISH"
+    assert "硬上限" in decision.reason
+
+
+def test_no_findings_routes_to_searcher():
+    signals = _make_signals(findings_count=0)
+    decision = decide_route_by_rules(signals)
+    assert decision.next == "searcher"
+    assert decision.confidence == "high"
+
+
+def test_findings_without_analysis_routes_to_analyst():
+    signals = _make_signals(findings_count=2)
+    decision = decide_route_by_rules(signals)
+    assert decision.next == "analyst"
+
+
+def test_insufficient_analysis_routes_back_to_searcher_within_retry_limit():
+    signals = _make_signals(
+        findings_count=1,
+        has_analysis=True,
+        analysis_looks_insufficient=True,
+        searcher_retry_count=MAX_STAGE_RETRIES - 1,
+    )
+    decision = decide_route_by_rules(signals)
+    assert decision.next == "searcher"
+    assert "退回搜索员" in decision.reason
+
+
+def test_insufficient_analysis_but_retry_exhausted_moves_to_writer():
+    """即便分析师仍然反馈资料不足,一旦退回次数已达上限,也应当强制推进到writer,
+    而不是无休止地在searcher与analyst之间循环——这正是决策优先级第4条和第5条
+    之间的边界情况,必须被单元测试显式覆盖,否则很容易被后续代码改动悄悄破坏。
+    """
+    signals = _make_signals(
+        findings_count=1,
+        has_analysis=True,
+        analysis_looks_insufficient=True,
+        searcher_retry_count=MAX_STAGE_RETRIES,
+    )
+    decision = decide_route_by_rules(signals)
+    assert decision.next == "writer"
+
+
+def test_analysis_ready_without_report_routes_to_writer():
+    signals = _make_signals(findings_count=2, has_analysis=True)
+    decision = decide_route_by_rules(signals)
+    assert decision.next == "writer"
+
+
+def test_short_final_report_routes_back_to_writer_within_retry_limit():
+    signals = _make_signals(
+        findings_count=2,
+        has_analysis=True,
+        has_final_report=True,
+        final_report_length=MIN_FINAL_REPORT_LENGTH - 1,
+        writer_retry_count=0,
+    )
+    decision = decide_route_by_rules(signals)
+    assert decision.next == "writer"
+    assert decision.confidence == "low"
+
+
+def test_short_report_but_retry_exhausted_finishes_anyway():
+    signals = _make_signals(
+        findings_count=2,
+        has_analysis=True,
+        has_final_report=True,
+        final_report_length=MIN_FINAL_REPORT_LENGTH - 1,
+        writer_retry_count=MAX_STAGE_RETRIES,
+    )
+    decision = decide_route_by_rules(signals)
+    assert decision.next == "FINISH"
+
+
+def test_all_stages_complete_and_report_long_enough_finishes():
+    signals = _make_signals(
+        findings_count=3,
+        has_analysis=True,
+        has_final_report=True,
+        final_report_length=MIN_FINAL_REPORT_LENGTH + 10,
+    )
+    decision = decide_route_by_rules(signals)
+    assert decision.next == "FINISH"
+    assert decision.confidence == "high"
+
+
+def test_compute_progress_signals_reads_from_real_state():
+    """确保compute_progress_signals能够正确从真实的ResearchTeamState中提取信号,
+    而不仅仅是在手工构造的ProgressSignals上验证逻辑正确性。
+    """
+    state = build_initial_state("规则引擎测试课题", max_rounds=6)
+    state["search_findings"] = [{"title": "a", "source": "b", "content": "c"}]
+    state["analysis_report"] = "资料不足,暂无法给出结论"
+    state["round_count"] = 2
+
+    signals = compute_progress_signals(state)
+
+    assert signals.findings_count == 1
+    assert signals.has_analysis is True
+    assert signals.analysis_looks_insufficient is True
+    assert signals.max_rounds == 6
+    assert signals.round_count == 2
+
+
+@pytest.mark.parametrize(
+    "round_count,max_rounds,expect_reminder",
+    [
+        (1, 8, False),
+        (5, 8, False),
+        (6, 8, True),
+        (8, 8, True),
+    ],
+)
+def test_soft_reminder_triggers_only_past_threshold(round_count, max_rounds, expect_reminder):
+    signals = _make_signals(round_count=round_count, max_rounds=max_rounds)
+    reminder = build_soft_reminder_text(signals)
+    if expect_reminder:
+        assert "重要提醒" in reminder
+    else:
+        assert reminder == ""
+```
+
+### 拓展场景:"产品评审团队"多Agent协作系统(产品经理 + 设计师 + 工程师)
+
+规则引擎补完之后,老王又给陈铭出了一道"验证题":"你说Supervisor架构的核心卖点之一,是'换个业务场景,核心框架代码不用大改',那你现在就拿一个跟'调研分析'完全不搭边的场景,试着套一遍这套架构,看看到底有多少代码是能直接复用的,有多少是必须重写的。"
+
+陈铭想了想蓬远科技内部真实存在的一个协作场景——每次周晓提一个新需求想法,通常都会拉一个小范围评审,林悦从产品角度看需求是否站得住脚,UI设计师看交互和视觉是否可行,老王或者其他后端同事看技术实现是否有坑。这个"产品评审团队"场景,角色分工天然清晰,又和"研究团队"的业务领域完全不同,是一个很合适的验证案例。他按照Supervisor模式,新建了一个独立的多Agent子系统——`backend/app/services/agent/product_review_team/`,复用了`multi_agent.config`里的模型配置和`multi_agent.agents`里的JSON解析工具函数,但状态定义、工具集、三个评审角色、Supervisor路由逻辑,都是完全独立的一套实现,验证了"新场景只需要新写角色相关的代码,核心的星形拓扑与调度模式可以完全照搬"这个设计假设。
+
+#### 文件十四:`backend/app/services/agent/product_review_team/state.py`
+
+```python
+"""
+product_review_team 多Agent协作系统 —— "产品评审团队"共享状态定义模块
+
+设计说明:
+    这是继"研究团队"(searcher/analyst/writer)之后,苍穹Agent编排层落地的
+    第二个Supervisor模式多Agent协作场景——用于内部评审一个产品需求。
+    团队成员对应三个真实存在的职能角色:产品经理(评估需求本身是否清晰、
+    是否有业务价值)、设计师(评估交互与视觉设计是否可行、是否符合规范)、
+    工程师(评估技术实现是否可行、是否存在明显的技术风险)。
+
+    选择这个场景作为"研究团队"架构的第二个验证案例,是为了具体验证PRD里
+    反复强调的一条非功能需求——"新增或替换某个子Agent角色时,只需要修改
+    该角色对应的节点定义与工具集,不需要改动Supervisor的核心路由逻辑与
+    图拓扑结构"。事实上,本场景的Supervisor路由结构与状态共享机制,
+    与research_team几乎是同构的,只是把"查资料/做分析/写报告"换成了
+    "评产品/评设计/评技术",这恰恰印证了Supervisor模式框架代码的可复用性。
+"""
+from __future__ import annotations
+
+from typing import Annotated, Literal, TypedDict
+
+from langchain_core.messages import BaseMessage
+from langgraph.graph.message import add_messages
+
+# 评审团队成员名单,与graph_builder.py中注册的节点名保持严格一致
+REVIEW_TEAM_MEMBERS: list[str] = ["product_manager", "designer", "engineer"]
+
+# 评审主持人(Supervisor)每一轮可以路由到的目标
+ReviewRouteTarget = Literal["product_manager", "designer", "engineer", "FINISH"]
+
+# 单轮评审的默认调度轮次上限。一次完整评审正常需要3次路由决策
+# (产品经理->设计师->工程师各评审一轮),预留冗余空间应付"某个角色
+# 认为需求描述不清楚,要求打回补充说明"这种正常的返工情形。
+DEFAULT_REVIEW_MAX_ROUNDS: int = 6
+
+# 最终评审结论的枚举取值
+ReviewVerdict = Literal["通过", "有条件通过", "驳回"]
+
+
+class RoleReview(TypedDict):
+    """单个评审角色给出的结构化评审意见。
+
+    三个角色(产品经理/设计师/工程师)复用同一份评审意见结构,
+    是为了让Supervisor在汇总阶段可以用统一的方式处理三份评审意见,
+    不需要为每个角色单独写一套解析逻辑。
+    """
+
+    reviewer: str  # 角色标识,例如"product_manager"
+    verdict: ReviewVerdict  # 该角色给出的评审结论
+    comments: str  # 具体评审意见与理由
+    concerns: list[str]  # 该角色提出的具体顾虑点(可能为空列表)
+    blocking: bool  # 是否认为存在"阻塞性问题",阻塞性问题会导致整体评审无法通过
+
+
+class ProductReviewState(TypedDict):
+    """产品评审团队多Agent协作系统的全局共享状态。"""
+
+    # 完整的协作消息历史,复用与ResearchTeamState一致的add_messages归并策略
+    messages: Annotated[list[BaseMessage], add_messages]
+
+    # 待评审的产品需求描述,由发起评审的同事一次性给定,贯穿整个评审流程
+    requirement: str
+
+    # 评审主持人本轮给出的路由决策
+    next: ReviewRouteTarget
+
+    # 累计已经完成的调度轮次
+    round_count: int
+
+    # 允许的最大调度轮次
+    max_rounds: int
+
+    # 产品经理的结构化评审产出,尚未评审时为None
+    pm_review: RoleReview | None
+
+    # 设计师的结构化评审产出
+    design_review: RoleReview | None
+
+    # 工程师的结构化评审产出
+    engineering_review: RoleReview | None
+
+    # 每个环节的退回重做次数统计,key为角色名,value为退回次数,
+    # 用于配合decision_rules.py中同样思路的"局部循环保护"机制
+    stage_retry_counts: dict[str, int]
+
+    # 评审主持人汇总三份评审意见后,生成的最终评审结论文本(Markdown格式)
+    final_verdict: str
+
+
+def build_initial_review_state(
+    requirement: str, max_rounds: int = DEFAULT_REVIEW_MAX_ROUNDS
+) -> ProductReviewState:
+    """根据待评审的产品需求,构造一份初始的共享状态。
+
+    Args:
+        requirement: 待评审的产品需求描述文本。
+        max_rounds: 本次评审允许的最大调度轮次。
+
+    Returns:
+        一份可以直接喂给编译后的图执行的初始状态。
+    """
+    if not requirement or not requirement.strip():
+        raise ValueError("产品需求描述不能为空,请提供具体的需求内容后再发起评审")
+
+    return ProductReviewState(
+        messages=[],
+        requirement=requirement.strip(),
+        next="product_manager",  # 评审流程固定先从产品经理开始:先确认需求本身站得住脚
+        round_count=0,
+        max_rounds=max_rounds,
+        pm_review=None,
+        design_review=None,
+        engineering_review=None,
+        stage_retry_counts={},
+        final_verdict="",
+    )
+
+
+def make_role_review(
+    reviewer: str,
+    verdict: ReviewVerdict,
+    comments: str,
+    concerns: list[str] | None = None,
+    blocking: bool = False,
+) -> RoleReview:
+    """构造一份RoleReview的工厂函数,统一在各Agent节点里复用,
+    避免每个节点各自手写一份字典字面量导致字段拼写不一致。
+    """
+    return RoleReview(
+        reviewer=reviewer,
+        verdict=verdict,
+        comments=comments,
+        concerns=concerns or [],
+        blocking=blocking,
+    )
+```
+
+#### 文件十五:`backend/app/services/agent/product_review_team/tools.py`
+
+```python
+"""
+product_review_team 多Agent协作系统 —— 工具集模块
+
+设计说明:
+    与research_team/tools.py的设计原则一致——工具函数本身使用简化的
+    启发式实现(关键词匹配、规则判断),核心目的是让课堂演示与自动化
+    测试可以在没有外部服务依赖的情况下稳定复现,同时把"企业级评审工具
+    应该长什么样"的接口形态定义清楚。生产环境中,这些工具可以被替换为
+    真正对接需求管理系统(如飞书项目、Jira)、设计规范检查服务、
+    代码依赖分析服务的实现,只需要保持函数签名与docstring描述不变,
+    上层Agent节点代码完全不需要改动。
+"""
+from __future__ import annotations
+
+from langchain_core.tools import tool
+
+# ------------------------------------------------------------------
+# 产品经理工具集
+# ------------------------------------------------------------------
+
+_REQUIREMENT_ESSENTIAL_SECTIONS: tuple[str, ...] = ("背景", "用户", "功能", "验收")
+
+
+@tool
+def check_requirement_completeness(requirement: str) -> list[str]:
+    """检查一份产品需求描述是否包含评审所需的关键要素。
+
+    企业级需求评审通常要求需求描述至少覆盖:背景动机、目标用户、
+    具体功能点、验收标准这四类信息。本工具用简单的关键词匹配方式
+    快速判断需求文本中是否提及了这几类信息,不代表严格的NLP语义分析。
+
+    Args:
+        requirement: 待评审的产品需求描述全文。
+
+    Returns:
+        缺失的关键要素列表;如果四类要素都有提及,返回空列表。
+    """
+    missing = []
+    for section in _REQUIREMENT_ESSENTIAL_SECTIONS:
+        if section not in requirement:
+            missing.append(section)
+    return missing
+
+
+@tool
+def assess_business_value(requirement: str) -> str:
+    """对需求的业务价值做一个简要的启发式评估。
+
+    Args:
+        requirement: 待评审的产品需求描述全文。
+
+    Returns:
+        一段简要的业务价值评估文本。
+    """
+    value_signals = ["提升转化", "降低成本", "提升效率", "留存", "营收", "合规", "客户投诉"]
+    hits = [signal for signal in value_signals if signal in requirement]
+    if hits:
+        return f"需求描述中提及了与业务价值相关的信号:{'、'.join(hits)},建议在评审意见中明确量化目标。"
+    return "需求描述中暂未发现明确的业务价值量化信号,建议要求产品同事补充预期收益或衡量指标。"
+
+
+@tool
+def estimate_priority(requirement: str) -> str:
+    """基于关键词启发式,给出一个粗略的优先级建议(P0/P1/P2)。
+
+    Args:
+        requirement: 待评审的产品需求描述全文。
+
+    Returns:
+        优先级建议,附带简要理由。
+    """
+    if any(kw in requirement for kw in ("合规", "安全漏洞", "生产事故", "紧急")):
+        return "P0(涉及合规或安全风险,建议优先处理)"
+    if any(kw in requirement for kw in ("客户投诉", "重要客户", "签约")):
+        return "P1(与重要客户或商业机会直接相关,建议尽快排期)"
+    return "P2(常规功能优化,可按正常排期节奏处理)"
+
+
+# ------------------------------------------------------------------
+# 设计师工具集
+# ------------------------------------------------------------------
+
+@tool
+def check_design_consistency(requirement: str) -> list[str]:
+    """检查需求中提到的交互方式是否可能与现有设计规范冲突。
+
+    Args:
+        requirement: 待评审的产品需求描述全文。
+
+    Returns:
+        潜在的设计一致性问题列表;如果没有发现明显问题,返回空列表。
+    """
+    issues = []
+    if "弹窗" in requirement and "确认" not in requirement:
+        issues.append("需求中提到弹窗交互,但未说明是否需要二次确认,建议补充交互细节以符合现有弹窗规范。")
+    if "新增页面" in requirement and "导航" not in requirement:
+        issues.append("需求中提到新增独立页面,但未说明导航入口位置,建议补充信息架构设计。")
+    if "颜色" in requirement or "色彩" in requirement:
+        issues.append("需求涉及色彩相关表达,建议与现有品牌色板核对,避免出现风格不统一的问题。")
+    return issues
+
+
+@tool
+def list_accessibility_concerns(requirement: str) -> list[str]:
+    """检查需求是否可能带来无障碍可用性方面的风险点。
+
+    Args:
+        requirement: 待评审的产品需求描述全文。
+
+    Returns:
+        无障碍可用性方面的潜在风险点列表。
+    """
+    concerns = []
+    if "图标" in requirement and "文字" not in requirement:
+        concerns.append("需求中提到纯图标交互,建议补充文字标签或语音提示,兼顾视觉障碍用户的可用性。")
+    if "颜色区分" in requirement or ("颜色" in requirement and "状态" in requirement):
+        concerns.append("需求中提到用颜色区分状态,建议同时补充图形或文字标识,避免色盲用户无法识别。")
+    return concerns
+
+
+@tool
+def estimate_ui_effort(requirement: str) -> str:
+    """对界面设计工作量给出一个粗略的启发式估算。
+
+    Args:
+        requirement: 待评审的产品需求描述全文。
+
+    Returns:
+        工作量估算说明(小/中/大),附带理由。
+    """
+    new_page_count = requirement.count("新增页面") + requirement.count("新页面")
+    if new_page_count >= 2 or "全新设计" in requirement:
+        return "大(涉及多个新页面或全新视觉设计,建议预留至少一周的设计周期)"
+    if "新增页面" in requirement or "新增弹窗" in requirement or "新增组件" in requirement:
+        return "中(涉及新增页面/弹窗/组件,建议预留2-3天设计周期)"
+    return "小(主要为现有页面的局部调整,预计1天内可以完成设计稿)"
+
+
+# ------------------------------------------------------------------
+# 工程师工具集
+# ------------------------------------------------------------------
+
+@tool
+def estimate_dev_effort(requirement: str) -> str:
+    """对开发工作量给出一个粗略的启发式估算(人天)。
+
+    Args:
+        requirement: 待评审的产品需求描述全文。
+
+    Returns:
+        开发工作量估算说明,附带理由。
+    """
+    complexity_signals = ["权限", "第三方", "对接", "迁移", "多端同步", "分布式"]
+    hits = [signal for signal in complexity_signals if signal in requirement]
+    if len(hits) >= 2:
+        return f"预计5-8人天(涉及多项复杂因素:{'、'.join(hits)},建议拆分成多个开发任务)"
+    if hits:
+        return f"预计2-4人天(涉及{hits[0]}相关工作,建议提前确认依赖方接口是否稳定)"
+    return "预计1-2人天(常规功能改动,复杂度可控)"
+
+
+@tool
+def flag_technical_risk(requirement: str) -> list[str]:
+    """识别需求描述中可能存在的技术实现风险点。
+
+    Args:
+        requirement: 待评审的产品需求描述全文。
+
+    Returns:
+        技术风险点列表;如果没有发现明显风险,返回空列表。
+    """
+    risks = []
+    if "实时" in requirement and "同步" in requirement:
+        risks.append("需求涉及实时数据同步,建议评估现有消息队列/WebSocket方案能否满足时延要求。")
+    if "第三方" in requirement:
+        risks.append("需求涉及第三方服务对接,建议提前确认对方接口的SLA、限流策略与费用模式。")
+    if "历史数据" in requirement or "迁移" in requirement:
+        risks.append("需求涉及历史数据处理或迁移,建议提前评估数据量级,设计灰度迁移与回滚方案。")
+    if "并发" in requirement or "高峰" in requirement:
+        risks.append("需求提及高并发或高峰场景,建议提前进行容量评估与压测,避免上线后出现性能问题。")
+    return risks
+
+
+@tool
+def check_api_compatibility(requirement: str, existing_apis: str = "") -> str:
+    """检查需求是否可能与现有API产生兼容性冲突。
+
+    Args:
+        requirement: 待评审的产品需求描述全文。
+        existing_apis: 现有相关API的简要描述(可选,留空时仅做通用提示)。
+
+    Returns:
+        兼容性检查说明文本。
+    """
+    if not existing_apis:
+        return "未提供现有API清单,建议工程师在评审前先核对是否存在字段级或版本级的兼容性冲突。"
+    if "字段" in requirement and "删除" in requirement:
+        return f"需求涉及字段删除,需要与现有API({existing_apis})逐一核对是否有下游依赖,建议走灰度废弃流程而非直接删除。"
+    return f"需求与现有API({existing_apis})暂未发现明显冲突,建议开发阶段仍以接口契约测试做二次确认。"
+
+
+# 按角色分组的工具列表,供agents.py在构造子Agent时直接引用
+PRODUCT_MANAGER_TOOLS = [check_requirement_completeness, assess_business_value, estimate_priority]
+DESIGNER_TOOLS = [check_design_consistency, list_accessibility_concerns, estimate_ui_effort]
+ENGINEER_TOOLS = [estimate_dev_effort, flag_technical_risk, check_api_compatibility]
+```
+
+#### 文件十六:`backend/app/services/agent/product_review_team/agents.py`
+
+```python
+"""
+product_review_team 多Agent协作系统 —— 三个评审角色节点定义模块
+
+设计说明:
+    与research_team/agents.py的实现思路完全一致(复用create_react_agent
+    与"回复末尾附加JSON代码块"的结构化产出约定),这里额外复用了
+    research_team.agents模块里的_extract_trailing_json工具函数,
+    避免同一段JSON解析逻辑在两个场景里各写一份——这也是"新增子Agent场景
+    时,核心工具函数应当可以直接复用"这条设计原则的具体体现。
+"""
+from __future__ import annotations
+
+from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.prebuilt import create_react_agent
+
+from app.services.agent.multi_agent.agents import _extract_trailing_json
+from app.services.agent.multi_agent.config import (
+    ANALYST_MODEL_CONFIG,
+    SEARCHER_MODEL_CONFIG,
+    WRITER_MODEL_CONFIG,
+    get_llm,
+)
+from app.services.agent.product_review_team.state import ProductReviewState, make_role_review
+from app.services.agent.product_review_team.tools import (
+    DESIGNER_TOOLS,
+    ENGINEER_TOOLS,
+    PRODUCT_MANAGER_TOOLS,
+)
+
+# 与multi_agent.agents模块里的_JSON_FENCE同样的考虑:用拼接方式构造三个反引号,
+# 避免在源码字符串里直接写出连续三个反引号字符,与Markdown文档自身的代码围栏冲突。
+_JSON_FENCE = "`" * 3
+
+_ROLE_REVIEW_JSON_INSTRUCTION = (
+    "完成评审后,必须在回复最后附上一段JSON,格式如下,不要添加多余文字:\n"
+    f"{_JSON_FENCE}json\n"
+    '{"verdict": "通过|有条件通过|驳回", "comments": "具体评审意见",'
+    ' "concerns": ["顾虑点1", "顾虑点2"], "blocking": false}\n'
+    f"{_JSON_FENCE}\n"
+    "其中blocking表示你认为是否存在阻塞性问题(会导致整体评审无法通过),"
+    "如果只是建议性意见、不影响推进,应填false。"
+)
+
+_PRODUCT_MANAGER_SYSTEM_PROMPT = (
+    "你是苍穹产品评审团队里的产品经理,职责是评审一份产品需求描述本身是否"
+    "清晰、是否有明确的业务价值、优先级是否合理。\n"
+    "工作要求:\n"
+    "1. 只负责评审需求本身的完整性与业务价值,不要评审设计细节或技术实现方案。\n"
+    "2. 必须调用check_requirement_completeness、assess_business_value、"
+    "estimate_priority等工具辅助判断,不要凭空给出结论。\n"
+    "3. 如果需求描述缺失关键要素(背景/用户/功能/验收标准),应当将blocking"
+    "设为true,要求补充后再进入设计与技术评审环节。\n"
+    f"4. {_ROLE_REVIEW_JSON_INSTRUCTION}"
+)
+
+_DESIGNER_SYSTEM_PROMPT = (
+    "你是苍穹产品评审团队里的设计师,职责是评审需求在交互与视觉设计层面"
+    "是否可行、是否符合现有设计规范、是否存在无障碍可用性风险。\n"
+    "工作要求:\n"
+    "1. 只负责设计层面的评审,不要评审需求的业务价值(那是产品经理的工作),"
+    "也不要评审技术实现方案(那是工程师的工作)。\n"
+    "2. 必须调用check_design_consistency、list_accessibility_concerns、"
+    "estimate_ui_effort等工具辅助判断。\n"
+    "3. 只有在发现明显违反现有设计规范、且难以通过局部调整解决的问题时,"
+    "才将blocking设为true,一般性的设计建议应当作为concerns列出但不阻塞流程。\n"
+    f"4. {_ROLE_REVIEW_JSON_INSTRUCTION}"
+)
+
+_ENGINEER_SYSTEM_PROMPT = (
+    "你是苍穹产品评审团队里的工程师,职责是评审需求在技术实现层面是否可行、"
+    "是否存在明显的技术风险、开发工作量是否在合理范围内。\n"
+    "工作要求:\n"
+    "1. 只负责技术可行性评审,不要评审需求的业务价值或设计细节。\n"
+    "2. 必须调用estimate_dev_effort、flag_technical_risk、"
+    "check_api_compatibility等工具辅助判断。\n"
+    "3. 只有在发现的技术风险确实会导致方案无法按当前描述实现时,"
+    "才将blocking设为true;可以通过额外排期或技术方案调整解决的风险,"
+    "应当作为concerns列出,不必阻塞流程。\n"
+    f"4. {_ROLE_REVIEW_JSON_INSTRUCTION}"
+)
+
+
+def _build_review_input(state: ProductReviewState, extra_instruction: str) -> HumanMessage:
+    """为评审角色这一轮的执行,拼装一条包含必要上下文的输入消息。"""
+    lines = [f"待评审的产品需求:\n{state['requirement']}"]
+    if state.get("pm_review"):
+        lines.append(f"产品经理已给出的评审意见(供参考):{state['pm_review']['comments']}")
+    if state.get("design_review"):
+        lines.append(f"设计师已给出的评审意见(供参考):{state['design_review']['comments']}")
+    lines.append(f"本轮具体任务:{extra_instruction}")
+    return HumanMessage(content="\n".join(lines))
+
+
+def product_manager_node(state: ProductReviewState) -> dict:
+    """产品经理评审节点。
+
+    评审需求本身的完整性与业务价值,将结构化评审结论写入state["pm_review"]。
+    """
+    llm = get_llm(SEARCHER_MODEL_CONFIG)  # 评审判断同样偏向克制、低temperature
+    agent = create_react_agent(llm, tools=PRODUCT_MANAGER_TOOLS, prompt=_PRODUCT_MANAGER_SYSTEM_PROMPT)
+
+    input_message = _build_review_input(state, "请评审该需求的完整性与业务价值,并按要求的JSON格式给出结论。")
+    result = agent.invoke({"messages": [input_message]})
+    last_message = result["messages"][-1]
+    content_text = last_message.content if isinstance(last_message.content, str) else str(last_message.content)
+
+    parsed = _extract_trailing_json(content_text)
+    review = make_role_review(
+        reviewer="product_manager",
+        verdict=parsed.get("verdict", "有条件通过"),
+        comments=parsed.get("comments", content_text[:200]),
+        concerns=parsed.get("concerns", []),
+        blocking=bool(parsed.get("blocking", False)),
+    )
+
+    tagged_message = AIMessage(content=content_text, name="product_manager")
+    return {"messages": [tagged_message], "pm_review": review}
+
+
+def designer_node(state: ProductReviewState) -> dict:
+    """设计师评审节点。
+
+    评审需求在交互与视觉设计层面的可行性,将结构化评审结论写入
+    state["design_review"]。
+    """
+    llm = get_llm(ANALYST_MODEL_CONFIG)
+    agent = create_react_agent(llm, tools=DESIGNER_TOOLS, prompt=_DESIGNER_SYSTEM_PROMPT)
+
+    input_message = _build_review_input(state, "请评审该需求在设计层面的可行性,并按要求的JSON格式给出结论。")
+    result = agent.invoke({"messages": [input_message]})
+    last_message = result["messages"][-1]
+    content_text = last_message.content if isinstance(last_message.content, str) else str(last_message.content)
+
+    parsed = _extract_trailing_json(content_text)
+    review = make_role_review(
+        reviewer="designer",
+        verdict=parsed.get("verdict", "有条件通过"),
+        comments=parsed.get("comments", content_text[:200]),
+        concerns=parsed.get("concerns", []),
+        blocking=bool(parsed.get("blocking", False)),
+    )
+
+    tagged_message = AIMessage(content=content_text, name="designer")
+    return {"messages": [tagged_message], "design_review": review}
+
+
+def engineer_node(state: ProductReviewState) -> dict:
+    """工程师评审节点。
+
+    评审需求在技术实现层面的可行性,将结构化评审结论写入
+    state["engineering_review"]。
+    """
+    llm = get_llm(WRITER_MODEL_CONFIG)
+    agent = create_react_agent(llm, tools=ENGINEER_TOOLS, prompt=_ENGINEER_SYSTEM_PROMPT)
+
+    input_message = _build_review_input(state, "请评审该需求在技术实现层面的可行性,并按要求的JSON格式给出结论。")
+    result = agent.invoke({"messages": [input_message]})
+    last_message = result["messages"][-1]
+    content_text = last_message.content if isinstance(last_message.content, str) else str(last_message.content)
+
+    parsed = _extract_trailing_json(content_text)
+    review = make_role_review(
+        reviewer="engineer",
+        verdict=parsed.get("verdict", "有条件通过"),
+        comments=parsed.get("comments", content_text[:200]),
+        concerns=parsed.get("concerns", []),
+        blocking=bool(parsed.get("blocking", False)),
+    )
+
+    tagged_message = AIMessage(content=content_text, name="engineer")
+    return {"messages": [tagged_message], "engineering_review": review}
+```
+
+#### 文件十七:`backend/app/services/agent/product_review_team/supervisor.py`
+
+```python
+"""
+product_review_team 多Agent协作系统 —— 评审主持人(Supervisor)调度节点模块
+
+设计说明:
+    评审主持人的角色定位与research_team.supervisor中的Supervisor完全一致——
+    只做路由判断和结果汇总,不参与具体的评审工作。与research_team略有不同
+    的一点是,本场景里"生成最终结论"这一步没有单独设计一个LLM角色去写作,
+    而是直接用确定性代码(aggregate_final_verdict)汇总三份结构化评审意见——
+    因为最终结论的生成规则是明确的(任意一个角色标记blocking即整体驳回,
+    否则根据是否存在concerns判断"通过"或"有条件通过"),这是一个典型的
+    "可以完全交给确定性代码处理,不需要额外消耗一次LLM调用"的场景,
+    与research_team课堂笔记里反复强调的工程原则一脉相承。
+"""
+from __future__ import annotations
+
+import logging
+
+from langchain_core.messages import AIMessage
+from pydantic import BaseModel, Field
+
+from app.services.agent.multi_agent.config import SUPERVISOR_MODEL_CONFIG, get_llm
+from app.services.agent.product_review_team.state import ProductReviewState, ReviewRouteTarget
+
+logger = logging.getLogger("cangqiong.agent.product_review_team.supervisor")
+
+# 单个环节允许被退回重做的次数上限,与research_team.decision_rules里的
+# MAX_STAGE_RETRIES思路一致,只是这里的"环节"换成了评审角色。
+MAX_REVIEW_STAGE_RETRIES: int = 1
+
+
+class ReviewRouteDecision(BaseModel):
+    """评审主持人在每一轮协作中给出的结构化路由决策。"""
+
+    next: ReviewRouteTarget = Field(
+        description=(
+            "下一步应该邀请谁评审:'product_manager'表示需要产品经理(重新)评审,"
+            "'designer'表示需要设计师(重新)评审,'engineer'表示需要工程师(重新)评审,"
+            "'FINISH'表示三个角色的评审都已完成,可以汇总最终结论。"
+        )
+    )
+    reason: str = Field(description="做出这一决策的简要理由,用于评审过程的审计追溯。")
+
+
+_SUPERVISOR_PROMPT_TEMPLATE = """\
+你是苍穹产品评审团队的评审主持人,负责协调以下三名评审角色完成一次产品需求评审:
+- product_manager(产品经理):评审需求完整性与业务价值。
+- designer(设计师):评审交互与视觉设计可行性。
+- engineer(工程师):评审技术实现可行性。
+
+待评审需求:
+{requirement}
+
+当前评审进展:
+- 产品经理是否已评审:{has_pm_review}(是否存在阻塞性问题:{pm_blocking})
+- 设计师是否已评审:{has_design_review}(是否存在阻塞性问题:{design_blocking})
+- 工程师是否已评审:{has_engineering_review}(是否存在阻塞性问题:{engineering_blocking})
+- 已进行的调度轮次:{round_count} / 最大允许轮次:{max_rounds}
+
+请你严格按照以下原则做出下一步的路由决策:
+1. 三个角色的评审顺序默认是product_manager -> designer -> engineer,
+   如果某个角色还没有评审过,应当优先路由给它。
+2. 如果产品经理评审时标记了阻塞性问题(要求补充需求信息),
+   应当在需求补充说明之后重新路由给product_manager,不要跳过去继续设计/技术评审。
+3. 如果三个角色都已经评审完毕,应当判断为FINISH,由系统自动汇总最终结论。
+"""
+
+
+def _describe_blocking(review: dict | None) -> str:
+    if review is None:
+        return "尚未评审"
+    return "是" if review.get("blocking") else "否"
+
+
+def _build_prompt(state: ProductReviewState, round_count: int) -> str:
+    return _SUPERVISOR_PROMPT_TEMPLATE.format(
+        requirement=state["requirement"],
+        has_pm_review="是" if state.get("pm_review") else "否",
+        pm_blocking=_describe_blocking(state.get("pm_review")),
+        has_design_review="是" if state.get("design_review") else "否",
+        design_blocking=_describe_blocking(state.get("design_review")),
+        has_engineering_review="是" if state.get("engineering_review") else "否",
+        engineering_blocking=_describe_blocking(state.get("engineering_review")),
+        round_count=round_count,
+        max_rounds=state.get("max_rounds", 6),
+    )
+
+
+def aggregate_final_verdict(state: ProductReviewState) -> str:
+    """用确定性代码汇总三份结构化评审意见,生成最终评审结论(Markdown格式)。
+
+    汇总规则:
+        - 任意一个角色标记了blocking=true,整体结论为"驳回";
+        - 没有阻塞性问题,但至少有一个角色提出了concerns,结论为"有条件通过";
+        - 三个角色都没有提出任何concerns,结论为"通过"。
+    这套规则完全由业务代码表达,不依赖LLM的"综合判断",保证了最终结论的
+    可预测性与可解释性——这也是Supervisor模式里"能用确定性代码判断的事情,
+    不交给LLM去猜"这条原则,在汇总环节的延伸应用。
+    """
+    reviews = [state.get("pm_review"), state.get("design_review"), state.get("engineering_review")]
+    reviews = [r for r in reviews if r is not None]
+
+    if any(r.get("blocking") for r in reviews):
+        verdict = "驳回"
+    elif any(r.get("concerns") for r in reviews):
+        verdict = "有条件通过"
+    else:
+        verdict = "通过"
+
+    sections = [f"# 产品需求评审结论\n\n**总体结论:{verdict}**\n"]
+    role_labels = {"product_manager": "产品经理", "designer": "设计师", "engineer": "工程师"}
+    for review in reviews:
+        label = role_labels.get(review["reviewer"], review["reviewer"])
+        concerns_text = "、".join(review["concerns"]) if review["concerns"] else "无"
+        sections.append(
+            f"## {label}评审意见\n\n"
+            f"- 评审结论:{review['verdict']}\n"
+            f"- 具体意见:{review['comments']}\n"
+            f"- 提出的顾虑:{concerns_text}\n"
+            f"- 是否存在阻塞性问题:{'是' if review['blocking'] else '否'}\n"
+        )
+    return "\n".join(sections)
+
+
+def _force_finish_due_to_round_limit(state: ProductReviewState, round_count: int) -> dict:
+    """调度轮次超过上限时,强制终止并汇总现有评审意见给出降级结论。"""
+    logger.warning(
+        "评审调度轮次(%s)已达到上限(%s),强制终止评审流程。",
+        round_count,
+        state.get("max_rounds", 6),
+    )
+    partial_verdict = aggregate_final_verdict(state)
+    fallback_notice = (
+        f"\n\n---\n**注**:因调度轮次超出上限({state.get('max_rounds', 6)}轮),"
+        "评审流程被系统强制终止,以上结论基于当前已完成的评审角色汇总得出,"
+        "可能不完整,建议人工确认尚未完成评审的角色意见。"
+    )
+    forced_message = AIMessage(content="评审调度轮次已达上限,流程被强制终止。" + fallback_notice, name="supervisor")
+    return {
+        "next": "FINISH",
+        "final_verdict": partial_verdict + fallback_notice,
+        "messages": [forced_message],
+        "round_count": round_count,
+    }
+
+
+def review_supervisor_node(state: ProductReviewState) -> dict:
+    """评审主持人调度节点的核心实现。"""
+    round_count = state.get("round_count", 0) + 1
+    max_rounds = state.get("max_rounds", 6)
+
+    if round_count > max_rounds:
+        return _force_finish_due_to_round_limit(state, round_count)
+
+    llm = get_llm(SUPERVISOR_MODEL_CONFIG)
+    structured_llm = llm.with_structured_output(ReviewRouteDecision)
+
+    prompt_text = _build_prompt(state, round_count)
+    decision: ReviewRouteDecision = structured_llm.invoke(prompt_text)
+
+    logger.info(
+        "第%s轮评审调度决策 | next=%s | reason=%s",
+        round_count,
+        decision.next,
+        decision.reason,
+    )
+
+    updates: dict = {
+        "next": decision.next,
+        "round_count": round_count,
+        "messages": [
+            AIMessage(
+                content=f"【评审调度】第{round_count}轮 → 邀请「{decision.next}」评审。理由:{decision.reason}",
+                name="supervisor",
+            )
+        ],
+    }
+
+    # 如果这一轮的路由决策是"重新邀请某个已经评审过的角色",说明发生了返工,
+    # 需要累加该角色对应的退回计数,供未来接入类似decision_rules.py的
+    # 局部循环保护机制时直接复用这份统计数据。
+    already_reviewed = {
+        "product_manager": state.get("pm_review") is not None,
+        "designer": state.get("design_review") is not None,
+        "engineer": state.get("engineering_review") is not None,
+    }
+    if decision.next in already_reviewed and already_reviewed[decision.next]:
+        retry_counts = dict(state.get("stage_retry_counts", {}))
+        retry_counts[decision.next] = retry_counts.get(decision.next, 0) + 1
+        updates["stage_retry_counts"] = retry_counts
+
+    if decision.next == "FINISH":
+        updates["final_verdict"] = aggregate_final_verdict(state)
+
+    return updates
+
+
+def route_after_review_supervisor(state: ProductReviewState) -> str:
+    """条件边函数:根据state["next"]决定图执行的下一个节点。"""
+    return state["next"]
+```
+
+#### 文件十八:`backend/app/services/agent/product_review_team/graph_builder.py`
+
+```python
+"""
+product_review_team 多Agent协作系统 —— 图拓扑构建模块
+
+设计说明:
+    拓扑结构与research_team.graph_builder完全同构——评审主持人在中心,
+    三个评审角色各自与主持人之间有一来一回的边,角色之间没有直连边。
+    这里刻意保留与research_team几乎一样的代码结构(而不是尝试抽象出一个
+    "通用Supervisor图构建函数"),是一个有意为之的工程取舍:目前只有两个
+    Supervisor模式的落地场景,过早抽象一个通用构建器,容易在还没见到
+    第三个、第四个场景之前就把抽象设计错——这也是Day43晚自习部分反复
+    强调的"不要过度设计"原则的延伸应用。等未来这类场景积累到三个以上,
+    再回头抽象出通用的Supervisor图构建工具函数,会是更稳妥的时机。
+"""
+from __future__ import annotations
+
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+
+from app.services.agent.product_review_team.agents import (
+    designer_node,
+    engineer_node,
+    product_manager_node,
+)
+from app.services.agent.product_review_team.state import ProductReviewState
+from app.services.agent.product_review_team.supervisor import (
+    review_supervisor_node,
+    route_after_review_supervisor,
+)
+
+NODE_SUPERVISOR = "supervisor"
+NODE_PRODUCT_MANAGER = "product_manager"
+NODE_DESIGNER = "designer"
+NODE_ENGINEER = "engineer"
+
+
+def build_product_review_graph(use_checkpointer: bool = True):
+    """构建并编译"产品评审团队"多Agent协作系统的LangGraph图。
+
+    Args:
+        use_checkpointer: 是否启用内存版Checkpointer以支持中断恢复。
+
+    Returns:
+        一个编译完成、可以直接调用invoke/stream的LangGraph图对象。
+    """
+    builder = StateGraph(ProductReviewState)
+
+    builder.add_node(NODE_SUPERVISOR, review_supervisor_node)
+    builder.add_node(NODE_PRODUCT_MANAGER, product_manager_node)
+    builder.add_node(NODE_DESIGNER, designer_node)
+    builder.add_node(NODE_ENGINEER, engineer_node)
+
+    builder.add_edge(START, NODE_SUPERVISOR)
+
+    builder.add_conditional_edges(
+        NODE_SUPERVISOR,
+        route_after_review_supervisor,
+        {
+            NODE_PRODUCT_MANAGER: NODE_PRODUCT_MANAGER,
+            NODE_DESIGNER: NODE_DESIGNER,
+            NODE_ENGINEER: NODE_ENGINEER,
+            "FINISH": END,
+        },
+    )
+
+    builder.add_edge(NODE_PRODUCT_MANAGER, NODE_SUPERVISOR)
+    builder.add_edge(NODE_DESIGNER, NODE_SUPERVISOR)
+    builder.add_edge(NODE_ENGINEER, NODE_SUPERVISOR)
+
+    checkpointer = MemorySaver() if use_checkpointer else None
+    return builder.compile(checkpointer=checkpointer)
+
+
+# 模块级单例,供API层与CLI脚本直接复用
+product_review_graph = build_product_review_graph()
+```
+
+#### 文件十九:`scripts/run_product_review_demo.py`
+
+```python
+"""
+产品评审团队多Agent协作系统 —— 命令行演示脚本
+
+用法示例:
+    python scripts/run_product_review_demo.py --requirement "..."
+
+该脚本用于验证"产品评审团队"这个第二个Supervisor模式落地场景是否能
+正常运转,风格上与run_research_team_demo.py保持一致,方便对照阅读。
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import uuid
+
+from app.services.agent.product_review_team.graph_builder import build_product_review_graph
+from app.services.agent.product_review_team.state import build_initial_review_state
+
+_DEFAULT_REQUIREMENT = (
+    "背景:客服同事反馈,用户在提交工单后无法查看工单的实时处理进度,导致重复催单。\n"
+    "用户:使用苍穹控制台提交工单的企业客户管理员。\n"
+    "功能:在工单详情页新增一个进度条组件,实时展示工单当前处于'已提交/处理中/已完成'"
+    "哪个阶段,并在状态变化时通过弹窗提醒用户。\n"
+    "验收标准:工单状态变化后,进度条应在5秒内更新,弹窗提醒需支持用户手动关闭。"
+)
+
+
+def _print_divider(title: str) -> None:
+    print("\n" + "=" * 70)
+    print(title)
+    print("=" * 70)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="产品评审团队多Agent协作系统命令行演示")
+    parser.add_argument("--requirement", type=str, default=_DEFAULT_REQUIREMENT, help="待评审的产品需求描述")
+    parser.add_argument("--max-rounds", type=int, default=6, help="允许的最大调度轮次(默认6轮)")
+    args = parser.parse_args()
+
+    graph = build_product_review_graph(use_checkpointer=True)
+    thread_id = str(uuid.uuid4())
+    initial_state = build_initial_review_state(args.requirement, max_rounds=args.max_rounds)
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 60}
+
+    _print_divider("待评审需求")
+    print(args.requirement)
+    print(f"会话线程ID: {thread_id}")
+
+    final_state = None
+    for step in graph.stream(initial_state, config=config, stream_mode="updates"):
+        for node_name, node_output in step.items():
+            _print_divider(f"节点执行完毕: {node_name}")
+            if "next" in node_output:
+                print(f"  下一步邀请: {node_output['next']}")
+            if node_output.get("round_count") is not None:
+                print(f"  当前调度轮次: {node_output['round_count']}")
+            for review_key in ("pm_review", "design_review", "engineering_review"):
+                if node_output.get(review_key):
+                    review = node_output[review_key]
+                    print(f"  {review_key} 评审结论: {review['verdict']}(阻塞性问题: {review['blocking']})")
+            if node_output.get("final_verdict"):
+                print("  已生成最终评审结论(前80字):")
+                print("    " + node_output["final_verdict"][:80].replace("\n", " "))
+            final_state = node_output
+
+    _print_divider("评审流程结束")
+    if final_state and final_state.get("final_verdict"):
+        print(final_state["final_verdict"])
+    else:
+        print("未能生成最终评审结论,请检查上方日志排查具体原因。")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+#### 文件二十:`backend/tests/test_product_review_team.py`
+
+```python
+"""
+产品评审团队多Agent协作系统 —— 核心逻辑单元测试
+
+覆盖state.py中的初始状态构造、supervisor.py中的汇总规则(aggregate_final_verdict)
+与调度轮次保护机制,测试方式与test_multi_agent_supervisor.py保持一致的风格——
+对LLM调用打桩,不依赖真实网络请求。
+"""
+from __future__ import annotations
+
+from unittest.mock import patch
+
+import pytest
+
+from app.services.agent.product_review_team.state import (
+    build_initial_review_state,
+    make_role_review,
+)
+from app.services.agent.product_review_team.supervisor import (
+    ReviewRouteDecision,
+    _force_finish_due_to_round_limit,
+    aggregate_final_verdict,
+    review_supervisor_node,
+    route_after_review_supervisor,
+)
+
+
+class _FakeStructuredLLM:
+    def __init__(self, decision: ReviewRouteDecision) -> None:
+        self._decision = decision
+
+    def invoke(self, _prompt: str) -> ReviewRouteDecision:
+        return self._decision
+
+
+class _FakeLLM:
+    def __init__(self, decision: ReviewRouteDecision) -> None:
+        self._decision = decision
+
+    def with_structured_output(self, _schema):
+        return _FakeStructuredLLM(self._decision)
+
+
+@pytest.fixture
+def base_state():
+    return build_initial_review_state(
+        "背景:测试用需求。用户:测试用户。功能:测试功能点。验收:测试验收标准。",
+        max_rounds=6,
+    )
+
+
+def test_build_initial_review_state_rejects_empty_requirement():
+    with pytest.raises(ValueError, match="产品需求描述不能为空"):
+        build_initial_review_state("   ")
+
+
+def test_build_initial_review_state_defaults_next_to_product_manager(base_state):
+    assert base_state["next"] == "product_manager"
+    assert base_state["round_count"] == 0
+    assert base_state["pm_review"] is None
+
+
+def test_route_after_review_supervisor_returns_next_field(base_state):
+    state = {**base_state, "next": "designer"}
+    assert route_after_review_supervisor(state) == "designer"
+
+
+@patch("app.services.agent.product_review_team.supervisor.get_llm")
+def test_supervisor_routes_to_product_manager_first(mock_get_llm, base_state):
+    fake_decision = ReviewRouteDecision(next="product_manager", reason="尚未评审,先派给产品经理")
+    mock_get_llm.return_value = _FakeLLM(fake_decision)
+
+    result = review_supervisor_node(base_state)
+
+    assert result["next"] == "product_manager"
+    assert result["round_count"] == 1
+
+
+@patch("app.services.agent.product_review_team.supervisor.get_llm")
+def test_supervisor_increments_retry_count_when_revisiting_role(mock_get_llm, base_state):
+    """当Supervisor决定重新邀请一个已经评审过的角色时,应当累加该角色的退回计数。"""
+    state = {
+        **base_state,
+        "pm_review": make_role_review("product_manager", "有条件通过", "需要补充信息", [], True),
+    }
+    fake_decision = ReviewRouteDecision(next="product_manager", reason="需求信息不完整,退回产品经理补充")
+    mock_get_llm.return_value = _FakeLLM(fake_decision)
+
+    result = review_supervisor_node(state)
+
+    assert result["stage_retry_counts"]["product_manager"] == 1
+
+
+@patch("app.services.agent.product_review_team.supervisor.get_llm")
+def test_supervisor_does_not_increment_retry_for_first_time_review(mock_get_llm, base_state):
+    """第一次邀请某个角色评审时,不应当被计为一次"退回重做"。"""
+    fake_decision = ReviewRouteDecision(next="designer", reason="产品经理已评审通过,轮到设计师")
+    mock_get_llm.return_value = _FakeLLM(fake_decision)
+
+    result = review_supervisor_node(base_state)
+
+    assert result.get("stage_retry_counts", {}).get("designer", 0) == 0
+
+
+def test_round_limit_forces_finish_without_llm_call(base_state):
+    state = {**base_state, "round_count": 6, "max_rounds": 6}
+
+    with patch("app.services.agent.product_review_team.supervisor.get_llm") as mock_get_llm:
+        result = review_supervisor_node(state)
+        mock_get_llm.assert_not_called()
+
+    assert result["next"] == "FINISH"
+    assert "调度轮次超出上限" in result["final_verdict"]
+
+
+def test_aggregate_final_verdict_returns_reject_when_any_review_blocking():
+    state = {
+        "pm_review": make_role_review("product_manager", "通过", "需求清晰", [], False),
+        "design_review": make_role_review("designer", "驳回", "存在无障碍风险", ["无障碍风险"], True),
+        "engineering_review": make_role_review("engineer", "通过", "技术可行", [], False),
+    }
+    verdict_text = aggregate_final_verdict(state)
+    assert "总体结论:驳回" in verdict_text
+    assert "无障碍风险" in verdict_text
+
+
+def test_aggregate_final_verdict_returns_conditional_pass_when_concerns_without_blocking():
+    state = {
+        "pm_review": make_role_review("product_manager", "通过", "需求清晰", [], False),
+        "design_review": make_role_review("designer", "有条件通过", "有一点小建议", ["建议优化文案"], False),
+        "engineering_review": make_role_review("engineer", "通过", "技术可行", [], False),
+    }
+    verdict_text = aggregate_final_verdict(state)
+    assert "总体结论:有条件通过" in verdict_text
+
+
+def test_aggregate_final_verdict_returns_pass_when_all_clean():
+    state = {
+        "pm_review": make_role_review("product_manager", "通过", "需求清晰", [], False),
+        "design_review": make_role_review("designer", "通过", "设计没有问题", [], False),
+        "engineering_review": make_role_review("engineer", "通过", "技术可行", [], False),
+    }
+    verdict_text = aggregate_final_verdict(state)
+    assert "总体结论:通过" in verdict_text
+
+
+def test_aggregate_final_verdict_handles_partial_reviews_gracefully():
+    """即便只有部分角色完成评审(例如强制终止场景),汇总函数也不应该抛异常。"""
+    state = {
+        "pm_review": make_role_review("product_manager", "通过", "需求清晰", [], False),
+        "design_review": None,
+        "engineering_review": None,
+    }
+    verdict_text = aggregate_final_verdict(state)
+    assert "产品经理评审意见" in verdict_text
+    assert "设计师" not in verdict_text
+
+
+def test_force_finish_includes_partial_verdict(base_state):
+    state = {
+        **base_state,
+        "pm_review": make_role_review("product_manager", "通过", "需求清晰", [], False),
+        "round_count": 7,
+        "max_rounds": 6,
+    }
+    result = _force_finish_due_to_round_limit(state, round_count=7)
+    assert result["next"] == "FINISH"
+    assert "产品经理评审意见" in result["final_verdict"]
+    assert "建议人工确认" in result["final_verdict"]
+```
+
+这套"产品评审团队"跑通之后,陈铭把两个场景的代码目录并排放在一起看了一眼,发现真正需要重写的部分,确实只集中在`state.py`(字段定义换了一套)、`tools.py`(工具换了一套)、`agents.py`(角色提示词换了一套)、`supervisor.py`里的提示词模板和汇总逻辑;而"星形拓扑""调度轮次保护""结构化输出约束路由决策""子Agent执行完毕无条件回到Supervisor"这几条Supervisor模式的核心骨架,几乎是逐行照搬过来的。他把这个对比结论也记进了笔记本——这比单纯听老王讲"这套架构可复用",要来得更有说服力。
+
 ---
 
 ## 今日复盘
@@ -2205,7 +3682,7 @@ Supervisor模式的通信路径是"轮辐式"的——所有信息都要经过�
 
 好处二:降低成本、降低出错概率。如果依赖LLM重新阅读全部messages历史去判断"目前进展到哪一步了",这本身需要额外一次(甚至多次)LLM调用,不仅增加了token成本和响应延迟,也多了一次"LLM理解错误"的风险点。用结构化字段,这一步判断完全不需要LLM参与。
 
-局限性:结构化字段的更新完全依赖子Agent"如实"把产出写入对应字段(比如今天代码里依赖对```json ... ```代码块的正则解析),一旦某个子Agent的输出格式不符合约定(例如没有按要求输出JSON代码块),对应字段就可能仍是空的,即便该Agent实际上已经完成了工作。这也是为什么_extract_trailing_json在解析失败时返回空字典,而不是抛异常——需要业务代码对"解析失败"这种情况有明确的兜底逻辑,而不能假设子Agent的输出永远严格合规。
+局限性:结构化字段的更新完全依赖子Agent"如实"把产出写入对应字段(比如今天代码里依赖对由三个反引号包裹、标注json语言的代码块做正则解析),一旦某个子Agent的输出格式不符合约定(例如没有按要求输出JSON代码块),对应字段就可能仍是空的,即便该Agent实际上已经完成了工作。这也是为什么_extract_trailing_json在解析失败时返回空字典,而不是抛异常——需要业务代码对"解析失败"这种情况有明确的兜底逻辑,而不能假设子Agent的输出永远严格合规。
 
 **第3题参考答案**:
 
