@@ -2310,6 +2310,1844 @@ if __name__ == "__main__":
 
 当天深夜,陈铭对着镜子练习了三次"向量库选型"那道题的精简版回答,每次都用这个工具记了一下时间——第一次99秒,第二次82秒,第三次71秒,已经压到了建议时长以内。他把这三次记录都存了下来,笑着跟自己说了一句:"数字不会说谎,这次是真的在变简洁,不是感觉上的变简洁。"这句话后来也被他写进了当晚笔记本的复盘里,作为对老王那句"表达的密度"最直接的呼应——不是靠感觉判断自己有没有进步,是靠一个个可以被验证的数字。
 
+### 六、单元测试:编排引擎核心状态机测试套件
+
+反馈会上,郭建军其实还留了一句没有当场说完的话,是后来在走廊里单独跟陈铭补的:"你今晚重构的那份代码,逻辑我认可,但你有没有想过,如果这份代码半年后交给一个新同事维护,他怎么知道自己改的地方有没有破坏原来的行为?讲解和文档能传递'为什么这么设计',但只有测试能在代码变化的那一刻,立刻告诉你'哪里被破坏了'。"这句话让陈铭想起自己这段时间写代码的一个习惯性缺口——很多模块功能上是对的,但配套的单元测试往往写得零散、不成体系,尤其是像"死循环防护""配额超限"这类边界场景,几乎全靠手工在本地跑一下"看起来正常"就算过关。当天晚上,他索性把改进版编排引擎的核心逻辑,补齐了一整套结构化的单元测试,覆盖指纹归一化、死循环检测、重试策略解析、主状态机正常路径与边界场景、子状态机的超时重试行为一共六大类场景。
+
+这套测试全部使用Python标准库`unittest`编写,不依赖`pytest`等第三方框架,这是陈铭刻意做的选择——他解释说:"苍穹中台的CI流水线目前对第三方测试框架的支持还在评估阶段,用标准库写测试,至少能保证任何环境下`python3 xxx.py`就能直接跑起来,不会因为环境依赖问题而被搁置。"
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+test_orchestrator.py
+
+苍穹企业级智能体中台 - Agent编排引擎核心状态机模块单元测试
+
+背景:
+    反馈会上郭建军明确提出"代码的健壮性需要用测试来证明,不是靠讲解"。
+    陈铭当晚除了重构代码本身,还补写了一套针对改进版编排引擎的单元测试,
+    覆盖正常路径、配额超限、重复调用检测、重试与超时、
+    以及若干在真实答辩问答里被追问到但代码里此前没有显式测试覆盖的边界场景。
+
+说明:
+    为了让测试可以独立运行,本文件在开头重新粘贴了一份改进版编排引擎的
+    精简依赖(与前一节改进代码保持逐字段一致),测试全部使用标准库
+    unittest 编写,不依赖 pytest,方便在任意环境下直接运行。
+作者: 陈铭
+"""
+
+from __future__ import annotations
+
+import time
+import uuid
+import hashlib
+import logging
+import threading
+import unittest
+import contextvars
+from enum import Enum
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional
+from collections import deque
+
+logger = logging.getLogger("cangqiong.orchestrator.test")
+
+_trace_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "trace_id", default="-"
+)
+
+
+def set_trace_id(trace_id: str) -> None:
+    _trace_id_var.set(trace_id)
+
+
+def get_trace_id() -> str:
+    return _trace_id_var.get()
+
+
+class ErrorCategory(Enum):
+    QUOTA_EXCEEDED = "QUOTA_EXCEEDED"
+    DUPLICATE_CALL = "DUPLICATE_CALL"
+    TOOL_FAILURE = "TOOL_FAILURE"
+    TOOL_TIMEOUT = "TOOL_TIMEOUT"
+    CONFIG_ERROR = "CONFIG_ERROR"
+    UNKNOWN = "UNKNOWN"
+
+
+class OrchestrationError(Exception):
+    def __init__(self, message: str, category: ErrorCategory = ErrorCategory.UNKNOWN,
+                 session_id: Optional[str] = None, retriable: bool = False):
+        super().__init__(message)
+        self.message = message
+        self.category = category
+        self.session_id = session_id
+        self.retriable = retriable
+
+    def to_dict(self) -> dict:
+        return {
+            "message": self.message,
+            "category": self.category.value,
+            "session_id": self.session_id,
+            "retriable": self.retriable,
+        }
+
+
+def max_tool_call_exceeded(session_id: str, limit: int) -> OrchestrationError:
+    return OrchestrationError(
+        f"会话 {session_id} 工具调用次数已达上限 {limit}",
+        category=ErrorCategory.QUOTA_EXCEEDED,
+        session_id=session_id,
+        retriable=False,
+    )
+
+
+def duplicate_tool_call(session_id: str, fingerprint: str) -> OrchestrationError:
+    return OrchestrationError(
+        f"会话 {session_id} 检测到重复工具调用,指纹 {fingerprint}",
+        category=ErrorCategory.DUPLICATE_CALL,
+        session_id=session_id,
+        retriable=True,
+    )
+
+
+def tool_call_failed(session_id: str, tool_name: str, detail: str,
+                      category: ErrorCategory, retriable: bool) -> OrchestrationError:
+    return OrchestrationError(
+        f"会话 {session_id} 工具 {tool_name} 调用未成功: {detail}",
+        category=category,
+        session_id=session_id,
+        retriable=retriable,
+    )
+
+
+class AgentState(Enum):
+    INIT = "INIT"
+    PLANNING = "PLANNING"
+    TOOL_CALLING = "TOOL_CALLING"
+    TOOL_RESULT_PENDING = "TOOL_RESULT_PENDING"
+    REFLECTING = "REFLECTING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
+class ToolCallOutcome(Enum):
+    SUCCESS = "SUCCESS"
+    FAILURE = "FAILURE"
+    TIMEOUT = "TIMEOUT"
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    max_retries: int = 2
+    timeout_seconds: float = 10.0
+    backoff_base_ms: int = 200
+    backoff_factor: float = 2.0
+
+    def backoff_ms(self, attempt: int) -> int:
+        return int(self.backoff_base_ms * (self.backoff_factor ** (attempt - 1)))
+
+
+DEFAULT_RETRY_POLICY = RetryPolicy()
+
+
+class RetryPolicyRegistry:
+    def __init__(self, default_policy: RetryPolicy = DEFAULT_RETRY_POLICY):
+        self._default_policy = default_policy
+        self._tool_policies: dict[str, RetryPolicy] = {}
+        self._tenant_tool_policies: dict[tuple[str, str], RetryPolicy] = {}
+        self._lock = threading.RLock()
+
+    def set_tool_policy(self, tool_name: str, policy: RetryPolicy) -> None:
+        with self._lock:
+            self._tool_policies[tool_name] = policy
+
+    def set_tenant_tool_policy(self, tenant_id: str, tool_name: str,
+                                policy: RetryPolicy) -> None:
+        with self._lock:
+            self._tenant_tool_policies[(tenant_id, tool_name)] = policy
+
+    def resolve(self, tenant_id: str, tool_name: str) -> RetryPolicy:
+        with self._lock:
+            specific = self._tenant_tool_policies.get((tenant_id, tool_name))
+            if specific is not None:
+                return specific
+            tool_level = self._tool_policies.get(tool_name)
+            if tool_level is not None:
+                return tool_level
+            return self._default_policy
+
+
+@dataclass
+class ToolCallRecord:
+    tool_name: str
+    params: dict
+    fingerprint: str
+    outcome: Optional[ToolCallOutcome] = None
+    elapsed_ms: Optional[int] = None
+    error_category: Optional[str] = None
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class SessionContext:
+    session_id: str
+    tenant_id: str
+    trace_id: str
+    max_tool_calls: int = 20
+    tool_call_records: list[ToolCallRecord] = field(default_factory=list)
+    current_state: AgentState = AgentState.INIT
+    reflection_count: int = 0
+    created_at: float = field(default_factory=time.time)
+
+    def tool_call_count(self) -> int:
+        return len(self.tool_call_records)
+
+
+def compute_fingerprint(tool_name: str, params: dict) -> str:
+    normalized_params = {}
+    for key in sorted(params.keys()):
+        value = params[key]
+        if isinstance(value, str):
+            value = value.strip()
+        normalized_params[key] = value
+    raw = f"{tool_name}::{normalized_params}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+class DuplicateCallDetector:
+    def __init__(self, window_size: int = 5, duplicate_threshold: int = 3):
+        self.window_size = window_size
+        self.duplicate_threshold = duplicate_threshold
+        self._recent_fingerprints: deque = deque(maxlen=window_size)
+
+    def check_and_record(self, fingerprint: str) -> bool:
+        self._recent_fingerprints.append(fingerprint)
+        if len(self._recent_fingerprints) < self.duplicate_threshold:
+            return False
+        recent = list(self._recent_fingerprints)[-self.duplicate_threshold:]
+        return len(set(recent)) == 1
+
+
+class ToolCallSubStateMachine:
+    def __init__(self, tool_registry: dict, policy_registry: RetryPolicyRegistry):
+        self.tool_registry = tool_registry
+        self.policy_registry = policy_registry
+
+    def invoke(self, session: SessionContext, tool_name: str, params: dict):
+        if tool_name not in self.tool_registry:
+            return ToolCallOutcome.FAILURE, None, 0, "工具未注册"
+
+        policy = self.policy_registry.resolve(session.tenant_id, tool_name)
+        tool_func = self.tool_registry[tool_name]
+        attempt = 0
+        start = time.time()
+        last_error_detail: Optional[str] = None
+
+        while attempt <= policy.max_retries:
+            attempt += 1
+            try:
+                result = self._invoke_with_timeout(tool_func, params, policy.timeout_seconds)
+                elapsed_ms = int((time.time() - start) * 1000)
+                return ToolCallOutcome.SUCCESS, result, elapsed_ms, None
+            except TimeoutError:
+                elapsed_ms = int((time.time() - start) * 1000)
+                last_error_detail = f"超过{policy.timeout_seconds}秒未返回"
+                if attempt <= policy.max_retries:
+                    time.sleep(policy.backoff_ms(attempt) / 1000)
+                    continue
+                return ToolCallOutcome.TIMEOUT, None, elapsed_ms, last_error_detail
+            except Exception as exc:  # noqa: BLE001
+                elapsed_ms = int((time.time() - start) * 1000)
+                last_error_detail = str(exc)
+                if attempt <= policy.max_retries:
+                    time.sleep(policy.backoff_ms(attempt) / 1000)
+                    continue
+                return ToolCallOutcome.FAILURE, None, elapsed_ms, last_error_detail
+
+        return ToolCallOutcome.FAILURE, None, int((time.time() - start) * 1000), "重试耗尽"
+
+    def _invoke_with_timeout(self, func: Callable, params: dict, timeout: float) -> Any:
+        result_container: dict = {}
+        exception_container: dict = {}
+
+        def runner():
+            try:
+                result_container["value"] = func(**params)
+            except Exception as exc:  # noqa: BLE001
+                exception_container["error"] = exc
+
+        thread = threading.Thread(target=runner, daemon=True)
+        thread.start()
+        thread.join(timeout)
+
+        if thread.is_alive():
+            raise TimeoutError(f"工具调用超过 {timeout} 秒未返回")
+        if "error" in exception_container:
+            raise exception_container["error"]
+        return result_container.get("value")
+
+
+class AgentOrchestrator:
+    def __init__(self, tool_registry: dict,
+                 policy_registry: Optional[RetryPolicyRegistry] = None,
+                 observability_sink: Optional[Callable[[dict], None]] = None):
+        self.policy_registry = policy_registry or RetryPolicyRegistry()
+        self.tool_sub_machine = ToolCallSubStateMachine(tool_registry, self.policy_registry)
+        self.observability_sink = observability_sink or self._default_sink
+        self._duplicate_detectors: dict[str, DuplicateCallDetector] = {}
+
+    def create_session(self, tenant_id: str, max_tool_calls: int = 20,
+                        trace_id: Optional[str] = None) -> SessionContext:
+        trace_id = trace_id or str(uuid.uuid4())
+        set_trace_id(trace_id)
+        session = SessionContext(
+            session_id=str(uuid.uuid4()),
+            tenant_id=tenant_id,
+            trace_id=trace_id,
+            max_tool_calls=max_tool_calls,
+        )
+        self._duplicate_detectors[session.session_id] = DuplicateCallDetector()
+        self._transition(session, AgentState.PLANNING, reason="会话初始化完成")
+        return session
+
+    def run_tool_call(self, session: SessionContext, tool_name: str, params: dict) -> Any:
+        set_trace_id(session.trace_id)
+
+        if session.tool_call_count() >= session.max_tool_calls:
+            self._transition(session, AgentState.FAILED, reason="工具调用次数超限")
+            raise max_tool_call_exceeded(session.session_id, session.max_tool_calls)
+
+        fingerprint = compute_fingerprint(tool_name, params)
+        detector = self._duplicate_detectors[session.session_id]
+
+        if detector.check_and_record(fingerprint):
+            self._transition(session, AgentState.REFLECTING, reason="检测到重复调用,触发反思")
+            session.reflection_count += 1
+            raise duplicate_tool_call(session.session_id, fingerprint)
+
+        self._transition(session, AgentState.TOOL_CALLING, reason=f"发起工具调用 {tool_name}")
+
+        outcome, result, elapsed_ms, error_detail = self.tool_sub_machine.invoke(
+            session, tool_name, params
+        )
+
+        record = ToolCallRecord(
+            tool_name=tool_name,
+            params=params,
+            fingerprint=fingerprint,
+            outcome=outcome,
+            elapsed_ms=elapsed_ms,
+            error_category=(outcome.value if outcome != ToolCallOutcome.SUCCESS else None),
+        )
+        session.tool_call_records.append(record)
+
+        if outcome == ToolCallOutcome.SUCCESS:
+            self._transition(session, AgentState.TOOL_RESULT_PENDING,
+                              reason=f"工具调用成功,耗时{elapsed_ms}ms")
+            return result
+
+        self._transition(session, AgentState.FAILED,
+                          reason=f"工具调用{outcome.value},耗时{elapsed_ms}ms")
+
+        category = (ErrorCategory.TOOL_TIMEOUT if outcome == ToolCallOutcome.TIMEOUT
+                    else ErrorCategory.TOOL_FAILURE)
+        raise tool_call_failed(
+            session.session_id, tool_name, error_detail or "未知错误",
+            category=category, retriable=(outcome == ToolCallOutcome.TIMEOUT),
+        )
+
+    def complete_session(self, session: SessionContext) -> None:
+        self._transition(session, AgentState.COMPLETED, reason="会话正常结束")
+        self._duplicate_detectors.pop(session.session_id, None)
+
+    def _transition(self, session: SessionContext, new_state: AgentState, reason: str) -> None:
+        old_state = session.current_state
+        session.current_state = new_state
+        self.observability_sink({
+            "trace_id": session.trace_id,
+            "session_id": session.session_id,
+            "tenant_id": session.tenant_id,
+            "from_state": old_state.value,
+            "to_state": new_state.value,
+            "reason": reason,
+            "timestamp": time.time(),
+        })
+
+    @staticmethod
+    def _default_sink(event: dict) -> None:
+        logger.info("状态转换: %s", event)
+
+
+# ---------------------------------------------------------------------------
+# 单元测试正文
+# ---------------------------------------------------------------------------
+
+class TestFingerprintNormalization(unittest.TestCase):
+    """验证指纹归一化逻辑,覆盖答辩现场被追问的边界场景"""
+
+    def test_same_params_different_order_same_fingerprint(self):
+        """字典参数顺序不同,指纹应该相同"""
+        fp1 = compute_fingerprint("search", {"query": "苍穹", "top_k": 5})
+        fp2 = compute_fingerprint("search", {"top_k": 5, "query": "苍穹"})
+        self.assertEqual(fp1, fp2)
+
+    def test_leading_trailing_space_normalized(self):
+        """字符串参数首尾空格应被去除,指纹应该相同"""
+        fp1 = compute_fingerprint("search", {"query": "人工智能发展"})
+        fp2 = compute_fingerprint("search", {"query": "  人工智能发展  "})
+        self.assertEqual(fp1, fp2)
+
+    def test_middle_space_not_normalized(self):
+        """
+        中间空格目前不会被归一化,这是答辩现场陈铭主动指出的已知局限性。
+        本测试用于固化这个已知行为,防止未来有人无意间"修复"了它却没有
+        意识到这是一个需要谨慎评估的语义变更。
+        """
+        fp1 = compute_fingerprint("search", {"query": "人工智能 发展"})
+        fp2 = compute_fingerprint("search", {"query": "人工智能发展"})
+        self.assertNotEqual(fp1, fp2)
+
+    def test_different_tool_name_different_fingerprint(self):
+        """相同参数但工具名不同,指纹必须不同,否则会产生跨工具误判"""
+        fp1 = compute_fingerprint("search", {"query": "苍穹"})
+        fp2 = compute_fingerprint("search_v2", {"query": "苍穹"})
+        self.assertNotEqual(fp1, fp2)
+
+    def test_empty_params_does_not_crash(self):
+        """空参数字典是一个容易被忽略的边界场景,不应抛异常"""
+        fp = compute_fingerprint("ping", {})
+        self.assertIsInstance(fp, str)
+        self.assertEqual(len(fp), 16)
+
+    def test_non_string_values_are_supported(self):
+        """参数值可能是数字、布尔值、None,归一化逻辑不应因类型而报错"""
+        fp = compute_fingerprint("search", {"top_k": 5, "strict": True, "cursor": None})
+        self.assertIsInstance(fp, str)
+
+
+class TestDuplicateCallDetector(unittest.TestCase):
+    """验证死循环防护:重复调用检测器"""
+
+    def test_three_consecutive_identical_calls_triggers_detection(self):
+        detector = DuplicateCallDetector(window_size=5, duplicate_threshold=3)
+        fp = "abc123"
+        self.assertFalse(detector.check_and_record(fp))
+        self.assertFalse(detector.check_and_record(fp))
+        self.assertTrue(detector.check_and_record(fp))
+
+    def test_two_identical_calls_do_not_trigger(self):
+        """只有两次重复,还没达到阈值,不应误报"""
+        detector = DuplicateCallDetector(window_size=5, duplicate_threshold=3)
+        fp = "abc123"
+        self.assertFalse(detector.check_and_record(fp))
+        self.assertFalse(detector.check_and_record(fp))
+
+    def test_interleaved_calls_do_not_trigger_false_positive(self):
+        """
+        交替调用不同指纹不应被误判为死循环——
+        这是模拟"Agent正常轮询两种不同工具"的合理场景。
+        """
+        detector = DuplicateCallDetector(window_size=5, duplicate_threshold=3)
+        sequence = ["a", "b", "a", "b", "a", "b"]
+        results = [detector.check_and_record(fp) for fp in sequence]
+        self.assertFalse(any(results))
+
+    def test_duplicate_after_gap_still_detected(self):
+        """
+        在窗口范围内,重复调用即便中间有一次其他调用打断,
+        只要最后连续duplicate_threshold次一致,依然应该被检测到。
+        """
+        detector = DuplicateCallDetector(window_size=5, duplicate_threshold=3)
+        detector.check_and_record("a")
+        detector.check_and_record("b")
+        detector.check_and_record("a")
+        detector.check_and_record("a")
+        triggered = detector.check_and_record("a")
+        self.assertTrue(triggered)
+
+    def test_window_size_limits_memory(self):
+        """窗口大小应该真正限制住内部deque的长度,不会无限增长"""
+        detector = DuplicateCallDetector(window_size=3, duplicate_threshold=3)
+        for i in range(100):
+            detector.check_and_record(f"fp-{i}")
+        self.assertLessEqual(len(detector._recent_fingerprints), 3)
+
+
+class TestRetryPolicyRegistry(unittest.TestCase):
+    """验证配置化重试策略的优先级解析逻辑"""
+
+    def test_default_policy_used_when_nothing_configured(self):
+        registry = RetryPolicyRegistry()
+        policy = registry.resolve("tenant_a", "search")
+        self.assertEqual(policy.max_retries, DEFAULT_RETRY_POLICY.max_retries)
+
+    def test_tool_level_policy_overrides_default(self):
+        registry = RetryPolicyRegistry()
+        registry.set_tool_policy("slow_tool", RetryPolicy(max_retries=5, timeout_seconds=3.0))
+        policy = registry.resolve("tenant_a", "slow_tool")
+        self.assertEqual(policy.max_retries, 5)
+        self.assertEqual(policy.timeout_seconds, 3.0)
+
+    def test_tenant_tool_policy_has_highest_priority(self):
+        registry = RetryPolicyRegistry()
+        registry.set_tool_policy("slow_tool", RetryPolicy(max_retries=5))
+        registry.set_tenant_tool_policy("vip_tenant", "slow_tool", RetryPolicy(max_retries=8))
+        policy_vip = registry.resolve("vip_tenant", "slow_tool")
+        policy_normal = registry.resolve("normal_tenant", "slow_tool")
+        self.assertEqual(policy_vip.max_retries, 8)
+        self.assertEqual(policy_normal.max_retries, 5)
+
+    def test_backoff_ms_grows_exponentially(self):
+        policy = RetryPolicy(backoff_base_ms=100, backoff_factor=2.0)
+        self.assertEqual(policy.backoff_ms(1), 100)
+        self.assertEqual(policy.backoff_ms(2), 200)
+        self.assertEqual(policy.backoff_ms(3), 400)
+
+    def test_registry_is_thread_safe_under_concurrent_updates(self):
+        """
+        模拟多线程同时更新和读取策略,验证RLock保护是否生效。
+        这个测试对应老王在反馈会上提到的"运行时动态更新"场景——
+        动态更新的前提是并发安全,否则线上更新配置可能引发数据竞争。
+        """
+        registry = RetryPolicyRegistry()
+        errors: list[Exception] = []
+
+        def writer(tool_index: int):
+            try:
+                for _ in range(50):
+                    registry.set_tool_policy(
+                        f"tool_{tool_index}", RetryPolicy(max_retries=tool_index)
+                    )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def reader(tool_index: int):
+            try:
+                for _ in range(50):
+                    registry.resolve("tenant_x", f"tool_{tool_index}")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = []
+        for i in range(8):
+            threads.append(threading.Thread(target=writer, args=(i,)))
+            threads.append(threading.Thread(target=reader, args=(i,)))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [])
+
+
+class TestAgentOrchestratorHappyPath(unittest.TestCase):
+    """验证主状态机在正常路径下的行为"""
+
+    def setUp(self):
+        self.captured_events: list[dict] = []
+
+        def sink(event: dict) -> None:
+            self.captured_events.append(event)
+
+        def echo_tool(text: str) -> str:
+            return f"echo:{text}"
+
+        self.registry = {"echo": echo_tool}
+        self.orchestrator = AgentOrchestrator(
+            tool_registry=self.registry, observability_sink=sink
+        )
+
+    def test_create_session_transitions_to_planning(self):
+        session = self.orchestrator.create_session(tenant_id="tenant_demo")
+        self.assertEqual(session.current_state, AgentState.PLANNING)
+        self.assertEqual(self.captured_events[-1]["to_state"], "PLANNING")
+
+    def test_successful_tool_call_transitions_to_result_pending(self):
+        session = self.orchestrator.create_session(tenant_id="tenant_demo")
+        result = self.orchestrator.run_tool_call(session, "echo", {"text": "hi"})
+        self.assertEqual(result, "echo:hi")
+        self.assertEqual(session.current_state, AgentState.TOOL_RESULT_PENDING)
+
+    def test_complete_session_transitions_to_completed_and_cleans_up(self):
+        session = self.orchestrator.create_session(tenant_id="tenant_demo")
+        self.orchestrator.run_tool_call(session, "echo", {"text": "hi"})
+        self.orchestrator.complete_session(session)
+        self.assertEqual(session.current_state, AgentState.COMPLETED)
+        self.assertNotIn(session.session_id, self.orchestrator._duplicate_detectors)
+
+    def test_all_events_carry_trace_id(self):
+        """所有可观测性事件都必须携带trace_id,这是反馈会里明确要求的"""
+        session = self.orchestrator.create_session(tenant_id="tenant_demo")
+        self.orchestrator.run_tool_call(session, "echo", {"text": "hi"})
+        for event in self.captured_events:
+            self.assertIn("trace_id", event)
+            self.assertNotEqual(event["trace_id"], "-")
+
+
+class TestAgentOrchestratorEdgeCases(unittest.TestCase):
+    """
+    覆盖答辩问答里被反复追问的边界场景:
+    配额超限、重复调用、未注册工具、并发会话隔离
+    """
+
+    def setUp(self):
+        def flaky_tool(should_fail: bool) -> str:
+            if should_fail:
+                raise ValueError("模拟工具内部异常")
+            return "ok"
+
+        self.registry = {"flaky": flaky_tool}
+        self.orchestrator = AgentOrchestrator(tool_registry=self.registry)
+
+    def test_quota_exceeded_raises_with_correct_category(self):
+        session = self.orchestrator.create_session(tenant_id="tenant_demo", max_tool_calls=1)
+        self.orchestrator.run_tool_call(session, "flaky", {"should_fail": False})
+        with self.assertRaises(OrchestrationError) as ctx:
+            self.orchestrator.run_tool_call(session, "flaky", {"should_fail": False})
+        self.assertEqual(ctx.exception.category, ErrorCategory.QUOTA_EXCEEDED)
+        self.assertFalse(ctx.exception.retriable)
+
+    def test_duplicate_call_raises_with_retriable_true(self):
+        """重复调用异常应标记为retriable=True,提示调用方可以换个策略重试"""
+        session = self.orchestrator.create_session(tenant_id="tenant_demo", max_tool_calls=10)
+        params = {"should_fail": False}
+        self.orchestrator.run_tool_call(session, "flaky", params)
+        self.orchestrator.run_tool_call(session, "flaky", params)
+        with self.assertRaises(OrchestrationError) as ctx:
+            self.orchestrator.run_tool_call(session, "flaky", params)
+        self.assertEqual(ctx.exception.category, ErrorCategory.DUPLICATE_CALL)
+        self.assertTrue(ctx.exception.retriable)
+        self.assertEqual(session.current_state, AgentState.REFLECTING)
+
+    def test_unregistered_tool_raises_tool_failure(self):
+        session = self.orchestrator.create_session(tenant_id="tenant_demo")
+        with self.assertRaises(OrchestrationError) as ctx:
+            self.orchestrator.run_tool_call(session, "not_exists", {})
+        self.assertEqual(ctx.exception.category, ErrorCategory.TOOL_FAILURE)
+
+    def test_tool_internal_exception_is_wrapped_not_leaked(self):
+        """
+        工具内部抛出的原始异常(ValueError)不应该直接冒泡给调用方,
+        而应该被包装成统一的OrchestrationError,这是"异常处理链路过长"
+        这条反馈的核心验证点。
+        """
+        session = self.orchestrator.create_session(tenant_id="tenant_demo", max_tool_calls=10)
+        with self.assertRaises(OrchestrationError):
+            self.orchestrator.run_tool_call(session, "flaky", {"should_fail": True})
+
+    def test_concurrent_sessions_do_not_interfere_with_each_other(self):
+        """
+        并发场景下,不同会话的重复调用检测器必须互相隔离,
+        一个会话触发了死循环检测,不应影响另一个会话的正常调用。
+        """
+        session_a = self.orchestrator.create_session(tenant_id="tenant_a", max_tool_calls=10)
+        session_b = self.orchestrator.create_session(tenant_id="tenant_b", max_tool_calls=10)
+
+        params = {"should_fail": False}
+        self.orchestrator.run_tool_call(session_a, "flaky", params)
+        self.orchestrator.run_tool_call(session_a, "flaky", params)
+        with self.assertRaises(OrchestrationError):
+            self.orchestrator.run_tool_call(session_a, "flaky", params)
+
+        # session_b 应该完全不受 session_a 死循环检测状态的影响
+        result_b = self.orchestrator.run_tool_call(session_b, "flaky", params)
+        self.assertEqual(result_b, "ok")
+
+    def test_zero_max_tool_calls_immediately_blocks(self):
+        """
+        max_tool_calls=0 是一个容易被忽略的边界值,
+        应该在第一次调用之前就直接拒绝,而不是产生"负数配额"之类的怪状态。
+        """
+        session = self.orchestrator.create_session(tenant_id="tenant_demo", max_tool_calls=0)
+        with self.assertRaises(OrchestrationError) as ctx:
+            self.orchestrator.run_tool_call(session, "flaky", {"should_fail": False})
+        self.assertEqual(ctx.exception.category, ErrorCategory.QUOTA_EXCEEDED)
+
+
+class TestToolCallSubStateMachineTimeoutAndRetry(unittest.TestCase):
+    """验证工具调用子状态机的重试与超时行为,包括配置化策略的实际生效效果"""
+
+    def test_slow_tool_times_out_and_exhausts_retries(self):
+        def always_slow(seconds: float) -> str:
+            time.sleep(seconds)
+            return "done"
+
+        registry = {"slow": always_slow}
+        policy_registry = RetryPolicyRegistry()
+        policy_registry.set_tool_policy(
+            "slow", RetryPolicy(max_retries=1, timeout_seconds=0.05, backoff_base_ms=1)
+        )
+        sub_machine = ToolCallSubStateMachine(registry, policy_registry)
+
+        fake_session = SessionContext(
+            session_id="s1", tenant_id="t1", trace_id="tr1", max_tool_calls=10
+        )
+        outcome, result, elapsed_ms, detail = sub_machine.invoke(
+            fake_session, "slow", {"seconds": 0.3}
+        )
+        self.assertEqual(outcome, ToolCallOutcome.TIMEOUT)
+        self.assertIsNone(result)
+        self.assertIsNotNone(detail)
+
+    def test_tool_succeeds_after_one_retry(self):
+        """模拟工具第一次失败、第二次成功的场景,验证重试机制真正生效"""
+        call_counter = {"count": 0}
+
+        def flaky_then_ok() -> str:
+            call_counter["count"] += 1
+            if call_counter["count"] == 1:
+                raise RuntimeError("第一次调用故意失败")
+            return "success_on_retry"
+
+        registry = {"flaky_then_ok": flaky_then_ok}
+        policy_registry = RetryPolicyRegistry()
+        policy_registry.set_tool_policy(
+            "flaky_then_ok", RetryPolicy(max_retries=2, timeout_seconds=1.0, backoff_base_ms=1)
+        )
+        sub_machine = ToolCallSubStateMachine(registry, policy_registry)
+        fake_session = SessionContext(
+            session_id="s2", tenant_id="t1", trace_id="tr2", max_tool_calls=10
+        )
+        outcome, result, elapsed_ms, detail = sub_machine.invoke(
+            fake_session, "flaky_then_ok", {}
+        )
+        self.assertEqual(outcome, ToolCallOutcome.SUCCESS)
+        self.assertEqual(result, "success_on_retry")
+        self.assertEqual(call_counter["count"], 2)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+```
+
+这套测试跑起来一共28个用例,全部通过。陈铭在提交这份测试代码之前,特意统计了一下测试覆盖到的场景类型,他把这些场景归纳成了四类,写在了测试文件顶部的背景说明之外:
+
+1. **归一化的等价类划分**:参数顺序不同、首尾空格、跨工具同参数、空参数、非字符串类型参数,这五种场景对应着"指纹计算函数在真实输入空间里可能遇到的主要形态",而不是随手写两个例子应付了事;
+2. **状态转换的正反面验证**:不仅验证"正常路径下状态按预期转换",还验证"异常路径下状态同样按预期转换到`FAILED`或`REFLECTING`",两个方向都要覆盖,只测正常路径的测试套件,本质上只验证了一半的行为;
+3. **并发安全性的显式验证**:`test_registry_is_thread_safe_under_concurrent_updates`和`test_concurrent_sessions_do_not_interfere_with_each_other`这两个测试,专门用多线程模拟生产环境下的并发场景,而不是假设"单线程测试通过了,并发场景大概也没问题"——陈铭说这个习惯是被老王过去两个月反复念叨"你的测试用例是不是只测了单线程场景"给逼出来的;
+4. **零值和边界值的专项覆盖**:`max_tool_calls=0`这种边界值,是陈铭在写这套测试的过程中才想到要专门补一个用例的,他事后反思说,如果不是刻意去想"这个参数的合法取值范围里,哪个值最容易被忽略",这类边界场景很容易被漏掉,而恰恰是这类边界场景,在生产环境里出问题的概率并不低——配置错误、误传0这种情况在真实系统里并不罕见。
+
+### 七、扩展功能版本:多模型供应商健康探测与熔断切换模块
+
+上午技术问答的第七问,郭建军追问"如果两个供应商同时出问题呢",陈铭在现场只给出了一个偏概念性的口头回答——依靠规则引擎驱动的降级问答兜底,覆盖率大概15%。这个回答本身没有错,但陈铭很清楚,"口头描述一个机制"和"这个机制真的能跑起来、真的经得起测试"之间,还有很长的一段距离。当晚,他把这部分内容真正落地成了代码,同时补上了此前答辩现场没有展开讲的两个细节:一是"主动探测"和"被动反馈"两种健康判定信号具体怎么协同工作,二是全部供应商失效时,路由器如何在不抛异常给最终用户的前提下,平滑切换到规则引擎兜底。
+
+这个模块的设计,陈铭延续了编排引擎里"状态显式化、每一次转换都可审计"的一贯风格——`ProviderHealthTracker`内部维护的健康状态不是一个隐式的布尔值,而是一个带有完整转换历史记录的显式状态机,任何一次"从健康到降级""从降级到不健康""从不健康恢复到健康"的变化,都会被记录下来,方便事后复盘"这个供应商到底是什么时候、因为什么原因被判定为不健康的"。
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+multi_provider_circuit_breaker.py
+
+苍穹企业级智能体中台 - 多模型供应商健康探测与熔断切换模块
+
+背景:
+    在上午技术问答的第七问里,陈铭讲述了大模型供应商API大面积不可用时,
+    系统依靠"健康检查 + 自动切换备用供应商"的机制完成降级。
+    郭建军追问"如果两个供应商同时出问题呢?"陈铭在口头回答里提到了
+    "主动探测+被动反馈"结合的熔断机制,把切换窗口从30秒压缩到10秒以内,
+    但答辩现场只是口头描述,没有落地成代码。当晚陈铭把这部分逻辑
+    完整实现了出来,作为对这道追问的书面补充材料。
+
+功能:
+    1. 支持多个模型供应商的健康状态管理(健康 / 不健康 / 降级观察中)
+    2. 支持"主动探测"(周期性ping)与"被动反馈"(调用失败率超阈值立即降级)
+       两种健康判定方式相结合
+    3. 支持在全部供应商都不健康时,自动切换到规则引擎驱动的降级问答兜底
+    4. 提供切换耗时的可观测性打点,方便复盘验证"切换窗口是否真的被压缩了"
+作者: 陈铭
+"""
+
+from __future__ import annotations
+
+import time
+import threading
+import statistics
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable, Dict, List, Optional, Tuple
+
+
+class ProviderHealthState(Enum):
+    HEALTHY = "HEALTHY"
+    DEGRADED = "DEGRADED"      # 被动反馈触发的观察态,尚未彻底判定不健康
+    UNHEALTHY = "UNHEALTHY"
+
+
+@dataclass
+class ProviderCallResult:
+    """一次模型供应商调用的结果记录,用于被动反馈判定"""
+
+    success: bool
+    latency_ms: int
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class ProviderHealthSnapshot:
+    """某一时刻某个供应商的健康快照,用于审计和复盘"""
+
+    provider_name: str
+    state: ProviderHealthState
+    consecutive_probe_failures: int
+    recent_failure_rate: float
+    last_transition_reason: str
+    timestamp: float = field(default_factory=time.time)
+
+
+class ProviderHealthTracker:
+    """
+    单个模型供应商的健康状态追踪器。
+
+    结合两种信号:
+    1. 主动探测(probe):周期性地调用一个轻量ping接口,
+       连续N次探测失败则判定为不健康。
+    2. 被动反馈(feedback):记录最近一个滑动窗口内的真实业务调用成功率,
+       一旦失败率超过阈值,不必等下一次定时探测,立即判定为降级/不健康。
+    """
+
+    def __init__(
+        self,
+        provider_name: str,
+        probe_fn: Callable[[], bool],
+        probe_failure_threshold: int = 2,
+        feedback_window_size: int = 20,
+        feedback_failure_rate_threshold: float = 0.5,
+        feedback_min_samples: int = 5,
+    ):
+        self.provider_name = provider_name
+        self.probe_fn = probe_fn
+        self.probe_failure_threshold = probe_failure_threshold
+        self.feedback_window_size = feedback_window_size
+        self.feedback_failure_rate_threshold = feedback_failure_rate_threshold
+        self.feedback_min_samples = feedback_min_samples
+
+        self._state = ProviderHealthState.HEALTHY
+        self._consecutive_probe_failures = 0
+        self._recent_calls: List[ProviderCallResult] = []
+        self._last_transition_reason = "初始状态"
+        self._lock = threading.RLock()
+        self._transition_history: List[ProviderHealthSnapshot] = []
+
+    @property
+    def state(self) -> ProviderHealthState:
+        with self._lock:
+            return self._state
+
+    def run_active_probe(self) -> None:
+        """执行一次主动探测,更新连续失败计数,可能触发状态转换"""
+        try:
+            probe_ok = self.probe_fn()
+        except Exception:  # noqa: BLE001
+            probe_ok = False
+
+        with self._lock:
+            if probe_ok:
+                self._consecutive_probe_failures = 0
+                if self._state == ProviderHealthState.UNHEALTHY:
+                    self._transition(
+                        ProviderHealthState.HEALTHY,
+                        reason="主动探测恢复成功,判定供应商已恢复健康",
+                    )
+            else:
+                self._consecutive_probe_failures += 1
+                if self._consecutive_probe_failures >= self.probe_failure_threshold:
+                    self._transition(
+                        ProviderHealthState.UNHEALTHY,
+                        reason=f"连续{self._consecutive_probe_failures}次主动探测失败",
+                    )
+
+    def record_call_result(self, success: bool, latency_ms: int) -> None:
+        """
+        记录一次真实业务调用的结果(被动反馈信号)。
+        一旦滑动窗口内失败率超过阈值,立即判定为降级,
+        不需要等待下一次定时探测——这是把切换窗口从30秒压缩到10秒以内的关键机制。
+        """
+        with self._lock:
+            self._recent_calls.append(ProviderCallResult(success=success, latency_ms=latency_ms))
+            if len(self._recent_calls) > self.feedback_window_size:
+                self._recent_calls.pop(0)
+
+            if len(self._recent_calls) < self.feedback_min_samples:
+                return
+
+            failure_rate = self._current_failure_rate()
+            if failure_rate >= self.feedback_failure_rate_threshold:
+                if self._state == ProviderHealthState.HEALTHY:
+                    self._transition(
+                        ProviderHealthState.DEGRADED,
+                        reason=f"被动反馈失败率{failure_rate:.0%}超过阈值,立即降级观察",
+                    )
+            elif self._state == ProviderHealthState.DEGRADED and failure_rate < 0.2:
+                # 失败率明显回落,允许从DEGRADED状态自动恢复,
+                # 但仍然保留主动探测作为最终的健康判定权威
+                self._transition(
+                    ProviderHealthState.HEALTHY,
+                    reason=f"被动反馈失败率回落到{failure_rate:.0%},解除降级观察",
+                )
+
+    def _current_failure_rate(self) -> float:
+        if not self._recent_calls:
+            return 0.0
+        failures = sum(1 for call in self._recent_calls if not call.success)
+        return failures / len(self._recent_calls)
+
+    def _transition(self, new_state: ProviderHealthState, reason: str) -> None:
+        self._state = new_state
+        self._last_transition_reason = reason
+        snapshot = ProviderHealthSnapshot(
+            provider_name=self.provider_name,
+            state=new_state,
+            consecutive_probe_failures=self._consecutive_probe_failures,
+            recent_failure_rate=self._current_failure_rate(),
+            last_transition_reason=reason,
+        )
+        self._transition_history.append(snapshot)
+
+    def is_usable(self) -> bool:
+        """DEGRADED状态仍然可用,只是优先级降低;UNHEALTHY完全不可用"""
+        with self._lock:
+            return self._state != ProviderHealthState.UNHEALTHY
+
+    def snapshot(self) -> ProviderHealthSnapshot:
+        with self._lock:
+            return ProviderHealthSnapshot(
+                provider_name=self.provider_name,
+                state=self._state,
+                consecutive_probe_failures=self._consecutive_probe_failures,
+                recent_failure_rate=self._current_failure_rate(),
+                last_transition_reason=self._last_transition_reason,
+            )
+
+    def transition_history(self) -> List[ProviderHealthSnapshot]:
+        with self._lock:
+            return list(self._transition_history)
+
+
+@dataclass
+class DegradedAnswer:
+    """规则引擎兜底问答的返回结构,明确标注这是降级响应,不能与正常响应混淆"""
+
+    answer: str
+    is_degraded: bool = True
+    matched_rule: Optional[str] = None
+
+
+class RuleBasedFallbackEngine:
+    """
+    全部供应商都不可用时的最后一层兜底:
+    用简单的关键词规则匹配,覆盖高频、标准化的场景。
+    覆盖面有限(陈铭在答辩里估算约15%),但保证极端场景下系统不是"全黑"的。
+    """
+
+    def __init__(self):
+        self._rules: List[Tuple[str, str]] = []
+
+    def add_rule(self, keyword: str, template_answer: str) -> None:
+        self._rules.append((keyword, template_answer))
+
+    def answer(self, user_input: str) -> DegradedAnswer:
+        for keyword, template in self._rules:
+            if keyword in user_input:
+                return DegradedAnswer(answer=template, matched_rule=keyword)
+        return DegradedAnswer(
+            answer="当前系统繁忙,请稍后重试。",
+            matched_rule=None,
+        )
+
+
+@dataclass
+class RoutingDecision:
+    """一次路由决策的结果,记录决策依据,便于事后审计"""
+
+    selected_provider: Optional[str]
+    is_fallback: bool
+    reason: str
+    candidates_considered: List[str] = field(default_factory=list)
+
+
+class MultiProviderRouter:
+    """
+    多模型供应商路由器:
+    综合健康状态和优先级顺序,选出当前应该使用的供应商;
+    当所有供应商都不可用时,自动切换到规则引擎兜底。
+    """
+
+    def __init__(self, fallback_engine: Optional[RuleBasedFallbackEngine] = None):
+        self._trackers: Dict[str, ProviderHealthTracker] = {}
+        self._priority_order: List[str] = []
+        self.fallback_engine = fallback_engine or RuleBasedFallbackEngine()
+        self._decision_log: List[RoutingDecision] = []
+
+    def register_provider(self, tracker: ProviderHealthTracker, priority: int = 0) -> None:
+        """priority数字越小优先级越高,插入到对应位置"""
+        self._trackers[tracker.provider_name] = tracker
+        insert_at = len(self._priority_order)
+        for idx, name in enumerate(self._priority_order):
+            if priority < self._trackers[name].__dict__.get("_priority", 999):
+                insert_at = idx
+                break
+        self._priority_order.insert(insert_at, tracker.provider_name)
+        tracker.__dict__["_priority"] = priority
+
+    def select_provider(self) -> RoutingDecision:
+        """
+        按优先级顺序挑选第一个可用(非UNHEALTHY)的供应商。
+        如果全部不可用,返回is_fallback=True的决策,提示调用方走规则引擎兜底。
+        """
+        candidates = list(self._priority_order)
+        for name in self._priority_order:
+            tracker = self._trackers[name]
+            if tracker.is_usable():
+                decision = RoutingDecision(
+                    selected_provider=name,
+                    is_fallback=False,
+                    reason=f"供应商{name}当前健康状态为{tracker.state.value},选中",
+                    candidates_considered=candidates,
+                )
+                self._decision_log.append(decision)
+                return decision
+
+        decision = RoutingDecision(
+            selected_provider=None,
+            is_fallback=True,
+            reason="所有已注册供应商均不可用,切换到规则引擎兜底",
+            candidates_considered=candidates,
+        )
+        self._decision_log.append(decision)
+        return decision
+
+    def handle_request(self, user_input: str,
+                        provider_call_fn: Callable[[str, str], str]) -> str:
+        """
+        处理一次请求的完整路径:
+        选择供应商 -> 尝试调用 -> 记录反馈 -> 失败时递归尝试下一个供应商 ->
+        全部失败时走规则引擎兜底。
+        """
+        attempted_providers: List[str] = []
+
+        for name in self._priority_order:
+            tracker = self._trackers[name]
+            if not tracker.is_usable() or name in attempted_providers:
+                continue
+            attempted_providers.append(name)
+
+            start = time.time()
+            try:
+                result = provider_call_fn(name, user_input)
+                latency_ms = int((time.time() - start) * 1000)
+                tracker.record_call_result(success=True, latency_ms=latency_ms)
+                return result
+            except Exception:  # noqa: BLE001
+                latency_ms = int((time.time() - start) * 1000)
+                tracker.record_call_result(success=False, latency_ms=latency_ms)
+                continue
+
+        fallback_answer = self.fallback_engine.answer(user_input)
+        return fallback_answer.answer
+
+    def health_report(self) -> List[ProviderHealthSnapshot]:
+        return [tracker.snapshot() for tracker in self._trackers.values()]
+
+    def decision_log(self) -> List[RoutingDecision]:
+        return list(self._decision_log)
+
+
+class ActiveProbeScheduler:
+    """
+    周期性触发主动探测的调度器。
+    答辩反馈之后,探测频率从15秒一次优化到5秒一次,
+    这里把频率做成可配置参数,而不是硬编码,方便后续继续调优。
+    """
+
+    def __init__(self, trackers: List[ProviderHealthTracker], interval_seconds: float = 5.0):
+        self.trackers = trackers
+        self.interval_seconds = interval_seconds
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+
+        def loop():
+            while not self._stop_event.is_set():
+                for tracker in self.trackers:
+                    tracker.run_active_probe()
+                self._stop_event.wait(self.interval_seconds)
+
+        self._thread = threading.Thread(target=loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self.interval_seconds + 1)
+            self._thread = None
+
+
+def build_demo_router() -> MultiProviderRouter:
+    """构造一个演示用的双供应商 + 规则兜底路由器"""
+
+    def make_probe(is_healthy_flag: Dict[str, bool]) -> Callable[[], bool]:
+        return lambda: is_healthy_flag["healthy"]
+
+    provider_a_flag = {"healthy": True}
+    provider_b_flag = {"healthy": True}
+
+    tracker_a = ProviderHealthTracker(
+        provider_name="provider_a", probe_fn=make_probe(provider_a_flag)
+    )
+    tracker_b = ProviderHealthTracker(
+        provider_name="provider_b", probe_fn=make_probe(provider_b_flag)
+    )
+
+    fallback = RuleBasedFallbackEngine()
+    fallback.add_rule("工单", "您的工单已收到,我们会在24小时内处理。")
+    fallback.add_rule("密码", "请前往账户设置页面重置密码。")
+
+    router = MultiProviderRouter(fallback_engine=fallback)
+    router.register_provider(tracker_a, priority=0)
+    router.register_provider(tracker_b, priority=1)
+    return router
+
+
+if __name__ == "__main__":
+    demo_router = build_demo_router()
+
+    def mock_call(provider_name: str, user_input: str) -> str:
+        if provider_name == "provider_a":
+            raise ConnectionError("provider_a 模拟不可用")
+        return f"[{provider_name}] 回复: {user_input}"
+
+    print(demo_router.handle_request("请帮我查一下最近的工单状态", mock_call))
+    for snapshot in demo_router.health_report():
+        print(snapshot)
+```
+
+这段代码里有几个设计细节,值得单独展开说明:
+
+第一,`DEGRADED`和`UNHEALTHY`是两个语义不同的状态,而不是简单的"健康/不健康"二元判断。`DEGRADED`代表"被动反馈信号已经发出预警,但还没有达到彻底判定不健康的程度",这个状态下供应商仍然可用(`is_usable()`返回`True`),只是在真实生产环境里应该被赋予更低的路由优先级——本篇的简化版本暂时没有实现"按健康状态动态调整优先级排序"这个更精细的能力,陈铭把这一点写进了代码注释里,作为后续可以继续迭代的方向。
+
+第二,主动探测和被动反馈是两条独立但会互相影响的信号通道。被动反馈可以比主动探测更快地把状态推进到`DEGRADED`(不需要等下一次定时探测),但只有主动探测的连续失败才能把状态推进到`UNHEALTHY`——这个设计的考虑是,被动反馈基于的是"真实业务调用的失败率",样本量和触发速度更及时,适合用来做"预警"和"降级观察";而主动探测基于的是"专门设计的健康检查接口",判定更权威、更适合用来做"最终的不可用判定",两者结合,既能快速响应,又不会因为一两次业务调用的偶然失败就草率下线一个供应商。
+
+第三,`MultiProviderRouter.handle_request`方法完整实现了"选择供应商 -> 尝试调用 -> 记录反馈 -> 失败时递归尝试下一个供应商 -> 全部失败时走规则引擎兜底"这条完整路径,并且这条路径里的每一步都会更新对应供应商的健康追踪状态,形成一个自我调节的闭环——一次故障不会只是"这次请求失败了",它会实时反映到下一次路由决策的依据里。
+
+### 八、单元测试与边界情况处理:Token预算预测模块
+
+前面展示的Token预算轻量特征回归预估器,是陈铭在答辩现场临时提出、当晚整理成代码原型的一份材料。原型跑通、能给出比基线方案更低的误差,这件事本身已经让陈铭有点小小的满足感,但他很快想起郭建军经常说的一句话——"一个模型能在一份合成数据上跑出好看的结果,不代表这个模型是可靠的,可靠不可靠,要看它在各种刁钻的边界输入下会不会崩溃、会不会给出荒谬的结果。"于是他又花了将近一个小时,专门给这个预估器补充了一整套边界情况测试,包括训练样本过少、目标值退化为常数、特征矩阵线性相关、极端输入值等此前完全没有验证过的场景。
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+test_token_budget_predictor.py
+
+苍穹企业级智能体中台 - Token预算预测模块单元测试与边界情况覆盖
+
+背景:
+    前一节的轻量特征回归预估器,是陈铭针对答辩现场自己提出的
+    "现有方案预估偏低"问题,连夜整理成的可运行原型。
+    这套单元测试重点覆盖三类场景:
+    1. 正常训练与预测流程是否符合预期;
+    2. 容易被忽略的边界情况(样本过少、目标值全部相同导致的退化矩阵、
+       极端输入值)是否会导致程序崩溃或给出荒谬的预测结果;
+    3. 基线方案与改进方案的对比评估逻辑本身是否正确。
+作者: 陈铭
+"""
+
+from __future__ import annotations
+
+import statistics
+import unittest
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable, Dict, List, Tuple
+
+
+class AgentPhase(Enum):
+    SIMPLE_QA = "SIMPLE_QA"
+    MULTI_TURN_CHAT = "MULTI_TURN_CHAT"
+    TOOL_REASONING = "TOOL_REASONING"
+    REFLECTION = "REFLECTION"
+
+
+@dataclass
+class CallFeatureSample:
+    input_token_count: int
+    conversation_turn_count: int
+    agent_phase: AgentPhase
+    actual_total_tokens: int
+
+
+@dataclass
+class PredictionResult:
+    predicted_tokens: float
+    lower_bound: float
+    upper_bound: float
+    method: str
+    feature_contributions: Dict[str, float] = field(default_factory=dict)
+
+
+class HistoricalMeanPredictor:
+    def __init__(self) -> None:
+        self._history: List[int] = []
+
+    def fit(self, samples: List[CallFeatureSample]) -> None:
+        self._history = [s.actual_total_tokens for s in samples]
+
+    def predict(self, sample: CallFeatureSample) -> PredictionResult:
+        if not self._history:
+            return PredictionResult(predicted_tokens=0.0, lower_bound=0.0,
+                                     upper_bound=0.0, method="历史均值(无数据)")
+        mean_value = statistics.mean(self._history)
+        stddev_value = statistics.pstdev(self._history) if len(self._history) > 1 else 0.0
+        return PredictionResult(
+            predicted_tokens=mean_value,
+            lower_bound=max(0.0, mean_value - stddev_value),
+            upper_bound=mean_value + stddev_value,
+            method="历史均值",
+        )
+
+
+PHASE_MULTIPLIER: Dict[AgentPhase, float] = {
+    AgentPhase.SIMPLE_QA: 1.0,
+    AgentPhase.MULTI_TURN_CHAT: 1.3,
+    AgentPhase.TOOL_REASONING: 2.1,
+    AgentPhase.REFLECTION: 2.6,
+}
+
+
+@dataclass
+class LinearRegressionWeights:
+    intercept: float = 0.0
+    weight_input_tokens: float = 0.0
+    weight_turn_count: float = 0.0
+    weight_phase_multiplier: float = 0.0
+
+
+class LightweightFeaturePredictor:
+    def __init__(self) -> None:
+        self._weights = LinearRegressionWeights()
+        self._residual_stddev: float = 0.0
+
+    def _build_feature_matrix(
+        self, samples: List[CallFeatureSample]
+    ) -> Tuple[List[List[float]], List[float]]:
+        feature_rows: List[List[float]] = []
+        targets: List[float] = []
+        for sample in samples:
+            phase_value = PHASE_MULTIPLIER[sample.agent_phase]
+            feature_rows.append([
+                1.0,
+                float(sample.input_token_count),
+                float(sample.conversation_turn_count),
+                phase_value,
+            ])
+            targets.append(float(sample.actual_total_tokens))
+        return feature_rows, targets
+
+    def fit(self, samples: List[CallFeatureSample]) -> None:
+        if len(samples) < 5:
+            raise ValueError("训练样本过少,至少需要5条历史记录才能拟合回归模型")
+
+        feature_rows, targets = self._build_feature_matrix(samples)
+        weights_vector = self._solve_normal_equation(feature_rows, targets)
+
+        self._weights = LinearRegressionWeights(
+            intercept=weights_vector[0],
+            weight_input_tokens=weights_vector[1],
+            weight_turn_count=weights_vector[2],
+            weight_phase_multiplier=weights_vector[3],
+        )
+
+        residuals = []
+        for row, target in zip(feature_rows, targets):
+            predicted = sum(w * x for w, x in zip(weights_vector, row))
+            residuals.append(target - predicted)
+        self._residual_stddev = (
+            statistics.pstdev(residuals) if len(residuals) > 1 else 0.0
+        )
+
+    def _solve_normal_equation(
+        self, feature_rows: List[List[float]], targets: List[float]
+    ) -> List[float]:
+        dim = len(feature_rows[0])
+        xtx = [[0.0] * dim for _ in range(dim)]
+        xty = [0.0] * dim
+
+        for row, target in zip(feature_rows, targets):
+            for i in range(dim):
+                xty[i] += row[i] * target
+                for j in range(dim):
+                    xtx[i][j] += row[i] * row[j]
+
+        return self._gaussian_elimination(xtx, xty)
+
+    @staticmethod
+    def _gaussian_elimination(matrix: List[List[float]], vector: List[float]) -> List[float]:
+        n = len(vector)
+        augmented = [row[:] + [vector[i]] for i, row in enumerate(matrix)]
+
+        for pivot in range(n):
+            max_row = max(range(pivot, n), key=lambda r: abs(augmented[r][pivot]))
+            if abs(augmented[max_row][pivot]) < 1e-9:
+                augmented[pivot][pivot] += 1e-6
+            augmented[pivot], augmented[max_row] = augmented[max_row], augmented[pivot]
+
+            pivot_value = augmented[pivot][pivot]
+            for col in range(pivot, n + 1):
+                augmented[pivot][col] /= pivot_value
+
+            for row in range(n):
+                if row == pivot:
+                    continue
+                factor = augmented[row][pivot]
+                for col in range(pivot, n + 1):
+                    augmented[row][col] -= factor * augmented[pivot][col]
+
+        return [augmented[i][n] for i in range(n)]
+
+    def predict(self, sample: CallFeatureSample) -> PredictionResult:
+        w = self._weights
+        phase_value = PHASE_MULTIPLIER[sample.agent_phase]
+
+        contribution_input = w.weight_input_tokens * sample.input_token_count
+        contribution_turn = w.weight_turn_count * sample.conversation_turn_count
+        contribution_phase = w.weight_phase_multiplier * phase_value
+
+        predicted = w.intercept + contribution_input + contribution_turn + contribution_phase
+        predicted = max(0.0, predicted)
+
+        return PredictionResult(
+            predicted_tokens=predicted,
+            lower_bound=max(0.0, predicted - self._residual_stddev),
+            upper_bound=predicted + self._residual_stddev,
+            method="轻量特征回归",
+            feature_contributions={
+                "截距项": w.intercept,
+                "输入Token数贡献": contribution_input,
+                "对话轮次贡献": contribution_turn,
+                "推理阶段贡献": contribution_phase,
+            },
+        )
+
+
+@dataclass
+class EvaluationReport:
+    method_name: str
+    mean_absolute_percentage_error: float
+    sample_count: int
+    underestimate_rate: float
+
+
+def evaluate_predictor(
+    predictor_name: str,
+    predict_fn: Callable[[CallFeatureSample], PredictionResult],
+    test_samples: List[CallFeatureSample],
+) -> EvaluationReport:
+    absolute_percentage_errors: List[float] = []
+    underestimate_count = 0
+
+    for sample in test_samples:
+        result = predict_fn(sample)
+        actual = sample.actual_total_tokens
+        if actual == 0:
+            continue
+        error_ratio = abs(result.predicted_tokens - actual) / actual
+        absolute_percentage_errors.append(error_ratio)
+        if result.predicted_tokens < actual:
+            underestimate_count += 1
+
+    mape = (
+        statistics.mean(absolute_percentage_errors) * 100
+        if absolute_percentage_errors else 0.0
+    )
+    underestimate_rate = (
+        underestimate_count / len(test_samples) * 100 if test_samples else 0.0
+    )
+
+    return EvaluationReport(
+        method_name=predictor_name,
+        mean_absolute_percentage_error=mape,
+        sample_count=len(test_samples),
+        underestimate_rate=underestimate_rate,
+    )
+
+
+def _make_sample(input_tokens: int, turns: int, phase: AgentPhase, actual: int) -> CallFeatureSample:
+    return CallFeatureSample(
+        input_token_count=input_tokens,
+        conversation_turn_count=turns,
+        agent_phase=phase,
+        actual_total_tokens=actual,
+    )
+
+
+class TestHistoricalMeanPredictor(unittest.TestCase):
+    """基线方案的正常行为与边界情况"""
+
+    def test_predict_without_fit_returns_zero(self):
+        """从未训练过的预测器,不应该抛异常,而应该返回一个明确标注'无数据'的兜底结果"""
+        predictor = HistoricalMeanPredictor()
+        sample = _make_sample(100, 1, AgentPhase.SIMPLE_QA, 0)
+        result = predictor.predict(sample)
+        self.assertEqual(result.predicted_tokens, 0.0)
+        self.assertIn("无数据", result.method)
+
+    def test_predict_with_single_history_sample_has_zero_stddev(self):
+        """只有一条历史样本时标准差应为0,置信区间退化为一个点,不应抛异常"""
+        predictor = HistoricalMeanPredictor()
+        predictor.fit([_make_sample(100, 1, AgentPhase.SIMPLE_QA, 500)])
+        result = predictor.predict(_make_sample(200, 2, AgentPhase.TOOL_REASONING, 0))
+        self.assertEqual(result.predicted_tokens, 500)
+        self.assertEqual(result.lower_bound, 500)
+        self.assertEqual(result.upper_bound, 500)
+
+    def test_predict_ignores_current_sample_features_by_design(self):
+        """
+        基线方案的核心问题(答辩现场提到的局限性)就是不区分输入特征,
+        本测试用于固化并验证这个已知行为——不管输入token数多大,
+        预测结果始终等于历史均值,不会随当前样本变化。
+        """
+        predictor = HistoricalMeanPredictor()
+        predictor.fit([
+            _make_sample(100, 1, AgentPhase.SIMPLE_QA, 400),
+            _make_sample(100, 1, AgentPhase.SIMPLE_QA, 600),
+        ])
+        small_input_result = predictor.predict(_make_sample(10, 1, AgentPhase.SIMPLE_QA, 0))
+        huge_input_result = predictor.predict(_make_sample(50000, 20, AgentPhase.REFLECTION, 0))
+        self.assertEqual(small_input_result.predicted_tokens, huge_input_result.predicted_tokens)
+
+
+class TestLightweightFeaturePredictorEdgeCases(unittest.TestCase):
+    """改进方案的边界情况覆盖,这是本节测试的核心价值所在"""
+
+    def test_fit_with_too_few_samples_raises_value_error(self):
+        """样本少于5条时应该明确拒绝训练,而不是默默训练出一个不可靠的模型"""
+        predictor = LightweightFeaturePredictor()
+        with self.assertRaises(ValueError):
+            predictor.fit([_make_sample(100, 1, AgentPhase.SIMPLE_QA, 300)] * 4)
+
+    def test_fit_with_exactly_minimum_samples_does_not_raise(self):
+        predictor = LightweightFeaturePredictor()
+        samples = [
+            _make_sample(100 + i * 10, 1 + i, AgentPhase.SIMPLE_QA, 300 + i * 50)
+            for i in range(5)
+        ]
+        predictor.fit(samples)  # 不应抛异常
+
+    def test_all_identical_targets_produces_degenerate_but_stable_prediction(self):
+        """
+        当所有历史样本的实际Token消耗完全相同时,特征矩阵在数值上会更容易退化,
+        高斯消元里的微小扰动机制应该保证不会抛出除零异常,
+        且预测结果应该收敛到这个常数值附近,而不是给出荒谬的数字。
+        """
+        predictor = LightweightFeaturePredictor()
+        samples = [
+            _make_sample(100 + i, 1, AgentPhase.SIMPLE_QA, 500)
+            for i in range(10)
+        ]
+        predictor.fit(samples)
+        result = predictor.predict(_make_sample(105, 1, AgentPhase.SIMPLE_QA, 0))
+        self.assertGreater(result.predicted_tokens, 0)
+        self.assertLess(abs(result.predicted_tokens - 500), 500)
+
+    def test_all_identical_features_still_fits_without_crash(self):
+        """
+        当所有样本的输入特征完全一致(只有目标值不同)时,
+        特征矩阵会出现线性相关的行,这是最容易触发矩阵奇异问题的场景之一。
+        """
+        predictor = LightweightFeaturePredictor()
+        samples = [
+            _make_sample(100, 3, AgentPhase.TOOL_REASONING, 300 + i * 20)
+            for i in range(8)
+        ]
+        predictor.fit(samples)
+        result = predictor.predict(_make_sample(100, 3, AgentPhase.TOOL_REASONING, 0))
+        self.assertGreaterEqual(result.predicted_tokens, 0)
+
+    def test_prediction_never_returns_negative_tokens(self):
+        """
+        即便回归系数在某些极端输入组合下计算出负值,
+        predict方法也必须把结果clamp到0以上——Token消耗不可能是负数,
+        这是一个防止"技术上正确但业务上荒谬"的结果被使用的保护措施。
+        """
+        predictor = LightweightFeaturePredictor()
+        samples = [
+            _make_sample(1000 + i * 5, 10, AgentPhase.REFLECTION, 100 - i)
+            for i in range(10)
+        ]
+        predictor.fit(samples)
+        # 故意构造一个远超训练数据范围的极端输入,容易触发外推导致的负值预测
+        result = predictor.predict(_make_sample(0, 0, AgentPhase.SIMPLE_QA, 0))
+        self.assertGreaterEqual(result.predicted_tokens, 0.0)
+
+    def test_extremely_large_input_token_count_does_not_overflow(self):
+        """极端大的输入token数(比如误传了一个字节数而不是token数)不应导致数值溢出或异常"""
+        predictor = LightweightFeaturePredictor()
+        samples = [
+            _make_sample(100 + i * 50, 2, AgentPhase.MULTI_TURN_CHAT, 200 + i * 60)
+            for i in range(10)
+        ]
+        predictor.fit(samples)
+        huge_sample = _make_sample(10_000_000, 2, AgentPhase.MULTI_TURN_CHAT, 0)
+        result = predictor.predict(huge_sample)
+        self.assertTrue(result.predicted_tokens == result.predicted_tokens)  # 排除NaN
+
+    def test_feature_contributions_sum_matches_predicted_before_clamping(self):
+        """
+        feature_contributions字段是用于审计的关键字段,
+        四项贡献之和应该等于clamp之前的原始预测值,否则审计信息会失真。
+        """
+        predictor = LightweightFeaturePredictor()
+        samples = [
+            _make_sample(100 + i * 20, 1 + i, AgentPhase.SIMPLE_QA, 300 + i * 40)
+            for i in range(8)
+        ]
+        predictor.fit(samples)
+        result = predictor.predict(_make_sample(150, 3, AgentPhase.SIMPLE_QA, 0))
+        contributions_sum = sum(result.feature_contributions.values())
+        # 由于predict内部对负值做了clamp,只有在预测值本身非负时,两者才应该严格相等
+        if result.predicted_tokens > 0:
+            self.assertAlmostEqual(contributions_sum, result.predicted_tokens, places=6)
+
+
+class TestEvaluatePredictorEdgeCases(unittest.TestCase):
+    """评估工具函数的边界情况"""
+
+    def test_empty_test_samples_returns_zero_report_without_crash(self):
+        report = evaluate_predictor("空样本测试", lambda s: PredictionResult(0, 0, 0, "x"), [])
+        self.assertEqual(report.sample_count, 0)
+        self.assertEqual(report.mean_absolute_percentage_error, 0.0)
+        self.assertEqual(report.underestimate_rate, 0.0)
+
+    def test_samples_with_zero_actual_tokens_are_skipped_from_mape(self):
+        """
+        actual_total_tokens=0的样本会导致除零,评估函数应该主动跳过这类样本,
+        而不是让百分比误差计算抛出ZeroDivisionError。
+        """
+        samples = [
+            _make_sample(10, 1, AgentPhase.SIMPLE_QA, 0),
+            _make_sample(10, 1, AgentPhase.SIMPLE_QA, 100),
+        ]
+        report = evaluate_predictor(
+            "含零样本测试",
+            lambda s: PredictionResult(90, 0, 0, "x"),
+            samples,
+        )
+        # 只有第二条样本参与了MAPE计算: |90-100|/100 = 10%
+        self.assertAlmostEqual(report.mean_absolute_percentage_error, 10.0, places=3)
+
+    def test_perfect_predictor_has_zero_mape(self):
+        samples = [_make_sample(10, 1, AgentPhase.SIMPLE_QA, 300)]
+
+        def perfect_predict(sample: CallFeatureSample) -> PredictionResult:
+            return PredictionResult(sample.actual_total_tokens, 0, 0, "完美预测")
+
+        report = evaluate_predictor("完美预测测试", perfect_predict, samples)
+        self.assertEqual(report.mean_absolute_percentage_error, 0.0)
+        self.assertEqual(report.underestimate_rate, 0.0)
+
+    def test_always_underestimate_predictor_has_100_percent_underestimate_rate(self):
+        samples = [
+            _make_sample(10, 1, AgentPhase.SIMPLE_QA, 500),
+            _make_sample(20, 2, AgentPhase.SIMPLE_QA, 600),
+        ]
+
+        def always_low(sample: CallFeatureSample) -> PredictionResult:
+            return PredictionResult(sample.actual_total_tokens - 100, 0, 0, "总是偏低")
+
+        report = evaluate_predictor("总是偏低测试", always_low, samples)
+        self.assertEqual(report.underestimate_rate, 100.0)
+
+
+class TestImprovedPredictorOutperformsBaselineOnSyntheticData(unittest.TestCase):
+    """
+    集成级验证:改进方案在合成数据上的整体误差表现,
+    是否确实比基线方案更好——这是答辩现场判断方向的最终验证。
+    """
+
+    def setUp(self):
+        import random
+        random.seed(2024)
+        self.samples: List[CallFeatureSample] = []
+        phases = list(AgentPhase)
+        for _ in range(200):
+            phase = random.choice(phases)
+            input_tokens = random.randint(50, 2000)
+            turn_count = random.randint(1, 15)
+            base_ratio = PHASE_MULTIPLIER[phase]
+            noise = random.gauss(0, 60)
+            actual = max(
+                10,
+                int(input_tokens * base_ratio * 0.6 + turn_count * 40 + noise),
+            )
+            self.samples.append(_make_sample(input_tokens, turn_count, phase, actual))
+
+    def test_improved_predictor_has_lower_mape_than_baseline(self):
+        split = int(len(self.samples) * 0.7)
+        train, test = self.samples[:split], self.samples[split:]
+
+        baseline = HistoricalMeanPredictor()
+        baseline.fit(train)
+        improved = LightweightFeaturePredictor()
+        improved.fit(train)
+
+        baseline_report = evaluate_predictor("基线", baseline.predict, test)
+        improved_report = evaluate_predictor("改进", improved.predict, test)
+
+        self.assertLess(
+            improved_report.mean_absolute_percentage_error,
+            baseline_report.mean_absolute_percentage_error,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+```
+
+这套测试跑完之后,陈铭在笔记本里写了这样一段小结:"写这套测试的过程中,我发现了一个原本没有意识到的隐患——如果所有历史样本的输入特征完全一致(比如都是同一种`AgentPhase`、差不多的Token数),只是最终消耗的Token数不同,特征矩阵在数学上会退化成'秩不足'的状态,如果不做任何保护,高斯消元里的除法步骤可能会因为除以一个接近0的数而产生极不稳定的结果。原来代码里那个'如果主元素接近0就加一个微小扰动'的写法,现在看来不只是我随手写的一个'看起来稳妥'的技巧,而是真正在保护这个模型不在退化场景下产生离谱的输出。"
+
+这段反思也回应了本篇课后作业第五题延伸出来的一个更普遍的道理——**代码里那些"看起来是防御性编程的小技巧",如果没有专门的测试去验证它们到底在防御什么场景,这些技巧本身的价值就没有被真正确认过,写测试的过程,往往也是重新理解自己代码的过程**。
+
+### 九、扩展功能版本:重试策略注册中心可观测性增强版
+
+本篇课后作业第五题里,针对`RetryPolicyRegistry.resolve`方法"策略解析过程完全没有可观测性"这个设计缺陷,给出了一个改进思路——让`resolve`返回携带来源信息的对象,并在结构化日志里带上这个来源字段。陈铭觉得这个思路既然已经在作业参考答案里写清楚了,不能只停留在文字层面,于是当晚把这个改进思路也变成了一份真正可运行、可测试的代码,顺带把课后作业提到的另一个隐患——"误删专属策略导致悄悄退回默认策略却无法追溯"——也一并解决了。
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+retry_policy_registry_v2.py
+
+苍穹企业级智能体中台 - 重试策略注册中心(可观测性增强版)
+
+背景:
+    本篇"课后作业"第五题指出,原有RetryPolicyRegistry.resolve方法
+    有一个潜在设计缺陷——策略解析过程完全没有可观测性,外部无法感知
+    某次调用实际命中的是"租户专属策略"还是"全局默认策略"。
+    陈铭把作业参考答案里给出的改进思路,真正写成了可运行的代码,
+    验证这个思路在实践中是否真的解决了排查困难和可测试性不足的问题。
+
+改进点:
+    1. resolve方法不再直接返回RetryPolicy,而是返回携带来源信息的
+       ResolvedRetryPolicy,来源字段可以直接进入结构化日志。
+    2. 新增策略变更审计日志,记录每一次set_tool_policy /
+       set_tenant_tool_policy的调用者、时间、变更前后的值,
+       方便排查"为什么这次调用用了非预期的重试策略"这类问题。
+    3. 提供按来源统计策略命中分布的能力,用于验证"配置是否按预期生效"。
+作者: 陈铭
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, List, Optional, Tuple
+
+
+class PolicySource(Enum):
+    TENANT_TOOL_SPECIFIC = "TENANT_TOOL_SPECIFIC"
+    TOOL_DEFAULT = "TOOL_DEFAULT"
+    GLOBAL_DEFAULT = "GLOBAL_DEFAULT"
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    max_retries: int = 2
+    timeout_seconds: float = 10.0
+    backoff_base_ms: int = 200
+    backoff_factor: float = 2.0
+
+    def backoff_ms(self, attempt: int) -> int:
+        return int(self.backoff_base_ms * (self.backoff_factor ** (attempt - 1)))
+
+
+DEFAULT_RETRY_POLICY = RetryPolicy()
+
+
+@dataclass(frozen=True)
+class ResolvedRetryPolicy:
+    """
+    resolve方法的新返回类型:除了策略本身,还携带来源信息。
+    调用方可以把source字段直接写入结构化日志,
+    也可以在单元测试里直接断言"这次解析命中了哪一级策略"。
+    """
+
+    policy: RetryPolicy
+    source: PolicySource
+    matched_key: str  # 命中的具体key,便于审计(比如"vip_tenant::slow_tool"或"__global__")
+
+
+@dataclass
+class PolicyChangeRecord:
+    """一条策略变更的审计记录"""
+
+    scope: str          # "tool" 或 "tenant_tool"
+    key: str
+    old_policy: Optional[RetryPolicy]
+    new_policy: RetryPolicy
+    changed_by: str
+    timestamp: float = field(default_factory=time.time)
+
+
+class RetryPolicyRegistryV2:
+    """
+    重试策略注册中心(可观测性增强版)。
+    优先级:租户+工具专属策略 > 工具默认策略 > 全局默认策略,
+    与原版resolve行为完全一致,只是补齐了来源信息和变更审计。
+    """
+
+    def __init__(self, default_policy: RetryPolicy = DEFAULT_RETRY_POLICY):
+        self._default_policy = default_policy
+        self._tool_policies: Dict[str, RetryPolicy] = {}
+        self._tenant_tool_policies: Dict[Tuple[str, str], RetryPolicy] = {}
+        self._lock = threading.RLock()
+        self._change_log: List[PolicyChangeRecord] = []
+        self._resolution_hit_counter: Dict[PolicySource, int] = {
+            source: 0 for source in PolicySource
+        }
+
+    def set_tool_policy(self, tool_name: str, policy: RetryPolicy,
+                         changed_by: str = "unknown") -> None:
+        with self._lock:
+            old_policy = self._tool_policies.get(tool_name)
+            self._tool_policies[tool_name] = policy
+            self._change_log.append(PolicyChangeRecord(
+                scope="tool", key=tool_name,
+                old_policy=old_policy, new_policy=policy, changed_by=changed_by,
+            ))
+
+    def set_tenant_tool_policy(self, tenant_id: str, tool_name: str,
+                                policy: RetryPolicy, changed_by: str = "unknown") -> None:
+        with self._lock:
+            key = (tenant_id, tool_name)
+            old_policy = self._tenant_tool_policies.get(key)
+            self._tenant_tool_policies[key] = policy
+            self._change_log.append(PolicyChangeRecord(
+                scope="tenant_tool", key=f"{tenant_id}::{tool_name}",
+                old_policy=old_policy, new_policy=policy, changed_by=changed_by,
+            ))
+
+    def remove_tenant_tool_policy(self, tenant_id: str, tool_name: str,
+                                   changed_by: str = "unknown") -> bool:
+        """
+        显式支持删除某个租户专属策略,并留下审计记录——
+        这正是原版设计缺陷里提到的"误删专属策略导致悄悄退回默认策略"场景,
+        通过审计日志,这类误删操作现在至少是可追溯的。
+        """
+        with self._lock:
+            key = (tenant_id, tool_name)
+            if key not in self._tenant_tool_policies:
+                return False
+            old_policy = self._tenant_tool_policies.pop(key)
+            self._change_log.append(PolicyChangeRecord(
+                scope="tenant_tool_removed", key=f"{tenant_id}::{tool_name}",
+                old_policy=old_policy, new_policy=self._default_policy,
+                changed_by=changed_by,
+            ))
+            return True
+
+    def resolve(self, tenant_id: str, tool_name: str) -> ResolvedRetryPolicy:
+        """
+        解析出当前应该使用的重试策略,并明确标注来源。
+        调用方现在可以做到:
+        1. 把source写入结构化日志,排查"这次为什么用了默认策略";
+        2. 在单元测试里直接断言resolve返回的source字段。
+        """
+        with self._lock:
+            specific = self._tenant_tool_policies.get((tenant_id, tool_name))
+            if specific is not None:
+                self._resolution_hit_counter[PolicySource.TENANT_TOOL_SPECIFIC] += 1
+                return ResolvedRetryPolicy(
+                    policy=specific,
+                    source=PolicySource.TENANT_TOOL_SPECIFIC,
+                    matched_key=f"{tenant_id}::{tool_name}",
+                )
+
+            tool_level = self._tool_policies.get(tool_name)
+            if tool_level is not None:
+                self._resolution_hit_counter[PolicySource.TOOL_DEFAULT] += 1
+                return ResolvedRetryPolicy(
+                    policy=tool_level,
+                    source=PolicySource.TOOL_DEFAULT,
+                    matched_key=tool_name,
+                )
+
+            self._resolution_hit_counter[PolicySource.GLOBAL_DEFAULT] += 1
+            return ResolvedRetryPolicy(
+                policy=self._default_policy,
+                source=PolicySource.GLOBAL_DEFAULT,
+                matched_key="__global__",
+            )
+
+    def resolve_policy_only(self, tenant_id: str, tool_name: str) -> RetryPolicy:
+        """
+        向后兼容接口:如果调用方暂时不关心来源信息,只想要策略本身,
+        避免所有调用点都要立刻改造成处理ResolvedRetryPolicy的写法。
+        这是渐进式重构中很常见的一种兼容层设计。
+        """
+        return self.resolve(tenant_id, tool_name).policy
+
+    def change_log(self) -> List[PolicyChangeRecord]:
+        with self._lock:
+            return list(self._change_log)
+
+    def resolution_hit_distribution(self) -> Dict[str, int]:
+        """
+        统计各个来源的命中次数分布,用于验证配置是否按预期生效——
+        比如"预期大部分VIP租户的调用都应该命中TENANT_TOOL_SPECIFIC",
+        如果实际统计显示大量命中GLOBAL_DEFAULT,说明专属策略配置可能有遗漏。
+        """
+        with self._lock:
+            return {source.value: count for source, count in self._resolution_hit_counter.items()}
+
+    def find_changes_for_key(self, key_substring: str) -> List[PolicyChangeRecord]:
+        """按key的子串查找相关的历史变更记录,方便排查'这个策略是什么时候被改的'"""
+        with self._lock:
+            return [record for record in self._change_log if key_substring in record.key]
+
+
+def build_demo_registry() -> RetryPolicyRegistryV2:
+    registry = RetryPolicyRegistryV2()
+    registry.set_tool_policy(
+        "knowledge_search", RetryPolicy(max_retries=3, timeout_seconds=8.0),
+        changed_by="陈铭",
+    )
+    registry.set_tenant_tool_policy(
+        "vip_tenant_001", "knowledge_search", RetryPolicy(max_retries=5, timeout_seconds=12.0),
+        changed_by="陈铭",
+    )
+    return registry
+
+
+if __name__ == "__main__":
+    demo_registry = build_demo_registry()
+
+    resolved_vip = demo_registry.resolve("vip_tenant_001", "knowledge_search")
+    resolved_normal = demo_registry.resolve("normal_tenant_002", "knowledge_search")
+    resolved_unknown_tool = demo_registry.resolve("normal_tenant_002", "unregistered_tool")
+
+    print(f"VIP租户解析结果: source={resolved_vip.source.value}, matched_key={resolved_vip.matched_key}")
+    print(f"普通租户解析结果: source={resolved_normal.source.value}, matched_key={resolved_normal.matched_key}")
+    print(f"未注册工具解析结果: source={resolved_unknown_tool.source.value}")
+    print(f"命中分布: {demo_registry.resolution_hit_distribution()}")
+```
+
+这份改进版注册中心相比原版,新增了三个此前完全缺失的能力:
+
+第一,`ResolvedRetryPolicy`把"策略解析结果"和"策略解析来源"绑定在一起返回,调用方现在可以直接把`resolved.source.value`写入结构化日志,一旦生产环境出现"这次调用用的重试策略不对"这类问题,排查者不再需要凭猜测去翻配置,而是能从日志里直接看到"这次命中的是TENANT_TOOL_SPECIFIC还是GLOBAL_DEFAULT"。
+
+第二,`PolicyChangeRecord`审计日志记录了每一次策略变更的操作者、变更前后的值、变更时间,`remove_tenant_tool_policy`方法在删除一个租户专属策略时,同样会留下审计记录并标注`scope="tenant_tool_removed"`——这直接对应课后作业里提到的"误删专属策略导致悄悄退回默认策略"这一具体风险场景,一旦发生误删,至少可以从审计日志里追溯到"是谁、在什么时候删除了这条策略"。
+
+第三,`resolution_hit_distribution`方法统计了各个来源的命中次数分布,陈铭在代码注释里专门举了一个例子说明这个能力的价值——如果运营侧配置了十个VIP租户都应该命中专属重试策略,但上线后统计发现只有八个租户命中了`TENANT_TOOL_SPECIFIC`、另外两个悄悄落到了`GLOBAL_DEFAULT`,这个分布统计能够在配置遗漏造成实际影响之前,就先暴露出这个问题,而不需要等到某个VIP客户投诉"为什么我的请求这么容易超时"才回头排查。
+
+陈铭把这份代码发给老王看的时候,附了一句话:"课后作业第五题我不只是写了参考答案,也顺手把这个改进落地了,想请你看看这个思路在真实代码里跑起来是不是真的解决了问题,而不是纸面上看起来合理。"老王后来在群里回复了一句:"这才是真正的'把反馈当反馈用'——不仅是别人给你的反馈,连你自己设计出来给别人做的练习题,你也拿自己的标准去验证了一遍。"
+
 ---
 
 ## 今日复盘
