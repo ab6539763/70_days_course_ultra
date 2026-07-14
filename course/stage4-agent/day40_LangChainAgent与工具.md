@@ -1953,6 +1953,1411 @@ pytest tests/ -v
 
 陈铭下午跑通全部测试之后，把 `combo` 任务的执行日志截图发到了项目群里，林悦回复了一句"这个链路看起来已经有点祺瑞那个场景的意思了"，老王补了一句"骨架有了，接下来要打磨的是每个工具在真实业务系统里的实现细节"。
 
+### 补充：更多自定义工具示例 + 更详细的执行日志（工程加固）
+
+跑通 `combo` 演示的第二天，老王在代码评审时又追加了一轮要求。他的原话是："三个工具能跑通，说明骨架是对的，但客户真正会问的问题，往往不是'能不能搜索'，而是'能不能查日程、能不能起草邮件、能不能安全地访问一个已知的公开网页、能不能对一批业务数据做统计'。这几类能力，跟今天写的搜索/代码/文件工具的'形态'是一致的，但具体实现完全不同——你需要多写几个真正贴近业务的自定义工具，把'怎么设计一个新工具'这件事练熟。另外，`StepRecorderCallback` 现在只是打印到终端、存在内存里，任务一结束这些记录就没了。企业客户要的是能落盘、能追溯、能按 `run_id` 关联起来的结构化日志，这个得单独做一层，不能只靠 `verbose=True`。"
+
+陈铭把这轮要求拆成了两块：第一块是新增一组更贴近祺瑞集团场景的自定义工具（日程查询与排班、邮件草稿与审核、受限的公开网页访问、业务数据统计），第二块是做一层独立的、可落盘的详细执行日志模块，与已有的 `StepRecorderCallback` 并存而不是相互替代（保留原有实现作为"内存态、实时打印"的轻量版本，新增的日志模块作为"落盘态、结构化、可关联 run_id"的加固版本）。以下是补充实现，仍然放在同一个工程目录下，只是新增了 `telemetry/` 目录和若干新的工具文件。
+
+补充后的目录结构（新增部分用注释标出）：
+
+```
+cangqiong_agent_day40/
+├── config.py
+├── schemas.py
+├── schemas_extended.py          # 新增：更多自定义工具的输入 Schema
+├── prompts.py
+├── agent_factory.py
+├── agent_factory_logging.py     # 新增：整合扩展工具 + 详细日志的装配入口
+├── main.py
+├── main_extended.py             # 新增：综合演示（日程+邮件+网页+统计+详细日志）
+├── tools/
+│   ├── __init__.py
+│   ├── search_tool.py
+│   ├── code_exec_tool.py
+│   ├── file_tool.py
+│   ├── calendar_tool.py         # 新增：日程查询/排班自定义工具
+│   ├── email_draft_tool.py      # 新增：邮件草稿与审核自定义工具
+│   ├── http_fetch_tool.py       # 新增：受限公开网页访问自定义工具
+│   └── data_stats_tool.py       # 新增：业务数据统计自定义工具
+├── telemetry/
+│   ├── __init__.py              # 新增
+│   └── execution_logger.py      # 新增：结构化落盘日志 + 延迟统计
+├── callbacks/
+│   └── observability.py
+└── tests/
+    ├── test_tools.py
+    ├── test_agent.py
+    ├── test_calendar_tool_extended.py   # 新增
+    ├── test_email_draft_tool.py         # 新增
+    ├── test_http_fetch_tool.py          # 新增
+    ├── test_data_stats_tool.py          # 新增
+    └── test_execution_logger.py         # 新增
+```
+
+#### `schemas_extended.py` —— 新增工具的输入参数 Schema
+
+```python
+"""
+新增自定义工具的输入参数 Schema。
+单独拆出一个文件而不是直接往 schemas.py 里追加，
+是为了让"日程/邮件/网页/统计"这几类新业务的 Schema 变更，
+不会跟原有三个基础工具的 Schema 混在同一份变更历史里，
+方便代码评审时按业务模块单独审阅。
+"""
+from __future__ import annotations
+
+from typing import List, Optional
+
+from pydantic import BaseModel, Field, field_validator
+
+
+class CalendarConflictInput(BaseModel):
+    person: str = Field(..., description="要查询日程的人员姓名，例如 '陈铭'")
+    start_time: str = Field(..., description="查询时间段的开始时间，格式 'YYYY-MM-DD HH:MM'")
+    end_time: str = Field(..., description="查询时间段的结束时间，格式 'YYYY-MM-DD HH:MM'")
+
+
+class DailyScheduleInput(BaseModel):
+    person: str = Field(..., description="要查询日程的人员姓名")
+    date: str = Field(..., description="要查询的日期，格式 'YYYY-MM-DD'")
+
+
+class AvailableSlotInput(BaseModel):
+    person: str = Field(..., description="要查询空闲时间的人员姓名")
+    date: str = Field(..., description="要查询的日期，格式 'YYYY-MM-DD'")
+    duration_minutes: int = Field(30, description="需要的最短连续空闲时长（分钟），默认30分钟", ge=5, le=480)
+    work_start: str = Field("09:00", description="工作时间开始，格式 'HH:MM'，默认09:00")
+    work_end: str = Field("18:00", description="工作时间结束，格式 'HH:MM'，默认18:00")
+
+
+class CreateTentativeEventInput(BaseModel):
+    person: str = Field(..., description="要创建日程的人员姓名")
+    title: str = Field(..., description="日程标题，例如 '与供应商C续签沟通会'")
+    start_time: str = Field(..., description="开始时间，格式 'YYYY-MM-DD HH:MM'")
+    end_time: str = Field(..., description="结束时间，格式 'YYYY-MM-DD HH:MM'")
+
+
+class EmailDraftInput(BaseModel):
+    to: str = Field(..., description="收件人姓名或邮箱地址，例如 '供应商B联系人'")
+    subject: str = Field(..., description="邮件主题")
+    key_points: List[str] = Field(
+        ...,
+        description="邮件正文需要包含的关键信息点列表，每一项是一句话，"
+                    "例如 ['合同将于7月25日到期', '请在7月20日前确认是否续签']",
+    )
+    tone: str = Field(
+        "formal",
+        description="邮件语气风格，可选 'formal'（正式商务）或 'friendly'（友好提醒）",
+    )
+
+    @field_validator("tone")
+    @classmethod
+    def validate_tone(cls, v: str) -> str:
+        if v not in ("formal", "friendly"):
+            raise ValueError("tone 只能是 'formal' 或 'friendly'")
+        return v
+
+    @field_validator("key_points")
+    @classmethod
+    def validate_key_points(cls, v: List[str]) -> List[str]:
+        if not v:
+            raise ValueError("key_points 不能为空，至少需要一条关键信息")
+        return v
+
+
+class ListEmailDraftsInput(BaseModel):
+    status_filter: Optional[str] = Field(
+        None,
+        description="按状态过滤草稿，可选 'draft'（未审核）或 'reviewed'（已审核），留空表示不过滤",
+    )
+
+
+class MarkDraftReviewedInput(BaseModel):
+    draft_id: str = Field(..., description="要标记为已审核的草稿 ID，由 draft_email 工具返回")
+    reviewer: str = Field(..., description="审核人姓名")
+
+
+class FetchWebpageInput(BaseModel):
+    url: str = Field(
+        ...,
+        description="要访问的公开网页 URL，必须是 http:// 或 https:// 开头，"
+                    "且域名必须在企业白名单内",
+    )
+
+
+class PropertyFeeRecord(BaseModel):
+    project: str = Field(..., description="项目/社区名称")
+    amount: float = Field(..., description="该项目本期物业费金额（元）")
+
+
+class SummarizePropertyFeesInput(BaseModel):
+    records: List[PropertyFeeRecord] = Field(
+        ...,
+        description="需要汇总统计的物业费记录列表，每条记录包含项目名称与金额",
+    )
+
+    @field_validator("records")
+    @classmethod
+    def validate_records(cls, v: List[PropertyFeeRecord]) -> List[PropertyFeeRecord]:
+        if not v:
+            raise ValueError("records 不能为空，至少需要一条记录")
+        return v
+```
+
+#### `tools/calendar_tool.py` —— 日程查询与排班自定义工具
+
+祺瑞集团场景里"查日程、判断冲突"这条链路，今天用一份内存里的模拟数据库落地成四个独立工具：查冲突、查当天全部日程、查空闲时间段、创建待定日程。四个工具拆开而不是揉进一个工具，正是上午课堂笔记里强调的命名规范——"同一类操作如果有多个变体，应该拆成独立的工具"。
+
+```python
+"""
+日程查询与排班自定义工具。
+内部用一份写死的字典模拟客户 OA 系统的日程数据源，
+真实对接时，只需要替换 _CALENDAR_DB 的读写实现为真实 API 调用，
+四个工具的对外接口（名称、参数、返回格式）可以保持不变。
+"""
+from __future__ import annotations
+
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Dict, List
+
+from langchain_core.tools import tool
+
+from schemas_extended import (
+    AvailableSlotInput,
+    CalendarConflictInput,
+    CreateTentativeEventInput,
+    DailyScheduleInput,
+)
+
+_TIME_FMT = "%Y-%m-%d %H:%M"
+_DATE_FMT = "%Y-%m-%d"
+
+# 创建/查询日程涉及对共享字典的读写，用一把锁保护，
+# 避免未来多线程 / 并发请求场景下出现脏读脏写。
+_DB_LOCK = threading.Lock()
+
+
+@dataclass
+class CalendarEvent:
+    title: str
+    start: datetime
+    end: datetime
+    status: str = "confirmed"  # confirmed / tentative
+
+
+def _seed_calendar() -> Dict[str, List[CalendarEvent]]:
+    """构造一份初始的模拟日程数据，覆盖多个人员、多种状态的日程。"""
+    return {
+        "陈铭": [
+            CalendarEvent("与供应商A续签沟通会", datetime(2026, 7, 20, 10, 0), datetime(2026, 7, 20, 11, 0)),
+            CalendarEvent("季度物业费核算评审", datetime(2026, 7, 20, 14, 0), datetime(2026, 7, 20, 16, 0)),
+            CalendarEvent("片区巡检安排", datetime(2026, 7, 21, 9, 0), datetime(2026, 7, 21, 10, 0)),
+        ],
+        "林悦": [
+            CalendarEvent("祺瑞集团方案汇报", datetime(2026, 7, 21, 9, 0), datetime(2026, 7, 21, 10, 30)),
+        ],
+        "王振宇": [
+            CalendarEvent("技术评审会", datetime(2026, 7, 20, 15, 0), datetime(2026, 7, 20, 17, 0)),
+        ],
+    }
+
+
+_CALENDAR_DB: Dict[str, List[CalendarEvent]] = _seed_calendar()
+
+
+def _parse_time(text: str, fmt: str) -> datetime:
+    try:
+        return datetime.strptime(text, fmt)
+    except ValueError as exc:
+        raise ValueError(f"时间格式不正确，期望格式 '{fmt}'，实际收到 '{text}'") from exc
+
+
+@tool(args_schema=CalendarConflictInput)
+def query_calendar_conflicts(person: str, start_time: str, end_time: str) -> str:
+    """查询指定人员在给定时间段内是否存在日程冲突，返回冲突的日程列表或'无冲突'的说明。
+
+    适用于安排新会议、新拜访前先确认对方是否已有安排的场景。
+    这是使用模拟数据的原型工具，真实场景中应替换为对接客户 OA 系统的实现。
+    """
+    try:
+        query_start = _parse_time(start_time, _TIME_FMT)
+        query_end = _parse_time(end_time, _TIME_FMT)
+    except ValueError as exc:
+        return f"[查询失败] {exc}"
+
+    if query_end <= query_start:
+        return "[查询失败] 结束时间必须晚于开始时间"
+
+    with _DB_LOCK:
+        events = _CALENDAR_DB.get(person)
+
+    if events is None:
+        return f"[未找到人员] 日程数据库中没有 {person} 的日程记录"
+
+    conflicts = [
+        e for e in events if e.start < query_end and query_start < e.end
+    ]
+    if not conflicts:
+        return f"{person} 在 {start_time} 至 {end_time} 期间没有日程冲突"
+
+    lines = [f"{person} 在 {start_time} 至 {end_time} 期间存在以下冲突日程："]
+    for e in sorted(conflicts, key=lambda x: x.start):
+        lines.append(
+            f"  - {e.title}（{e.start.strftime(_TIME_FMT)} ~ {e.end.strftime(_TIME_FMT)}，状态：{e.status}）"
+        )
+    return "\n".join(lines)
+
+
+@tool(args_schema=DailyScheduleInput)
+def list_daily_schedule(person: str, date: str) -> str:
+    """列出指定人员在给定日期的全部日程安排，按开始时间排序。
+
+    适用于"帮我看看某人今天/某天都有什么安排"这类整体查看的场景，
+    与 query_calendar_conflicts 的区别是：本工具不判断冲突，只做罗列展示。
+    """
+    try:
+        target_date = _parse_time(date, _DATE_FMT).date()
+    except ValueError as exc:
+        return f"[查询失败] {exc}"
+
+    with _DB_LOCK:
+        events = _CALENDAR_DB.get(person)
+
+    if events is None:
+        return f"[未找到人员] 日程数据库中没有 {person} 的日程记录"
+
+    day_events = sorted(
+        (e for e in events if e.start.date() == target_date),
+        key=lambda x: x.start,
+    )
+    if not day_events:
+        return f"{person} 在 {date} 当天没有任何日程安排"
+
+    lines = [f"{person} 在 {date} 当天的日程如下："]
+    for e in day_events:
+        lines.append(
+            f"  - {e.start.strftime('%H:%M')}~{e.end.strftime('%H:%M')} {e.title}（{e.status}）"
+        )
+    return "\n".join(lines)
+
+
+@tool(args_schema=AvailableSlotInput)
+def find_available_slots(
+    person: str,
+    date: str,
+    duration_minutes: int = 30,
+    work_start: str = "09:00",
+    work_end: str = "18:00",
+) -> str:
+    """在给定日期的工作时间范围内，查找指定人员满足最短时长要求的空闲时间段。
+
+    适用于"帮我找一个能安排半小时会议的空档"这类排班场景，
+    会自动排除该人员当天已有的全部日程占用（无论状态是 confirmed 还是 tentative）。
+    """
+    try:
+        target_date = _parse_time(date, _DATE_FMT).date()
+    except ValueError as exc:
+        return f"[查询失败] {exc}"
+
+    try:
+        work_start_h, work_start_m = (int(x) for x in work_start.split(":"))
+        work_end_h, work_end_m = (int(x) for x in work_end.split(":"))
+    except (ValueError, AttributeError):
+        return "[查询失败] work_start / work_end 格式不正确，应为 'HH:MM'"
+
+    day_start = datetime.combine(target_date, datetime.min.time()).replace(
+        hour=work_start_h, minute=work_start_m
+    )
+    day_end = datetime.combine(target_date, datetime.min.time()).replace(
+        hour=work_end_h, minute=work_end_m
+    )
+    if day_end <= day_start:
+        return "[查询失败] work_end 必须晚于 work_start"
+
+    with _DB_LOCK:
+        events = _CALENDAR_DB.get(person)
+    if events is None:
+        return f"[未找到人员] 日程数据库中没有 {person} 的日程记录"
+
+    day_events = sorted(
+        (e for e in events if e.start.date() == target_date),
+        key=lambda x: x.start,
+    )
+
+    free_slots: List[tuple] = []
+    cursor = day_start
+    for e in day_events:
+        busy_start = max(e.start, day_start)
+        busy_end = min(e.end, day_end)
+        if busy_start > cursor:
+            free_slots.append((cursor, busy_start))
+        cursor = max(cursor, busy_end)
+    if cursor < day_end:
+        free_slots.append((cursor, day_end))
+
+    min_delta = timedelta(minutes=duration_minutes)
+    qualified = [(s, e) for s, e in free_slots if (e - s) >= min_delta]
+
+    if not qualified:
+        return (
+            f"{person} 在 {date} 的工作时间（{work_start}~{work_end}）内，"
+            f"没有找到连续 {duration_minutes} 分钟以上的空闲时间段"
+        )
+
+    lines = [f"{person} 在 {date} 满足 {duration_minutes} 分钟时长要求的空闲时段："]
+    for s, e in qualified:
+        lines.append(f"  - {s.strftime('%H:%M')} ~ {e.strftime('%H:%M')}")
+    return "\n".join(lines)
+
+
+@tool(args_schema=CreateTentativeEventInput)
+def create_tentative_event(person: str, title: str, start_time: str, end_time: str) -> str:
+    """为指定人员创建一条'待定（tentative）'状态的日程安排，创建前会自动检查是否存在冲突。
+
+    如果与已有日程冲突，会拒绝创建并返回冲突详情，不会强行覆盖，
+    这与'真正确认发送的邮件'一样，遵循企业场景里'关键写操作需要显式确认'的原则——
+    待定日程创建后仍需要人工或后续流程二次确认才会转为 confirmed 状态（本工具不涉及该步骤）。
+    """
+    try:
+        new_start = _parse_time(start_time, _TIME_FMT)
+        new_end = _parse_time(end_time, _TIME_FMT)
+    except ValueError as exc:
+        return f"[创建失败] {exc}"
+
+    if new_end <= new_start:
+        return "[创建失败] 结束时间必须晚于开始时间"
+
+    with _DB_LOCK:
+        events = _CALENDAR_DB.setdefault(person, [])
+        conflicts = [e for e in events if e.start < new_end and new_start < e.end]
+        if conflicts:
+            lines = [f"[创建失败] 与 {person} 的以下日程存在冲突，未创建新日程："]
+            for e in conflicts:
+                lines.append(f"  - {e.title}（{e.start.strftime(_TIME_FMT)} ~ {e.end.strftime(_TIME_FMT)}）")
+            return "\n".join(lines)
+
+        events.append(CalendarEvent(title=title, start=new_start, end=new_end, status="tentative"))
+
+    return (
+        f"[创建成功] 已为 {person} 创建待定日程《{title}》"
+        f"（{start_time} ~ {end_time}），状态为 tentative，等待后续确认"
+    )
+
+
+def reset_calendar_for_test() -> None:
+    """测试专用：重置内存日程数据库到初始状态，避免多个测试用例之间相互污染。"""
+    global _CALENDAR_DB
+    with _DB_LOCK:
+        _CALENDAR_DB = _seed_calendar()
+```
+
+#### `tools/email_draft_tool.py` —— 邮件草稿与审核自定义工具
+
+这个工具组特意只做到"生成草稿 + 标记审核"，不实现真正的发信能力——这是对作业五参考答案里"草稿生成与真正发送必须物理隔离"这条原则的代码落地，即便在原型阶段，也提前把这条安全边界画出来。
+
+```python
+"""
+邮件草稿生成与审核自定义工具。
+刻意不提供任何"真正发送邮件"的能力——发信是高风险操作，
+按照今天课堂笔记与作业五的结论，必须与草稿生成物理隔离，
+并且需要独立的、更高权限的工具与人工确认流程，本工具组不涉及。
+"""
+from __future__ import annotations
+
+import itertools
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Dict, List, Optional
+
+from langchain_core.tools import tool
+
+from schemas_extended import EmailDraftInput, ListEmailDraftsInput, MarkDraftReviewedInput
+
+_STORE_LOCK = threading.Lock()
+_ID_COUNTER = itertools.count(1)
+
+
+@dataclass
+class EmailDraft:
+    draft_id: str
+    to: str
+    subject: str
+    body: str
+    status: str = "draft"  # draft / reviewed
+    reviewer: Optional[str] = None
+    created_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+
+_DRAFT_STORE: Dict[str, EmailDraft] = {}
+
+
+_TONE_TEMPLATES = {
+    "formal": {
+        "opening": "尊敬的{to}：\n\n您好，就以下事项与您沟通：",
+        "closing": "\n\n如有任何疑问，欢迎随时与我们联系。\n\n此致\n蓬远科技 苍穹平台运营团队",
+    },
+    "friendly": {
+        "opening": "{to}，你好呀：\n\n有个事情想跟你提一下：",
+        "closing": "\n\n有问题随时找我聊，谢谢啦！",
+    },
+}
+
+
+def _render_email_body(to: str, key_points: List[str], tone: str) -> str:
+    """根据语气风格和关键信息点，渲染出一段结构清晰的邮件正文草稿。"""
+    template = _TONE_TEMPLATES[tone]
+    opening = template["opening"].format(to=to)
+    body_lines = [f"{idx}. {point}" for idx, point in enumerate(key_points, start=1)]
+    closing = template["closing"]
+    return "\n".join([opening, "", *body_lines, closing])
+
+
+@tool(args_schema=EmailDraftInput)
+def draft_email(to: str, subject: str, key_points: List[str], tone: str = "formal") -> str:
+    """根据收件人、主题和关键信息点，生成一封邮件草稿并保存，返回草稿编号与内容预览。
+
+    仅生成草稿，不会真正发送邮件。草稿生成后需要调用 mark_draft_reviewed 完成审核标记，
+    真正的发信操作需要独立的、更高权限的工具（本平台原型阶段暂未实现）。
+    """
+    with _STORE_LOCK:
+        draft_id = f"draft-{next(_ID_COUNTER):04d}"
+        body = _render_email_body(to=to, key_points=key_points, tone=tone)
+        draft = EmailDraft(draft_id=draft_id, to=to, subject=subject, body=body)
+        _DRAFT_STORE[draft_id] = draft
+
+    preview = body if len(body) <= 400 else body[:400] + "……（内容过长，已截断预览）"
+    return (
+        f"[草稿已创建] 编号：{draft_id}\n"
+        f"收件人：{to}\n主题：{subject}\n状态：{draft.status}\n"
+        f"正文预览：\n{preview}"
+    )
+
+
+@tool(args_schema=ListEmailDraftsInput)
+def list_email_drafts(status_filter: Optional[str] = None) -> str:
+    """列出当前已生成的邮件草稿，可按状态（draft/reviewed）过滤，用于审核前的整体查看。"""
+    with _STORE_LOCK:
+        drafts = list(_DRAFT_STORE.values())
+
+    if status_filter:
+        drafts = [d for d in drafts if d.status == status_filter]
+
+    if not drafts:
+        return "当前没有符合条件的邮件草稿"
+
+    lines = ["当前邮件草稿列表："]
+    for d in sorted(drafts, key=lambda x: x.created_at):
+        reviewer_info = f"，审核人：{d.reviewer}" if d.reviewer else ""
+        lines.append(f"  - [{d.draft_id}] 收件人={d.to} 主题={d.subject} 状态={d.status}{reviewer_info}")
+    return "\n".join(lines)
+
+
+@tool(args_schema=MarkDraftReviewedInput)
+def mark_draft_reviewed(draft_id: str, reviewer: str) -> str:
+    """将指定编号的邮件草稿标记为'已审核'状态，记录审核人姓名，用于后续人工确认发送流程的前置步骤。"""
+    with _STORE_LOCK:
+        draft = _DRAFT_STORE.get(draft_id)
+        if draft is None:
+            return f"[操作失败] 未找到编号为 {draft_id} 的草稿"
+        if draft.status == "reviewed":
+            return f"[无需操作] 草稿 {draft_id} 已处于 reviewed 状态（审核人：{draft.reviewer}）"
+        draft.status = "reviewed"
+        draft.reviewer = reviewer
+
+    return f"[标记成功] 草稿 {draft_id} 已标记为已审核，审核人：{reviewer}"
+
+
+def reset_drafts_for_test() -> None:
+    """测试专用：清空内存草稿存储，避免测试用例之间相互污染。"""
+    with _STORE_LOCK:
+        _DRAFT_STORE.clear()
+```
+
+#### `tools/http_fetch_tool.py` —— 受限的公开网页访问自定义工具
+
+上午课堂笔记里提到，`RequestsGetTool` 这类现成工具直接暴露给模型有 SSRF（服务端请求伪造）风险——模型可能被诱导访问内网地址（如 `http://169.254.169.254/`、`http://localhost:xxxx`）。这个工具用"域名白名单 + 协议限制 + 响应大小限制"三层防御，落地这条安全原则。
+
+```python
+"""
+受限的公开网页访问工具。
+设计原则：
+1. 只允许 http/https 协议，拒绝其他协议（file://、ftp:// 等）；
+2. 只允许访问预先配置的域名白名单，防止模型被诱导访问内网地址造成 SSRF；
+3. 限制响应体大小与请求超时时间，防止读取一个超大文件或挂起的连接拖垂 Agent；
+4. 返回内容做简单的 HTML 标签清理，转换成对模型更友好的纯文本摘要。
+"""
+from __future__ import annotations
+
+import logging
+import re
+import socket
+import urllib.request
+from dataclasses import dataclass, field
+from typing import Tuple
+from urllib.parse import urlparse
+
+from langchain_core.tools import tool
+
+from schemas_extended import FetchWebpageInput
+
+logger = logging.getLogger("cangqiong.tools.http_fetch")
+
+
+@dataclass
+class HttpFetchConfig:
+    """网页访问工具的安全配置，域名白名单是这个工具唯一的安全边界，务必谨慎维护。"""
+    allowed_domains: Tuple[str, ...] = (
+        "example.com",
+        "www.example.com",
+        "gov.cn",
+        "www.gov.cn",
+    )
+    request_timeout_seconds: int = 8
+    max_response_bytes: int = 200_000
+    allowed_schemes: Tuple[str, ...] = ("http", "https")
+
+
+_cfg = HttpFetchConfig()
+
+
+class UrlNotAllowedError(Exception):
+    """URL 未通过安全校验（协议不合法、域名不在白名单等）时抛出。"""
+
+
+def _extract_root_domain(hostname: str) -> str:
+    """粗略提取根域名，用于与白名单里配置的裸域名做匹配（同时兼容子域名）。"""
+    parts = hostname.split(".")
+    if len(parts) <= 2:
+        return hostname
+    return ".".join(parts[-2:])
+
+
+def _validate_url(url: str, allowed_domains: Tuple[str, ...], allowed_schemes: Tuple[str, ...]) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in allowed_schemes:
+        raise UrlNotAllowedError(f"不支持的协议: {parsed.scheme}，仅允许 {allowed_schemes}")
+
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        raise UrlNotAllowedError("无法解析出有效的域名")
+
+    # 防止直接用 IP 地址绕过域名白名单（尤其是内网 / 元数据服务地址）
+    try:
+        socket.inet_aton(hostname)
+        raise UrlNotAllowedError("不允许直接使用 IP 地址访问，请使用域名")
+    except OSError:
+        pass  # 不是合法 IPv4 格式，属于正常域名，继续往下走
+
+    root_domain = _extract_root_domain(hostname)
+    if hostname not in allowed_domains and root_domain not in allowed_domains:
+        raise UrlNotAllowedError(f"域名 {hostname} 不在允许访问的白名单内")
+
+
+def _strip_html_tags(html_text: str) -> str:
+    """极简的 HTML 转纯文本处理：去掉标签、合并多余空白。生产环境建议替换为更健壮的解析库。"""
+    without_script = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", html_text, flags=re.DOTALL | re.IGNORECASE)
+    without_tags = re.sub(r"<[^>]+>", " ", without_script)
+    collapsed = re.sub(r"\s+", " ", without_tags).strip()
+    return collapsed
+
+
+def _do_fetch(url: str, timeout: int, max_bytes: int) -> str:
+    """真正发起 HTTP 请求的底层函数，拆成独立函数方便在单测中被 Mock 替换。"""
+    request = urllib.request.Request(url, headers={"User-Agent": "CangqiongAgent/1.0"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - 已做白名单/协议限制
+        raw = response.read(max_bytes + 1)
+        if len(raw) > max_bytes:
+            raw = raw[:max_bytes]
+        charset = response.headers.get_content_charset() or "utf-8"
+        return raw.decode(charset, errors="ignore")
+
+
+@tool(args_schema=FetchWebpageInput)
+def fetch_public_webpage(url: str) -> str:
+    """访问一个预先在企业白名单内的公开网页，返回其去除 HTML 标签后的纯文本摘要。
+
+    仅支持 http/https 协议，且域名必须在企业配置的白名单内，
+    不支持访问内网地址、IP 地址直连的资源，用于防止服务端请求伪造（SSRF）风险。
+    适用于查阅已知的、受信任的公开信息页面，不适用于任意未知网站的抓取。
+    """
+    try:
+        _validate_url(url, _cfg.allowed_domains, _cfg.allowed_schemes)
+    except UrlNotAllowedError as exc:
+        logger.warning("fetch_public_webpage 被拒绝: %s url=%s", exc, url)
+        return f"[访问被拒绝] {exc}"
+
+    try:
+        raw_text = _do_fetch(url, _cfg.request_timeout_seconds, _cfg.max_response_bytes)
+    except TimeoutError:
+        return f"[访问超时] 请求 {url} 超过 {_cfg.request_timeout_seconds} 秒未响应"
+    except Exception as exc:  # noqa: BLE001 - 网络请求的异常类型繁多，统一兜底转换为提示文本
+        logger.exception("fetch_public_webpage 请求失败 url=%s", url)
+        return f"[访问失败] 请求 {url} 时发生错误：{exc}"
+
+    plain_text = _strip_html_tags(raw_text)
+    if len(plain_text) > 2000:
+        plain_text = plain_text[:2000] + "……（内容过长，已截断）"
+    return plain_text or "（页面内容为空，或全部为无法解析的非文本内容）"
+```
+
+#### `tools/data_stats_tool.py` —— 业务数据统计自定义工具
+
+这个工具与上午的 `execute_python_code` 是两种不同的设计思路的对照：`execute_python_code` 是"通用计算能力"，任何计算逻辑都靠模型现场写代码；而 `summarize_property_fees` 是"专用统计能力"，把一个高频出现的具体业务计算（按项目汇总物业费）直接封装成一个专用工具。老王在评审时特别点出这个对比："如果某类计算任务出现频率足够高、逻辑相对固定，封装成专用工具比每次都让模型现场写代码更快、更稳定、也更容易加测试——这是'通用兜底能力'和'专用高频能力'之间的工程取舍，两者应该同时存在，互为补充。"
+
+```python
+"""
+业务数据统计自定义工具：按项目汇总物业费，输出总额、均值、极值等统计结果。
+与 execute_python_code（通用计算兜底）形成互补——
+针对"按项目汇总费用"这一类高频、逻辑固定的统计需求，
+直接封装成专用工具，比每次都让模型现场写代码更快、更稳定、更容易维护和测试。
+"""
+from __future__ import annotations
+
+import statistics
+from collections import defaultdict
+from typing import Dict, List
+
+from langchain_core.tools import tool
+
+from schemas_extended import PropertyFeeRecord, SummarizePropertyFeesInput
+
+
+def _group_by_project(records: List[PropertyFeeRecord]) -> Dict[str, List[float]]:
+    grouped: Dict[str, List[float]] = defaultdict(list)
+    for r in records:
+        grouped[r.project].append(r.amount)
+    return grouped
+
+
+@tool(args_schema=SummarizePropertyFeesInput)
+def summarize_property_fees(records: List[PropertyFeeRecord]) -> str:
+    """对一批物业费记录（项目名称+金额）做统计汇总，返回总额、均值、最高/最低项目等信息。
+
+    适用于需要对多个项目的物业费数据做汇总分析、生成简报的场景，
+    如果输入的记录里同一个项目出现多次，会先按项目累加后再统计。
+    """
+    if not records:
+        return "[统计失败] 输入记录为空，无法进行统计"
+
+    grouped = _group_by_project(records)
+    project_totals = {project: round(sum(values), 2) for project, values in grouped.items()}
+
+    all_amounts = [r.amount for r in records]
+    total = round(sum(all_amounts), 2)
+    average = round(statistics.mean(all_amounts), 2)
+    highest_project = max(project_totals, key=lambda p: project_totals[p])
+    lowest_project = min(project_totals, key=lambda p: project_totals[p])
+
+    lines = [
+        f"本次统计共涉及 {len(records)} 条记录、{len(project_totals)} 个项目：",
+        f"  总金额：{total} 元",
+        f"  平均每条记录金额：{average} 元",
+        f"  金额最高的项目：{highest_project}（{project_totals[highest_project]} 元）",
+        f"  金额最低的项目：{lowest_project}（{project_totals[lowest_project]} 元）",
+        "各项目明细：",
+    ]
+    for project, amount in sorted(project_totals.items(), key=lambda kv: kv[1], reverse=True):
+        lines.append(f"  - {project}：{amount} 元")
+
+    if len(all_amounts) >= 2:
+        lines.append(f"  金额标准差：{round(statistics.pstdev(all_amounts), 2)} 元")
+
+    return "\n".join(lines)
+```
+
+#### `telemetry/execution_logger.py` —— 结构化落盘日志与延迟统计
+
+这一层专门解决"`verbose=True` 只能打印在终端、任务结束就没了"的问题。它跟已有的 `StepRecorderCallback` 是互补关系而不是替代关系——`StepRecorderCallback` 侧重"实时展示给开发者、生成给业务用户看的摘要"，`RunLogger` + `DetailedLoggingCallback` 侧重"结构化落盘、可按 `run_id` 检索、可统计延迟分布"，这正是需求文档里"可观测性"这条非功能需求更完整的落地。
+
+```python
+"""
+结构化执行日志模块：将每次 Agent 运行的完整过程，以 JSON Lines 格式落盘，
+并支持按 run_id 关联查询、计算工具调用延迟的统计分布（均值/P50/P95）。
+这是对 callbacks/observability.py 里 StepRecorderCallback 的加固补充，
+两者可以同时挂载在同一个 AgentExecutor 上，互不干扰。
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+from langchain_core.agents import AgentAction, AgentFinish
+from langchain_core.callbacks import BaseCallbackHandler
+
+logger = logging.getLogger("cangqiong.telemetry")
+
+# 涉及敏感信息的字段名，落盘时会被替换为占位符，不写入原始内容。
+_REDACT_KEYS = {"api_key", "token", "password", "secret"}
+
+
+def _redact(payload: Any) -> Any:
+    """递归地对字典中命中敏感字段名的值做脱敏处理，其余内容原样保留。"""
+    if isinstance(payload, dict):
+        redacted = {}
+        for key, value in payload.items():
+            if key.lower() in _REDACT_KEYS:
+                redacted[key] = "***REDACTED***"
+            else:
+                redacted[key] = _redact(value)
+        return redacted
+    if isinstance(payload, list):
+        return [_redact(item) for item in payload]
+    return payload
+
+
+class RunLogger:
+    """负责把单次任务运行过程中的事件，以 JSON Lines 格式追加写入日志文件。
+
+    每个事件都带上统一的 run_id，方便后续从一个混合了多次运行记录的日志文件里，
+    按 run_id 筛选出属于同一次任务的完整事件序列。
+    """
+
+    def __init__(self, log_dir: str = "agent_logs", run_id: Optional[str] = None) -> None:
+        self.run_id = run_id or self.new_run_id()
+        self.log_dir = log_dir
+        os.makedirs(self.log_dir, exist_ok=True)
+        self.log_path = os.path.join(self.log_dir, f"run_{self.run_id}.jsonl")
+
+    @staticmethod
+    def new_run_id() -> str:
+        """生成一个全局唯一的运行编号，用于关联同一次任务产生的所有日志事件。"""
+        return uuid.uuid4().hex[:16]
+
+    def log_event(self, event_type: str, payload: Dict[str, Any]) -> None:
+        record = {
+            "run_id": self.run_id,
+            "event_type": event_type,
+            "timestamp": time.time(),
+            "payload": _redact(payload),
+        }
+        with open(self.log_path, "a", encoding="utf-8") as fp:
+            fp.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def read_events(self) -> List[Dict[str, Any]]:
+        """读取本次运行已经落盘的全部事件，主要用于测试验证和事后排查。"""
+        if not os.path.exists(self.log_path):
+            return []
+        events = []
+        with open(self.log_path, "r", encoding="utf-8") as fp:
+            for line in fp:
+                line = line.strip()
+                if line:
+                    events.append(json.loads(line))
+        return events
+
+
+def _percentile(sorted_values: List[float], pct: float) -> float:
+    """计算给定百分位数（0~100）对应的数值，使用最近邻插值法，足够满足日志分析场景的精度需求。"""
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    k = (len(sorted_values) - 1) * (pct / 100.0)
+    lower_idx = int(k)
+    upper_idx = min(lower_idx + 1, len(sorted_values) - 1)
+    fraction = k - lower_idx
+    return sorted_values[lower_idx] + (sorted_values[upper_idx] - sorted_values[lower_idx]) * fraction
+
+
+@dataclass
+class _PendingCall:
+    tool_name: str
+    tool_input: Dict[str, Any]
+    started_at: float
+
+
+@dataclass
+class DetailedLoggingCallback(BaseCallbackHandler):
+    """详细执行日志回调：在每一步工具调用发生时，把事件结构化落盘，并在任务结束时汇总延迟统计。
+
+    与 StepRecorderCallback 的区别：
+    - StepRecorderCallback 面向"实时展示 + 生成人类可读摘要"；
+    - DetailedLoggingCallback 面向"持久化存储 + 可编程分析（比如计算P95延迟）"。
+    两者是互补关系，生产环境建议同时挂载。
+    """
+
+    run_logger: RunLogger
+    _pending: Dict[str, _PendingCall] = field(default_factory=dict)
+    _latencies_by_tool: Dict[str, List[float]] = field(default_factory=lambda: defaultdict_list())
+    _step_counter: int = 0
+
+    def on_agent_action(self, action: AgentAction, **kwargs: Any) -> None:
+        self._step_counter += 1
+        run_id_key = str(kwargs.get("run_id", self._step_counter))
+        tool_input = dict(action.tool_input) if isinstance(action.tool_input, dict) else {"input": action.tool_input}
+        self._pending[run_id_key] = _PendingCall(
+            tool_name=action.tool, tool_input=tool_input, started_at=time.monotonic()
+        )
+        self.run_logger.log_event(
+            "agent_action",
+            {"step": self._step_counter, "tool": action.tool, "tool_input": tool_input},
+        )
+
+    def on_tool_end(self, output: Any, **kwargs: Any) -> None:
+        run_id_key = str(kwargs.get("run_id", ""))
+        pending = self._pending.pop(run_id_key, None)
+        if pending is None:
+            return
+        latency = time.monotonic() - pending.started_at
+        self._latencies_by_tool.setdefault(pending.tool_name, []).append(latency)
+        self.run_logger.log_event(
+            "tool_end",
+            {
+                "tool": pending.tool_name,
+                "tool_input": pending.tool_input,
+                "observation_preview": str(output)[:300],
+                "latency_seconds": round(latency, 4),
+            },
+        )
+
+    def on_tool_error(self, error: BaseException, **kwargs: Any) -> None:
+        run_id_key = str(kwargs.get("run_id", ""))
+        pending = self._pending.pop(run_id_key, None)
+        latency = time.monotonic() - pending.started_at if pending else None
+        self.run_logger.log_event(
+            "tool_error",
+            {
+                "tool": pending.tool_name if pending else "未知",
+                "error": str(error),
+                "latency_seconds": round(latency, 4) if latency is not None else None,
+            },
+        )
+
+    def on_agent_finish(self, finish: AgentFinish, **kwargs: Any) -> None:
+        self.run_logger.log_event(
+            "agent_finish",
+            {"output_preview": str(finish.return_values.get("output", ""))[:300]},
+        )
+
+    def latency_report(self) -> Dict[str, Dict[str, float]]:
+        """汇总每个工具的调用次数与延迟分布（均值/P50/P95），用于容量评估与性能优化排查。"""
+        report: Dict[str, Dict[str, float]] = {}
+        for tool_name, latencies in self._latencies_by_tool.items():
+            sorted_latencies = sorted(latencies)
+            report[tool_name] = {
+                "count": len(latencies),
+                "avg_seconds": round(sum(latencies) / len(latencies), 4),
+                "p50_seconds": round(_percentile(sorted_latencies, 50), 4),
+                "p95_seconds": round(_percentile(sorted_latencies, 95), 4),
+                "max_seconds": round(max(latencies), 4),
+            }
+        return report
+
+
+def defaultdict_list() -> Dict[str, List[float]]:
+    """辅助函数：构造一个值类型为 list 的普通字典，用于 dataclass 的 default_factory。"""
+    return {}
+```
+
+上面 `DetailedLoggingCallback` 里的 `_latencies_by_tool` 字段，陈铭一开始想直接用 `field(default_factory=lambda: __import__("collections").defaultdict(list))`，图省事少写一次 `setdefault`。老王在评审时提醒他："`defaultdict` 塞进 `dataclass` 字段技术上没问题，但会让这个字段的真实类型变得模糊——别人读代码的时候容易忽略'这是个 defaultdict'这个细节，一旦某处不小心把它当成普通 dict 处理（比如做了浅拷贝、或者传给了某个只接受普通字典的函数），行为可能会和预期不一致。用普通字典配合显式的 `setdefault(key, []).append(...)`，虽然多写几个字符，但类型意图更清晰，排查问题的时候也更直接。"陈铭因此把最终版本统一成了上面这种写法——`_latencies_by_tool` 的 `default_factory` 直接返回一个全新的空字典，所有的写入操作都显式调用 `setdefault`，不依赖 `defaultdict` 的隐式行为。这条经验也被记进了个人踩坑笔记："`dataclass` 字段的默认值选型，不只是'能不能用'的问题，还要考虑'读代码的人能不能一眼看出这个字段的真实语义'。"
+
+#### `agent_factory_logging.py` —— 整合扩展工具与详细日志的装配入口
+
+```python
+"""
+在原有 agent_factory.py 基础上，新增一个整合了扩展工具（日程/邮件/网页/统计）
+与详细执行日志（DetailedLoggingCallback）的装配入口，
+不修改原有 build_executor 的行为，保持向后兼容——
+老的调用方（比如 main.py）不受任何影响，新的调用方可以显式选择使用加固版本。
+"""
+from __future__ import annotations
+
+import logging
+from typing import List, Optional, Tuple
+
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain_core.language_models import BaseChatModel
+from langchain_core.tools import BaseTool
+
+from agent_factory import build_llm
+from config import AgentRuntimeConfig, load_runtime_config
+from prompts import build_agent_prompt
+from tools import get_all_tools
+from tools.calendar_tool import (
+    create_tentative_event,
+    find_available_slots,
+    list_daily_schedule,
+    query_calendar_conflicts,
+)
+from tools.data_stats_tool import summarize_property_fees
+from tools.email_draft_tool import draft_email, list_email_drafts, mark_draft_reviewed
+from tools.http_fetch_tool import fetch_public_webpage
+from telemetry.execution_logger import DetailedLoggingCallback, RunLogger
+
+logger = logging.getLogger("cangqiong.agent_factory_logging")
+
+
+def get_extended_tools() -> List[BaseTool]:
+    """返回基础三工具 + 全部扩展自定义工具的完整列表，供加固版 Agent 使用。"""
+    return get_all_tools() + [
+        query_calendar_conflicts,
+        list_daily_schedule,
+        find_available_slots,
+        create_tentative_event,
+        draft_email,
+        list_email_drafts,
+        mark_draft_reviewed,
+        fetch_public_webpage,
+        summarize_property_fees,
+    ]
+
+
+def build_executor_with_logging(
+    llm: Optional[BaseChatModel] = None,
+    tools: Optional[List[BaseTool]] = None,
+    cfg: Optional[AgentRuntimeConfig] = None,
+    log_dir: str = "agent_logs",
+) -> Tuple[AgentExecutor, DetailedLoggingCallback, RunLogger]:
+    """构建带有扩展工具与详细落盘日志的 AgentExecutor。
+
+    返回三元组：(执行器, 详细日志回调, 日志记录器实例)，
+    调用方可以在任务结束后，通过回调对象的 latency_report() 拿到延迟统计，
+    也可以通过日志记录器的 read_events() 拿到完整的结构化事件流。
+    """
+    cfg = cfg or load_runtime_config()
+    llm = llm or build_llm(cfg)
+    tools = tools if tools is not None else get_extended_tools()
+    prompt = build_agent_prompt()
+
+    agent = create_tool_calling_agent(llm=llm, tools=tools, prompt=prompt)
+
+    run_logger = RunLogger(log_dir=log_dir)
+    detailed_callback = DetailedLoggingCallback(run_logger=run_logger)
+
+    executor = AgentExecutor(
+        agent=agent,
+        tools=tools,
+        verbose=cfg.verbose,
+        max_iterations=cfg.max_iterations,
+        max_execution_time=cfg.max_execution_time,
+        return_intermediate_steps=True,
+        handle_parsing_errors=(
+            "抱歉，刚才的输出格式不太规范，请重新按照工具调用的规范格式给出下一步动作。"
+        ),
+        callbacks=[detailed_callback],
+    )
+
+    logger.info(
+        "加固版 AgentExecutor 构建完成 run_id=%s tools=%s",
+        run_logger.run_id, [t.name for t in tools],
+    )
+    return executor, detailed_callback, run_logger
+
+
+def run_task_with_logging(user_input: str, chat_history: Optional[list] = None) -> dict:
+    """加固版任务入口：返回结果、完整中间步骤，以及可直接落盘复用的延迟统计报告。"""
+    executor, detailed_callback, run_logger = build_executor_with_logging()
+    result = executor.invoke({"input": user_input, "chat_history": chat_history or []})
+    return {
+        "run_id": run_logger.run_id,
+        "output": result.get("output", ""),
+        "intermediate_steps": result.get("intermediate_steps", []),
+        "latency_report": detailed_callback.latency_report(),
+        "log_path": run_logger.log_path,
+    }
+```
+
+#### `main_extended.py` —— 综合演示入口（新工具 + 详细日志）
+
+```python
+"""
+综合演示入口：串联日程冲突查询、邮件草稿生成、公开网页访问、物业费统计四类新工具，
+并在任务结束后打印按 run_id 关联的延迟统计报告，验证"详细执行日志"这一加固能力。
+"""
+from __future__ import annotations
+
+import logging
+
+from agent_factory_logging import run_task_with_logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+
+EXTENDED_DEMO_TASK = (
+    "帮我先查一下陈铭在2026-07-20 09:30到2026-07-20 10:30之间是否有日程冲突，"
+    "然后统计一下四个项目本月的物业费：翠湖花园128400.5元、金桂苑96230元、"
+    "青松雅苑143800.75元、锦绣东城88900元，"
+    "最后根据统计结果，起草一封发给'各社区项目负责人'的邮件草稿，"
+    "邮件里说明本月物业费总额和最高的项目，语气使用正式商务风格。"
+)
+
+
+def run_extended_demo() -> None:
+    print(f"\n{'=' * 60}\n综合任务: {EXTENDED_DEMO_TASK}\n{'=' * 60}")
+    result = run_task_with_logging(EXTENDED_DEMO_TASK)
+
+    print(f"\n----- run_id: {result['run_id']} -----")
+    print("\n----- 最终答案 -----")
+    print(result["output"])
+
+    print(f"\n----- 中间步骤数量: {len(result['intermediate_steps'])} -----")
+    for i, (action, observation) in enumerate(result["intermediate_steps"], start=1):
+        print(f"  #{i} 工具={action.tool} 参数={action.tool_input}")
+        print(f"      观察(截断)={str(observation)[:150]}")
+
+    print("\n----- 各工具延迟统计报告 -----")
+    for tool_name, stats in result["latency_report"].items():
+        print(
+            f"  {tool_name}: 调用{stats['count']}次, "
+            f"平均{stats['avg_seconds']}s, P50={stats['p50_seconds']}s, "
+            f"P95={stats['p95_seconds']}s, 最大={stats['max_seconds']}s"
+        )
+
+    print(f"\n----- 完整结构化日志文件路径: {result['log_path']} -----")
+
+
+if __name__ == "__main__":
+    run_extended_demo()
+```
+
+#### `tests/test_calendar_tool_extended.py`
+
+```python
+"""
+日程查询与排班工具的单元测试，覆盖正常查询、边界情况与创建冲突拦截。
+"""
+from __future__ import annotations
+
+import pytest
+
+from tools.calendar_tool import (
+    create_tentative_event,
+    find_available_slots,
+    list_daily_schedule,
+    query_calendar_conflicts,
+    reset_calendar_for_test,
+)
+
+
+@pytest.fixture(autouse=True)
+def _reset_calendar():
+    reset_calendar_for_test()
+    yield
+    reset_calendar_for_test()
+
+
+def test_query_calendar_conflicts_detects_overlap():
+    result = query_calendar_conflicts.invoke(
+        {"person": "陈铭", "start_time": "2026-07-20 09:30", "end_time": "2026-07-20 10:30"}
+    )
+    assert "存在以下冲突日程" in result
+    assert "与供应商A续签沟通会" in result
+
+
+def test_query_calendar_conflicts_no_overlap():
+    result = query_calendar_conflicts.invoke(
+        {"person": "陈铭", "start_time": "2026-07-22 09:00", "end_time": "2026-07-22 10:00"}
+    )
+    assert "没有日程冲突" in result
+
+
+def test_query_calendar_conflicts_person_not_found():
+    result = query_calendar_conflicts.invoke(
+        {"person": "不存在的人", "start_time": "2026-07-20 09:00", "end_time": "2026-07-20 10:00"}
+    )
+    assert "[未找到人员]" in result
+
+
+def test_query_calendar_conflicts_invalid_time_range():
+    result = query_calendar_conflicts.invoke(
+        {"person": "陈铭", "start_time": "2026-07-20 11:00", "end_time": "2026-07-20 10:00"}
+    )
+    assert "[查询失败]" in result
+
+
+def test_list_daily_schedule_returns_sorted_events():
+    result = list_daily_schedule.invoke({"person": "陈铭", "date": "2026-07-20"})
+    idx_first = result.index("与供应商A续签沟通会")
+    idx_second = result.index("季度物业费核算评审")
+    assert idx_first < idx_second
+
+
+def test_list_daily_schedule_empty_day():
+    result = list_daily_schedule.invoke({"person": "陈铭", "date": "2026-08-01"})
+    assert "没有任何日程安排" in result
+
+
+def test_find_available_slots_returns_free_gap():
+    result = find_available_slots.invoke(
+        {"person": "陈铭", "date": "2026-07-20", "duration_minutes": 60,
+         "work_start": "09:00", "work_end": "18:00"}
+    )
+    assert "16:00" in result or "11:00" in result
+
+
+def test_create_tentative_event_success_then_conflict():
+    ok_result = create_tentative_event.invoke(
+        {"person": "陈铭", "title": "新客户拜访", "start_time": "2026-07-22 13:00", "end_time": "2026-07-22 14:00"}
+    )
+    assert "[创建成功]" in ok_result
+
+    conflict_result = create_tentative_event.invoke(
+        {"person": "陈铭", "title": "另一场会议", "start_time": "2026-07-22 13:30", "end_time": "2026-07-22 14:30"}
+    )
+    assert "[创建失败]" in conflict_result
+    assert "新客户拜访" in conflict_result
+```
+
+#### `tests/test_email_draft_tool.py`
+
+```python
+"""
+邮件草稿与审核工具的单元测试。
+"""
+from __future__ import annotations
+
+import pytest
+
+from tools.email_draft_tool import (
+    draft_email,
+    list_email_drafts,
+    mark_draft_reviewed,
+    reset_drafts_for_test,
+)
+
+
+@pytest.fixture(autouse=True)
+def _reset_drafts():
+    reset_drafts_for_test()
+    yield
+    reset_drafts_for_test()
+
+
+def test_draft_email_creates_entry_with_formal_tone():
+    result = draft_email.invoke(
+        {
+            "to": "供应商B联系人",
+            "subject": "合同续签提醒",
+            "key_points": ["合同将于7月25日到期", "请在7月20日前确认是否续签"],
+            "tone": "formal",
+        }
+    )
+    assert "[草稿已创建]" in result
+    assert "尊敬的供应商B联系人" in result
+
+
+def test_draft_email_creates_entry_with_friendly_tone():
+    result = draft_email.invoke(
+        {
+            "to": "小李",
+            "subject": "本周巡检提醒",
+            "key_points": ["周五之前完成B区巡检"],
+            "tone": "friendly",
+        }
+    )
+    assert "你好呀" in result
+
+
+def test_list_email_drafts_filter_by_status():
+    draft_email.invoke({"to": "A", "subject": "s1", "key_points": ["p1"], "tone": "formal"})
+    draft_result = draft_email.invoke({"to": "B", "subject": "s2", "key_points": ["p2"], "tone": "formal"})
+
+    draft_id = draft_result.split("编号：")[1].split("\n")[0]
+    mark_draft_reviewed.invoke({"draft_id": draft_id, "reviewer": "王振宇"})
+
+    reviewed_list = list_email_drafts.invoke({"status_filter": "reviewed"})
+    draft_list = list_email_drafts.invoke({"status_filter": "draft"})
+
+    assert draft_id in reviewed_list
+    assert "s1" in draft_list and "s2" not in draft_list
+
+
+def test_mark_draft_reviewed_not_found():
+    result = mark_draft_reviewed.invoke({"draft_id": "draft-9999", "reviewer": "王振宇"})
+    assert "[操作失败]" in result
+
+
+def test_mark_draft_reviewed_idempotent():
+    draft_result = draft_email.invoke({"to": "C", "subject": "s3", "key_points": ["p3"], "tone": "formal"})
+    draft_id = draft_result.split("编号：")[1].split("\n")[0]
+
+    first = mark_draft_reviewed.invoke({"draft_id": draft_id, "reviewer": "林悦"})
+    second = mark_draft_reviewed.invoke({"draft_id": draft_id, "reviewer": "陈铭"})
+
+    assert "[标记成功]" in first
+    assert "[无需操作]" in second
+    assert "林悦" in second  # 第二次不应覆盖第一次的审核人
+```
+
+#### `tests/test_http_fetch_tool.py`
+
+```python
+"""
+受限公开网页访问工具的单元测试，重点覆盖安全边界（域名白名单/协议限制/IP直连拦截）。
+"""
+from __future__ import annotations
+
+import pytest
+
+from tools.http_fetch_tool import fetch_public_webpage, _validate_url, UrlNotAllowedError, _cfg
+
+
+def test_validate_url_rejects_non_whitelisted_domain():
+    with pytest.raises(UrlNotAllowedError):
+        _validate_url("https://not-allowed-domain.com/page", _cfg.allowed_domains, _cfg.allowed_schemes)
+
+
+def test_validate_url_rejects_disallowed_scheme():
+    with pytest.raises(UrlNotAllowedError):
+        _validate_url("ftp://example.com/file", _cfg.allowed_domains, _cfg.allowed_schemes)
+
+
+def test_validate_url_rejects_ip_address():
+    with pytest.raises(UrlNotAllowedError):
+        _validate_url("http://192.168.1.1/admin", _cfg.allowed_domains, _cfg.allowed_schemes)
+
+
+def test_validate_url_allows_whitelisted_subdomain():
+    _validate_url("https://www.example.com/page", _cfg.allowed_domains, _cfg.allowed_schemes)  # 不抛异常即通过
+
+
+def test_fetch_public_webpage_blocks_disallowed_domain():
+    result = fetch_public_webpage.invoke({"url": "https://malicious-site.com/steal"})
+    assert "[访问被拒绝]" in result
+
+
+def test_fetch_public_webpage_success_strips_html(monkeypatch):
+    import tools.http_fetch_tool as http_module
+
+    fake_html = "<html><head><style>.a{}</style></head><body><h1>标题</h1><p>正文内容</p></body></html>"
+    monkeypatch.setattr(http_module, "_do_fetch", lambda url, timeout, max_bytes: fake_html)
+
+    result = fetch_public_webpage.invoke({"url": "https://example.com/page"})
+    assert "标题" in result and "正文内容" in result
+    assert "<" not in result
+
+
+def test_fetch_public_webpage_handles_request_exception(monkeypatch):
+    import tools.http_fetch_tool as http_module
+
+    def _raise(*args, **kwargs):
+        raise ConnectionError("模拟连接失败")
+
+    monkeypatch.setattr(http_module, "_do_fetch", _raise)
+    result = fetch_public_webpage.invoke({"url": "https://example.com/page"})
+    assert "[访问失败]" in result
+```
+
+#### `tests/test_data_stats_tool.py`
+
+```python
+"""
+业务数据统计工具的单元测试。
+"""
+from __future__ import annotations
+
+from tools.data_stats_tool import summarize_property_fees
+
+
+def test_summarize_property_fees_basic():
+    result = summarize_property_fees.invoke(
+        {
+            "records": [
+                {"project": "翠湖花园", "amount": 128400.5},
+                {"project": "金桂苑", "amount": 96230},
+                {"project": "青松雅苑", "amount": 143800.75},
+                {"project": "锦绣东城", "amount": 88900},
+            ]
+        }
+    )
+    assert "青松雅苑" in result  # 金额最高
+    assert "锦绣东城" in result  # 金额最低
+    assert "457331.25" in result  # 总额校验
+
+
+def test_summarize_property_fees_merges_duplicate_projects():
+    result = summarize_property_fees.invoke(
+        {
+            "records": [
+                {"project": "翠湖花园", "amount": 100.0},
+                {"project": "翠湖花园", "amount": 200.0},
+            ]
+        }
+    )
+    assert "300.0" in result
+
+
+def test_summarize_property_fees_single_record_no_stdev_crash():
+    result = summarize_property_fees.invoke({"records": [{"project": "翠湖花园", "amount": 100.0}]})
+    assert "总金额：100.0 元" in result
+```
+
+#### `tests/test_execution_logger.py`
+
+```python
+"""
+结构化执行日志模块的单元测试，覆盖落盘格式、脱敏逻辑与延迟统计计算。
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import tempfile
+
+import pytest
+
+from telemetry.execution_logger import RunLogger, _percentile, _redact
+
+
+@pytest.fixture()
+def temp_log_dir():
+    d = tempfile.mkdtemp(prefix="cangqiong_test_logs_")
+    yield d
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_logger_writes_jsonl_events(temp_log_dir):
+    run_logger = RunLogger(log_dir=temp_log_dir)
+    run_logger.log_event("agent_action", {"tool": "web_search", "tool_input": {"query": "测试"}})
+    run_logger.log_event("agent_finish", {"output_preview": "完成"})
+
+    assert os.path.exists(run_logger.log_path)
+    events = run_logger.read_events()
+    assert len(events) == 2
+    assert events[0]["event_type"] == "agent_action"
+    assert events[0]["run_id"] == run_logger.run_id
+
+
+def test_new_run_id_is_unique():
+    ids = {RunLogger.new_run_id() for _ in range(100)}
+    assert len(ids) == 100
+
+
+def test_redact_masks_sensitive_keys():
+    payload = {"api_key": "sk-real-secret", "query": "普通内容", "nested": {"token": "abc123"}}
+    redacted = _redact(payload)
+    assert redacted["api_key"] == "***REDACTED***"
+    assert redacted["query"] == "普通内容"
+    assert redacted["nested"]["token"] == "***REDACTED***"
+
+
+def test_percentile_basic_cases():
+    data = sorted([10.0, 20.0, 30.0, 40.0, 50.0])
+    assert _percentile(data, 0) == 10.0
+    assert _percentile(data, 100) == 50.0
+    assert _percentile([], 50) == 0.0
+    assert _percentile([42.0], 50) == 42.0
+
+
+def test_run_logger_read_events_when_file_missing(temp_log_dir):
+    run_logger = RunLogger(log_dir=temp_log_dir)
+    assert run_logger.read_events() == []
+```
+
+至此，`代码实战` 部分补充完成：新增了 4 个贴近祺瑞集团场景的自定义工具（日程查询排班、邮件草稿审核、受限网页访问、物业费统计）、1 套独立的结构化落盘日志与延迟统计模块、1 个整合装配入口、1 个综合演示脚本，以及配套的 5 份单元测试文件。这些新增内容与原有的搜索/代码执行/文件读写三个基础工具、`StepRecorderCallback` 实时观测层保持并存，互为补充，不影响任何已有代码的行为。
+
 ---
 
 ## 今日复盘
