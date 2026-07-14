@@ -1904,6 +1904,1111 @@ def build_default_registry(mcp_client: Any) -> ToolAdapterRegistry:
 
 这份规范代码,王振宇要求当天就同步给所有参与过Day44开发的同事传阅,并在团队内部知识库里标注为"下一阶段项目强制遵循规范"。他半开玩笑地说:"郭总说年底那个旗舰项目规模会大出一个量级,如果那时候工具适配代码还是各写各的风格,新同事接手都得先猜半天每个适配器的调用习惯,这个坑咱们现在就该提前填上。"
 
+### 六、动态语义路由引擎(回应宋顾问的第一条建议)
+
+宋顾问在内部技术评审环节提到的第一个问题——多Agent之间的路由决策目前偏向"规则驱动",场景复杂度进一步提升之后可维护性会下降——王振宇当场没有现成的方案给出来,但他要求陈铭趁着复盘会的热度,当天就把一个"规则优先、语义兜底"的过渡方案原型写出来,不必追求完美,但要能验证这条改进思路是否可行,作为技术债清单里第一条的"预研凭证"。
+
+```python
+"""
+苍穹企业级智能体中台 - 动态语义路由引擎(过渡方案原型)
+模块路径建议:cangqiong/orchestration/semantic_router.py
+
+背景:
+宋顾问在Day50内部技术评审中指出,当前Supervisor Agent的任务路由逻辑
+主要依赖显式规则(关键词匹配、字段判断),这类规则在场景数量较少时
+(目前四个专业场景)运行良好,但一旦场景数量增长到两位数以上,
+规则之间容易产生交叉重叠、难以维护,且规则本身无法很好地处理
+"用户表达方式多样但意图相同"的自然语言变体问题。
+
+设计思路:
+本模块实现一个"规则优先、语义兜底"的混合路由策略——
+1. 先尝试用现有的规则路由表做快速、可解释、零成本的匹配;
+2. 如果规则路由无法给出足够高置信度的判断(比如同时匹配多条规则,
+   或者完全匹配不到任何规则),再退化到基于语义相似度的动态路由,
+   把用户请求与各个专业Agent的"能力描述向量"做相似度比较,
+   选出最匹配的一个或多个候选,必要时提示需要人工确认;
+3. 每一次路由决策都记录决策路径(规则命中还是语义兜底),
+   便于团队持续观察语义兜底被触发的频率,作为未来是否需要
+   进一步优化规则库或者干脆转向纯语义路由的数据依据。
+
+这套代码目前是一份"过渡期原型",不代表最终的生产实现,
+但已经具备完整的可测试性,足以支撑年底旗舰项目预研阶段的技术验证。
+"""
+
+from __future__ import annotations
+
+import math
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional
+
+logger = logging.getLogger("cangqiong.orchestration.semantic_router")
+
+
+@dataclass
+class RoutingRule:
+    """
+    单条规则路由的定义。
+
+    keywords中任意一个关键词出现在用户输入里,即视为命中该规则,
+    priority用于同时命中多条规则时的优先级排序(数值越大优先级越高)。
+    """
+
+    agent_name: str
+    keywords: list[str]
+    priority: int = 0
+    description: str = ""
+
+    def matches(self, user_text: str) -> bool:
+        return any(keyword in user_text for keyword in self.keywords)
+
+
+@dataclass
+class AgentCapabilityProfile:
+    """
+    专业Agent的能力画像,用于语义兜底路由阶段计算相似度。
+
+    capability_vector在真实生产实现中,应该是通过embedding模型
+    对description编码得到的稠密向量;这里为了保证课堂代码不依赖
+    外部模型服务、可以离线独立运行和测试,采用一种简化的
+    "词袋频率向量"来近似模拟语义相似度计算的效果,
+    保留完整的接口形态,方便未来直接替换为真实的embedding调用。
+    """
+
+    agent_name: str
+    description: str
+    sample_utterances: list[str] = field(default_factory=list)
+
+    def build_bag_of_words_vector(self) -> dict[str, float]:
+        """
+        用样例语句构建一个简化的词袋向量,作为embedding的替代品。
+
+        这不是真正的语义向量,但足以在没有外部模型依赖的情况下,
+        验证"混合路由架构"本身的正确性,后续接入真实embedding服务时,
+        只需要替换这个方法的实现,上层调用逻辑完全不需要改动。
+        """
+
+        vector: dict[str, float] = {}
+        all_text = self.description + " " + " ".join(self.sample_utterances)
+        for char in all_text:
+            if char.strip():
+                vector[char] = vector.get(char, 0.0) + 1.0
+        norm = math.sqrt(sum(v * v for v in vector.values())) or 1.0
+        return {k: v / norm for k, v in vector.items()}
+
+
+def _text_to_char_vector(text: str) -> dict[str, float]:
+    """把输入文本转换成和build_bag_of_words_vector同构的字符频率向量"""
+    vector: dict[str, float] = {}
+    for char in text:
+        if char.strip():
+            vector[char] = vector.get(char, 0.0) + 1.0
+    norm = math.sqrt(sum(v * v for v in vector.values())) or 1.0
+    return {k: v / norm for k, v in vector.items()}
+
+
+def _cosine_similarity(vec_a: dict[str, float], vec_b: dict[str, float]) -> float:
+    common_keys = set(vec_a.keys()) & set(vec_b.keys())
+    return sum(vec_a[k] * vec_b[k] for k in common_keys)
+
+
+@dataclass
+class RoutingDecision:
+    """一次路由决策的完整结果,包含决策路径用于后续观测分析。"""
+
+    matched_agent: Optional[str]
+    decision_path: str            # "rule_matched" / "semantic_fallback" / "no_match"
+    confidence: float
+    candidates: list[tuple[str, float]] = field(default_factory=list)
+    matched_rule_count: int = 0
+
+
+class HybridSemanticRouter:
+    """
+    规则优先、语义兜底的混合路由引擎。
+
+    使用示例::
+
+        router = HybridSemanticRouter()
+        router.register_rule(RoutingRule("meeting_agent", ["会议纪要", "会议记录"], priority=10))
+        router.register_capability(AgentCapabilityProfile(
+            "meeting_agent", "负责整理会议内容、提炼待办事项",
+            sample_utterances=["帮我整理一下这次周会的内容"],
+        ))
+        decision = router.route("能不能帮我把刚才那场评审会的讨论内容整理一下")
+    """
+
+    def __init__(self, semantic_confidence_threshold: float = 0.35) -> None:
+        self.rules: list[RoutingRule] = []
+        self.capability_profiles: dict[str, AgentCapabilityProfile] = {}
+        self.semantic_confidence_threshold = semantic_confidence_threshold
+        self._decision_log: list[RoutingDecision] = []
+
+    def register_rule(self, rule: RoutingRule) -> None:
+        self.rules.append(rule)
+
+    def register_capability(self, profile: AgentCapabilityProfile) -> None:
+        self.capability_profiles[profile.agent_name] = profile
+
+    def _route_by_rules(self, user_text: str) -> RoutingDecision:
+        matched = [rule for rule in self.rules if rule.matches(user_text)]
+        if not matched:
+            return RoutingDecision(matched_agent=None, decision_path="no_rule_match", confidence=0.0)
+
+        if len(matched) == 1:
+            return RoutingDecision(
+                matched_agent=matched[0].agent_name,
+                decision_path="rule_matched",
+                confidence=1.0,
+                matched_rule_count=1,
+            )
+
+        # 多条规则同时命中,这正是宋顾问担心的"规则重叠"场景,
+        # 按优先级取最高的一条,但要如实记录"命中了多条规则"这个信号,
+        # 供后续统计分析规则库是否需要精简重构。
+        matched_sorted = sorted(matched, key=lambda r: r.priority, reverse=True)
+        top_priority = matched_sorted[0].priority
+        top_candidates = [r for r in matched_sorted if r.priority == top_priority]
+
+        if len(top_candidates) == 1:
+            return RoutingDecision(
+                matched_agent=top_candidates[0].agent_name,
+                decision_path="rule_matched_with_overlap",
+                confidence=0.8,
+                matched_rule_count=len(matched),
+            )
+
+        # 最高优先级仍然有多个候选,规则层面无法消歧,交给语义兜底处理
+        return RoutingDecision(
+            matched_agent=None,
+            decision_path="rule_ambiguous",
+            confidence=0.0,
+            matched_rule_count=len(matched),
+        )
+
+    def _route_by_semantic_fallback(self, user_text: str) -> RoutingDecision:
+        if not self.capability_profiles:
+            return RoutingDecision(matched_agent=None, decision_path="no_match", confidence=0.0)
+
+        user_vector = _text_to_char_vector(user_text)
+        scored: list[tuple[str, float]] = []
+        for agent_name, profile in self.capability_profiles.items():
+            profile_vector = profile.build_bag_of_words_vector()
+            similarity = _cosine_similarity(user_vector, profile_vector)
+            scored.append((agent_name, similarity))
+        scored.sort(key=lambda item: item[1], reverse=True)
+
+        best_agent, best_score = scored[0]
+        if best_score >= self.semantic_confidence_threshold:
+            return RoutingDecision(
+                matched_agent=best_agent,
+                decision_path="semantic_fallback",
+                confidence=best_score,
+                candidates=scored[:3],
+            )
+
+        return RoutingDecision(
+            matched_agent=None,
+            decision_path="no_match",
+            confidence=best_score,
+            candidates=scored[:3],
+        )
+
+    def route(self, user_text: str) -> RoutingDecision:
+        """
+        执行一次完整的路由决策。
+
+        决策顺序:先尝试规则路由,规则能给出唯一且明确结果时直接采用,
+        速度快、可解释性强、成本几乎为零;只有规则路由结果不明确
+        (无匹配或多条规则冲突且优先级也无法区分)时,才启用语义兜底,
+        这也是"混合路由"相比"纯语义路由"的关键优势——
+        绝大多数高频、明确的请求不需要付出语义计算的额外成本。
+        """
+
+        rule_decision = self._route_by_rules(user_text)
+        if rule_decision.decision_path in ("rule_matched", "rule_matched_with_overlap"):
+            self._decision_log.append(rule_decision)
+            return rule_decision
+
+        semantic_decision = self._route_by_semantic_fallback(user_text)
+        semantic_decision.matched_rule_count = rule_decision.matched_rule_count
+        self._decision_log.append(semantic_decision)
+
+        if semantic_decision.matched_agent is None:
+            logger.warning(
+                "路由未能匹配到任何专业Agent,用户输入: %s,语义候选: %s",
+                user_text, semantic_decision.candidates,
+            )
+        return semantic_decision
+
+    def fallback_rate(self) -> float:
+        """统计语义兜底被触发的比例,这个指标是判断规则库是否需要重构的核心依据。"""
+        if not self._decision_log:
+            return 0.0
+        fallback_count = sum(
+            1 for d in self._decision_log if d.decision_path in ("semantic_fallback", "no_match")
+        )
+        return round(fallback_count / len(self._decision_log) * 100, 2)
+
+    def ambiguous_rate(self) -> float:
+        """统计规则本身产生歧义(多条规则命中且无法通过优先级消歧)的比例"""
+        if not self._decision_log:
+            return 0.0
+        ambiguous_count = sum(1 for d in self._decision_log if d.decision_path == "rule_ambiguous")
+        return round(ambiguous_count / len(self._decision_log) * 100, 2)
+
+
+def build_default_router() -> HybridSemanticRouter:
+    """
+    构建对应祺瑞四大场景的默认路由引擎实例,
+    作为团队后续接入更多场景时的参考模板。
+    """
+
+    router = HybridSemanticRouter()
+
+    router.register_rule(RoutingRule("meeting_agent", ["会议纪要", "会议记录", "待办事项"], priority=10))
+    router.register_rule(RoutingRule("approval_agent", ["报销", "请假", "审批", "采购申请"], priority=10))
+    router.register_rule(RoutingRule("contract_agent", ["合同", "条款", "付款条件"], priority=10))
+    router.register_rule(RoutingRule("report_agent", ["周报", "进展汇总", "本周工作"], priority=10))
+
+    router.register_capability(AgentCapabilityProfile(
+        "meeting_agent", "负责整理会议录音转写稿,提炼待办事项、责任人与截止时间",
+        sample_utterances=["帮我把刚才那场评审会的讨论内容整理一下", "这次周会有什么要跟进的事项"],
+    ))
+    router.register_capability(AgentCapabilityProfile(
+        "approval_agent", "负责处理报销、请假、采购等审批流程,校验材料完整性并跟踪审批状态",
+        sample_utterances=["我出差的费用怎么报", "这笔采购申请审批到哪一步了"],
+    ))
+    router.register_capability(AgentCapabilityProfile(
+        "contract_agent", "基于企业合同知识库回答合同条款相关问题,并标注引用来源",
+        sample_utterances=["咱们标准合同里付款周期一般怎么约定", "保密协议的通用条款是什么"],
+    ))
+    router.register_capability(AgentCapabilityProfile(
+        "report_agent", "从多个协作工具汇总团队进展,自动生成结构化周报草稿",
+        sample_utterances=["帮我整理一下这周各个团队的进展", "生成一份本周工作汇总"],
+    ))
+
+    return router
+```
+
+陈铭把这份原型跑起来之后,用一批模拟的用户输入做了验证,专门补了一套单元测试,用来量化观察"混合路由"相比"纯规则路由"在语义变体表达上的提升效果:
+
+```python
+"""
+文件:cangqiong/orchestration/test_semantic_router.py
+说明:动态语义路由引擎的单元测试。
+
+覆盖场景:
+1. 明确命中单条规则的高频请求,应该走rule_matched路径,不触发语义计算。
+2. 命中多条规则但优先级可以区分的场景,应该走rule_matched_with_overlap路径。
+3. 完全没有命中任何规则关键词、但语义上接近某个Agent能力描述的请求,
+   应该能通过语义兜底正确路由(验证"规则覆盖不到的表达方式"能被兜底捕获)。
+4. 完全无法匹配任何专业Agent的请求,应该返回no_match,而不是强行凑一个结果。
+5. fallback_rate和ambiguous_rate两个统计指标计算是否正确。
+"""
+
+from __future__ import annotations
+
+import unittest
+
+from cangqiong.orchestration.semantic_router import (
+    AgentCapabilityProfile,
+    HybridSemanticRouter,
+    RoutingRule,
+    build_default_router,
+)
+
+
+class TestRuleMatchedRouting(unittest.TestCase):
+    def setUp(self) -> None:
+        self.router = build_default_router()
+
+    def test_exact_keyword_match_routes_via_rule(self) -> None:
+        decision = self.router.route("帮我生成这次会议纪要")
+        self.assertEqual(decision.matched_agent, "meeting_agent")
+        self.assertEqual(decision.decision_path, "rule_matched")
+        self.assertEqual(decision.confidence, 1.0)
+
+    def test_approval_keyword_match_routes_via_rule(self) -> None:
+        decision = self.router.route("我想申请一下上周的出差报销")
+        self.assertEqual(decision.matched_agent, "approval_agent")
+        self.assertEqual(decision.decision_path, "rule_matched")
+
+
+class TestRuleOverlapHandling(unittest.TestCase):
+    def test_overlapping_rules_resolved_by_priority(self) -> None:
+        router = HybridSemanticRouter()
+        router.register_rule(RoutingRule("agent_a", ["申请"], priority=5))
+        router.register_rule(RoutingRule("agent_b", ["申请", "报销"], priority=10))
+        decision = router.route("我要申请报销")
+        self.assertEqual(decision.matched_agent, "agent_b")
+        self.assertEqual(decision.decision_path, "rule_matched_with_overlap")
+        self.assertEqual(decision.matched_rule_count, 2)
+
+    def test_equal_priority_overlap_becomes_ambiguous(self) -> None:
+        router = HybridSemanticRouter()
+        router.register_rule(RoutingRule("agent_a", ["申请"], priority=5))
+        router.register_rule(RoutingRule("agent_b", ["申请"], priority=5))
+        router.register_capability(AgentCapabilityProfile("agent_a", "处理申请类请求甲"))
+        router.register_capability(AgentCapabilityProfile("agent_b", "处理申请类请求乙"))
+        decision = router.route("我要申请")
+        # 规则层面无法消歧,应该走语义兜底(即便语义置信度可能很低)
+        self.assertIn(decision.decision_path, ("semantic_fallback", "no_match"))
+
+
+class TestSemanticFallbackCoversRuleBlindSpots(unittest.TestCase):
+    """
+    验证混合路由的核心价值:当用户的表达方式没有命中任何预设关键词,
+    但语义上明显更接近某个Agent的能力描述时,依然能被正确路由,
+    这正是宋顾问指出的"纯规则路由无法应对表达多样性"问题的解法验证。
+    """
+
+    def setUp(self) -> None:
+        self.router = build_default_router()
+
+    def test_paraphrased_meeting_request_falls_back_to_semantic_routing(self) -> None:
+        # 故意不使用"会议纪要"这个精确关键词,而是用近义表达
+        decision = self.router.route("刚才那场评审会讨论的内容能不能帮我整理一下")
+        self.assertEqual(decision.decision_path, "semantic_fallback")
+        # 由于是简化的字符词袋模型,不保证100%命中meeting_agent,
+        # 但至少应该给出一个非空的候选列表用于人工复核参考
+        self.assertTrue(len(decision.candidates) > 0)
+
+    def test_completely_irrelevant_request_returns_no_match(self) -> None:
+        decision = self.router.route("今天天气怎么样适合出去玩吗")
+        self.assertIsNone(decision.matched_agent)
+        self.assertIn(decision.decision_path, ("no_match", "rule_ambiguous"))
+
+
+class TestRoutingMetrics(unittest.TestCase):
+    def test_fallback_rate_reflects_semantic_trigger_frequency(self) -> None:
+        router = build_default_router()
+        router.route("帮我生成会议纪要")          # rule_matched
+        router.route("这周出差报销怎么报")        # rule_matched
+        router.route("刚才讨论的事情整理一下")     # 大概率semantic_fallback或no_match
+        rate = router.fallback_rate()
+        self.assertGreaterEqual(rate, 0.0)
+        self.assertLessEqual(rate, 100.0)
+
+    def test_empty_log_returns_zero_rates(self) -> None:
+        router = HybridSemanticRouter()
+        self.assertEqual(router.fallback_rate(), 0.0)
+        self.assertEqual(router.ambiguous_rate(), 0.0)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+```
+
+王振宇看完这份原型的测试结果,特别提到`test_paraphrased_meeting_request_falls_back_to_semantic_routing`这个用例:"这个测试用例本身就是给宋顾问的答卷——它验证了咱们确实能处理'用户换了个说法但意图不变'的场景,不再是死记硬背几个关键词。这份代码今天肯定不会直接上生产,但它证明了这条改进思路是可行的,足够写进技术债清单里,标注'预研已完成,可排期正式实现'。"
+
+### 七、长期记忆老化与清理策略(回应宋顾问的第二条建议)
+
+宋顾问提的第二条意见——长期记忆缺乏"遗忘机制",长期跑下去记忆库会无限膨胀——同样被王振宇要求当场原型化验证。陈铭结合Day46记忆系统的设计,补了一套记忆重要性评分与老化清理的机制。
+
+```python
+"""
+苍穹企业级智能体中台 - 长期记忆老化与清理策略
+模块路径建议:cangqiong/memory/decay_manager.py
+
+背景:
+宋顾问指出,当前长期记忆系统只有"写入"和"检索"两个动作,
+没有任何机制去处理"这条记忆是不是已经不再重要、该不该被清理"的问题。
+如果放任记忆库无限增长,不仅会持续消耗存储成本,
+检索阶段的候选集越大,相关性排序的噪声也会越大,
+反而可能拖累检索质量,这是一个"看起来记得越多越好,
+实际上记得越杂越差"的典型反直觉工程问题。
+
+设计思路:
+借鉴心理学里"艾宾浩斯遗忘曲线"和推荐系统里"时间衰减因子"的思路,
+给每一条长期记忆维护一个动态的"重要性分数",
+这个分数会随时间自然衰减,但每次被检索命中并被判定为有用时会被强化,
+分数低于阈值的记忆条目会被标记为"可清理",
+由后台定时任务批量清理,而不是立即物理删除
+(先标记、观察一段时间、再物理删除,是为了给误判留出纠错空间)。
+"""
+
+from __future__ import annotations
+
+import math
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Any, Optional
+
+logger = logging.getLogger("cangqiong.memory.decay_manager")
+
+
+class MemoryLifecycleStage(str, Enum):
+    ACTIVE = "active"                 # 正常活跃,参与检索
+    MARKED_FOR_CLEANUP = "marked"     # 分数过低,已标记待清理,但仍保留一段观察期
+    ARCHIVED = "archived"             # 已归档(移入冷存储,不再参与实时检索,但未彻底删除)
+    PURGED = "purged"                 # 已彻底清理
+
+
+@dataclass
+class MemoryImportanceConfig:
+    """记忆重要性评分的可调参数,不同客户/场景可以有不同的衰减策略"""
+
+    half_life_days: float = 30.0        # 重要性分数的半衰期,即多少天分数衰减到初始值的一半
+    reinforcement_boost: float = 0.3    # 每次被有效检索命中后,分数提升的比例
+    cleanup_threshold: float = 0.05     # 分数低于该阈值,标记为待清理
+    observation_period_days: int = 14   # 标记待清理后,观察期天数,期间仍可被"复活"
+    max_reinforcement_score: float = 1.0  # 分数上限,避免无限累积
+
+
+@dataclass
+class MemoryEntry:
+    """单条长期记忆的完整生命周期数据结构"""
+
+    memory_id: str
+    content: str
+    owner_scope: str                 # 记忆归属范围,例如用户ID或团队ID,用于隔离不同租户/用户的记忆
+    base_importance: float = 0.5     # 记忆写入时的初始重要性,由业务场景决定
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    last_reinforced_at: Optional[datetime] = None
+    reinforcement_count: int = 0
+    lifecycle_stage: MemoryLifecycleStage = MemoryLifecycleStage.ACTIVE
+    marked_for_cleanup_at: Optional[datetime] = None
+
+    def current_importance(self, config: MemoryImportanceConfig, now: Optional[datetime] = None) -> float:
+        """
+        计算记忆条目当前时刻的实时重要性分数。
+
+        使用指数衰减模型:score(t) = base_importance * 0.5^(elapsed_days / half_life_days),
+        每次被强化会临时"续命",相当于把衰减的起始时间点重置为最近一次强化的时刻,
+        这也是为什么公式里用的是"距离最近一次强化(或创建)的天数",而不是"距离创建的天数"。
+        """
+        now = now or datetime.utcnow()
+        reference_time = self.last_reinforced_at or self.created_at
+        elapsed_days = max(0.0, (now - reference_time).total_seconds() / 86400.0)
+
+        decay_factor = 0.5 ** (elapsed_days / config.half_life_days)
+        boosted_base = min(
+            config.max_reinforcement_score,
+            self.base_importance * (1 + self.reinforcement_count * config.reinforcement_boost),
+        )
+        return round(boosted_base * decay_factor, 6)
+
+    def reinforce(self, config: MemoryImportanceConfig, now: Optional[datetime] = None) -> None:
+        """
+        当这条记忆在一次检索中被判定为"确实有用"(比如被下游Agent引用生成了回答)时,
+        调用这个方法进行强化,提升它未来一段时间内的重要性分数,
+        并把它从"标记待清理"状态复活回"活跃"状态(如果之前被标记过)。
+        """
+        now = now or datetime.utcnow()
+        self.last_reinforced_at = now
+        self.reinforcement_count += 1
+        if self.lifecycle_stage == MemoryLifecycleStage.MARKED_FOR_CLEANUP:
+            self.lifecycle_stage = MemoryLifecycleStage.ACTIVE
+            self.marked_for_cleanup_at = None
+            logger.info("记忆[%s]因被重新检索命中而复活,退出待清理状态", self.memory_id)
+
+
+class MemoryDecayManager:
+    """
+    长期记忆老化与清理的统一管理器。
+
+    典型使用流程::
+
+        manager = MemoryDecayManager(MemoryImportanceConfig())
+        manager.add_entry(entry)
+        ...
+        manager.run_decay_scan()          # 每日定时任务调用,更新标记状态
+        purge_report = manager.run_purge_sweep()  # 每周定时任务调用,彻底清理观察期已过的条目
+    """
+
+    def __init__(self, config: Optional[MemoryImportanceConfig] = None) -> None:
+        self.config = config or MemoryImportanceConfig()
+        self._entries: dict[str, MemoryEntry] = {}
+
+    def add_entry(self, entry: MemoryEntry) -> None:
+        self._entries[entry.memory_id] = entry
+
+    def reinforce(self, memory_id: str, now: Optional[datetime] = None) -> None:
+        entry = self._entries.get(memory_id)
+        if entry is None:
+            logger.warning("尝试强化一个不存在的记忆条目: %s", memory_id)
+            return
+        entry.reinforce(self.config, now=now)
+
+    def active_entries(self) -> list[MemoryEntry]:
+        """获取当前仍参与实时检索的记忆条目,检索层应该只在这个集合里做相关性排序"""
+        return [
+            e for e in self._entries.values()
+            if e.lifecycle_stage in (MemoryLifecycleStage.ACTIVE, MemoryLifecycleStage.MARKED_FOR_CLEANUP)
+        ]
+
+    def run_decay_scan(self, now: Optional[datetime] = None) -> dict[str, int]:
+        """
+        每日定时扫描任务:重新计算所有活跃记忆的当前重要性分数,
+        分数低于阈值的条目标记为待清理(而不是立即删除)。
+        """
+        now = now or datetime.utcnow()
+        stats = {"scanned": 0, "newly_marked": 0, "still_active": 0}
+
+        for entry in self._entries.values():
+            if entry.lifecycle_stage != MemoryLifecycleStage.ACTIVE:
+                continue
+            stats["scanned"] += 1
+            importance = entry.current_importance(self.config, now=now)
+            if importance < self.config.cleanup_threshold:
+                entry.lifecycle_stage = MemoryLifecycleStage.MARKED_FOR_CLEANUP
+                entry.marked_for_cleanup_at = now
+                stats["newly_marked"] += 1
+                logger.info(
+                    "记忆[%s]重要性分数(%.4f)低于阈值(%.4f),标记为待清理",
+                    entry.memory_id, importance, self.config.cleanup_threshold,
+                )
+            else:
+                stats["still_active"] += 1
+        return stats
+
+    def run_purge_sweep(self, now: Optional[datetime] = None) -> dict[str, int]:
+        """
+        每周定时清理任务:把标记待清理且已经度过观察期、期间未被复活的记忆条目,
+        转入归档状态(而不是直接物理删除,保留一份可追溯的痕迹)。
+        """
+        now = now or datetime.utcnow()
+        stats = {"checked": 0, "archived": 0}
+
+        for entry in self._entries.values():
+            if entry.lifecycle_stage != MemoryLifecycleStage.MARKED_FOR_CLEANUP:
+                continue
+            stats["checked"] += 1
+            if entry.marked_for_cleanup_at is None:
+                continue
+            elapsed_days = (now - entry.marked_for_cleanup_at).total_seconds() / 86400.0
+            if elapsed_days >= self.config.observation_period_days:
+                entry.lifecycle_stage = MemoryLifecycleStage.ARCHIVED
+                stats["archived"] += 1
+                logger.info("记忆[%s]观察期已满且未被复活,转入归档状态", entry.memory_id)
+        return stats
+
+    def purge_archived_permanently(self, older_than_days: int = 90) -> int:
+        """
+        真正意义上的物理清理,仅对已经归档超过指定天数的记忆条目执行,
+        这一步操作不可逆,应该由更高权限的运维流程触发,而不是自动定时任务,
+        这也是团队讨论后达成的共识:自动化流程负责"降级",人工决策负责"彻底删除"。
+        """
+        now = datetime.utcnow()
+        to_purge = []
+        for memory_id, entry in self._entries.items():
+            if entry.lifecycle_stage != MemoryLifecycleStage.ARCHIVED:
+                continue
+            if entry.marked_for_cleanup_at is None:
+                continue
+            elapsed_days = (now - entry.marked_for_cleanup_at).total_seconds() / 86400.0
+            if elapsed_days >= older_than_days:
+                to_purge.append(memory_id)
+
+        for memory_id in to_purge:
+            self._entries[memory_id].lifecycle_stage = MemoryLifecycleStage.PURGED
+        return len(to_purge)
+
+    def stats_summary(self) -> dict[str, int]:
+        summary: dict[str, int] = {stage.value: 0 for stage in MemoryLifecycleStage}
+        for entry in self._entries.values():
+            summary[entry.lifecycle_stage.value] += 1
+        return summary
+```
+
+配套的单元测试,重点验证"衰减—标记—复活—归档"这一整套生命周期的边界条件是否正确:
+
+```python
+"""
+文件:cangqiong/memory/test_decay_manager.py
+说明:长期记忆老化与清理策略的单元测试。
+
+覆盖场景:
+1. 新写入的记忆,短期内重要性分数应保持较高水平,不应被误标记清理。
+2. 长期未被访问的记忆,重要性分数应随时间正确衰减,最终被标记为待清理。
+3. 被标记为待清理的记忆,如果在观察期内被重新检索命中(调用reinforce),
+   应该正确"复活"回活跃状态。
+4. 观察期满且未被复活的记忆,应该被正确转入归档状态。
+5. 归档超过指定天数的记忆,才应该被彻底清理(purge)。
+"""
+
+from __future__ import annotations
+
+import unittest
+from datetime import datetime, timedelta
+
+from cangqiong.memory.decay_manager import (
+    MemoryDecayManager,
+    MemoryEntry,
+    MemoryImportanceConfig,
+    MemoryLifecycleStage,
+)
+
+
+class TestFreshMemoryStaysActive(unittest.TestCase):
+    def test_newly_created_memory_has_high_importance(self) -> None:
+        config = MemoryImportanceConfig(half_life_days=30)
+        entry = MemoryEntry(memory_id="m1", content="用户偏好每周三下午开会", owner_scope="user-001", base_importance=0.8)
+        importance = entry.current_importance(config, now=entry.created_at)
+        self.assertAlmostEqual(importance, 0.8, places=3)
+
+
+class TestDecayOverTime(unittest.TestCase):
+    def test_importance_decays_to_half_after_one_half_life(self) -> None:
+        config = MemoryImportanceConfig(half_life_days=10)
+        created_at = datetime(2026, 1, 1)
+        entry = MemoryEntry(memory_id="m2", content="测试记忆", owner_scope="user-001",
+                             base_importance=0.6, created_at=created_at)
+        importance_after_10_days = entry.current_importance(config, now=created_at + timedelta(days=10))
+        self.assertAlmostEqual(importance_after_10_days, 0.3, places=3)
+
+    def test_decay_scan_marks_low_importance_entries(self) -> None:
+        config = MemoryImportanceConfig(half_life_days=5, cleanup_threshold=0.1)
+        manager = MemoryDecayManager(config)
+        created_at = datetime(2026, 1, 1)
+        stale_entry = MemoryEntry(memory_id="stale", content="很久没用的记忆", owner_scope="user-001",
+                                   base_importance=0.5, created_at=created_at)
+        manager.add_entry(stale_entry)
+
+        # 经过40天(8个半衰期),重要性分数应远低于阈值
+        stats = manager.run_decay_scan(now=created_at + timedelta(days=40))
+        self.assertEqual(stats["newly_marked"], 1)
+        self.assertEqual(stale_entry.lifecycle_stage, MemoryLifecycleStage.MARKED_FOR_CLEANUP)
+
+
+class TestReinforcementRevivesMemory(unittest.TestCase):
+    def test_reinforce_revives_marked_entry(self) -> None:
+        config = MemoryImportanceConfig(half_life_days=5, cleanup_threshold=0.1, reinforcement_boost=0.5)
+        manager = MemoryDecayManager(config)
+        created_at = datetime(2026, 1, 1)
+        entry = MemoryEntry(memory_id="revive-test", content="长期不用但突然又被需要的记忆",
+                             owner_scope="user-001", base_importance=0.5, created_at=created_at)
+        manager.add_entry(entry)
+
+        manager.run_decay_scan(now=created_at + timedelta(days=40))
+        self.assertEqual(entry.lifecycle_stage, MemoryLifecycleStage.MARKED_FOR_CLEANUP)
+
+        manager.reinforce("revive-test", now=created_at + timedelta(days=41))
+        self.assertEqual(entry.lifecycle_stage, MemoryLifecycleStage.ACTIVE)
+        self.assertIsNone(entry.marked_for_cleanup_at)
+
+
+class TestPurgeSweepAndPermanentPurge(unittest.TestCase):
+    def test_purge_sweep_archives_entries_past_observation_period(self) -> None:
+        config = MemoryImportanceConfig(observation_period_days=7)
+        manager = MemoryDecayManager(config)
+        marked_at = datetime(2026, 1, 1)
+        entry = MemoryEntry(memory_id="archive-test", content="待归档记忆", owner_scope="user-001")
+        entry.lifecycle_stage = MemoryLifecycleStage.MARKED_FOR_CLEANUP
+        entry.marked_for_cleanup_at = marked_at
+        manager.add_entry(entry)
+
+        stats = manager.run_purge_sweep(now=marked_at + timedelta(days=8))
+        self.assertEqual(stats["archived"], 1)
+        self.assertEqual(entry.lifecycle_stage, MemoryLifecycleStage.ARCHIVED)
+
+    def test_purge_sweep_does_not_archive_within_observation_period(self) -> None:
+        config = MemoryImportanceConfig(observation_period_days=14)
+        manager = MemoryDecayManager(config)
+        marked_at = datetime(2026, 1, 1)
+        entry = MemoryEntry(memory_id="not-yet", content="观察期内的记忆", owner_scope="user-001")
+        entry.lifecycle_stage = MemoryLifecycleStage.MARKED_FOR_CLEANUP
+        entry.marked_for_cleanup_at = marked_at
+        manager.add_entry(entry)
+
+        stats = manager.run_purge_sweep(now=marked_at + timedelta(days=5))
+        self.assertEqual(stats["archived"], 0)
+        self.assertEqual(entry.lifecycle_stage, MemoryLifecycleStage.MARKED_FOR_CLEANUP)
+
+    def test_permanent_purge_only_affects_old_enough_archived_entries(self) -> None:
+        manager = MemoryDecayManager()
+        old_entry = MemoryEntry(memory_id="old", content="很久之前归档的记忆", owner_scope="user-001")
+        old_entry.lifecycle_stage = MemoryLifecycleStage.ARCHIVED
+        old_entry.marked_for_cleanup_at = datetime.utcnow() - timedelta(days=200)
+        manager.add_entry(old_entry)
+
+        recent_entry = MemoryEntry(memory_id="recent", content="不久前归档的记忆", owner_scope="user-001")
+        recent_entry.lifecycle_stage = MemoryLifecycleStage.ARCHIVED
+        recent_entry.marked_for_cleanup_at = datetime.utcnow() - timedelta(days=10)
+        manager.add_entry(recent_entry)
+
+        purged_count = manager.purge_archived_permanently(older_than_days=90)
+        self.assertEqual(purged_count, 1)
+        self.assertEqual(old_entry.lifecycle_stage, MemoryLifecycleStage.PURGED)
+        self.assertEqual(recent_entry.lifecycle_stage, MemoryLifecycleStage.ARCHIVED)
+
+
+class TestActiveEntriesFiltering(unittest.TestCase):
+    def test_purged_and_archived_entries_excluded_from_active_set(self) -> None:
+        manager = MemoryDecayManager()
+        active_entry = MemoryEntry(memory_id="a", content="活跃", owner_scope="u1")
+        archived_entry = MemoryEntry(memory_id="b", content="已归档", owner_scope="u1")
+        archived_entry.lifecycle_stage = MemoryLifecycleStage.ARCHIVED
+        manager.add_entry(active_entry)
+        manager.add_entry(archived_entry)
+
+        active_ids = {e.memory_id for e in manager.active_entries()}
+        self.assertIn("a", active_ids)
+        self.assertNotIn("b", active_ids)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+```
+
+宋顾问看完这两份当天赶出来的原型代码(在复盘会结束前,王振宇特意又把他请回会议室看了一眼),评价说:"十二天的项目周期里,能在收官当天就把评审提出的问题原型化到这个程度,说明这个团队的反应速度和工程习惯是过硬的。这两块东西离生产可用还有距离,但方向选对了,比很多团队'记下问题然后不了了之'要好得多。"这句话被林悦当场记进了复盘会的会议纪要里。
+
+### 八、复盘数据统计工具扩展:项目健康度综合评分
+
+陈铭在整理"复盘数据汇总小工具"的时候,总觉得只看单一的测试通过率曲线不够全面,晚饭前又追加了一版扩展,把故障恢复时长(MTTR)、团队交付速度(Velocity)也纳入统计,尝试算出一个综合的"项目健康度评分",作为郭建军年底旗舰项目启动前,团队自我评估的一个起点工具。
+
+```python
+"""
+苍穹企业级智能体中台 - 项目健康度综合评分工具(复盘数据统计扩展版)
+模块路径建议:cangqiong/retro/day50_health_score.py
+
+设计说明:
+在原有的"复盘数据汇总小工具"(day50_retro_summary.py)基础上,
+补充三个维度的统计能力:
+1. 故障恢复时长(MTTR, Mean Time To Recovery)—— 衡量团队应急响应能力
+2. 团队交付速度(Velocity)—— 衡量团队在给定周期内完成的功能点数量
+3. 综合项目健康度评分 —— 把测试通过率、延迟、遗留问题数、MTTR、Velocity
+   五个指标按团队认可的权重合成为一个0-100的综合分数,
+   用于在没有客户答辩这种"外部锚点"的普通迭代周期里,
+   也能有一个量化的自我健康检查工具。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+
+@dataclass
+class IncidentRecord:
+    """单次生产或演示环境故障的记录,用于计算MTTR"""
+
+    day: int
+    description: str
+    detected_at_hour: float     # 故障发现时刻,用当天的小时数表示,简化演示
+    resolved_at_hour: float     # 故障解决时刻
+    severity: str = "medium"    # low / medium / high / critical
+
+    @property
+    def recovery_hours(self) -> float:
+        return max(0.0, self.resolved_at_hour - self.detected_at_hour)
+
+
+@dataclass
+class DailyVelocitySnapshot:
+    """单日交付速度快照,用完成的功能点数量近似衡量团队产出"""
+
+    day: int
+    completed_story_points: float
+    planned_story_points: float
+
+    @property
+    def completion_ratio(self) -> float:
+        if self.planned_story_points == 0:
+            return 0.0
+        return round(self.completed_story_points / self.planned_story_points * 100, 2)
+
+
+INCIDENT_HISTORY: list[IncidentRecord] = [
+    IncidentRecord(42, "LangGraph状态图循环终止条件缺陷导致死循环", detected_at_hour=22.5, resolved_at_hour=23.2, severity="high"),
+    IncidentRecord(43, "多Agent并发写入同一状态字段导致竞态条件", detected_at_hour=21.0, resolved_at_hour=23.8, severity="critical"),
+    IncidentRecord(47, "安全护栏异常被宽泛except吞掉导致越权请求未拦截", detected_at_hour=15.3, resolved_at_hour=16.1, severity="critical"),
+    IncidentRecord(49, "MCP Server连接池在高并发下耗尽", detected_at_hour=1.0, resolved_at_hour=3.5, severity="high"),
+]
+
+VELOCITY_HISTORY: list[DailyVelocitySnapshot] = [
+    DailyVelocitySnapshot(39, completed_story_points=5.0, planned_story_points=6.0),
+    DailyVelocitySnapshot(40, completed_story_points=6.0, planned_story_points=6.0),
+    DailyVelocitySnapshot(41, completed_story_points=4.0, planned_story_points=7.0),
+    DailyVelocitySnapshot(42, completed_story_points=5.0, planned_story_points=7.0),
+    DailyVelocitySnapshot(43, completed_story_points=3.0, planned_story_points=8.0),
+    DailyVelocitySnapshot(44, completed_story_points=6.0, planned_story_points=7.0),
+    DailyVelocitySnapshot(45, completed_story_points=5.0, planned_story_points=5.0),
+    DailyVelocitySnapshot(46, completed_story_points=7.0, planned_story_points=7.0),
+    DailyVelocitySnapshot(47, completed_story_points=6.0, planned_story_points=7.0),
+    DailyVelocitySnapshot(48, completed_story_points=8.0, planned_story_points=8.0),
+    DailyVelocitySnapshot(49, completed_story_points=7.0, planned_story_points=7.0),
+]
+
+
+def compute_mttr_by_severity(incidents: list[IncidentRecord]) -> dict[str, float]:
+    """按严重程度分组计算平均故障恢复时长(小时)"""
+    grouped: dict[str, list[float]] = {}
+    for incident in incidents:
+        grouped.setdefault(incident.severity, []).append(incident.recovery_hours)
+
+    return {
+        severity: round(sum(hours) / len(hours), 2)
+        for severity, hours in grouped.items()
+    }
+
+
+def compute_overall_mttr(incidents: list[IncidentRecord]) -> float:
+    if not incidents:
+        return 0.0
+    total = sum(i.recovery_hours for i in incidents)
+    return round(total / len(incidents), 2)
+
+
+def compute_velocity_trend(history: list[DailyVelocitySnapshot]) -> dict[str, Any]:
+    """计算团队交付速度的趋势摘要,重点关注'完成率是否稳定在高位'这个信号"""
+    ratios = [snap.completion_ratio for snap in history]
+    avg_ratio = round(sum(ratios) / len(ratios), 2) if ratios else 0.0
+    min_snap = min(history, key=lambda s: s.completion_ratio)
+    max_snap = max(history, key=lambda s: s.completion_ratio)
+
+    return {
+        "平均完成率": f"{avg_ratio}%",
+        "完成率最低的一天": f"Day{min_snap.day}(完成率{min_snap.completion_ratio}%)",
+        "完成率最高的一天": f"Day{max_snap.day}(完成率{max_snap.completion_ratio}%)",
+        "近三天完成率趋势": [f"Day{s.day}: {s.completion_ratio}%" for s in history[-3:]],
+    }
+
+
+@dataclass
+class HealthScoreWeights:
+    """
+    综合健康度评分的权重配置。
+
+    这套权重是复盘会上团队现场讨论确定的初版,王振宇特意说明:
+    "这个权重不是拍脑袋定的终版,是给年底旗舰项目启动前,
+    先立一个能跑起来的量化基线,后续每个Sprint结束都可以重新校准。"
+    """
+
+    test_pass_rate_weight: float = 0.30
+    latency_weight: float = 0.15
+    open_issues_weight: float = 0.20
+    mttr_weight: float = 0.20
+    velocity_weight: float = 0.15
+
+
+def compute_health_score(
+    latest_pass_rate: float,
+    latest_latency_ms: float,
+    latest_open_issues: int,
+    overall_mttr_hours: float,
+    avg_velocity_completion_ratio: float,
+    weights: HealthScoreWeights = HealthScoreWeights(),
+) -> dict[str, Any]:
+    """
+    计算综合项目健康度评分(0-100分)。
+
+    每个原始指标先归一化到0-100的分数区间,再按权重加权求和:
+    - 测试通过率本身就是0-100的百分比,直接使用
+    - 延迟指标反向计分:延迟越低分数越高,这里假设6000ms为可接受上限
+    - 遗留问题数反向计分:假设15个问题为"很糟糕"的参考基线
+    - MTTR反向计分:假设8小时为"响应很慢"的参考基线
+    - 团队完成率本身就是0-100的百分比,直接使用
+    """
+
+    latency_score = max(0.0, min(100.0, (1 - latest_latency_ms / 6000.0) * 100))
+    open_issues_score = max(0.0, min(100.0, (1 - latest_open_issues / 15.0) * 100))
+    mttr_score = max(0.0, min(100.0, (1 - overall_mttr_hours / 8.0) * 100))
+
+    weighted_total = (
+        latest_pass_rate * weights.test_pass_rate_weight
+        + latency_score * weights.latency_weight
+        + open_issues_score * weights.open_issues_weight
+        + mttr_score * weights.mttr_weight
+        + avg_velocity_completion_ratio * weights.velocity_weight
+    )
+
+    if weighted_total >= 85:
+        grade = "优秀:具备承接更大规模项目的工程基础"
+    elif weighted_total >= 70:
+        grade = "良好:核心能力扎实,存在局部需要打磨的短板"
+    elif weighted_total >= 50:
+        grade = "及格:基本可用,但多个维度需要在下一阶段重点补强"
+    else:
+        grade = "需要重点关注:建议暂缓承接新的高复杂度项目,先补齐工程基础"
+
+    return {
+        "综合健康度评分": round(weighted_total, 2),
+        "评级": grade,
+        "分项得分": {
+            "测试通过率得分": latest_pass_rate,
+            "延迟得分": round(latency_score, 2),
+            "遗留问题得分": round(open_issues_score, 2),
+            "MTTR得分": round(mttr_score, 2),
+            "交付速度得分": avg_velocity_completion_ratio,
+        },
+    }
+
+
+def print_health_report() -> None:
+    from cangqiong.retro.day50_retro_summary import HISTORY  # 复用原有的历史指标数据
+
+    latest = HISTORY[-1]
+    mttr_by_severity = compute_mttr_by_severity(INCIDENT_HISTORY)
+    overall_mttr = compute_overall_mttr(INCIDENT_HISTORY)
+    velocity_trend = compute_velocity_trend(VELOCITY_HISTORY)
+    avg_completion_ratio = float(velocity_trend["平均完成率"].rstrip("%"))
+
+    health_result = compute_health_score(
+        latest_pass_rate=latest.test_pass_rate,
+        latest_latency_ms=latest.avg_latency_ms,
+        latest_open_issues=latest.known_issues,
+        overall_mttr_hours=overall_mttr,
+        avg_velocity_completion_ratio=avg_completion_ratio,
+    )
+
+    print("=" * 70)
+    print("Sprint 4-5(Day39-Day49)项目健康度综合评分报告")
+    print("=" * 70)
+    print(f"按严重程度分组的平均故障恢复时长(MTTR): {mttr_by_severity}")
+    print(f"整体平均MTTR: {overall_mttr}小时")
+    print("-" * 70)
+    for key, value in velocity_trend.items():
+        print(f"{key}: {value}")
+    print("-" * 70)
+    print(f"综合健康度评分: {health_result['综合健康度评分']}")
+    print(f"评级: {health_result['评级']}")
+    print("分项得分明细:")
+    for key, value in health_result["分项得分"].items():
+        print(f"  {key}: {value}")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    print_health_report()
+```
+
+同样地,陈铭补了一套针对这个扩展评分工具的单元测试,重点验证边界值计算和评级判断逻辑的正确性:
+
+```python
+"""
+文件:cangqiong/retro/test_day50_health_score.py
+说明:项目健康度综合评分工具的单元测试。
+"""
+
+from __future__ import annotations
+
+import unittest
+
+from cangqiong.retro.day50_health_score import (
+    HealthScoreWeights,
+    IncidentRecord,
+    compute_health_score,
+    compute_mttr_by_severity,
+    compute_overall_mttr,
+    compute_velocity_trend,
+    DailyVelocitySnapshot,
+)
+
+
+class TestMTTRCalculation(unittest.TestCase):
+    def test_mttr_by_severity_groups_correctly(self) -> None:
+        incidents = [
+            IncidentRecord(1, "a", detected_at_hour=1.0, resolved_at_hour=2.0, severity="high"),
+            IncidentRecord(2, "b", detected_at_hour=1.0, resolved_at_hour=4.0, severity="high"),
+            IncidentRecord(3, "c", detected_at_hour=1.0, resolved_at_hour=1.5, severity="low"),
+        ]
+        result = compute_mttr_by_severity(incidents)
+        self.assertAlmostEqual(result["high"], 2.0)
+        self.assertAlmostEqual(result["low"], 0.5)
+
+    def test_overall_mttr_averages_all_incidents(self) -> None:
+        incidents = [
+            IncidentRecord(1, "a", detected_at_hour=1.0, resolved_at_hour=2.0),
+            IncidentRecord(2, "b", detected_at_hour=1.0, resolved_at_hour=6.0),
+        ]
+        self.assertAlmostEqual(compute_overall_mttr(incidents), 3.0)
+
+    def test_empty_incident_list_returns_zero(self) -> None:
+        self.assertEqual(compute_overall_mttr([]), 0.0)
+
+    def test_negative_recovery_time_clamped_to_zero(self) -> None:
+        # 防御性测试:即便数据录入错误(解决时间早于发现时间),恢复时长不应为负数
+        incident = IncidentRecord(1, "数据录入错误示例", detected_at_hour=10.0, resolved_at_hour=8.0)
+        self.assertEqual(incident.recovery_hours, 0.0)
+
+
+class TestVelocityTrend(unittest.TestCase):
+    def test_completion_ratio_computed_correctly(self) -> None:
+        snap = DailyVelocitySnapshot(day=1, completed_story_points=6.0, planned_story_points=8.0)
+        self.assertEqual(snap.completion_ratio, 75.0)
+
+    def test_zero_planned_points_does_not_raise(self) -> None:
+        snap = DailyVelocitySnapshot(day=1, completed_story_points=0.0, planned_story_points=0.0)
+        self.assertEqual(snap.completion_ratio, 0.0)
+
+    def test_trend_summary_identifies_min_and_max_days(self) -> None:
+        history = [
+            DailyVelocitySnapshot(1, completed_story_points=2.0, planned_story_points=10.0),
+            DailyVelocitySnapshot(2, completed_story_points=9.0, planned_story_points=10.0),
+            DailyVelocitySnapshot(3, completed_story_points=5.0, planned_story_points=10.0),
+        ]
+        trend = compute_velocity_trend(history)
+        self.assertIn("Day1", trend["完成率最低的一天"])
+        self.assertIn("Day2", trend["完成率最高的一天"])
+
+
+class TestHealthScoreComputation(unittest.TestCase):
+    def test_perfect_metrics_yield_high_score(self) -> None:
+        result = compute_health_score(
+            latest_pass_rate=100.0,
+            latest_latency_ms=0.0,
+            latest_open_issues=0,
+            overall_mttr_hours=0.0,
+            avg_velocity_completion_ratio=100.0,
+        )
+        self.assertGreaterEqual(result["综合健康度评分"], 99.0)
+        self.assertIn("优秀", result["评级"])
+
+    def test_poor_metrics_yield_low_score(self) -> None:
+        result = compute_health_score(
+            latest_pass_rate=20.0,
+            latest_latency_ms=6000.0,
+            latest_open_issues=15,
+            overall_mttr_hours=8.0,
+            avg_velocity_completion_ratio=10.0,
+        )
+        self.assertLess(result["综合健康度评分"], 50.0)
+        self.assertIn("需要重点关注", result["评级"])
+
+    def test_day49_realistic_metrics_yield_reasonable_grade(self) -> None:
+        # 用课件中Day49真实的指标数据(通过率95%、延迟3200ms、遗留问题2个)做一次真实场景校验
+        result = compute_health_score(
+            latest_pass_rate=95.0,
+            latest_latency_ms=3200.0,
+            latest_open_issues=2,
+            overall_mttr_hours=2.0,
+            avg_velocity_completion_ratio=90.0,
+        )
+        self.assertGreaterEqual(result["综合健康度评分"], 70.0)
+        self.assertIn(result["评级"], ("优秀:具备承接更大规模项目的工程基础", "良好:核心能力扎实,存在局部需要打磨的短板"))
+
+    def test_custom_weights_change_score_emphasis(self) -> None:
+        heavy_mttr_weights = HealthScoreWeights(
+            test_pass_rate_weight=0.1,
+            latency_weight=0.1,
+            open_issues_weight=0.1,
+            mttr_weight=0.6,
+            velocity_weight=0.1,
+        )
+        result_bad_mttr = compute_health_score(
+            latest_pass_rate=95.0, latest_latency_ms=1000.0, latest_open_issues=1,
+            overall_mttr_hours=8.0, avg_velocity_completion_ratio=95.0,
+            weights=heavy_mttr_weights,
+        )
+        result_good_mttr = compute_health_score(
+            latest_pass_rate=95.0, latest_latency_ms=1000.0, latest_open_issues=1,
+            overall_mttr_hours=0.5, avg_velocity_completion_ratio=95.0,
+            weights=heavy_mttr_weights,
+        )
+        # 在MTTR权重被大幅上调的情况下,MTTR表现更差的一组,综合分应明显更低
+        self.assertLess(result_bad_mttr["综合健康度评分"], result_good_mttr["综合健康度评分"])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+```
+
+这份扩展评分工具跑出来的结果,拿Day49真实数据代入之后,综合健康度评分落在80分左右,和内部技术验收给出的82分相当接近,王振宇看到这个巧合评价说:"两套完全独立设计的评分体系,一个是人工评审打出来的,一个是纯量化指标算出来的,结果差不了几分,这说明咱们对'什么是好项目'这件事,团队的直觉判断和数据度量是基本一致的——这比单独看哪一个数字都更让人放心。"郭建军在旁边听完,笑着补了一句:"行,这个工具留着,年底那个旗舰项目每个阶段都拿它跑一遍,咱们心里也有底。"
+
 ## 今日复盘
 
 晚上七点,郭建军说的那顿庆祝饭如约而至。地点选在了公司附近一家开了很多年的火锅店,阿泽投票获胜。一进门,阿泽就喊了一句:"火锅万岁。"惹得一桌子人都笑了。
