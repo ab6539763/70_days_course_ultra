@@ -2627,6 +2627,1772 @@ if __name__ == "__main__":
         print(f"\n共处理 {len(all_samples)} 份样例。")
 ```
 
+### 文件9:`dict_comprehension_and_set_operations.py` —— 字典推导式与集合运算加练
+
+晚自习正式收尾前,陈铭把老王在课堂上提过一句、但没有展开细讲的"字典推导式"单独拎出来多练了几遍,顺便把"用集合运算对比两份字典的键"这个小技巧也一并练熟——这两个知识点,虽然今天课堂笔记里只是一句话带过,但陈铭发现自己白天写的好几份脚本,凡是"构造一个新字典"的地方,全都是用最朴素的`for`循环加`if`判断完成的,他想看看能不能写得更简洁一些。
+
+```python
+"""
+文件名:dict_comprehension_and_set_operations.py
+作者:陈铭
+说明:
+    晚自习收尾之后,陈铭意识到自己白天写的好几份脚本里,
+    "构造一个新字典"这个动作,都是用最朴素的for循环加if判断来完成的。
+    他把课堂笔记里老王提过一句、但没有展开细讲的"字典推导式"单独找出来
+    多练了几遍,顺便把"用集合运算对比两份字典的键"这个小技巧也一起练了。
+    这份脚本严格限定在Day1-Day5已学知识点范围内:变量、数据类型、
+    字符串、流程控制、列表/元组/集合、字典、JSON。
+"""
+
+print("=" * 70)
+print("Day5 加练:字典推导式与集合运算综合练习")
+print("=" * 70)
+
+# ============================================================
+# 第一部分:字典推导式基础——从列表构造字典
+# ============================================================
+print("\n【第一部分:字典推导式基础】")
+
+trainee_names = ["陈铭", "苏梦", "韩露", "张凡"]
+
+# 写法一:用for循环手动构造(对比用)
+name_length_dict_loop = {}
+for name in trainee_names:
+    name_length_dict_loop[name] = len(name)
+print("for循环构造的姓名长度字典:", name_length_dict_loop)
+
+# 写法二:用字典推导式,一行搞定,效果完全一样
+name_length_dict_comp = {name: len(name) for name in trainee_names}
+print("字典推导式构造的姓名长度字典:", name_length_dict_comp)
+
+print("两种写法结果是否一致:", name_length_dict_loop == name_length_dict_comp)
+
+# ============================================================
+# 第二部分:带条件的字典推导式——只保留满足条件的键值对
+# ============================================================
+print("\n【第二部分:带条件筛选的字典推导式】")
+
+day3_scores = {"陈铭": 92, "苏梦": 84, "韩露": 89, "张凡": 96}
+
+# 只保留成绩大于等于90的学员,用条件筛选的字典推导式
+excellent_scores = {name: score for name, score in day3_scores.items() if score >= 90}
+print("成绩>=90的学员:", excellent_scores)
+
+# 用三元表达式,给每个人的成绩打上"优秀"/"良好"标签,而不是筛选掉不满足条件的
+score_labels = {
+    name: ("优秀" if score >= 90 else "良好")
+    for name, score in day3_scores.items()
+}
+print("成绩标签映射:", score_labels)
+
+# ============================================================
+# 第三部分:字典推导式实现"键值互换"——注意值必须唯一且可哈希
+# ============================================================
+print("\n【第三部分:键值互换】")
+
+id_to_name = {1: "陈铭", 2: "苏梦", 3: "韩露", 4: "张凡"}
+name_to_id = {name: emp_id for emp_id, name in id_to_name.items()}
+print("原始(id->姓名):", id_to_name)
+print("互换后(姓名->id):", name_to_id)
+
+# 演示互换时如果值不唯一会发生什么——后出现的会覆盖先出现的,不会报错
+duplicated_value_dict = {"a": 1, "b": 1, "c": 2}
+swapped = {value: key for key, value in duplicated_value_dict.items()}
+print("\n值重复的字典互换(会发生静默覆盖):", duplicated_value_dict, "->", swapped)
+print("注意: 键a和键b原本都对应值1,互换后只剩下最后遍历到的那一个,这是一个需要小心的陷阱。")
+
+# ============================================================
+# 第四部分:嵌套结构里的字典推导式——从列表嵌套字典中提取新字典
+# ============================================================
+print("\n【第四部分:嵌套结构中的字典推导式】")
+
+trainee_records = [
+    {"name": "陈铭", "background": "跨境电商运营转行", "day3_score": 92},
+    {"name": "苏梦", "background": "零基础转行", "day3_score": 84},
+    {"name": "韩露", "background": "产品运营转行", "day3_score": 89},
+    {"name": "张凡", "background": "在读研究生", "day3_score": 96},
+]
+
+# 从一个"字典列表"提取出"姓名->成绩"的映射字典
+name_score_map = {record["name"]: record["day3_score"] for record in trainee_records}
+print("姓名->成绩映射:", name_score_map)
+
+# 从一个"字典列表"提取出"姓名->背景"的映射字典,同时按背景长度排序展示
+name_background_map = {record["name"]: record["background"] for record in trainee_records}
+sorted_by_background_length = sorted(
+    name_background_map.items(), key=lambda pair: len(pair[1]), reverse=True
+)
+print("按背景描述长度从长到短排序:")
+for name, background in sorted_by_background_length:
+    print(f"  {name}: {background}(长度{len(background)})")
+
+# ============================================================
+# 第五部分:集合运算对比两份字典的键——找出新增、删除、共同的字段
+# ============================================================
+print("\n【第五部分:用集合运算对比两个字典的键】")
+
+# 模拟场景:接口返回结构从"版本1"升级到"版本2",字段发生了变化
+api_response_v1_fields = {"id", "model", "choices", "usage", "created"}
+api_response_v2_fields = {"id", "model", "choices", "usage", "created", "system_fingerprint", "service_tier"}
+
+# 用户可以用集合运算直接对比两个"键的集合"
+newly_added_fields = api_response_v2_fields - api_response_v1_fields
+removed_fields = api_response_v1_fields - api_response_v2_fields
+common_fields = api_response_v1_fields & api_response_v2_fields
+all_fields_involved = api_response_v1_fields | api_response_v2_fields
+
+print("v2新增的字段:", newly_added_fields)
+print("v2相对v1删除的字段:", removed_fields)
+print("两个版本共同拥有的字段:", common_fields)
+print("两个版本涉及的全部字段(去重合并):", all_fields_involved)
+
+# ============================================================
+# 第六部分:把集合运算用在真实字典对象上(通过.keys()视图对象)
+# ============================================================
+print("\n【第六部分:直接对字典的keys()视图做集合运算】")
+
+config_default = {"timeout": 30, "retry": 3, "verbose": False}
+config_user_override = {"timeout": 60, "log_level": "debug"}
+
+# dict.keys()返回的"视图对象"本身就支持集合运算,不需要先手动转成set
+keys_only_in_default = config_default.keys() - config_user_override.keys()
+keys_only_in_override = config_user_override.keys() - config_default.keys()
+keys_in_both = config_default.keys() & config_user_override.keys()
+
+print("只在默认配置里出现的键:", keys_only_in_default)
+print("只在用户覆盖配置里出现的键(是新增的配置项):", keys_only_in_override)
+print("两份配置共同拥有的键(会被覆盖的部分):", keys_in_both)
+
+# ============================================================
+# 第七部分:综合练习——合并默认配置与用户配置,并报告变化
+# ============================================================
+print("\n【第七部分:综合练习——配置合并与变化报告】")
+
+
+def merge_config_with_report(default_config, override_config):
+    """
+    合并默认配置和用户自定义配置,返回合并后的最终配置,以及一份变化报告。
+
+    参数:
+        default_config: 系统默认配置字典。
+        override_config: 用户提供的覆盖配置字典。
+
+    返回:
+        一个元组 (最终配置字典, 变化报告字典)。
+        变化报告里包含:被覆盖的键、新增的键、最终生效的完整配置。
+    """
+    overridden_keys = default_config.keys() & override_config.keys()
+    added_keys = override_config.keys() - default_config.keys()
+
+    final_config = {**default_config, **override_config}
+
+    report = {
+        "overridden_keys": sorted(overridden_keys),
+        "added_keys": sorted(added_keys),
+        "final_key_count": len(final_config),
+    }
+    return final_config, report
+
+
+final_conf, change_report = merge_config_with_report(config_default, config_user_override)
+print("合并后的最终配置:", final_conf)
+print("配置变化报告:", change_report)
+
+# ============================================================
+# 第八部分:边界情况——空字典参与推导式与集合运算
+# ============================================================
+print("\n【第八部分:边界情况——空字典的推导式与集合运算】")
+
+empty_dict = {}
+comprehension_on_empty = {k: v for k, v in empty_dict.items()}
+print("对空字典做字典推导式,结果依然是空字典:", comprehension_on_empty)
+
+keys_diff_with_empty = {"a", "b", "c"} - set(empty_dict.keys())
+print("非空集合减去空字典的键集合,结果不变:", keys_diff_with_empty)
+
+# 两个字典的键完全没有交集时,common应该是空集合,不应该报错
+disjoint_a = {"x": 1, "y": 2}
+disjoint_b = {"m": 3, "n": 4}
+no_common_keys = disjoint_a.keys() & disjoint_b.keys()
+print("两个键完全不重叠的字典,共同键集合为空:", no_common_keys)
+
+print("\n字典推导式与集合运算综合练习结束。")
+```
+
+### 文件10:`nested_json_config_manager.py` —— 多层级JSON配置管理器加练
+
+老王在下午课上提过一句"配置文件也是JSON思维方式的典型应用",陈铭把这句话单独拿出来做了一个更完整的练习——一个模拟"苍穹项目组新人训练营"多层级配置管理器,支持点路径读取深层嵌套字段、支持"默认配置 <- 环境配置 <- 用户个人配置"的分层覆盖,还顺手做了一次"深度合并"与"浅合并"的对比实验,亲眼验证了浅合并会导致数据丢失这个常见的坑。
+
+```python
+"""
+文件名:nested_json_config_manager.py
+作者:陈铭
+说明:
+    老王在下午课上提过一句"配置文件也是JSON思维方式的典型应用",
+    陈铭把这句话单独拿出来做了一个更完整的练习——一个模拟的
+    "苍穹项目组新人训练营"多层级配置管理器,支持:
+        1. 从JSON文件加载配置,文件不存在时使用内置默认配置。
+        2. 支持"点路径"(比如"mentor.contact.email")读取深层嵌套字段。
+        3. 支持配置的分层覆盖(默认配置 <- 环境配置 <- 用户个人配置)。
+        4. 对配置里明显不合理的值做基础校验,并给出友好提示。
+    严格限定在Day1-Day5已学知识点范围内,不使用面向对象、不使用
+    argparse等尚未学过的模块,函数写法只用最基础的定义和调用方式。
+"""
+
+import json
+import os
+
+CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_CONFIG_FILE = os.path.join(CONFIG_DIR, "config_default.json")
+ENV_CONFIG_FILE = os.path.join(CONFIG_DIR, "config_env.json")
+USER_CONFIG_FILE = os.path.join(CONFIG_DIR, "config_user.json")
+
+# 内置的兜底默认配置——即便磁盘上一个配置文件都不存在,程序也应该能正常跑起来
+BUILTIN_DEFAULT_CONFIG = {
+    "training_camp": {
+        "group_name": "苍穹项目组新人训练营第一期",
+        "mentor": {
+            "name": "王振宇",
+            "role": "技术负责人",
+            "contact": {
+                "email": "wangzhenyu@pengyuan-tech.com",
+                "office": "二层B区",
+            },
+        },
+        "schedule": {
+            "morning_start": "09:00",
+            "afternoon_start": "14:00",
+            "evening_study_start": "19:00",
+            "evening_study_end": "21:00",
+        },
+    },
+    "logging": {
+        "level": "info",
+        "output_to_file": False,
+    },
+    "api_defaults": {
+        "timeout_seconds": 30,
+        "max_retry": 3,
+    },
+}
+
+
+def ensure_default_config_file_exists():
+    """
+    如果磁盘上还没有默认配置文件,就用内置的BUILTIN_DEFAULT_CONFIG创建一份。
+    这样第一次运行本脚本时,不需要手动准备任何配置文件就能正常工作。
+    """
+    if not os.path.exists(DEFAULT_CONFIG_FILE):
+        with open(DEFAULT_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(BUILTIN_DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
+        print(f"未找到默认配置文件,已使用内置默认值创建: {DEFAULT_CONFIG_FILE}")
+
+
+def load_json_config(file_path, config_label):
+    """
+    安全地从磁盘加载一份JSON格式的配置文件。
+
+    参数:
+        file_path: 配置文件的完整路径。
+        config_label: 用于打印提示信息时区分是哪一层配置。
+
+    返回:
+        解析成功返回对应的字典;文件不存在或者内容损坏,
+        都返回一个空字典,不会让程序崩溃——空字典意味着
+        "这一层没有提供任何覆盖项",后续合并逻辑天然能正确处理这种情况。
+    """
+    if not os.path.exists(file_path):
+        print(f"提示: {config_label}配置文件不存在({file_path}),视为无覆盖项。")
+        return {}
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"警告: {config_label}配置文件格式不合法(错误: {e.msg}),视为无覆盖项,请检查该文件。")
+        return {}
+
+
+def deep_merge_dict(base_dict, override_dict):
+    """
+    深度合并两个字典:override_dict里的值会覆盖base_dict里对应的值,
+    但如果某个键在两边都对应"字典"类型,则递归地继续深度合并这两个子字典,
+    而不是简单粗暴地整体替换掉。
+
+    这是配置分层覆盖场景里最核心的一个函数——如果不做深度合并,
+    仅仅合并第一层,用户配置里如果只想改mentor.contact.email这一个深层字段,
+    会导致mentor.name、mentor.role这些没提到的字段全部丢失。
+
+    参数:
+        base_dict: 基础字典(优先级较低)。
+        override_dict: 覆盖字典(优先级较高)。
+
+    返回:
+        合并后的新字典,不会修改传入的两个原始字典。
+    """
+    merged = dict(base_dict)   # 先复制一份,避免直接修改原始的base_dict
+
+    for key, override_value in override_dict.items():
+        if (
+            key in merged
+            and isinstance(merged[key], dict)
+            and isinstance(override_value, dict)
+        ):
+            # 两边这个键对应的值都是字典,递归深度合并
+            merged[key] = deep_merge_dict(merged[key], override_value)
+        else:
+            # 否则直接用override_dict里的值整体覆盖(包括override_value本身是列表、字符串、数字等情况)
+            merged[key] = override_value
+
+    return merged
+
+
+def get_by_dot_path(config, dot_path, default_value=None):
+    """
+    用类似"mentor.contact.email"这样的点路径字符串,读取深层嵌套配置的值。
+
+    参数:
+        config: 待读取的配置字典。
+        dot_path: 用点分隔的路径字符串,比如"training_camp.mentor.name"。
+        default_value: 路径上任意一层不存在时返回的默认值。
+
+    返回:
+        找到的值,或者default_value。
+
+    说明:
+        这个函数把"链式get()"的思路进一步封装成了一个通用工具,
+        以后不管配置嵌套多少层,都可以用一个字符串一次性定位到目标字段,
+        不需要每次都手写一长串.get().get().get()。
+    """
+    keys = dot_path.split(".")
+    current = config
+
+    for key in keys:
+        if isinstance(current, dict) and key in current:
+            current = current[key]
+        else:
+            return default_value
+
+    return current
+
+
+def validate_config(config):
+    """
+    对合并后的最终配置做一次基础的合理性校验。
+
+    返回:
+        一个列表,列表里的每一项是一条校验发现的问题描述。
+        空列表代表校验通过,没有发现问题。
+
+    说明:
+        今天(Day5)还没系统学习自定义异常和更严谨的数据校验框架,
+        这里用最朴素的"收集问题列表"的方式,先建立起"配置需要被校验"
+        这个意识,更完整的校验方案会在后面(尤其是学到Pydantic之后)大幅升级。
+    """
+    problems = []
+
+    timeout = get_by_dot_path(config, "api_defaults.timeout_seconds")
+    if timeout is not None and (not isinstance(timeout, (int, float)) or timeout <= 0):
+        problems.append(f"api_defaults.timeout_seconds 应该是一个正数,但实际值是: {timeout!r}")
+
+    max_retry = get_by_dot_path(config, "api_defaults.max_retry")
+    if max_retry is not None and (not isinstance(max_retry, int) or max_retry < 0):
+        problems.append(f"api_defaults.max_retry 应该是一个非负整数,但实际值是: {max_retry!r}")
+
+    log_level = get_by_dot_path(config, "logging.level")
+    valid_log_levels = {"debug", "info", "warning", "error"}
+    if log_level is not None and log_level not in valid_log_levels:
+        problems.append(
+            f"logging.level 取值不在合法范围内(合法值: {sorted(valid_log_levels)}),实际值是: {log_level!r}"
+        )
+
+    mentor_email = get_by_dot_path(config, "training_camp.mentor.contact.email")
+    if mentor_email is not None and "@" not in mentor_email:
+        problems.append(f"training_camp.mentor.contact.email 看起来不是一个合法的邮箱地址: {mentor_email!r}")
+
+    return problems
+
+
+def build_final_config():
+    """
+    完整的配置加载与合并主流程:
+        1. 确保默认配置文件存在(不存在则用内置值创建)。
+        2. 依次加载默认配置、环境配置、用户配置。
+        3. 按"默认 <- 环境 <- 用户"的优先级顺序,依次深度合并。
+        4. 对最终配置做基础校验,打印任何发现的问题。
+
+    返回:
+        最终生效的配置字典。
+    """
+    ensure_default_config_file_exists()
+
+    default_config = load_json_config(DEFAULT_CONFIG_FILE, "默认")
+    env_config = load_json_config(ENV_CONFIG_FILE, "环境")
+    user_config = load_json_config(USER_CONFIG_FILE, "用户个人")
+
+    merged_config = deep_merge_dict(default_config, env_config)
+    merged_config = deep_merge_dict(merged_config, user_config)
+
+    problems = validate_config(merged_config)
+    if problems:
+        print("\n配置校验发现以下问题(不会阻止程序继续运行,但建议尽快修复):")
+        for problem in problems:
+            print(f"  - {problem}")
+    else:
+        print("\n配置校验通过,没有发现明显问题。")
+
+    return merged_config
+
+
+def print_config_summary(config):
+    """打印一份配置摘要,方便快速核对当前生效的关键配置项。"""
+    print("\n当前生效的关键配置项:")
+    print(f"  训练营名称: {get_by_dot_path(config, 'training_camp.group_name', '未设置')}")
+    print(f"  导师姓名: {get_by_dot_path(config, 'training_camp.mentor.name', '未设置')}")
+    print(f"  导师邮箱: {get_by_dot_path(config, 'training_camp.mentor.contact.email', '未设置')}")
+    print(f"  日志级别: {get_by_dot_path(config, 'logging.level', '未设置')}")
+    print(f"  API超时时间: {get_by_dot_path(config, 'api_defaults.timeout_seconds', '未设置')}秒")
+    print(f"  一个不存在的路径(演示默认值兜底): "
+          f"{get_by_dot_path(config, 'training_camp.mentor.non_existent_field', '（该字段未配置)')}")
+
+
+def demo_deep_merge_behavior():
+    """
+    单独演示一次深度合并的行为细节,让"只覆盖提到的字段、不丢失未提到的字段"
+    这个核心特性,通过一个独立的小例子看得更清楚。
+    """
+    print("\n【深度合并行为单独演示】")
+
+    base = {
+        "mentor": {
+            "name": "王振宇",
+            "role": "技术负责人",
+            "contact": {"email": "old@pengyuan-tech.com", "office": "二层B区"},
+        }
+    }
+    override = {
+        "mentor": {
+            "contact": {"email": "new@pengyuan-tech.com"}
+        }
+    }
+
+    merged = deep_merge_dict(base, override)
+    print("基础配置:", base)
+    print("覆盖配置:", override)
+    print("深度合并结果:", merged)
+    print("验证: name和role字段没有丢失 ->", merged["mentor"]["name"], "/", merged["mentor"]["role"])
+    print("验证: office字段没有丢失(override没提到它) ->", merged["mentor"]["contact"]["office"])
+    print("验证: email字段被正确覆盖为新值 ->", merged["mentor"]["contact"]["email"])
+
+    # 对比一次"浅合并"(简单的{**base, **override})会丢失数据的错误示范
+    shallow_merged = {**base, **override}
+    print("\n对比: 如果用浅合并(**展开)而不是深度合并,结果会是:")
+    print(shallow_merged)
+    print("可以看到,浅合并直接把整个mentor字段替换掉了,name/role/office全部丢失,这是一个常见的坑。")
+
+
+if __name__ == "__main__":
+    print("=" * 70)
+    print("Day5 加练:嵌套JSON多层配置管理器")
+    print("=" * 70)
+
+    final_config = build_final_config()
+    print_config_summary(final_config)
+    demo_deep_merge_behavior()
+
+    print("\n嵌套JSON多层配置管理器练习结束。")
+```
+
+### 文件11:`trainee_performance_dict_analysis.py` —— 学员成绩嵌套字典分组统计分析
+
+老王提过一句"字典按键查找效率很高,适合快速分组统计",陈铭把这句话落地成了一份更完整的练习——针对训练营四名学员过去多天的模拟成绩数据,用嵌套字典和字典分组统计的方式,做了一份"简易数据分析报表",完全不依赖任何第三方数据分析库,靠今天学到的字典操作实现"按学员分组""按学员+科目双层分组""反向查找每科最高分获得者"这几种典型的分组统计场景。
+
+```python
+"""
+文件名:trainee_performance_dict_analysis.py
+作者:陈铭
+说明:
+    老王在今天下午提过一句"字典按键查找效率很高,适合快速分组统计"。
+    陈铭把这句话落地成了一份更完整的练习——针对训练营四名学员
+    过去多天的模拟成绩数据,用嵌套字典和字典分组统计的方式,
+    做一份"简易数据分析报表",不依赖任何第三方数据分析库(pandas等
+    要到很后面才会学),完全靠今天学到的字典操作实现。
+    严格限定在Day1-Day5已学知识点范围内。
+"""
+
+import json
+
+# ============================================================
+# 第一部分:构造模拟的多日成绩原始数据(列表嵌套字典)
+# ============================================================
+
+raw_score_records = [
+    {"name": "陈铭", "day": 1, "subject": "Python基础", "score": 90},
+    {"name": "陈铭", "day": 2, "subject": "Python基础", "score": 88},
+    {"name": "陈铭", "day": 3, "subject": "Python基础", "score": 92},
+    {"name": "陈铭", "day": 4, "subject": "数据结构", "score": 85},
+    {"name": "陈铭", "day": 5, "subject": "数据结构", "score": 94},
+    {"name": "苏梦", "day": 1, "subject": "Python基础", "score": 82},
+    {"name": "苏梦", "day": 2, "subject": "Python基础", "score": 85},
+    {"name": "苏梦", "day": 3, "subject": "Python基础", "score": 84},
+    {"name": "苏梦", "day": 4, "subject": "数据结构", "score": 80},
+    {"name": "苏梦", "day": 5, "subject": "数据结构", "score": 86},
+    {"name": "韩露", "day": 1, "subject": "Python基础", "score": 88},
+    {"name": "韩露", "day": 2, "subject": "Python基础", "score": 91},
+    {"name": "韩露", "day": 3, "subject": "Python基础", "score": 89},
+    {"name": "韩露", "day": 4, "subject": "数据结构", "score": 90},
+    {"name": "韩露", "day": 5, "subject": "数据结构", "score": 92},
+    {"name": "张凡", "day": 1, "subject": "Python基础", "score": 95},
+    {"name": "张凡", "day": 2, "subject": "Python基础", "score": 93},
+    {"name": "张凡", "day": 3, "subject": "Python基础", "score": 96},
+    {"name": "张凡", "day": 4, "subject": "数据结构", "score": 97},
+    {"name": "张凡", "day": 5, "subject": "数据结构", "score": 98},
+]
+
+print("=" * 70)
+print("Day5 加练:学员成绩嵌套字典分组统计分析")
+print("=" * 70)
+print(f"\n原始记录条数: {len(raw_score_records)}")
+
+# ============================================================
+# 第二部分:按学员姓名分组——用setdefault构造"分组字典"
+# ============================================================
+print("\n【第二部分:按学员姓名分组】")
+
+
+def group_records_by_name(records):
+    """
+    把一份扁平的记录列表,按name字段分组,变成"姓名 -> 该学员所有记录列表"的字典。
+
+    参数:
+        records: 原始的记录列表,每条记录是一个字典。
+
+    返回:
+        一个字典,键是姓名,值是属于该姓名的所有记录组成的列表。
+
+    说明:
+        这是"分组统计"最基础也是最常用的一个模式——用setdefault()
+        确保第一次遇到某个键时,先给它一个空列表,再把当前记录追加进去。
+        以后你们接触到更专业的数据分析库,这个模式背后的思路是完全通用的。
+    """
+    grouped = {}
+    for record in records:
+        name = record["name"]
+        grouped.setdefault(name, [])
+        grouped[name].append(record)
+    return grouped
+
+
+records_by_name = group_records_by_name(raw_score_records)
+for name, records in records_by_name.items():
+    print(f"{name}: 共有{len(records)}条记录")
+
+# ============================================================
+# 第三部分:按学员计算平均分、最高分、最低分
+# ============================================================
+print("\n【第三部分:按学员计算统计指标】")
+
+
+def compute_stats_for_group(records):
+    """
+    针对一组记录,计算平均分、最高分、最低分,以及最高分对应的那一天。
+
+    参数:
+        records: 属于同一个分组(比如同一个学员)的记录列表。
+
+    返回:
+        一个字典,包含average(平均分,保留2位小数)、highest(最高分)、
+        lowest(最低分)、highest_day(最高分出现在第几天)。
+    """
+    scores = [record["score"] for record in records]
+    average = round(sum(scores) / len(scores), 2)
+    highest = max(scores)
+    lowest = min(scores)
+
+    highest_day = None
+    for record in records:
+        if record["score"] == highest:
+            highest_day = record["day"]
+            break
+
+    return {
+        "average": average,
+        "highest": highest,
+        "lowest": lowest,
+        "highest_day": highest_day,
+    }
+
+
+trainee_stats = {}
+for name, records in records_by_name.items():
+    trainee_stats[name] = compute_stats_for_group(records)
+
+for name, stats in trainee_stats.items():
+    print(
+        f"{name}: 平均分={stats['average']}, "
+        f"最高分={stats['highest']}(第{stats['highest_day']}天), "
+        f"最低分={stats['lowest']}"
+    )
+
+# ============================================================
+# 第四部分:按科目分组统计——两层分组(姓名 -> 科目 -> 分数列表)
+# ============================================================
+print("\n【第四部分:按姓名+科目双层分组统计】")
+
+
+def group_records_by_name_and_subject(records):
+    """
+    构造一个两层嵌套的分组字典:第一层键是姓名,第二层键是科目,
+    最终的值是该学员该科目下的所有分数组成的列表。
+
+    这是"多维度分组统计"的一个典型练习——现实中的数据分析需求,
+    经常不是只按一个维度分组,而是按多个维度交叉分组。
+    """
+    grouped = {}
+    for record in records:
+        name = record["name"]
+        subject = record["subject"]
+        grouped.setdefault(name, {})
+        grouped[name].setdefault(subject, [])
+        grouped[name][subject].append(record["score"])
+    return grouped
+
+
+nested_grouped = group_records_by_name_and_subject(raw_score_records)
+
+for name, subject_scores in nested_grouped.items():
+    print(f"\n{name}:")
+    for subject, scores in subject_scores.items():
+        average = round(sum(scores) / len(scores), 2)
+        print(f"  {subject}: 各次分数={scores}, 平均分={average}")
+
+# ============================================================
+# 第五部分:找出全体学员在每个科目上的最高分获得者(反向查找)
+# ============================================================
+print("\n【第五部分:每个科目的最高分获得者】")
+
+
+def find_top_scorer_per_subject(records):
+    """
+    找出每个科目里,单次得分最高的那名学员。
+
+    参数:
+        records: 全部原始记录列表。
+
+    返回:
+        一个字典,键是科目名称,值是一个字典,包含最高分和对应的学员姓名。
+
+    说明:
+        这里用了一个常见的"运行中维护最大值"的模式:遍历一遍数据,
+        每遇到一个更高的分数就更新记录,不需要先把所有数据分好组再单独扫描一次。
+    """
+    top_scorer_by_subject = {}
+
+    for record in records:
+        subject = record["subject"]
+        score = record["score"]
+        name = record["name"]
+
+        current_top = top_scorer_by_subject.get(subject)
+        if current_top is None or score > current_top["score"]:
+            top_scorer_by_subject[subject] = {"name": name, "score": score, "day": record["day"]}
+
+    return top_scorer_by_subject
+
+
+top_scorers = find_top_scorer_per_subject(raw_score_records)
+for subject, info in top_scorers.items():
+    print(f"{subject}: 最高分是{info['name']}在第{info['day']}天拿到的{info['score']}分")
+
+# ============================================================
+# 第六部分:计算全体学员在全部科目上的总体平均分,并排出名次
+# ============================================================
+print("\n【第六部分:总体平均分排名】")
+
+overall_ranking = sorted(
+    trainee_stats.items(), key=lambda item: item[1]["average"], reverse=True
+)
+
+print("按平均分从高到低排名:")
+for rank, (name, stats) in enumerate(overall_ranking, start=1):
+    print(f"  第{rank}名: {name}, 平均分{stats['average']}")
+
+# ============================================================
+# 第七部分:边界情况——单条记录的分组、空记录列表的分组
+# ============================================================
+print("\n【第七部分:边界情况处理】")
+
+single_record_group = group_records_by_name([{"name": "临时插班生", "day": 1, "subject": "Python基础", "score": 100}])
+print("只有单条记录的分组结果:", single_record_group)
+single_stats = compute_stats_for_group(single_record_group["临时插班生"])
+print("单条记录的统计结果(平均分应该等于这条记录本身的分数):", single_stats)
+
+empty_group_result = group_records_by_name([])
+print("空记录列表分组结果(应该是空字典,不报错):", empty_group_result)
+
+# ============================================================
+# 第八部分:把最终分析报表保存成JSON文件,供后续查看或其他脚本读取
+# ============================================================
+print("\n【第八部分:保存分析报表到JSON文件】")
+
+import os
+
+REPORT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trainee_performance_report.json")
+
+final_report = {
+    "total_records": len(raw_score_records),
+    "trainee_stats": trainee_stats,
+    "top_scorer_by_subject": top_scorers,
+    "overall_ranking": [
+        {"rank": rank, "name": name, "average": stats["average"]}
+        for rank, (name, stats) in enumerate(overall_ranking, start=1)
+    ],
+}
+
+with open(REPORT_FILE, "w", encoding="utf-8") as f:
+    json.dump(final_report, f, ensure_ascii=False, indent=2)
+
+print(f"分析报表已保存到: {REPORT_FILE}")
+
+# 验证保存的内容能被正确读回,且内容一致
+with open(REPORT_FILE, "r", encoding="utf-8") as f:
+    reloaded_report = json.load(f)
+
+print("验证: 保存后重新加载的报表与原始报表是否一致 ->", reloaded_report == final_report)
+
+print("\n学员成绩嵌套字典分组统计分析结束。")
+```
+
+### 文件12:`assert_based_self_check_dict_json.py` —— 用assert语句给核心函数做自检
+
+老王强调过"哪怕是练习题,也要用真项目的标准去对待"。陈铭今天写的几份脚本,大多是靠肉眼对照输出结果来判断"对不对",他想试着换一种更严谨的做法——用Python内置的`assert`语句,给自己写的几个核心函数补一批"自检用例"。`assert`语句完全在今天已学知识点范围内,不需要用到`unittest`这类专门的测试框架(那是后面阶段项目才会引入的工具),单纯的`assert`已经能帮自己在提交代码前,快速发现明显的逻辑错误,而不是等老王现场提问才发现漏洞。
+
+```python
+"""
+文件名:assert_based_self_check_dict_json.py
+作者:陈铭
+说明:
+    老王强调过"哪怕是练习题,也要用真项目的标准去对待"。
+    陈铭今天写的几份脚本(dict_crud_practice.py、parse_mock_api.py等)
+    都是靠肉眼对照输出结果来判断"对不对",他想试着换一种更严谨的做法——
+    用Python内置的assert语句,给自己写的核心函数补一批"自检用例"。
+    assert语句今天(Day5)完全在已学知识点范围内,不需要用到
+    unittest这类专门的测试框架(那是后面阶段项目才会引入的工具),
+    单纯的assert已经能帮自己在提交代码前,快速发现明显的逻辑错误。
+
+    这份脚本把今天写的几个核心函数重新在本文件内简化实现一遍
+    (避免跨文件import带来的路径依赖问题,方便老王直接单独运行这一份检查),
+    然后针对每个函数设计正常情况和边界情况的断言用例。
+"""
+
+import json
+
+print("=" * 70)
+print("Day5 加练:用assert语句给核心函数做自检")
+print("=" * 70)
+
+# ============================================================
+# 待检验的函数一:安全解析JSON(简化版,来自parse_mock_api.py的思路)
+# ============================================================
+
+
+def safe_parse_json(raw_text):
+    """安全地解析JSON文本,失败时返回(False, 错误描述),成功时返回(True, 解析结果)。"""
+    try:
+        return True, json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        return False, f"解析失败: {e.msg}"
+
+
+print("\n【自检一:safe_parse_json】")
+
+# 用例1:合法JSON应该解析成功
+ok, result = safe_parse_json('{"name": "陈铭"}')
+assert ok is True, "用例1失败: 合法JSON应该解析成功"
+assert result == {"name": "陈铭"}, "用例1失败: 解析结果内容不符合预期"
+print("用例1通过: 合法JSON解析成功,结果正确")
+
+# 用例2:非法JSON(单引号)应该解析失败
+ok, result = safe_parse_json("{'name': '陈铭'}")
+assert ok is False, "用例2失败: 非法JSON应该返回解析失败"
+assert isinstance(result, str) and "解析失败" in result, "用例2失败: 失败时应返回包含错误描述的字符串"
+print("用例2通过: 非法JSON(单引号)正确返回解析失败")
+
+# 用例3:空字符串也应该被判定为解析失败,而不是意外报别的异常
+ok, result = safe_parse_json("")
+assert ok is False, "用例3失败: 空字符串应该解析失败"
+print("用例3通过: 空字符串正确返回解析失败")
+
+# 用例4:合法但内容是空对象的JSON,应该解析成功且结果是空字典
+ok, result = safe_parse_json("{}")
+assert ok is True and result == {}, "用例4失败: 空JSON对象应该解析成功为空字典"
+print("用例4通过: 空JSON对象'{}'正确解析为空字典")
+
+# 用例5:合法的JSON数组(不是对象),同样应该解析成功
+ok, result = safe_parse_json("[1, 2, 3]")
+assert ok is True and result == [1, 2, 3], "用例5失败: JSON数组应该正确解析成列表"
+print("用例5通过: JSON数组正确解析成Python列表")
+
+# ============================================================
+# 待检验的函数二:链式安全取值(简化版,来自nested_dict_traversal.py的思路)
+# ============================================================
+
+
+def get_nested_value(data, keys, default=None):
+    """
+    按一串键的路径,安全地读取嵌套字典里的深层值。
+
+    参数:
+        data: 待读取的嵌套字典。
+        keys: 一个字符串列表,依次表示每一层要访问的键。
+        default: 任意一层不存在时返回的默认值。
+    """
+    current = data
+    for key in keys:
+        if isinstance(current, dict) and key in current:
+            current = current[key]
+        else:
+            return default
+    return current
+
+
+print("\n【自检二:get_nested_value】")
+
+sample_data = {
+    "user": {
+        "profile": {
+            "name": "陈铭",
+            "address": {"city": "北京"},
+        }
+    }
+}
+
+# 用例1:正常的多层路径应该能正确取到值
+value = get_nested_value(sample_data, ["user", "profile", "name"])
+assert value == "陈铭", "用例1失败: 正常多层路径取值不正确"
+print("用例1通过: 正常多层路径取值正确")
+
+# 用例2:路径中途某一层不存在,应该返回默认值,不报错
+value = get_nested_value(sample_data, ["user", "profile", "phone"], default="未提供")
+assert value == "未提供", "用例2失败: 路径中途字段缺失时应返回默认值"
+print("用例2通过: 路径中途字段缺失,正确返回默认值")
+
+# 用例3:路径第一层就不存在,同样应该安全返回默认值
+value = get_nested_value(sample_data, ["contact", "email"], default="无联系方式")
+assert value == "无联系方式", "用例3失败: 路径第一层就不存在时应返回默认值"
+print("用例3通过: 路径第一层不存在,正确返回默认值")
+
+# 用例4:空的keys列表,应该直接返回原始数据本身(相当于没有访问任何层级)
+value = get_nested_value(sample_data, [])
+assert value == sample_data, "用例4失败: 空路径应该返回原始数据本身"
+print("用例4通过: 空路径正确返回原始数据本身")
+
+# 用例5:路径中途遇到了一个"非字典"的值,继续往下访问应该安全返回默认值,不应该报错
+value = get_nested_value(sample_data, ["user", "profile", "name", "first_char"], default="不支持继续访问")
+assert value == "不支持继续访问", "用例5失败: 路径中途遇到非字典值时应安全返回默认值"
+print("用例5通过: 路径中途遇到字符串(非字典)时,正确返回默认值而不报错")
+
+# 用例6:目标字段的值本身就是None,应该正确返回None,而不是误判成"字段不存在"
+data_with_none = {"a": {"b": None}}
+value = get_nested_value(data_with_none, ["a", "b"], default="默认值")
+assert value is None, "用例6失败: 值本身为None时,应该返回None而不是默认值"
+print("用例6通过: 字段存在但值为None时,正确区分'存在但为None'与'字段不存在'两种情况")
+
+# ============================================================
+# 待检验的函数三:统计字典里各类型值的分布(新写的一个小工具函数)
+# ============================================================
+
+
+def count_value_types(data):
+    """
+    统计一个字典里,所有"值"分别属于哪些数据类型,以及每种类型出现的次数。
+
+    参数:
+        data: 待统计的字典(只统计第一层的值,不递归深入嵌套结构)。
+
+    返回:
+        一个字典,键是类型名称(字符串形式),值是该类型出现的次数。
+    """
+    type_counts = {}
+    for value in data.values():
+        type_name = type(value).__name__
+        type_counts.setdefault(type_name, 0)
+        type_counts[type_name] += 1
+    return type_counts
+
+
+print("\n【自检三:count_value_types】")
+
+mixed_data = {
+    "name": "陈铭",
+    "age": 32,
+    "height": 175.5,
+    "is_full_time": True,
+    "manager": None,
+    "skills": ["Python", "Excel"],
+    "address": {"city": "北京"},
+    "employee_id": "EMP001",
+}
+
+type_counts = count_value_types(mixed_data)
+assert type_counts["str"] == 2, f"用例1失败: 字符串类型数量应该是2,实际是{type_counts.get('str')}"
+assert type_counts["int"] == 1, f"用例1失败: 整数类型数量应该是1,实际是{type_counts.get('int')}"
+assert type_counts["float"] == 1, f"用例1失败: 浮点数类型数量应该是1,实际是{type_counts.get('float')}"
+assert type_counts["bool"] == 1, f"用例1失败: 布尔类型数量应该是1,实际是{type_counts.get('bool')}"
+assert type_counts["NoneType"] == 1, f"用例1失败: None类型数量应该是1,实际是{type_counts.get('NoneType')}"
+assert type_counts["list"] == 1, f"用例1失败: 列表类型数量应该是1,实际是{type_counts.get('list')}"
+assert type_counts["dict"] == 1, f"用例1失败: 字典类型数量应该是1,实际是{type_counts.get('dict')}"
+print("用例1通过: 混合类型字典的类型统计结果全部正确")
+
+# 用例2:空字典应该返回空的统计结果,不报错
+empty_type_counts = count_value_types({})
+assert empty_type_counts == {}, "用例2失败: 空字典的类型统计结果应该是空字典"
+print("用例2通过: 空字典的类型统计结果正确为空")
+
+# 用例3:所有值都是同一种类型时,应该只有一个类型键,数量等于字典长度
+same_type_data = {"a": 1, "b": 2, "c": 3, "d": 4}
+same_type_counts = count_value_types(same_type_data)
+assert same_type_counts == {"int": 4}, "用例3失败: 全部同类型时统计结果不正确"
+print("用例3通过: 全部同类型的字典,统计结果正确")
+
+# ============================================================
+# 待检验的函数四:JSON安全序列化(处理不可直接序列化的类型)
+# ============================================================
+
+
+def safe_json_dumps(data, **kwargs):
+    """
+    尝试用json.dumps()序列化数据,如果遇到不支持的类型(比如set),
+    自动把set转换成排序后的列表再重试一次,而不是直接抛异常。
+    """
+    try:
+        return json.dumps(data, ensure_ascii=False, **kwargs)
+    except TypeError:
+        def fallback_serializer(obj):
+            if isinstance(obj, set):
+                return sorted(obj)
+            raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+        return json.dumps(data, ensure_ascii=False, default=fallback_serializer, **kwargs)
+
+
+print("\n【自检四:safe_json_dumps】")
+
+# 用例1:普通的、原生支持的数据类型,应该正常序列化
+normal_data = {"name": "陈铭", "age": 32}
+output = safe_json_dumps(normal_data)
+assert json.loads(output) == normal_data, "用例1失败: 普通数据序列化后反解析应该和原数据一致"
+print("用例1通过: 普通数据类型能正常序列化")
+
+# 用例2:包含set类型的数据,应该能被自动兜底转换成列表并成功序列化
+data_with_set = {"tags": {"python", "json", "dict"}}
+output = safe_json_dumps(data_with_set)
+parsed_back = json.loads(output)
+assert isinstance(parsed_back["tags"], list), "用例2失败: set类型应该被转换成list"
+assert set(parsed_back["tags"]) == data_with_set["tags"], "用例2失败: 转换后的内容应该和原始set内容一致"
+print("用例2通过: 含有set类型的数据,能被安全序列化并正确还原内容")
+
+# ============================================================
+# 全部自检结果汇总
+# ============================================================
+
+print("\n" + "=" * 70)
+print("全部自检用例执行完毕,没有任何断言失败,说明以上函数在已覆盖的场景下表现符合预期。")
+print("=" * 70)
+print(
+    "老王点评这种做法时说过一句话:'assert暴露的问题,永远比你自己肉眼盯着print输出'"
+    "发现得快、发现得早,尤其是以后代码越写越多,靠肉眼比对是不现实的。'"
+)
+```
+
+### 文件13:`mock_api_batch_processor.py` —— 批量模拟API返回结果处理与统计报告
+
+`parse_mock_api.py`只处理"一份"模拟API返回结果。晚自习结束前,陈铭想到一个更接近真实场景的问题:如果同时有一批返回结果需要处理(比如批量测试多个问题、统计一段时间内的整体token消耗),要怎么组织代码?这份脚本在`parse_mock_api.py`的基础上,做了一次"批量化"的加强练习——统一了每条记录的处理结果结构,统计成功率、总token消耗、按模型分组的调用次数,还专门验证了"空批次不应该因为除零而报错"这个容易被忽略的边界情况。
+
+```python
+"""
+文件名:mock_api_batch_processor.py
+作者:陈铭
+说明:
+    parse_mock_api.py只处理"一份"模拟API返回结果。晚自习结束前,
+    陈铭想到一个更接近真实场景的问题:如果同时有一批返回结果需要处理
+    (比如批量测试多个问题、统计一段时间内的整体token消耗),
+    要怎么组织代码?这份脚本在parse_mock_api.py的基础上,
+    做了一次"批量化"的加强练习:
+        1. 构造一批(而不是一份)模拟API返回结果。
+        2. 逐一解析并提取关键字段,汇总成一份批量处理报告。
+        3. 统计整批调用的总token消耗、成功率、按模型分组的调用次数。
+        4. 把批量报告保存成JSON文件,并提供一个"重新加载并校验"的环节。
+    严格限定在Day1-Day5已学知识点范围内。
+"""
+
+import json
+import os
+
+BATCH_REPORT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "batch_api_report.json")
+
+# ============================================================
+# 第一部分:构造一批模拟的API返回结果(包含正常返回和错误返回混合的情况)
+# ============================================================
+
+MOCK_BATCH_RESPONSES = [
+    {
+        "request_label": "问题1: 苍穹平台是做什么的",
+        "raw_response": '''
+        {
+            "id": "chatcmpl-batch0001",
+            "model": "deepseek-chat",
+            "choices": [{"message": {"role": "assistant", "content": "苍穹是企业级智能体中台。"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 30, "total_tokens": 50}
+        }
+        ''',
+    },
+    {
+        "request_label": "问题2: 海纳集团的项目进度",
+        "raw_response": '''
+        {
+            "id": "chatcmpl-batch0002",
+            "model": "deepseek-chat",
+            "choices": [{"message": {"role": "assistant", "content": "海纳集团的项目目前处于需求调研阶段。"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 18, "completion_tokens": 40, "total_tokens": 58}
+        }
+        ''',
+    },
+    {
+        "request_label": "问题3: 密钥配置错误的调用",
+        "raw_response": '''
+        {
+            "error": {"message": "Incorrect API key provided.", "type": "authentication_error", "code": "invalid_api_key"}
+        }
+        ''',
+    },
+    {
+        "request_label": "问题4: 用通义千问模型的调用",
+        "raw_response": '''
+        {
+            "id": "chatcmpl-batch0004",
+            "model": "qwen-plus",
+            "choices": [{"message": {"role": "assistant", "content": "供应链知识库覆盖了从原材料到成品的全流程文档。"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 22, "completion_tokens": 35, "total_tokens": 57}
+        }
+        ''',
+    },
+    {
+        "request_label": "问题5: 格式损坏的返回结果",
+        "raw_response": '''
+        {
+            "id": "chatcmpl-batch0005"
+            "model": "deepseek-chat"
+        }
+        ''',
+    },
+    {
+        "request_label": "问题6: 因超长被截断的回复",
+        "raw_response": '''
+        {
+            "id": "chatcmpl-batch0006",
+            "model": "deepseek-chat",
+            "choices": [{"message": {"role": "assistant", "content": "这是一段因为长度限制被截断的回复内容,后面还有很多没说完"}, "finish_reason": "length"}],
+            "usage": {"prompt_tokens": 15, "completion_tokens": 1024, "total_tokens": 1039}
+        }
+        ''',
+    },
+]
+
+print("=" * 70)
+print("Day5 加练:批量模拟API返回结果处理与统计报告")
+print("=" * 70)
+print(f"\n本批次共有 {len(MOCK_BATCH_RESPONSES)} 条待处理的模拟请求记录。")
+
+# ============================================================
+# 第二部分:单条记录的解析函数(思路沿用parse_mock_api.py,做了小幅简化)
+# ============================================================
+
+
+def parse_single_response(raw_text):
+    """
+    解析单条模拟API返回文本,返回一个统一结构的结果字典。
+
+    返回字典的结构约定如下(无论解析是否成功、是否是错误返回,结构保持一致):
+        {
+            "status": "ok" | "api_error" | "parse_error",
+            "model": 模型名称或None,
+            "content": 回复内容或None,
+            "finish_reason": 结束原因或None,
+            "total_tokens": 总token数或0,
+            "error_detail": 出错时的详细描述,正常时为None,
+        }
+
+    说明:
+        统一返回结构,是批量处理场景里非常重要的一个设计原则——
+        如果每条记录解析失败时返回的结构和成功时长得完全不一样,
+        后面做汇总统计的代码就要写一堆"先判断结构再处理"的分支,
+        代码会变得又臭又长。统一结构之后,汇总逻辑可以一视同仁地处理所有记录。
+    """
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        return {
+            "status": "parse_error",
+            "model": None,
+            "content": None,
+            "finish_reason": None,
+            "total_tokens": 0,
+            "error_detail": f"JSON解析失败: {e.msg}",
+        }
+
+    if isinstance(data, dict) and "error" in data:
+        error_block = data.get("error", {})
+        return {
+            "status": "api_error",
+            "model": None,
+            "content": None,
+            "finish_reason": None,
+            "total_tokens": 0,
+            "error_detail": error_block.get("message", "未提供错误详情"),
+        }
+
+    model = data.get("model", "未知模型")
+    choices = data.get("choices", [])
+    usage = data.get("usage", {})
+
+    if len(choices) == 0:
+        content = "（未获取到回复内容)"
+        finish_reason = "未知"
+    else:
+        content = choices[0].get("message", {}).get("content", "（未获取到回复内容)")
+        finish_reason = choices[0].get("finish_reason", "未知")
+
+    return {
+        "status": "ok",
+        "model": model,
+        "content": content,
+        "finish_reason": finish_reason,
+        "total_tokens": usage.get("total_tokens", 0),
+        "error_detail": None,
+    }
+
+
+# ============================================================
+# 第三部分:批量处理主流程——逐条解析,收集统一结构的结果
+# ============================================================
+print("\n【第三部分:逐条处理批量请求】")
+
+processed_results = []
+for item in MOCK_BATCH_RESPONSES:
+    label = item["request_label"]
+    parsed = parse_single_response(item["raw_response"])
+    parsed["request_label"] = label
+    processed_results.append(parsed)
+
+    print(f"\n{label}")
+    print(f"  处理状态: {parsed['status']}")
+    if parsed["status"] == "ok":
+        print(f"  模型: {parsed['model']}, 结束原因: {parsed['finish_reason']}, 消耗token: {parsed['total_tokens']}")
+        print(f"  回复内容摘要: {parsed['content'][:30]}...")
+    else:
+        print(f"  错误详情: {parsed['error_detail']}")
+
+# ============================================================
+# 第四部分:汇总统计——成功率、总token消耗、按模型分组次数
+# ============================================================
+print("\n【第四部分:批量汇总统计】")
+
+
+def summarize_batch_results(results):
+    """
+    对一批已经统一结构化处理过的结果,计算汇总统计信息。
+
+    返回:
+        一个字典,包含:
+            total_count: 总处理条数
+            success_count: 状态为ok的条数
+            api_error_count: 状态为api_error的条数
+            parse_error_count: 状态为parse_error的条数
+            success_rate: 成功率(百分比,保留1位小数)
+            total_tokens_consumed: 全部成功记录的total_tokens之和
+            calls_by_model: 按模型名称分组的调用次数字典(只统计成功的记录)
+            truncated_count: finish_reason为"length"(被截断)的记录数量
+    """
+    total_count = len(results)
+    success_count = sum(1 for r in results if r["status"] == "ok")
+    api_error_count = sum(1 for r in results if r["status"] == "api_error")
+    parse_error_count = sum(1 for r in results if r["status"] == "parse_error")
+
+    success_rate = round(success_count / total_count * 100, 1) if total_count > 0 else 0.0
+
+    total_tokens_consumed = sum(r["total_tokens"] for r in results if r["status"] == "ok")
+
+    calls_by_model = {}
+    for r in results:
+        if r["status"] == "ok":
+            model_name = r["model"]
+            calls_by_model.setdefault(model_name, 0)
+            calls_by_model[model_name] += 1
+
+    truncated_count = sum(1 for r in results if r["status"] == "ok" and r["finish_reason"] == "length")
+
+    return {
+        "total_count": total_count,
+        "success_count": success_count,
+        "api_error_count": api_error_count,
+        "parse_error_count": parse_error_count,
+        "success_rate": success_rate,
+        "total_tokens_consumed": total_tokens_consumed,
+        "calls_by_model": calls_by_model,
+        "truncated_count": truncated_count,
+    }
+
+
+summary = summarize_batch_results(processed_results)
+
+print(f"总处理条数: {summary['total_count']}")
+print(f"成功: {summary['success_count']}, API错误: {summary['api_error_count']}, 格式解析错误: {summary['parse_error_count']}")
+print(f"成功率: {summary['success_rate']}%")
+print(f"成功记录的总token消耗: {summary['total_tokens_consumed']}")
+print(f"按模型分组的调用次数: {summary['calls_by_model']}")
+print(f"因长度限制被截断的回复数量: {summary['truncated_count']}")
+
+if summary["truncated_count"] > 0:
+    print("提示: 存在被截断的回复,以后遇到这种情况,通常需要考虑调大max_tokens参数或者拆分成多轮请求。")
+
+# ============================================================
+# 第五部分:找出本批次里token消耗最高的一条成功记录
+# ============================================================
+print("\n【第五部分:找出token消耗最高的记录】")
+
+successful_results = [r for r in processed_results if r["status"] == "ok"]
+
+if len(successful_results) > 0:
+    most_expensive = max(successful_results, key=lambda r: r["total_tokens"])
+    print(f"消耗token最多的请求: {most_expensive['request_label']}")
+    print(f"消耗了 {most_expensive['total_tokens']} 个token")
+else:
+    print("本批次没有任何成功的记录,无法统计token消耗最高的记录。")
+
+# ============================================================
+# 第六部分:把完整的批量处理结果与汇总统计保存成JSON文件
+# ============================================================
+print("\n【第六部分:保存批量处理报告】")
+
+batch_report = {
+    "batch_size": len(MOCK_BATCH_RESPONSES),
+    "summary": summary,
+    "details": processed_results,
+}
+
+with open(BATCH_REPORT_FILE, "w", encoding="utf-8") as f:
+    json.dump(batch_report, f, ensure_ascii=False, indent=2)
+
+print(f"批量处理报告已保存到: {BATCH_REPORT_FILE}")
+
+# ============================================================
+# 第七部分:重新加载报告文件,验证内容一致,并演示一次"只读取摘要不读取细节"的用法
+# ============================================================
+print("\n【第七部分:重新加载报告并校验】")
+
+with open(BATCH_REPORT_FILE, "r", encoding="utf-8") as f:
+    reloaded_report = json.load(f)
+
+assert reloaded_report == batch_report, "重新加载的报告内容应该和保存前完全一致"
+print("校验通过: 重新加载的报告内容与保存前完全一致。")
+
+# 只关心摘要信息时,不需要处理details这个可能很长的列表
+reloaded_summary_only = reloaded_report["summary"]
+print("仅读取摘要部分(忽略details细节列表):")
+print(json.dumps(reloaded_summary_only, ensure_ascii=False, indent=2))
+
+# ============================================================
+# 第八部分:边界情况——空批次的处理
+# ============================================================
+print("\n【第八部分:边界情况——空批次】")
+
+empty_batch_summary = summarize_batch_results([])
+print("空批次的汇总统计结果(不应该因为除零而报错):", empty_batch_summary)
+assert empty_batch_summary["success_rate"] == 0.0, "空批次的成功率应该被安全地处理为0.0,而不是抛出除零异常"
+print("校验通过: 空批次场景下,成功率被正确地处理为0.0,没有出现除零异常。")
+
+print("\n批量模拟API返回结果处理与统计报告练习结束。")
+```
+
+### 文件14:`simple_json_shape_validator.py` —— 简易JSON形状校验器
+
+老王在需求文档备注里提过一句"以后对接真实API,字段命名、数据类型都要有约定"。陈铭据此写了一个不依赖任何第三方库的"简易JSON形状校验器"——用一份"期望结构"的字典,描述每个字段应该是什么类型、是否必填、长度下限,然后写一个函数逐一核对一份真实数据是否符合这个约定,不符合的地方汇总成一份问题清单,而不是校验到第一个问题就直接罢工。这个思路今天先用最朴素的方式练熟,等后面学到Pydantic之后,会看到一套更严谨的、用类和类型注解表达同样意图的方式。
+
+```python
+"""
+文件名:simple_json_shape_validator.py
+作者:陈铭
+说明:
+    老王在需求文档备注里提过一句"以后对接真实API,字段命名、
+    数据类型都要有约定"。陈铭据此写了一个更完整的练习——一个
+    不依赖任何第三方库(Pydantic等要到后面才学)的"简易JSON形状校验器"。
+    思路很朴素:用一份"期望结构"的字典,描述每个字段应该是什么类型、
+    是否必填,然后写一个函数逐一核对一份真实数据是否符合这个约定,
+    不符合的地方汇总成一份问题清单,而不是校验到第一个问题就直接罢工。
+    严格限定在Day1-Day5已学知识点范围内,不使用正式的异常类定义、
+    不使用面向对象、不使用任何第三方校验库。
+"""
+
+import json
+
+print("=" * 70)
+print("Day5 加练:简易JSON形状校验器")
+print("=" * 70)
+
+# ============================================================
+# 第一部分:定义"期望结构"的描述方式
+# ============================================================
+#
+# 约定:期望结构本身也是一个字典,键是字段名,值是一个描述字典,
+# 描述字典里可以包含:
+#   "type": 期望的Python类型(比如str、int、bool、list、dict)
+#   "required": 是否必填(布尔值,默认视为True)
+#   "min_length": (仅对字符串/列表有效)最小长度限制
+# 这是一种非常朴素的"手写规则表"思路,后面学到Pydantic之后,
+# 会看到一套更严谨、更强大的、用类和类型注解来表达同样意图的方式,
+# 但今天先理解"用字典描述规则、再用代码逐条核对"这个基本思路本身。
+
+USER_PROFILE_SCHEMA = {
+    "name": {"type": str, "required": True, "min_length": 1},
+    "age": {"type": int, "required": True},
+    "email": {"type": str, "required": False, "min_length": 5},
+    "is_full_time": {"type": bool, "required": True},
+    "skills": {"type": list, "required": False, "min_length": 1},
+}
+
+API_RESPONSE_SCHEMA = {
+    "model": {"type": str, "required": True, "min_length": 1},
+    "choices": {"type": list, "required": True, "min_length": 1},
+    "usage": {"type": dict, "required": True},
+}
+
+
+# ============================================================
+# 第二部分:核心校验函数
+# ============================================================
+
+
+def validate_against_schema(data, schema):
+    """
+    按照schema描述的规则,逐一核对data字典是否符合要求。
+
+    参数:
+        data: 待校验的真实数据字典。
+        schema: 描述期望结构的规则字典,格式见上方注释。
+
+    返回:
+        一个问题描述字符串组成的列表。空列表代表校验完全通过。
+
+    说明:
+        这个函数刻意设计成"收集所有问题、一次性返回",而不是
+        发现第一个问题就立即返回或者抛异常——这是校验类函数
+        在真实工程里更常见、也更友好的设计方式,能让调用方
+        一次性看到数据里所有不符合规范的地方,不用改一个报一个、来回折腾。
+    """
+    problems = []
+
+    for field_name, rule in schema.items():
+        is_required = rule.get("required", True)
+        expected_type = rule.get("type")
+        min_length = rule.get("min_length")
+
+        if field_name not in data:
+            if is_required:
+                problems.append(f"缺少必填字段: '{field_name}'")
+            continue   # 字段不存在但不是必填,直接跳过这个字段的其他校验
+
+        value = data[field_name]
+
+        if expected_type is not None and not isinstance(value, expected_type):
+            problems.append(
+                f"字段'{field_name}'的类型不符合预期: "
+                f"期望{expected_type.__name__},实际是{type(value).__name__}"
+            )
+            continue   # 类型都不对了,长度校验也没有意义,直接跳过
+
+        if min_length is not None and hasattr(value, "__len__") and len(value) < min_length:
+            problems.append(
+                f"字段'{field_name}'的长度不满足最小要求: "
+                f"期望至少{min_length},实际是{len(value)}"
+            )
+
+    return problems
+
+
+# ============================================================
+# 第三部分:用户档案数据的校验演示
+# ============================================================
+print("\n【第三部分:用户档案数据校验演示】")
+
+valid_profile = {
+    "name": "陈铭",
+    "age": 32,
+    "email": "chenming@pengyuan-tech.com",
+    "is_full_time": True,
+    "skills": ["Python", "Excel"],
+}
+
+problems = validate_against_schema(valid_profile, USER_PROFILE_SCHEMA)
+print("完全合规的档案数据,校验结果(应该为空列表):", problems)
+assert problems == [], "合规数据的校验结果应该是空列表"
+
+invalid_profile_1 = {
+    "name": "",              # 名字为空,违反min_length规则
+    "age": "三十二",          # 年龄应该是int,实际给了字符串
+    "is_full_time": True,
+    # email是可选字段,不填不算错
+    # skills字段没填,也是可选字段,不算错
+}
+
+problems = validate_against_schema(invalid_profile_1, USER_PROFILE_SCHEMA)
+print("\n存在多处问题的档案数据,校验结果:")
+for problem in problems:
+    print(f"  - {problem}")
+assert len(problems) == 2, f"预期发现2个问题,实际发现{len(problems)}个"
+
+invalid_profile_2 = {
+    "age": 26,
+    "is_full_time": False,
+    # 缺少必填的name字段
+}
+
+problems = validate_against_schema(invalid_profile_2, USER_PROFILE_SCHEMA)
+print("\n缺少必填字段的档案数据,校验结果:")
+for problem in problems:
+    print(f"  - {problem}")
+assert any("name" in p for p in problems), "应该检测到缺少name这个必填字段"
+
+# ============================================================
+# 第四部分:API返回结果的校验演示——用同一套校验器处理不同场景
+# ============================================================
+print("\n【第四部分:API返回结果结构校验演示】")
+
+valid_api_response_text = '''
+{
+    "model": "deepseek-chat",
+    "choices": [{"message": {"role": "assistant", "content": "你好"}}],
+    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+}
+'''
+valid_api_response = json.loads(valid_api_response_text)
+problems = validate_against_schema(valid_api_response, API_RESPONSE_SCHEMA)
+print("合规的API返回结构,校验结果(应该为空列表):", problems)
+assert problems == []
+
+broken_api_response_text = '''
+{
+    "model": "deepseek-chat",
+    "choices": []
+}
+'''
+broken_api_response = json.loads(broken_api_response_text)
+problems = validate_against_schema(broken_api_response, API_RESPONSE_SCHEMA)
+print("\n不合规的API返回结构(choices为空、缺少usage字段),校验结果:")
+for problem in problems:
+    print(f"  - {problem}")
+assert len(problems) == 2, f"预期发现2个问题(choices长度不足+usage缺失),实际发现{len(problems)}个"
+
+# ============================================================
+# 第五部分:批量校验一批数据,汇总出"哪些记录不合规"
+# ============================================================
+print("\n【第五部分:批量校验并汇总不合规记录】")
+
+batch_profiles = [
+    {"name": "陈铭", "age": 32, "is_full_time": True},
+    {"name": "苏梦", "age": "二十六", "is_full_time": True},   # age类型错误
+    {"age": 28, "is_full_time": False},                          # 缺少name
+    {"name": "张凡", "age": 22, "is_full_time": True, "skills": []},  # skills长度不满足要求
+]
+
+
+def batch_validate(records, schema):
+    """
+    批量校验一组记录,返回一个"记录索引 -> 问题列表"的字典,
+    只包含存在问题的记录,完全合规的记录不会出现在返回结果里。
+    """
+    result = {}
+    for index, record in enumerate(records):
+        problems = validate_against_schema(record, schema)
+        if problems:
+            result[index] = problems
+    return result
+
+
+batch_problems = batch_validate(batch_profiles, USER_PROFILE_SCHEMA)
+print(f"本批次共{len(batch_profiles)}条记录,发现{len(batch_problems)}条存在问题:")
+for index, problems in batch_problems.items():
+    print(f"  第{index}条记录:")
+    for problem in problems:
+        print(f"    - {problem}")
+
+assert 1 in batch_problems, "索引1的记录(age类型错误)应该被检测出问题"
+assert 2 in batch_problems, "索引2的记录(缺少name)应该被检测出问题"
+assert 3 in batch_problems, "索引3的记录(skills长度不足)应该被检测出问题"
+assert 0 not in batch_problems, "索引0的记录是完全合规的,不应该出现在问题字典里"
+
+# ============================================================
+# 第六部分:边界情况——空schema、空data的校验行为
+# ============================================================
+print("\n【第六部分:边界情况处理】")
+
+# 空的schema意味着"没有任何规则要求",任何数据都应该校验通过
+problems_with_empty_schema = validate_against_schema({"anything": "无所谓的内容"}, {})
+print("空schema下,任意数据的校验结果(应该为空列表):", problems_with_empty_schema)
+assert problems_with_empty_schema == []
+
+# 空的data,只要schema里的字段都不是必填,也应该校验通过
+optional_only_schema = {"nickname": {"type": str, "required": False}}
+problems_with_empty_data = validate_against_schema({}, optional_only_schema)
+print("空data,但schema里字段都是可选的,校验结果(应该为空列表):", problems_with_empty_data)
+assert problems_with_empty_data == []
+
+# 空的data,但schema里有必填字段,应该检测出缺失
+required_field_schema = {"nickname": {"type": str, "required": True}}
+problems_with_missing_required = validate_against_schema({}, required_field_schema)
+print("空data,但schema要求必填字段,校验结果:", problems_with_missing_required)
+assert len(problems_with_missing_required) == 1
+
+print("\n简易JSON形状校验器练习结束,全部断言均已通过。")
+```
+
+### 文件15:`dict_based_dedup_and_export_tool.py` —— 字典去重与导出工具
+
+这份练习针对一个在真实数据处理里很常见的小问题:一批记录里可能存在"重复"或者"近似重复"的数据,需要先去重、再统一导出成规整的格式。陈铭把这个问题拆成三步来练习:用字典的"键唯一性"特点给一批记录按某个字段去重(分别演示"保留第一条"和"保留最后一条"两种策略)、找出"完全重复"的记录、把去重后的结果分别导出成JSON文件和一份简化的纯文本表格。
+
+```python
+"""
+文件名:dict_based_dedup_and_export_tool.py
+作者:陈铭
+说明:
+    这份练习针对一个在真实数据处理里很常见的小问题:
+    一批记录里可能存在"重复"或者"近似重复"的数据,需要先去重、
+    再统一导出成规整的格式。陈铭把这个问题拆成三步来练习:
+        1. 用字典的"键唯一性"特点给一批记录按某个字段去重(保留第一条或最后一条)。
+        2. 找出"完全重复"的记录(所有字段值都一样)。
+        3. 把去重后的结果,分别导出成JSON文件和一份简化的纯文本表格,
+           作为"数据导出"场景的一个简单练习(还没学到csv模块,这里用
+           字符串拼接手动模拟一份表格式的文本输出)。
+    严格限定在Day1-Day5已学知识点范围内。
+"""
+
+import json
+import os
+
+EXPORT_FILE_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dedup_export.json")
+EXPORT_FILE_TXT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dedup_export.txt")
+
+print("=" * 70)
+print("Day5 加练:字典去重与导出工具")
+print("=" * 70)
+
+# ============================================================
+# 第一部分:构造一批包含重复数据的模拟记录
+# ============================================================
+
+raw_contact_records = [
+    {"name": "陈铭", "phone": "13800000001", "department": "培训生小组"},
+    {"name": "苏梦", "phone": "13800000002", "department": "培训生小组"},
+    {"name": "陈铭", "phone": "13800000001", "department": "培训生小组"},   # 与第一条完全重复
+    {"name": "韩露", "phone": "13800000003", "department": "培训生小组"},
+    {"name": "陈铭", "phone": "13800000009", "department": "培训生小组"},   # 姓名重复但手机号不同
+    {"name": "张凡", "phone": "13800000004", "department": "培训生小组"},
+    {"name": "王振宇", "phone": "13900000000", "department": "技术负责人"},
+]
+
+print(f"\n原始记录条数: {len(raw_contact_records)}")
+
+# ============================================================
+# 第二部分:按"姓名"字段去重——保留第一次出现的记录
+# ============================================================
+print("\n【第二部分:按姓名字段去重(保留首次出现)】")
+
+
+def deduplicate_by_key_keep_first(records, key_field):
+    """
+    按指定字段去重,同一个键值只保留第一次出现的那条记录。
+
+    参数:
+        records: 待去重的记录列表。
+        key_field: 用于判断"是否重复"的字段名。
+
+    返回:
+        去重后的记录列表,顺序保持和原始列表一致(只是把后出现的重复项去掉)。
+
+    说明:
+        这里用一个字典来记录"某个键值是否已经出现过",
+        字典的键唯一性天然适合做这种"是否已存在"的快速判断,
+        比每次都遍历一次结果列表检查是否已存在效率高得多。
+    """
+    seen_keys = {}
+    deduplicated = []
+    for record in records:
+        key_value = record[key_field]
+        if key_value not in seen_keys:
+            seen_keys[key_value] = True
+            deduplicated.append(record)
+    return deduplicated
+
+
+deduped_keep_first = deduplicate_by_key_keep_first(raw_contact_records, "name")
+print(f"按姓名去重(保留首次)后,剩余{len(deduped_keep_first)}条记录:")
+for record in deduped_keep_first:
+    print(f"  {record}")
+
+# ============================================================
+# 第三部分:按"姓名"字段去重——保留最后一次出现的记录
+# ============================================================
+print("\n【第三部分:按姓名字段去重(保留最后出现,常用于'以最新数据为准'的场景)】")
+
+
+def deduplicate_by_key_keep_last(records, key_field):
+    """
+    按指定字段去重,同一个键值只保留最后一次出现的那条记录。
+
+    说明:
+        这个函数体现的思路和上一个函数刚好相反——用字典的"后写入覆盖先写入"
+        这个天然特性,不需要额外判断逻辑,直接遍历一遍、不断用最新的记录覆盖
+        字典里对应的键,最后把字典的值取出来就是"保留最后一次"的结果。
+        这是"利用数据结构本身特性简化逻辑"的一个典型例子。
+    """
+    latest_by_key = {}
+    for record in records:
+        key_value = record[key_field]
+        latest_by_key[key_value] = record   # 后面的记录会自动覆盖前面的
+    return list(latest_by_key.values())
+
+
+deduped_keep_last = deduplicate_by_key_keep_last(raw_contact_records, "name")
+print(f"按姓名去重(保留最后一次)后,剩余{len(deduped_keep_last)}条记录:")
+for record in deduped_keep_last:
+    print(f"  {record}")
+
+print("\n对比: 陈铭这个姓名重复了两次,手机号不同。")
+print("保留首次策略下,陈铭的手机号是:", [r["phone"] for r in deduped_keep_first if r["name"] == "陈铭"])
+print("保留最后策略下,陈铭的手机号是:", [r["phone"] for r in deduped_keep_last if r["name"] == "陈铭"])
+
+# ============================================================
+# 第四部分:找出"完全重复"的记录(所有字段的值都完全一样)
+# ============================================================
+print("\n【第四部分:找出完全重复的记录】")
+
+
+def find_exact_duplicates(records):
+    """
+    找出记录列表中"所有字段值都完全相同"的重复记录组。
+
+    参数:
+        records: 待检查的记录列表,每条记录是一个字典。
+
+    返回:
+        一个列表,列表里的每一项本身又是一个"重复记录组"的列表
+        (只包含出现次数大于1的分组,唯一出现的记录不会出现在结果里)。
+
+    说明:
+        字典本身不能直接作为字典的键(前面学过,字典是不可哈希的),
+        所以这里借助一个小技巧——把每条记录转换成一个"排序后的键值对元组"
+        (元组是可哈希的),用这个元组作为分组依据。
+    """
+    groups = {}
+    for record in records:
+        # 用sorted()保证字典遍历顺序不影响元组的内容一致性
+        record_signature = tuple(sorted(record.items()))
+        groups.setdefault(record_signature, [])
+        groups[record_signature].append(record)
+
+    duplicate_groups = [group for group in groups.values() if len(group) > 1]
+    return duplicate_groups
+
+
+duplicate_groups = find_exact_duplicates(raw_contact_records)
+print(f"发现{len(duplicate_groups)}组完全重复的记录:")
+for group in duplicate_groups:
+    print(f"  重复{len(group)}次: {group[0]}")
+
+# ============================================================
+# 第五部分:导出去重后的结果为JSON文件
+# ============================================================
+print("\n【第五部分:导出为JSON文件】")
+
+with open(EXPORT_FILE_JSON, "w", encoding="utf-8") as f:
+    json.dump(deduped_keep_last, f, ensure_ascii=False, indent=2)
+
+print(f"去重后的记录已导出为JSON文件: {EXPORT_FILE_JSON}")
+
+# ============================================================
+# 第六部分:导出去重后的结果为一份简化的纯文本表格
+# ============================================================
+print("\n【第六部分:导出为纯文本表格(手动拼接,还没学csv模块)】")
+
+
+def export_records_as_text_table(records, field_order):
+    """
+    把一批字典记录,手动拼接成一份简单的纯文本表格。
+
+    参数:
+        records: 待导出的记录列表。
+        field_order: 一个列表,规定表格里字段的显示顺序。
+
+    返回:
+        一个多行的字符串,第一行是表头,后面每行是一条记录。
+
+    说明:
+        这不是正式的CSV格式(真正的CSV要考虑字段里包含逗号、换行符等
+        特殊情况的转义规则,这个我们后面用csv模块的时候会正式学),
+        这里只是用字符串拼接模拟一个"看起来像表格"的简化版本,
+        目的是练习"如何把字典列表转换成另一种适合展示的格式"这个思路本身。
+    """
+    lines = []
+    header_line = " | ".join(field_order)
+    lines.append(header_line)
+    lines.append("-" * len(header_line))
+
+    for record in records:
+        row_values = [str(record.get(field, "")) for field in field_order]
+        lines.append(" | ".join(row_values))
+
+    return "\n".join(lines)
+
+
+text_table = export_records_as_text_table(deduped_keep_last, ["name", "phone", "department"])
+print("生成的文本表格内容:")
+print(text_table)
+
+with open(EXPORT_FILE_TXT, "w", encoding="utf-8") as f:
+    f.write(text_table)
+
+print(f"\n文本表格已导出到: {EXPORT_FILE_TXT}")
+
+# ============================================================
+# 第七部分:边界情况——全部记录都重复、全部记录都不重复
+# ============================================================
+print("\n【第七部分:边界情况处理】")
+
+all_same_records = [
+    {"name": "测试甲", "phone": "10000000000", "department": "测试组"},
+    {"name": "测试甲", "phone": "10000000000", "department": "测试组"},
+    {"name": "测试甲", "phone": "10000000000", "department": "测试组"},
+]
+groups_all_same = find_exact_duplicates(all_same_records)
+print("全部记录都完全相同时,重复组数量:", len(groups_all_same))
+assert len(groups_all_same) == 1 and len(groups_all_same[0]) == 3, "应该只有一组重复,组内包含全部3条记录"
+
+all_unique_records = [
+    {"name": "测试乙", "phone": "10000000001", "department": "测试组"},
+    {"name": "测试丙", "phone": "10000000002", "department": "测试组"},
+]
+groups_all_unique = find_exact_duplicates(all_unique_records)
+print("全部记录都互不相同时,重复组数量(应该为0):", len(groups_all_unique))
+assert len(groups_all_unique) == 0, "全部记录都不重复时,应该找不到任何重复组"
+
+empty_records_result = deduplicate_by_key_keep_first([], "name")
+print("空记录列表去重后的结果(应该是空列表):", empty_records_result)
+assert empty_records_result == [], "空记录列表去重后仍然应该是空列表"
+
+print("\n字典去重与导出工具练习结束。")
+```
+
+晚自习真正结束前,陈铭把这七份加练脚本挨个跑了一遍,确认全部输出符合预期、断言全部通过之后,才把它们和白天的正式产出物一起提交到了GitLab练习仓库。他在commit信息里写了一句:"今天最后这一批加练,主要是想验证一件事——同样是字典和JSON,'刚好够用'和'尽量写扎实'之间,差的不只是代码行数,更是遇到边界情况时,自己心里有没有底。"
+
 ---
 
 ## 今日复盘
