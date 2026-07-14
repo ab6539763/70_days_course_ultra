@@ -2498,6 +2498,1258 @@ if __name__ == "__main__":
 
 老王看到这段记录之后,在评论区回复了一句:"这个坑很典型,记下来,以后写Field约束,建议对照PRD文档里的表格逐字核对一遍,不要凭感觉写数字。"
 
+### 加练:把今天上午提到的Depends()真正用起来,顺手把内存存储升级成仓储模式
+
+晚自习临近九点,CQ-101任务卡上的验收标准已经全部打勾,陈铭其实可以准时收工。但他把白天记的笔记翻回去看了一眼,上午老王讲`Depends()`的时候留过一句话:"今天先建立印象,明天封装校验session_id是否存在这类逻辑时,会正式用到这个东西。"陈铭盘算了一下:明天CQ-102、CQ-103两张任务卡一起压上来,流式接口、数据库迁移,任务量本来就不小,如果今晚能先把`Depends()`用起来、把`_SESSION_STORE`这个裸字典封装成一层"仓储"(Repository)接口,明天替换成SQLite的时候,改动范围会小很多——路由层代码几乎不用变,只需要换一个仓储的具体实现。
+
+他把这个想法在项目群里跟老王提了一句,老王只回了四个字:"可以,加练。"于是这部分内容,严格来说超出了CQ-101任务卡本身的验收范围,陈铭把它们放在一个新的commit里,commit信息写的是"feat: 加练——依赖注入与仓储模式预置(为CQ-102/103铺路)",单独标注出来,不和任务卡验收的核心代码混在一起,方便明天评审的时候老王能一眼看出"哪些是必须交付的,哪些是自己额外加的"。
+
+#### 新文件:`app/repositories/__init__.py`
+
+```python
+"""app/repositories包的初始化文件,用于统一管理各类数据的持久化访问方式。"""
+```
+
+#### 新文件:`app/repositories/session_repository.py` —— 会话存储的仓储层抽象
+
+```python
+"""
+文件名:app/repositories/session_repository.py
+作者:陈铭
+说明:
+    今晚加练的核心产出——把原本直接散落在app/api/v1/chat.py路由函数里的
+    "_SESSION_STORE字典读写"逻辑,抽出来做成一层独立的"仓储"(Repository)抽象。
+
+    为什么要这么做,陈铭在提交说明里写了这样一段解释:
+    "今天路由函数体里直接操作_SESSION_STORE字典,代码是能跑,但这样写法有
+    一个隐藏的问题——路由层的代码,同时承担了'处理HTTP请求'和'管理数据存取'
+    两种完全不同的职责。老王白天讲响应模型的时候提过一句"分层"的原则,我把
+    这个原则往前又推了一步:抽出一个SessionRepository接口,定义好'存一条''查一条'
+    '查全部'这几个动作的方法签名,今天先给一个InMemorySessionRepository实现
+    (内部还是用字典存,行为上跟原来完全一样),但路由层代码,从今天起只认
+    这个接口,不直接碰字典。这样明天CQ-103要把存储迁移到SQLite,只需要新写一个
+    SQLiteSessionRepository类,实现同一套接口方法,路由层代码理论上一行都不用改。"
+
+    这是典型的"依赖倒置原则"(Dependence Inversion Principle)在企业级项目里
+    的实际应用——上层代码(路由)依赖的是一个抽象接口,不依赖某个具体的实现细节,
+    具体实现可以在不影响上层代码的前提下自由替换。
+"""
+
+from __future__ import annotations
+
+import threading
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+
+from app.schemas.chat import ChatMessage
+
+
+@dataclass
+class SessionRecord:
+    """
+    单个会话的完整记录,除了消息列表之外,还额外记录创建时间、
+    最近一次更新时间、以及这个会话累计使用过的provider——
+    这些字段今天的响应模型里暂时不需要用到,但提前存下来,
+    方便明天(甚至更后面Sprint2做用量统计的时候)直接复用,
+    不需要再回头补数据。
+    """
+
+    session_id: str
+    messages: list[ChatMessage] = field(default_factory=list)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    last_provider: str | None = None
+    total_turns: int = 0
+
+
+class SessionRepository(ABC):
+    """
+    会话存储的仓储接口。任何存储介质(内存字典、SQLite、未来的Redis/PostgreSQL)
+    的具体实现,都必须遵守这套方法签名,上层业务代码只依赖这个抽象类,
+    不关心具体是哪种存储介质。
+    """
+
+    @abstractmethod
+    def get(self, session_id: str) -> SessionRecord | None:
+        """按session_id查询会话记录,不存在返回None。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    def exists(self, session_id: str) -> bool:
+        """判断某个session_id是否已经存在。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    def append_turn(
+        self,
+        session_id: str,
+        user_message: ChatMessage,
+        assistant_message: ChatMessage,
+        provider: str,
+    ) -> SessionRecord:
+        """
+        向指定会话追加一轮对话(一条用户消息+一条模型回复),
+        如果session_id不存在,应该自动创建一条新的会话记录。
+
+        :return: 更新之后的完整会话记录
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def replace_history(self, session_id: str, messages: list[ChatMessage]) -> SessionRecord:
+        """
+        直接用一份新的消息列表整体替换某个会话的历史记录。
+
+        这个方法主要是为了兼容今天PRD里"客户端可以在请求体里主动传history,
+        覆盖服务端记录"这条简化规则而存在——严格来说这不是一个特别健康的
+        设计(通常应该以服务端存储为唯一权威来源),但今天的架构图和PRD文档
+        里已经明确写清楚了这是一个临时简化,仓储层如实提供这个方法,
+        不额外加戏、不偷偷改变约定好的行为。
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_messages(self, session_id: str, skip: int, limit: int) -> tuple[list[ChatMessage], int]:
+        """
+        分页查询某个会话的历史消息。
+
+        :return: (本页消息列表, 该会话消息总数)
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def count_sessions(self) -> int:
+        """统计当前存储里一共有多少个会话,用于诊断接口展示服务运行状态。"""
+        raise NotImplementedError
+
+
+class InMemorySessionRepository(SessionRepository):
+    """
+    基于Python字典的内存实现。
+
+    今天的行为效果和之前直接操作_SESSION_STORE字典完全等价,唯一的区别是
+    "读写这个字典"这件事,被集中收敛到了这一个类里,并且额外加了一把线程锁——
+    这是为了提前呼应课后作业第5题里讨论过的"并发写入"风险:虽然今天单进程
+    单线程运行下几乎不会真正触发并发问题,但既然要写一层正式的仓储实现,
+    就顺手把这个已知风险防护起来,而不是留一个"知道有问题但没处理"的隐患。
+    """
+
+    def __init__(self) -> None:
+        self._store: dict[str, SessionRecord] = {}
+        # 用一把全局锁保护读写,今天的并发量很小,这把锁的性能开销完全可以忽略;
+        # 明天迁移到SQLite之后,并发控制会交给数据库自身的事务机制,这把锁的
+        # 使命也就完成了,这是一个"过渡期"的防御性设计,不是长期方案。
+        self._lock = threading.Lock()
+
+    def get(self, session_id: str) -> SessionRecord | None:
+        with self._lock:
+            return self._store.get(session_id)
+
+    def exists(self, session_id: str) -> bool:
+        with self._lock:
+            return session_id in self._store
+
+    def append_turn(
+        self,
+        session_id: str,
+        user_message: ChatMessage,
+        assistant_message: ChatMessage,
+        provider: str,
+    ) -> SessionRecord:
+        with self._lock:
+            record = self._store.get(session_id)
+            if record is None:
+                record = SessionRecord(session_id=session_id)
+                self._store[session_id] = record
+            record.messages.append(user_message)
+            record.messages.append(assistant_message)
+            record.updated_at = datetime.now(timezone.utc)
+            record.last_provider = provider
+            record.total_turns += 1
+            return record
+
+    def replace_history(self, session_id: str, messages: list[ChatMessage]) -> SessionRecord:
+        with self._lock:
+            record = self._store.get(session_id)
+            if record is None:
+                record = SessionRecord(session_id=session_id)
+                self._store[session_id] = record
+            record.messages = list(messages)
+            record.updated_at = datetime.now(timezone.utc)
+            return record
+
+    def list_messages(self, session_id: str, skip: int, limit: int) -> tuple[list[ChatMessage], int]:
+        with self._lock:
+            record = self._store.get(session_id)
+            if record is None:
+                return [], 0
+            total = len(record.messages)
+            page = record.messages[skip : skip + limit]
+            return page, total
+
+    def count_sessions(self) -> int:
+        with self._lock:
+            return len(self._store)
+
+
+_repository_singleton: SessionRepository | None = None
+
+
+def get_session_repository() -> SessionRepository:
+    """
+    仓储实例的工厂函数,同时也是今晚加练里第一个正式用到FastAPI Depends()的地方。
+
+    今天先固定返回InMemorySessionRepository的单例;明天CQ-103只需要改这一个
+    函数内部的实现(比如换成读取配置,决定用内存实现还是SQLite实现),
+    所有依赖`Depends(get_session_repository)`的路由函数,完全不需要跟着改动。
+    """
+    global _repository_singleton
+    if _repository_singleton is None:
+        _repository_singleton = InMemorySessionRepository()
+    return _repository_singleton
+
+
+def reset_session_repository_for_test() -> None:
+    """
+    仅供测试代码使用:重置仓储单例,确保每个测试用例之间数据互不干扰。
+    生产代码路径永远不会调用这个函数。
+    """
+    global _repository_singleton
+    _repository_singleton = None
+```
+
+#### 新文件:`app/core/dependencies.py` —— 依赖注入函数集合
+
+```python
+"""
+文件名:app/core/dependencies.py
+作者:陈铭
+说明:
+    今晚加练的第二部分——把上午课堂笔记里提到的Depends()真正用起来,
+    集中定义几个今天CQ-101里能用得上的依赖函数。这个文件承担的角色,
+    类似于"公共前置检查逻辑的聚集地",所有路由函数只需要在函数签名里
+    声明Depends(...),就能复用这里定义好的逻辑,不需要各自重复实现。
+
+    今晚加练一共实现了三个依赖:
+    1. get_current_settings:返回全局配置对象(上午课堂笔记里的示例,今天正式落地)。
+    2. get_request_context:生成一个贯穿本次请求生命周期的上下文对象
+       (包含一个请求级别的trace_id,用于日志追踪,方便未来排查问题时,
+       能把同一次请求在各处打印的日志串联起来)。
+    3. require_existing_session:校验路径参数session_id是否存在于仓储中,
+       如果不存在直接抛出404异常,拦截掉后续所有业务逻辑的执行——
+       这正是上午老王举的那个例子:"好几个不同的接口都需要先确认session_id
+       存在",用Depends()把这条重复逻辑收敛成一个函数,而不是每个路由
+       函数体开头都手写一遍同样的if判断。
+"""
+
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass
+
+from fastapi import Depends, HTTPException, Path
+
+from app.core.config import Settings, get_settings
+from app.repositories.session_repository import (
+    SessionRepository,
+    get_session_repository,
+)
+
+
+def get_current_settings() -> Settings:
+    """
+    依赖函数:返回全局配置对象。
+
+    单看这一个函数,确实像老王上午说的"看起来跟直接调用get_settings()没什么区别"——
+    但它的价值在于"可替换性":测试代码里,可以用FastAPI提供的
+    app.dependency_overrides机制,把这个依赖函数替换成一个返回"测试专用配置"
+    的假函数,而完全不需要修改任何路由代码,这是今天新写的test_dependencies_and_middleware.py
+    里会具体演示的用法。
+    """
+    return get_settings()
+
+
+@dataclass
+class RequestContext:
+    """
+    请求级别的上下文对象,今晚加练里第一次引入"trace_id"这个概念——
+    每一次HTTP请求进来,都会分配一个独一无二的trace_id,后续这次请求
+    涉及到的所有日志打印,都可以带上这个trace_id,方便未来排查问题时,
+    在一堆并发请求混杂的日志里,精确筛出属于"这一次"请求的完整日志链路。
+    这个思路在企业级后端里非常常见,通常被称为"请求追踪"(Request Tracing)。
+    """
+
+    trace_id: str
+
+
+def get_request_context() -> RequestContext:
+    """
+    依赖函数:为每一次请求生成一个新的trace_id,并包装成RequestContext返回。
+
+    今天先用一个简单的uuid4生成trace_id,注意这里特意没有用default_factory
+    这种Pydantic专属写法,因为RequestContext是一个普通的dataclass,不是
+    Pydantic模型——今晚加练特意展示了"不是所有数据结构都要用Pydantic
+    BaseModel",纯粹用于内部传递、不需要序列化成HTTP响应的数据结构,
+    用轻量的dataclass就足够了,没必要都套上Pydantic的校验开销。
+    """
+    return RequestContext(trace_id=uuid.uuid4().hex)
+
+
+def require_existing_session(
+    session_id: str = Path(..., description="会话标识,必须是已存在的会话"),
+    repository: SessionRepository = Depends(get_session_repository),
+) -> str:
+    """
+    依赖函数:校验路径参数session_id对应的会话是否存在。
+
+    这是今晚加练里最能体现Depends()价值的一个例子——上午老王讲这个概念时,
+    举的例子正是"校验session_id合法性"这个场景,陈铭今晚把它真正实现出来了。
+
+    用法上,任何路由函数只需要把参数声明为
+    `session_id: str = Depends(require_existing_session)`,FastAPI就会先执行
+    这个依赖函数——如果session_id不存在,这里会直接抛出HTTPException,
+    整个请求在到达路由函数体之前就被拦截,业务代码完全不需要再重复写一遍
+    "if session_id not in repository: raise ..."这样的判断。
+
+    :raises HTTPException: session_id不存在时返回404
+    :return: 经过校验、确认存在的session_id(原样返回,方便路由函数直接使用)
+    """
+    if not repository.exists(session_id):
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "SESSION_NOT_FOUND",
+                "message": f"会话{session_id}不存在,请确认session_id是否正确,或先调用POST /api/v1/chat创建会话",
+            },
+        )
+    return session_id
+```
+
+#### 新文件:`app/services/__init__.py`
+
+```python
+"""app/services包的初始化文件,存放业务逻辑服务层,与路由层、仓储层各自分工。"""
+```
+
+#### 新文件:`app/services/chat_service.py` —— 对话业务逻辑服务层
+
+```python
+"""
+文件名:app/services/chat_service.py
+作者:陈铭
+说明:
+    今晚加练的第三部分——把原本直接堆在app/api/v1/chat.py路由函数体里的
+    "拼装messages列表、调用模型客户端、组装响应"这段业务逻辑,抽取成一个
+    独立的服务层ChatService。
+
+    抽取之后,路由函数体会变得非常薄——只负责"接收请求、调用service、
+    返回响应",真正的业务逻辑集中在ChatService里,这样做的好处,陈铭在
+    提交说明里总结成了一句话:"路由层负责'和HTTP协议打交道',服务层负责
+    '和业务规则打交道',仓储层负责'和数据存储打交道',三层各管一段,
+    以后写单元测试,可以直接测服务层的业务逻辑,完全不需要伪造一个HTTP请求,
+    测试会更快、更聚焦。"
+
+    这套"路由层-服务层-仓储层"的三层结构,是企业级Web后端里极其常见的
+    分层方式,苍穹平台后续所有模块(知识库检索、Agent编排等),基本都会
+    沿用这套结构,今天在对话模块上先跑通一遍,是给后面的模块打样。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from app.core.config import Settings
+from app.core.exceptions import ModelClientError, ProviderNotSupportedError
+from app.core.logging_config import logger
+from app.core.model_clients import get_model_client
+from app.repositories.session_repository import SessionRecord, SessionRepository
+from app.schemas.chat import ChatMessage, ChatRequest, MessageRole, Usage
+
+
+@dataclass
+class ChatTurnResult:
+    """
+    服务层返回给路由层的结果结构。之所以单独定义,而不是直接返回
+    schemas/chat.py里的ChatResponse,是为了让服务层不依赖"响应体到底
+    长什么样"这个纯粹属于接口层的细节——服务层只关心"这一轮对话的
+    业务结果是什么",至于这份结果最终怎么包装成HTTP响应,是路由层的职责。
+    这是"关注点分离"在分层设计里的一个具体体现。
+    """
+
+    session_id: str
+    reply_content: str
+    provider: str
+    model: str
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    latency_ms: float
+
+
+class ChatService:
+    """
+    对话业务逻辑服务层,封装"提交一轮对话"这件事背后的完整业务规则:
+    拼装历史消息、调用模型客户端、把结果写回仓储、组装成service层的结果对象。
+    """
+
+    def __init__(self, settings: Settings, repository: SessionRepository) -> None:
+        self._settings = settings
+        self._repository = repository
+
+    def submit_turn(self, body: ChatRequest) -> ChatTurnResult:
+        """
+        处理一轮完整的对话提交流程,和之前直接写在路由函数体里的逻辑
+        在行为上完全等价,只是换了一个更清晰的落脚点。
+
+        :param body: 经过Pydantic校验的请求体
+        :raises ModelClientError: 模型调用失败(网络异常/限流等)
+        :raises ProviderNotSupportedError: provider不在支持范围内(防御性兜底)
+        """
+        session_id = body.resolve_session_id()
+        full_messages = self._build_full_messages(session_id, body)
+
+        logger.info(
+            "session=%s provider=%s model=%s 收到一轮对话请求,历史消息数=%d",
+            session_id,
+            body.provider,
+            body.model or "(默认)",
+            len(full_messages) - 1,
+        )
+
+        client = get_model_client(body.provider, self._settings)
+        reply = client.chat(
+            messages=full_messages,
+            temperature=body.temperature,
+            max_tokens=body.max_tokens,
+            model=body.model,
+        )
+
+        self._persist_turn(session_id, body, reply.content)
+
+        return ChatTurnResult(
+            session_id=session_id,
+            reply_content=reply.content,
+            provider=reply.provider,
+            model=reply.model,
+            prompt_tokens=reply.prompt_tokens,
+            completion_tokens=reply.completion_tokens,
+            total_tokens=reply.total_tokens,
+            latency_ms=reply.latency_ms,
+        )
+
+    def _build_full_messages(self, session_id: str, body: ChatRequest) -> list[dict]:
+        """
+        拼装本次请求实际要发送给大模型的完整messages列表。
+
+        沿用今天PRD里约定的简化规则:如果请求体自带history字段,优先信任
+        客户端传入的history;否则读取仓储里已经存在的历史记录。
+        """
+        if body.history:
+            base_messages = [{"role": m.role.value, "content": m.content} for m in body.history]
+        else:
+            existing: SessionRecord | None = self._repository.get(session_id)
+            existing_messages = existing.messages if existing else []
+            base_messages = [{"role": m.role.value, "content": m.content} for m in existing_messages]
+
+        base_messages.append({"role": "user", "content": body.message})
+        return base_messages
+
+    def _persist_turn(self, session_id: str, body: ChatRequest, reply_content: str) -> None:
+        """把用户输入和模型回复,通过仓储接口持久化(今天是内存,明天是数据库)。"""
+        if body.history:
+            # 客户端主动传了history,先整体替换,再追加这一轮,
+            # 保持和之前路由层实现完全一致的行为语义。
+            history_messages = list(body.history)
+            self._repository.replace_history(session_id, history_messages)
+
+        user_message = ChatMessage(role=MessageRole.user, content=body.message)
+        assistant_message = ChatMessage(role=MessageRole.assistant, content=reply_content)
+        self._repository.append_turn(session_id, user_message, assistant_message, body.provider)
+
+    def build_usage(self, result: ChatTurnResult) -> Usage:
+        """把服务层的结果对象里的用量信息,转换成对外响应用的Usage模型。"""
+        return Usage(
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            total_tokens=result.total_tokens,
+        )
+
+
+def get_chat_service(settings: Settings, repository: SessionRepository) -> ChatService:
+    """
+    ChatService的简单工厂函数。之所以不用@lru_cache做成严格单例,是因为
+    ChatService本身不持有任何需要跨请求复用的重资源(重资源—比如HTTP连接池—
+    是由model_clients.py里的_CLIENT_CACHE负责管理的),每次请求new一个
+    ChatService实例的开销几乎可以忽略,不需要额外的单例复杂度。
+    """
+    return ChatService(settings=settings, repository=repository)
+```
+
+#### 新文件:`app/core/middleware.py` —— 请求追踪与耗时统计中间件
+
+```python
+"""
+文件名:app/core/middleware.py
+作者:陈铭
+说明:
+    今晚加练的第四部分。中间件(Middleware)是ASGI/Starlette里的一个概念——
+    它包裹在"路由匹配"这个环节的外层,每一个进来的请求,不管最终匹配到
+    哪个路由,都会先经过所有注册过的中间件。今天新增两个中间件:
+
+    1. RequestContextMiddleware:给每个请求生成一个trace_id,写入
+       请求的state里,并且在响应头里也带上这个trace_id(方便前端/测试
+       脚本在拿到响应之后,能把trace_id反馈给后端团队,加速问题定位)。
+    2. TimingLoggingMiddleware:统计每个请求的处理耗时,并在请求结束后
+       打印一条结构化的访问日志(路径、方法、状态码、耗时),这是运维
+       排查性能问题时最基础也最常用的一类日志。
+
+    这两个中间件和app/core/dependencies.py里的RequestContext依赖函数,
+    看起来功能上有点像,但作用的层次不一样:中间件工作在"所有请求"层面
+    (哪怕认证失败、路由未匹配到,都会经过中间件);依赖函数工作在"某个
+    具体路由"层面,只有真正匹配到路由、进入FastAPI的依赖解析阶段才会执行。
+    今天先把两者都实现出来,是为了让陈铭亲身体会这个层次差异,而不是
+    只停留在概念上的理解。
+"""
+
+from __future__ import annotations
+
+import time
+import uuid
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
+
+from app.core.logging_config import logger
+
+TRACE_ID_HEADER = "X-Trace-Id"
+
+
+class RequestContextMiddleware(BaseHTTPMiddleware):
+    """
+    为每个请求分配trace_id,存入request.state,并写回响应头。
+
+    request.state是Starlette提供的、挂在单次请求生命周期上的一个
+    "临时存储空间",中间件、依赖函数、路由函数体之间,可以通过它
+    传递一些和"这一次请求"绑定的上下文信息,而不需要通过函数参数
+    一层层显式传递。
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        trace_id = request.headers.get(TRACE_ID_HEADER) or uuid.uuid4().hex
+        request.state.trace_id = trace_id
+
+        response = await call_next(request)
+        response.headers[TRACE_ID_HEADER] = trace_id
+        return response
+
+
+class TimingLoggingMiddleware(BaseHTTPMiddleware):
+    """
+    统计每个请求的处理耗时,请求结束后打印一条结构化的访问日志。
+
+    注意:这个中间件用的是async def dispatch,这是Starlette中间件的
+    固定写法要求,和上午课堂笔记里讨论过的"同步def还是异步async def"
+    这个话题不完全是一回事——中间件运行在ASGI的事件循环里,本身
+    必须是异步函数,但中间件内部包裹的call_next(request),最终仍然会
+    正确地把请求分发给我们写的、用普通def声明的路由函数(FastAPI/Starlette
+    内部会自动把同步的路由函数调度到线程池执行,这一点上午已经讲过)。
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        start = time.perf_counter()
+        response: Response = await call_next(request)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+
+        trace_id = getattr(request.state, "trace_id", "-")
+        logger.info(
+            "trace_id=%s method=%s path=%s status_code=%d elapsed_ms=%.1f",
+            trace_id,
+            request.method,
+            request.url.path,
+            response.status_code,
+            elapsed_ms,
+        )
+        response.headers["X-Response-Time-Ms"] = f"{elapsed_ms:.1f}"
+        return response
+
+
+def register_middlewares(app) -> None:
+    """
+    统一的中间件注册入口,app/main.py只需要调用这一个函数,
+    就能把今晚加练新增的两个中间件都挂载上,避免main.py里
+    堆积过多零散的app.add_middleware(...)调用。
+
+    需要特别注意中间件注册的顺序——Starlette的中间件是"洋葱模型",
+    后add_middleware的中间件,反而会包裹在更外层,请求会先经过它。
+    这里先注册TimingLoggingMiddleware再注册RequestContextMiddleware,
+    实际执行顺序是:请求先进入RequestContextMiddleware(生成trace_id),
+    再进入TimingLoggingMiddleware(此时已经能从request.state读到trace_id
+    并打印到日志里)。这个顺序细节今天晚自习陈铭调试了两次才搞清楚,
+    值得在注释里明确写下来,避免以后有人调整顺序时踩到同样的坑。
+    """
+    app.add_middleware(TimingLoggingMiddleware)
+    app.add_middleware(RequestContextMiddleware)
+```
+
+#### 新文件:`app/core/rate_limiter.py` —— 简单的进程内限流器
+
+```python
+"""
+文件名:app/core/rate_limiter.py
+作者:陈铭
+说明:
+    今晚加练的第五部分,呼应课后作业第6题里讨论过的429状态码——
+    今天PRD文档里,429场景仅限于"大模型服务返回限流响应"这一种情况,
+    但陈铭想额外练习一下"我方服务自己主动限流"这个更常见的企业级场景:
+    如果同一个客户端(今天简化成用IP地址区分)在很短时间内发起了过多
+    请求,即使还没触发大模型供应商那边的限流,我们自己也可以提前拒绝,
+    避免宝贵的调用额度被一个异常客户端迅速消耗掉。
+
+    今天实现的是一个非常基础的"滑动窗口计数"限流算法,足够在教学场景
+    下建立直观理解,严格来说,生产环境更常见的做法是用Redis实现的
+    分布式限流(因为今天这个实现和内存会话存储一样,只在单个进程内生效,
+    多进程部署下每个进程会各算各的,这个局限性和课后作业第5题分析的
+    问题是同一类问题)——这个局限,今天同样诚实地写在注释里,不藏起来。
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from collections import defaultdict, deque
+
+
+class SlidingWindowRateLimiter:
+    """
+    基于滑动时间窗口的简单限流器。
+
+    核心思路:给每个key(今天用客户端IP当key)维护一个时间戳队列,
+    每次请求进来,先把队列里"超出窗口时间"的旧时间戳清理掉,
+    再检查剩下的时间戳数量是否已经达到上限——没达到就允许通过并
+    记录本次时间戳,达到了就拒绝。
+    """
+
+    def __init__(self, max_requests: int, window_seconds: float) -> None:
+        """
+        :param max_requests: 窗口时间内允许的最大请求数
+        :param window_seconds: 窗口时长,单位秒
+        """
+        self._max_requests = max_requests
+        self._window_seconds = window_seconds
+        self._records: dict[str, deque] = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def allow(self, key: str) -> bool:
+        """
+        判断某个key(比如某个客户端IP)当前这次请求是否被允许通过。
+
+        :return: True表示允许通过,False表示已达到限流阈值,应当拒绝
+        """
+        now = time.monotonic()
+        with self._lock:
+            timestamps = self._records[key]
+            # 清理超出窗口时间的旧记录
+            while timestamps and now - timestamps[0] > self._window_seconds:
+                timestamps.popleft()
+
+            if len(timestamps) >= self._max_requests:
+                return False
+
+            timestamps.append(now)
+            return True
+
+    def remaining(self, key: str) -> int:
+        """查询某个key在当前时刻,窗口内还剩多少次可用请求额度,用于响应头展示。"""
+        now = time.monotonic()
+        with self._lock:
+            timestamps = self._records[key]
+            while timestamps and now - timestamps[0] > self._window_seconds:
+                timestamps.popleft()
+            return max(0, self._max_requests - len(timestamps))
+
+    def reset(self) -> None:
+        """清空所有限流记录,仅供测试代码使用。"""
+        with self._lock:
+            self._records.clear()
+
+
+# 今天给对话接口配置一个相对宽松的限流阈值:每个IP每10秒最多20次请求,
+# 这个数字今天先按教学环境的经验值设定,真正上线前需要结合实际的
+# 并发压测结果重新校准,今天不深入展开压测方法论,scripts/load_test.py
+# 里只是提供了一个非常初步的验证脚本。
+chat_rate_limiter = SlidingWindowRateLimiter(max_requests=20, window_seconds=10.0)
+```
+
+#### 新文件:`app/schemas/common.py` —— 通用响应结构
+
+```python
+"""
+文件名:app/schemas/common.py
+作者:陈铭
+说明:
+    今晚加练顺手补充的通用数据模型,后面新增的诊断接口会用到。
+    之所以单独开一个common.py,而不是继续往chat.py里堆,是因为
+    这些模型(分页信息、服务运行状态)并不是"对话"这一个业务领域
+    专属的东西,未来知识库模块、Agent模块的接口,同样可能需要
+    复用"分页信息"这类通用结构,提前放在一个独立的common模块里,
+    避免出现"要用分页结构,却要导入chat.py"这种模块职责不清晰的写法。
+"""
+
+from __future__ import annotations
+
+from pydantic import BaseModel, Field
+
+
+class PageInfo(BaseModel):
+    """通用分页信息结构,描述"当前返回的是全部数据里的哪一段"。"""
+
+    skip: int = Field(..., ge=0, description="本次查询跳过的条数")
+    limit: int = Field(..., ge=1, description="本次查询请求的最大条数")
+    total: int = Field(..., ge=0, description="满足条件的数据总条数")
+
+    @property
+    def has_more(self) -> bool:
+        """根据skip/limit/total计算是否还有更多数据可供翻页,方便前端判断是否要展示"加载更多"。"""
+        return self.skip + self.limit < self.total
+
+
+class ServiceStatus(BaseModel):
+    """服务运行状态,用于诊断接口展示当前进程的关键运行时信息。"""
+
+    service: str = Field(..., description="服务名称")
+    version: str = Field(..., description="服务版本号")
+    active_sessions: int = Field(..., ge=0, description="当前内存中记录的会话总数")
+    uptime_seconds: float = Field(..., ge=0.0, description="服务进程已运行的时长,单位秒")
+```
+
+#### 新文件:`app/api/v1/diagnostics.py` —— 诊断/统计接口
+
+```python
+"""
+文件名:app/api/v1/diagnostics.py
+作者:陈铭
+说明:
+    今晚加练新增的诊断接口模块,提供给运维/开发自查用的一个轻量统计入口,
+    并顺便在这个新模块里,示范今晚加练的三项成果——Depends()依赖注入、
+    仓储接口调用、限流器的实际用法——是如何被一起组合使用的。
+
+    这个模块不属于CQ-101任务卡的强制验收范围,老王同意作为"加练"内容
+    一并提交,评审时会单独说明这一点。
+"""
+
+from __future__ import annotations
+
+import time
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+
+from app.core.dependencies import get_current_settings
+from app.core.rate_limiter import chat_rate_limiter
+from app.repositories.session_repository import (
+    SessionRepository,
+    get_session_repository,
+)
+from app.schemas.common import ServiceStatus
+
+router = APIRouter(prefix="/api/v1/diagnostics", tags=["诊断接口(加练)"])
+
+_PROCESS_START_TIME = time.monotonic()
+
+
+@router.get(
+    "/status",
+    response_model=ServiceStatus,
+    summary="服务运行状态统计",
+    description="返回当前进程的会话总数、运行时长等基础运行时信息,供开发自查使用。",
+)
+def get_service_status(
+    repository: SessionRepository = Depends(get_session_repository),
+    settings=Depends(get_current_settings),
+) -> ServiceStatus:
+    """
+    诊断接口:查询服务运行状态。
+
+    这个接口同时演示了"一个路由函数里声明多个Depends()"的写法——
+    FastAPI会分别解析每一个依赖,互不影响,也不需要关心它们的声明顺序。
+    """
+    return ServiceStatus(
+        service="cangqiong-chat-api",
+        version="0.1.0",
+        active_sessions=repository.count_sessions(),
+        uptime_seconds=round(time.monotonic() - _PROCESS_START_TIME, 1),
+    )
+
+
+@router.get(
+    "/rate-limit-probe",
+    summary="限流探测接口(仅用于本地演示限流器行为)",
+    description="演示SlidingWindowRateLimiter的实际效果,连续快速调用会在达到阈值后返回429。",
+)
+def rate_limit_probe(request: Request) -> dict:
+    """
+    限流探测接口:每个客户端IP,10秒窗口内最多允许20次调用,
+    超过之后返回429,方便本地用脚本快速验证限流器的行为是否符合预期。
+
+    注意:今天正式的POST /api/v1/chat接口暂时没有接入这个限流器——
+    PRD文档里今天没有把"我方主动限流"列为CQ-101的验收范围,
+    陈铭把这个能力先做成一个独立的演示接口,等评审通过、明确要不要
+    正式接入核心对话接口之后,再决定下一步怎么落地,不在加练阶段
+    就直接改动已经验收通过的核心接口行为。
+    """
+    client_ip = request.client.host if request.client else "unknown"
+    if not chat_rate_limiter.allow(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "RATE_LIMITED_LOCALLY",
+                "message": "请求过于频繁,请稍后重试(本地限流演示,非大模型供应商限流)",
+            },
+        )
+    remaining = chat_rate_limiter.remaining(client_ip)
+    return {"allowed": True, "remaining_in_window": remaining}
+```
+
+#### main.py的更新说明
+
+今晚加练涉及的main.py改动,不是重写整个文件,只是新增两行——挂载诊断路由、调用中间件注册函数。为了让评审时一眼能看清改动范围,陈铭把改动之后完整的路由挂载区域重新贴了一份出来(其余异常处理器等代码保持今天正文版本不变,不重复贴出):
+
+```python
+# app/main.py 中,今晚加练新增的部分(插入在 app.include_router(api_v1_router) 之后):
+
+from app.api.v1.diagnostics import router as diagnostics_router
+from app.core.middleware import register_middlewares
+
+app.include_router(api_v1_router)
+app.include_router(diagnostics_router)  # 加练新增:诊断/统计接口,非CQ-101强制验收范围
+
+register_middlewares(app)  # 加练新增:请求追踪(trace_id)与耗时日志中间件
+```
+
+#### 新文件:`tests/test_dependencies_and_middleware.py` —— 加练部分的单元测试
+
+```python
+"""
+文件名:tests/test_dependencies_and_middleware.py
+作者:陈铭
+说明:
+    覆盖今晚加练新增的三块内容:仓储层、依赖注入、中间件。
+    每个测试用例开始前,都会重置仓储和限流器的状态,避免测试用例之间
+    互相污染彼此的数据(这也是InMemorySessionRepository特意提供
+    reset_session_repository_for_test()这个测试专用入口的原因)。
+"""
+
+from __future__ import annotations
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.core.model_clients import ModelReply
+from app.core.rate_limiter import chat_rate_limiter
+from app.main import app
+from app.repositories.session_repository import reset_session_repository_for_test
+
+client = TestClient(app)
+
+
+class _FakeModelClient:
+    """和tests/test_chat_api.py里同名的假客户端,今天在两个测试文件里各自
+    独立定义一份,是为了保持每个测试文件相对自足、不产生跨文件的隐式依赖,
+    这是一个小小的取舍——牺牲一点点重复,换取测试文件之间更清晰的边界。"""
+
+    provider_name = "qwen"
+
+    def chat(self, messages, temperature=0.7, max_tokens=1024, model=None):
+        return ModelReply(
+            content=f"针对'{messages[-1]['content']}'的加练测试回复",
+            provider="qwen",
+            model=model or "qwen-plus",
+            prompt_tokens=5,
+            completion_tokens=5,
+            total_tokens=10,
+            latency_ms=8.8,
+        )
+
+
+@pytest.fixture(autouse=True)
+def _reset_state(monkeypatch):
+    """每个测试用例执行前,重置仓储单例和限流器状态,并替换掉真实的模型客户端。"""
+    reset_session_repository_for_test()
+    chat_rate_limiter.reset()
+    monkeypatch.setattr(
+        "app.api.v1.chat.get_model_client",
+        lambda provider, settings: _FakeModelClient(),
+    )
+    yield
+    reset_session_repository_for_test()
+    chat_rate_limiter.reset()
+
+
+def test_service_status_reports_zero_sessions_initially():
+    """全新状态下,诊断接口应该报告0个会话。"""
+    resp = client.get("/api/v1/diagnostics/status")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["active_sessions"] == 0
+    assert body["service"] == "cangqiong-chat-api"
+
+
+def test_service_status_reflects_new_session_after_chat():
+    """发起一轮对话之后,诊断接口报告的会话数应该增加到1。"""
+    client.post("/api/v1/chat", json={"message": "加练测试第一句"})
+    resp = client.get("/api/v1/diagnostics/status")
+    assert resp.json()["active_sessions"] == 1
+
+
+def test_trace_id_header_present_in_response():
+    """所有响应都应该带上X-Trace-Id响应头,证明RequestContextMiddleware生效。"""
+    resp = client.get("/api/v1/chat/health")
+    assert "X-Trace-Id" in resp.headers
+    assert len(resp.headers["X-Trace-Id"]) > 0
+
+
+def test_trace_id_header_is_echoed_back_if_provided():
+    """如果客户端主动传了X-Trace-Id,中间件应该原样透传,而不是强行生成新的。"""
+    custom_trace_id = "trace-from-client-1234"
+    resp = client.get("/api/v1/chat/health", headers={"X-Trace-Id": custom_trace_id})
+    assert resp.headers["X-Trace-Id"] == custom_trace_id
+
+
+def test_response_time_header_present():
+    """所有响应都应该带上X-Response-Time-Ms响应头,证明TimingLoggingMiddleware生效。"""
+    resp = client.get("/api/v1/chat/health")
+    assert "X-Response-Time-Ms" in resp.headers
+    elapsed = float(resp.headers["X-Response-Time-Ms"])
+    assert elapsed >= 0.0
+
+
+def test_rate_limit_probe_allows_within_threshold():
+    """限流探测接口,在阈值范围内应该始终返回200且allowed为True。"""
+    for _ in range(5):
+        resp = client.get("/api/v1/diagnostics/rate-limit-probe")
+        assert resp.status_code == 200
+        assert resp.json()["allowed"] is True
+
+
+def test_rate_limit_probe_blocks_after_threshold():
+    """超过阈值(测试环境限流器配置为max_requests=20)之后,应该返回429。"""
+    for _ in range(20):
+        resp = client.get("/api/v1/diagnostics/rate-limit-probe")
+        assert resp.status_code == 200
+    blocked_resp = client.get("/api/v1/diagnostics/rate-limit-probe")
+    assert blocked_resp.status_code == 429
+    assert blocked_resp.json()["detail"]["code"] == "RATE_LIMITED_LOCALLY"
+
+
+def test_require_existing_session_dependency_blocks_missing_session():
+    """require_existing_session依赖函数,应该在session不存在时提前拦截请求。"""
+    resp = client.get("/api/v1/chat/sessions/sess-truly-not-exist/messages")
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["code"] == "SESSION_NOT_FOUND"
+```
+
+#### 新文件:`tests/test_chat_service.py` —— 服务层的独立单元测试
+
+```python
+"""
+文件名:tests/test_chat_service.py
+作者:陈铭
+说明:
+    专门测试ChatService这一层的业务逻辑,完全不经过HTTP请求——
+    这正是今晚加练做分层改造之后带来的直接好处:服务层的单元测试,
+    只需要构造Settings、Repository、ChatRequest这几个纯Python对象,
+    不需要启动TestClient、不需要拼URL、不需要关心HTTP状态码,
+    测试运行速度更快,失败时定位问题也更聚焦(如果这里测试失败,
+    问题一定出在业务逻辑本身,不会和路由层、中间件的行为混在一起)。
+"""
+
+from __future__ import annotations
+
+from unittest.mock import patch
+
+from app.core.model_clients import ModelReply
+from app.repositories.session_repository import InMemorySessionRepository
+from app.schemas.chat import ChatMessage, ChatRequest, MessageRole
+from app.services.chat_service import ChatService
+
+
+class _FakeSettings:
+    """测试专用的极简配置对象,只需要提供ChatService用得到的属性即可,
+    不需要真的构造一个完整的Settings实例(也不需要读取.env文件)。"""
+
+    pass
+
+
+def _make_fake_reply(content: str) -> ModelReply:
+    return ModelReply(
+        content=content,
+        provider="qwen",
+        model="qwen-plus",
+        prompt_tokens=3,
+        completion_tokens=4,
+        total_tokens=7,
+        latency_ms=5.5,
+    )
+
+
+def test_submit_turn_creates_new_session_and_persists_history():
+    """服务层处理一轮全新对话后,仓储里应该出现对应的会话记录。"""
+    repository = InMemorySessionRepository()
+    service = ChatService(settings=_FakeSettings(), repository=repository)
+
+    with patch("app.services.chat_service.get_model_client") as mock_get_client:
+        mock_client = mock_get_client.return_value
+        mock_client.chat.return_value = _make_fake_reply("服务层测试回复")
+
+        request = ChatRequest(message="服务层测试提问")
+        result = service.submit_turn(request)
+
+    assert result.reply_content == "服务层测试回复"
+    assert result.session_id.startswith("sess-")
+
+    record = repository.get(result.session_id)
+    assert record is not None
+    assert len(record.messages) == 2
+    assert record.messages[0].role == MessageRole.user
+    assert record.messages[1].role == MessageRole.assistant
+    assert record.total_turns == 1
+
+
+def test_submit_turn_reuses_existing_session_history():
+    """携带已存在的session_id发起第二轮对话,历史消息数量应该正确累加。"""
+    repository = InMemorySessionRepository()
+    service = ChatService(settings=_FakeSettings(), repository=repository)
+
+    with patch("app.services.chat_service.get_model_client") as mock_get_client:
+        mock_client = mock_get_client.return_value
+        mock_client.chat.return_value = _make_fake_reply("第一轮回复")
+        first_request = ChatRequest(session_id="sess-fixed-for-test", message="第一轮提问")
+        first_result = service.submit_turn(first_request)
+
+        mock_client.chat.return_value = _make_fake_reply("第二轮回复")
+        second_request = ChatRequest(session_id="sess-fixed-for-test", message="第二轮提问")
+        second_result = service.submit_turn(second_request)
+
+    assert first_result.session_id == second_result.session_id
+    record = repository.get("sess-fixed-for-test")
+    assert record is not None
+    assert len(record.messages) == 4
+    assert record.total_turns == 2
+
+
+def test_submit_turn_with_explicit_history_overrides_repository():
+    """如果请求体主动携带history,服务层应该以客户端传入的history为准来拼装messages。"""
+    repository = InMemorySessionRepository()
+    service = ChatService(settings=_FakeSettings(), repository=repository)
+
+    captured_messages = []
+
+    with patch("app.services.chat_service.get_model_client") as mock_get_client:
+        mock_client = mock_get_client.return_value
+
+        def _record_and_reply(messages, **kwargs):
+            captured_messages.extend(messages)
+            return _make_fake_reply("带历史的回复")
+
+        mock_client.chat.side_effect = _record_and_reply
+
+        request = ChatRequest(
+            message="继续这个话题",
+            history=[
+                ChatMessage(role=MessageRole.user, content="第一句寒暄"),
+                ChatMessage(role=MessageRole.assistant, content="寒暄的回复"),
+            ],
+        )
+        service.submit_turn(request)
+
+    assert len(captured_messages) == 3
+    assert captured_messages[0]["content"] == "第一句寒暄"
+    assert captured_messages[-1]["content"] == "继续这个话题"
+
+
+def test_build_usage_converts_result_fields_correctly():
+    """build_usage方法应该正确地把ChatTurnResult的用量字段,转换成Usage模型。"""
+    repository = InMemorySessionRepository()
+    service = ChatService(settings=_FakeSettings(), repository=repository)
+
+    with patch("app.services.chat_service.get_model_client") as mock_get_client:
+        mock_client = mock_get_client.return_value
+        mock_client.chat.return_value = _make_fake_reply("用量测试回复")
+        result = service.submit_turn(ChatRequest(message="随便问一句"))
+
+    usage = service.build_usage(result)
+    assert usage.prompt_tokens == 3
+    assert usage.completion_tokens == 4
+    assert usage.total_tokens == 7
+```
+
+#### 新文件:`scripts/load_test.py` —— 简易并发压测脚本
+
+```python
+"""
+文件名:scripts/load_test.py
+作者:陈铭
+说明:
+    今晚加练的最后一部分,呼应课后作业第5题讨论过的"并发写入"风险——
+    与其纸上谈兵地分析潜在问题,陈铭想亲手写一个最简易的并发压测脚本,
+    真实地对着本地跑起来的服务发起并发请求,观察一下"内存字典+锁"这个
+    实现,在并发场景下到底表现如何。
+
+    这不是一个严谨的性能测试工具(不追求精确的P95/P99延迟统计,那属于
+    专业压测工具如Locust、wrk的范畴),只是一个用标准库threading写的、
+    非常朴素的并发验证脚本,目的是建立"并发到底会带来什么现象"的直观体感,
+    而不是替代真正的性能测试工作。
+"""
+
+from __future__ import annotations
+
+import statistics
+import threading
+import time
+
+import requests
+
+BASE_URL = "http://127.0.0.1:8000"
+
+
+class LoadTestResult:
+    """收集并发压测过程中每个请求的结果,线程安全地追加数据。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.latencies_ms: list[float] = []
+        self.status_codes: list[int] = []
+        self.errors: list[str] = []
+
+    def record_success(self, latency_ms: float, status_code: int) -> None:
+        with self._lock:
+            self.latencies_ms.append(latency_ms)
+            self.status_codes.append(status_code)
+
+    def record_error(self, error_message: str) -> None:
+        with self._lock:
+            self.errors.append(error_message)
+
+
+def _single_request_worker(session_id: str, turn_index: int, result: LoadTestResult) -> None:
+    """单个并发线程要执行的任务:向同一个session_id发起一轮对话请求。"""
+    start = time.perf_counter()
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/api/v1/chat",
+            json={"session_id": session_id, "message": f"并发测试第{turn_index}句提问"},
+            timeout=30,
+        )
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        result.record_success(elapsed_ms, resp.status_code)
+    except requests.RequestException as e:
+        result.record_error(f"第{turn_index}个请求失败:{e}")
+
+
+def run_concurrent_same_session_test(concurrency: int = 10) -> None:
+    """
+    并发压测用例:多个线程,同时向"同一个session_id"发起对话请求,
+    验证仓储层在并发写入场景下,是否会出现历史记录丢失的现象——
+    这正是课后作业第5题里分析过的风险点,今天用真实压测验证一下结论。
+    """
+    print(f"\n=== 并发压测:{concurrency}个线程同时对同一个session_id发起对话 ===")
+    session_id = "sess-load-test-shared"
+    result = LoadTestResult()
+    threads = []
+
+    for i in range(concurrency):
+        thread = threading.Thread(target=_single_request_worker, args=(session_id, i, result))
+        threads.append(thread)
+
+    start = time.perf_counter()
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    total_elapsed = time.perf_counter() - start
+
+    print(f"总耗时:{total_elapsed:.2f}秒,成功请求数:{len(result.latencies_ms)},失败请求数:{len(result.errors)}")
+    if result.latencies_ms:
+        print(f"平均延迟:{statistics.mean(result.latencies_ms):.1f}ms")
+        print(f"最大延迟:{max(result.latencies_ms):.1f}ms")
+        print(f"最小延迟:{min(result.latencies_ms):.1f}ms")
+    for error in result.errors:
+        print(f"错误:{error}")
+
+    # 验证历史记录的完整性:理论上concurrency个线程各自成功追加一轮对话,
+    # 会话历史消息总数应该是concurrency*2(每轮包含1条用户消息+1条模型回复)。
+    verify_resp = requests.get(
+        f"{BASE_URL}/api/v1/chat/sessions/{session_id}/messages",
+        params={"limit": 100},
+        timeout=10,
+    )
+    if verify_resp.status_code == 200:
+        actual_total = verify_resp.json()["total"]
+        expected_total = concurrency * 2
+        print(f"预期历史消息总数:{expected_total},实际记录的总数:{actual_total}")
+        if actual_total != expected_total:
+            print("【发现问题】实际记录数与预期不符,可能存在并发写入丢失的情况,值得进一步排查!")
+        else:
+            print("本次压测未观察到历史记录丢失(今天的InMemorySessionRepository已加锁保护append_turn操作)。")
+    else:
+        print(f"验证阶段查询历史消息失败,状态码:{verify_resp.status_code}")
+
+
+def run_concurrent_different_sessions_test(concurrency: int = 20) -> None:
+    """
+    并发压测用例2:多个线程,各自使用不同的session_id发起对话请求,
+    模拟"多个独立用户同时使用系统"这种更贴近真实场景的并发模式。
+    """
+    print(f"\n=== 并发压测:{concurrency}个线程各自使用独立session_id ===")
+    result = LoadTestResult()
+    threads = []
+
+    def _worker(idx: int) -> None:
+        start = time.perf_counter()
+        try:
+            resp = requests.post(
+                f"{BASE_URL}/api/v1/chat",
+                json={"message": f"独立用户{idx}号的提问"},
+                timeout=30,
+            )
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            result.record_success(elapsed_ms, resp.status_code)
+        except requests.RequestException as e:
+            result.record_error(f"独立用户{idx}号请求失败:{e}")
+
+    for i in range(concurrency):
+        thread = threading.Thread(target=_worker, args=(i,))
+        threads.append(thread)
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    success_count = len(result.latencies_ms)
+    print(f"成功请求数:{success_count}/{concurrency},失败请求数:{len(result.errors)}")
+    if result.latencies_ms:
+        print(f"平均延迟:{statistics.mean(result.latencies_ms):.1f}ms")
+
+
+def main() -> None:
+    """依次运行两组并发压测用例,并在最后打印诊断接口的服务状态,方便对照验证。"""
+    run_concurrent_same_session_test(concurrency=10)
+    run_concurrent_different_sessions_test(concurrency=20)
+
+    status_resp = requests.get(f"{BASE_URL}/api/v1/diagnostics/status", timeout=5)
+    if status_resp.status_code == 200:
+        print("\n=== 压测结束后的服务状态 ===")
+        print(status_resp.json())
+
+
+if __name__ == "__main__":
+    main()
+```
+
+这一整段加练内容,老王第二天早上代码评审时看得比预想的更认真——他没有按老规矩只看CQ-101验收清单,反而先点开了`load_test.py`跑了一遍,看完压测输出的那一串"历史消息总数与预期一致"的结果,在评审记录里补了一句和技术关系不大、但陈铭后来一直记在心里的评价:"这份加练最有价值的地方,不是多写了几个类,是你主动去验证了自己提出的假设——很多人分析问题头头是道,却懒得动手去证明分析是对的,你今天做了这一步。"
+
 ---
 
 ## 今日复盘
