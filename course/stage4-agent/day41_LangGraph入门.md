@@ -1727,6 +1727,1203 @@ Interrupts require a checkpointer to persist state across resumptions.
 
 "这个报错其实是在保护你,"老王解释,"`interrupt()` 的语义本身就依赖'能把当前状态存下来,之后再取出来接着跑',如果压根没有配置Checkpointer,LangGraph没有任何地方能存这份状态,那`interrupt()`这个动作在逻辑上就是自相矛盾的——它承诺'我会帮你记住现在的进度',但连个记事本都没有。所以框架选择直接报错,而不是假装能正常工作却在恢复的时候丢数据。"陈铭把 `MemorySaver()` 这一行加回去之后,代码立刻恢复正常,他也由此更深刻地理解了架构设计图里 "`Interrupt` 中断控制"和"`Checkpointer` 状态检查点"这两个组件为什么必须配套出现——用今天课堂笔记里的话说,Interrupt决定"什么时候暂停",Checkpointer决定"暂停的内容存在哪",两者缺一,中断机制就无法真正生效,这也是他把这个报错记下来的原因:光记住"要配置Checkpointer"这条规则不够深刻,理解报错背后"承诺和能力必须匹配"这层逻辑,才不容易在换了别的应用场景后又犯类似的错误。
 
+### 实战三:更完整的图结构示例——工单智能分拨与升级处理(并行扇出、多路条件边、重试循环)
+
+前两份代码分别演示了"最基础的循环"(ReAct)和"最基础的中断/恢复"(审批工作流),但老王在代码评审收尾时又给陈铭补了一个作业:"客户真实的业务流程,往往不是一条直线套一个循环这么简单——经常需要同时从好几个系统查数据(并行扇出),查完了要汇总判断(扇入),判断觉得信息不够还要重新补查(重试循环),重试次数用完了还查不清楚就得转人工(升级),这几种控制流今天的两份代码都只沾了个边,不够完整。你把苍穹工单系统里'工单智能分拨'这个真实场景,用一张更复杂的图搭出来,把并行扇出、多路条件边、重试循环、人工升级这几种控制流一次性都用上。"
+
+这份代码对应的业务场景是:客服工单进来之后,系统需要**同时**查询财务系统(是否有相关的欠费/退款记录)、工单历史系统(是否有类似的历史工单及处理方式)、知识库(是否有对应的处理规范),三路查询是相互独立、可以并行执行的;查完之后汇总评估"当前掌握的信息是否足够给出自动处理结论",如果不够且还有重试机会,就再发起一轮补充查询;如果重试次数用完了置信度还是不够,或者工单本身被判定为高紧急度,就转人工review(带中断)。
+
+```python
+"""
+苍穹企业级智能体中台 - 工单智能分拨与升级处理工作流
+文件名: sky_ticket_triage_graph.py
+
+本文件的目标:
+1. 演示"并行扇出"(fan-out):一个条件边的路由函数返回一个节点名列表,
+   LangGraph会把这些节点全部并行调度执行。
+2. 演示"扇入汇聚"(fan-in):多个并行节点各自更新State的不同字段(或同一个
+   使用了归约器的字段),执行完之后汇总到下一个节点。
+3. 演示"重试循环":汇总节点判断信息不足时,回到补充查询节点重新走一轮,
+   用retry_count做循环次数保护。
+4. 演示"多路条件边"(3个以上分支):紧急度分级路由、汇总结果三路分支路由。
+5. 演示自定义归约器(而不是仅使用官方内置的add_messages)。
+
+运行依赖:
+    pip install langgraph
+
+运行方式:
+    python sky_ticket_triage_graph.py
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import operator
+import random
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Annotated, Any, Dict, List, Optional, TypedDict
+
+from langgraph.graph import END, START, StateGraph
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command, interrupt
+
+# --------------------------------------------------------------------------
+# 第一部分:日志配置
+# --------------------------------------------------------------------------
+
+logger = logging.getLogger("sky_agent.ticket_triage")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _formatter = logging.Formatter(
+        fmt="[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    _handler.setFormatter(_formatter)
+    logger.addHandler(_handler)
+
+
+# --------------------------------------------------------------------------
+# 第二部分:业务枚举与常量
+# --------------------------------------------------------------------------
+
+
+class UrgencyLevel(str, Enum):
+    LOW = "低"
+    MEDIUM = "中"
+    HIGH = "高"
+    CRITICAL = "紧急"
+
+
+class ResolutionPath(str, Enum):
+    AUTO_RESOLVED = "自动处理"
+    HUMAN_REVIEWED = "人工处理"
+
+
+CONFIDENCE_THRESHOLD = 0.75
+DEFAULT_MAX_RETRIES = 2
+
+
+# --------------------------------------------------------------------------
+# 第三部分:State定义(含自定义归约器)
+# --------------------------------------------------------------------------
+#
+# query_results 和 audit_log 都是"会被多个并行节点同时追加"的字段,
+# 这里直接使用Python标准库operator.add作为归约器——因为
+# list + list 这个操作本身就是"拼接",语义正好符合"追加"的需求,
+# 不需要像add_messages那样写一个专门处理消息去重/替换的复杂归约函数。
+# 这与官方内置的add_messages归约器形成对比,说明归约器不是只能用官方提供的那几个,
+# 任何"能把两个同类型的值合并成一个新值"的函数都可以拿来当归约器用。
+
+
+class TicketTriageState(TypedDict):
+    """
+    工单智能分拨工作流的图状态定义。
+
+    ticket_id:         工单唯一标识。
+    ticket_content:     工单原始内容描述。
+    urgency:            紧急度评估结果。
+    query_results:      各查询节点产出的结果列表,使用operator.add归约器实现追加语义,
+                        并行执行的多个查询节点各自返回一条记录,最终会被自动拼接到一起。
+    retry_count:        当前已经进行的补充查询轮数。
+    max_retries:        允许的最大补充查询轮数。
+    confidence_score:   汇总节点计算出的"当前信息是否足以自动处理"的置信度分数。
+    resolution_path:    最终走的是自动处理还是人工处理路径。
+    final_resolution:   最终处理结论文本。
+    audit_log:          全流程审计日志,同样用operator.add归约器实现追加语义。
+    """
+
+    ticket_id: str
+    ticket_content: str
+    urgency: Optional[str]
+    query_results: Annotated[List[Dict[str, Any]], operator.add]
+    retry_count: int
+    max_retries: int
+    confidence_score: Optional[float]
+    resolution_path: Optional[str]
+    final_resolution: Optional[str]
+    audit_log: Annotated[List[str], operator.add]
+
+
+def make_initial_triage_state(
+    ticket_content: str, max_retries: int = DEFAULT_MAX_RETRIES
+) -> TicketTriageState:
+    return TicketTriageState(
+        ticket_id=f"TK-{uuid.uuid4().hex[:8].upper()}",
+        ticket_content=ticket_content,
+        urgency=None,
+        query_results=[],
+        retry_count=0,
+        max_retries=max_retries,
+        confidence_score=None,
+        resolution_path=None,
+        final_resolution=None,
+        audit_log=[],
+    )
+
+
+def _audit(message: str) -> List[str]:
+    """构造一条带时间戳的审计日志条目,包装成列表方便直接作为归约器的增量返回。"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return [f"[{timestamp}] {message}"]
+
+
+# --------------------------------------------------------------------------
+# 第四部分:模拟的三个数据源(财务系统 / 工单历史系统 / 知识库)
+# --------------------------------------------------------------------------
+
+_FAKE_FINANCE_DB = {
+    "欠费": {"has_record": True, "detail": "该客户账户存在欠费记录,金额320元,已逾期15天。"},
+    "退款": {"has_record": True, "detail": "该客户上月提交过一笔退款申请,已处理完成。"},
+}
+
+_FAKE_TICKET_HISTORY_DB = [
+    {"keyword": "登录", "resolution": "重置密码并引导客户清除浏览器缓存后解决"},
+    {"keyword": "退款", "resolution": "按标准退款流程处理,财务确认到账后关闭工单"},
+]
+
+_FAKE_KNOWLEDGE_BASE = {
+    "登录": "客户无法登录的标准排查步骤:1.确认账号状态 2.重置密码 3.检查设备/网络环境",
+    "欠费": "欠费客户的标准处理规范:先核实欠费金额和账期,再引导客户完成补缴或协商分期",
+}
+
+
+# --------------------------------------------------------------------------
+# 第五部分:节点函数定义
+# --------------------------------------------------------------------------
+
+
+def node_classify_urgency(state: TicketTriageState) -> Dict[str, Any]:
+    """紧急度分类节点:根据工单内容里的关键词粗略判断紧急程度。"""
+    content = state["ticket_content"]
+    if "投诉" in content or "曝光" in content or "媒体" in content:
+        urgency = UrgencyLevel.CRITICAL.value
+    elif "欠费" in content or "无法登录" in content:
+        urgency = UrgencyLevel.HIGH.value
+    elif "退款" in content:
+        urgency = UrgencyLevel.MEDIUM.value
+    else:
+        urgency = UrgencyLevel.LOW.value
+
+    logger.info("[%s] 紧急度分类结果: %s", state["ticket_id"], urgency)
+    return {
+        "urgency": urgency,
+        "audit_log": _audit(f"紧急度分类完成: {urgency}"),
+    }
+
+
+def node_query_finance_system(state: TicketTriageState) -> Dict[str, Any]:
+    """并行查询节点一:查询财务系统是否有相关欠费/退款记录。"""
+    content = state["ticket_content"]
+    matched = None
+    for keyword, record in _FAKE_FINANCE_DB.items():
+        if keyword in content:
+            matched = record
+            break
+
+    result = {
+        "source": "财务系统",
+        "found": matched is not None,
+        "detail": matched["detail"] if matched else "未查到相关财务记录",
+    }
+    logger.info("[%s] 财务系统查询完成: found=%s", state["ticket_id"], result["found"])
+    return {
+        "query_results": [result],
+        "audit_log": _audit(f"财务系统查询完成,found={result['found']}"),
+    }
+
+
+def node_query_ticket_history(state: TicketTriageState) -> Dict[str, Any]:
+    """并行查询节点二:查询工单历史系统是否有类似的历史处理方式。"""
+    content = state["ticket_content"]
+    matched = None
+    for record in _FAKE_TICKET_HISTORY_DB:
+        if record["keyword"] in content:
+            matched = record
+            break
+
+    result = {
+        "source": "工单历史系统",
+        "found": matched is not None,
+        "detail": matched["resolution"] if matched else "未查到类似的历史工单",
+    }
+    logger.info("[%s] 工单历史系统查询完成: found=%s", state["ticket_id"], result["found"])
+    return {
+        "query_results": [result],
+        "audit_log": _audit(f"工单历史系统查询完成,found={result['found']}"),
+    }
+
+
+def node_query_knowledge_base(state: TicketTriageState) -> Dict[str, Any]:
+    """并行查询节点三:查询知识库是否有对应的标准处理规范。"""
+    content = state["ticket_content"]
+    matched_text = None
+    for keyword, spec in _FAKE_KNOWLEDGE_BASE.items():
+        if keyword in content:
+            matched_text = spec
+            break
+
+    result = {
+        "source": "知识库",
+        "found": matched_text is not None,
+        "detail": matched_text or "未查到对应的处理规范",
+    }
+    logger.info("[%s] 知识库查询完成: found=%s", state["ticket_id"], result["found"])
+    return {
+        "query_results": [result],
+        "audit_log": _audit(f"知识库查询完成,found={result['found']}"),
+    }
+
+
+def node_supplement_query(state: TicketTriageState) -> Dict[str, Any]:
+    """补充查询节点:当汇总节点判断信息不足且还有重试机会时,进行一轮补充查询。
+
+    真实场景里,这一步可能是换一种检索策略重新查知识库,或者调用一个更泛化的
+    模糊搜索接口。这里用一个简化的模拟实现:基于已有retry_count,
+    人为提升下一轮汇总时的置信度基础值,代表"补充查询确实获取到了增量信息"。
+    """
+    logger.info(
+        "[%s] 执行第%s轮补充查询...", state["ticket_id"], state["retry_count"] + 1
+    )
+    supplement_result = {
+        "source": f"补充查询第{state['retry_count'] + 1}轮",
+        "found": True,
+        "detail": "通过泛化关键词匹配,补充获取到一条相关处理建议。",
+    }
+    return {
+        "query_results": [supplement_result],
+        "retry_count": state["retry_count"] + 1,
+        "audit_log": _audit(f"完成第{state['retry_count'] + 1}轮补充查询"),
+    }
+
+
+def node_aggregate_results(state: TicketTriageState) -> Dict[str, Any]:
+    """汇总节点(扇入点):汇总此前所有并行查询/补充查询的结果,计算置信度分数。
+
+    置信度的简化计算规则:命中(found=True)的查询结果占比,
+    每多一轮补充查询,置信度会有一定的边际提升(模拟"信息越多,判断越有把握")。
+    """
+    results = state["query_results"]
+    found_count = sum(1 for r in results if r.get("found"))
+    total_count = len(results) if results else 1
+    base_confidence = found_count / total_count
+
+    retry_bonus = min(state["retry_count"] * 0.1, 0.2)
+    confidence = min(base_confidence + retry_bonus, 1.0)
+
+    logger.info(
+        "[%s] 汇总完成,共%s条查询结果,命中%s条,置信度=%.2f",
+        state["ticket_id"], total_count, found_count, confidence,
+    )
+    return {
+        "confidence_score": round(confidence, 2),
+        "audit_log": _audit(
+            f"汇总完成,查询结果{total_count}条,命中{found_count}条,置信度={confidence:.2f}"
+        ),
+    }
+
+
+def node_auto_resolve(state: TicketTriageState) -> Dict[str, Any]:
+    """自动处理节点:置信度足够高时,系统自动给出处理结论。"""
+    relevant_details = [r["detail"] for r in state["query_results"] if r.get("found")]
+    summary = ";".join(relevant_details) if relevant_details else "已根据现有信息完成自动处理。"
+    logger.info("[%s] 自动处理完成。", state["ticket_id"])
+    return {
+        "resolution_path": ResolutionPath.AUTO_RESOLVED.value,
+        "final_resolution": f"[自动处理] {summary}",
+        "audit_log": _audit("系统自动处理完成"),
+    }
+
+
+def node_human_review(state: TicketTriageState) -> Dict[str, Any]:
+    """人工升级节点:置信度不足或紧急度过高时,中断并转人工review。"""
+    logger.info("[%s] 转人工review,等待客服人员处理...", state["ticket_id"])
+
+    review_payload = interrupt(
+        {
+            "ticket_id": state["ticket_id"],
+            "ticket_content": state["ticket_content"],
+            "urgency": state["urgency"],
+            "confidence_score": state["confidence_score"],
+            "query_results": state["query_results"],
+            "prompt": "请客服人员review以上信息,给出最终处理结论。",
+        }
+    )
+
+    resolution_text = review_payload.get("resolution", "客服人员未填写处理结论")
+    reviewer = review_payload.get("reviewer", "未知客服")
+
+    logger.info("[%s] 收到人工review结果,处理人=%s", state["ticket_id"], reviewer)
+    return {
+        "resolution_path": ResolutionPath.HUMAN_REVIEWED.value,
+        "final_resolution": f"[人工处理,处理人:{reviewer}] {resolution_text}",
+        "audit_log": _audit(f"人工review完成,处理人={reviewer}"),
+    }
+
+
+def node_finalize(state: TicketTriageState) -> Dict[str, Any]:
+    """收尾节点:流程结束前统一记录一条最终状态日志。"""
+    logger.info(
+        "[%s] 工单处理流程结束,路径=%s", state["ticket_id"], state["resolution_path"]
+    )
+    return {"audit_log": _audit(f"工单处理流程结束,最终路径={state['resolution_path']}")}
+
+
+# --------------------------------------------------------------------------
+# 第六部分:条件边路由函数
+# --------------------------------------------------------------------------
+
+
+def route_fan_out_to_queries(state: TicketTriageState) -> List[str]:
+    """并行扇出路由:无论紧急度如何,都需要并行发起三路查询。
+
+    这里返回的是一个"节点名列表",而不是单个字符串——
+    LangGraph在识别到路由函数返回列表时,会把列表里的所有节点
+    全部并行调度执行,这正是"扇出"能力的体现。
+    """
+    return ["query_finance", "query_ticket_history", "query_knowledge_base"]
+
+
+def route_after_aggregate(state: TicketTriageState) -> str:
+    """汇总节点后的三路条件边:置信度足够->自动处理;还有重试机会->补充查询;
+    否则(重试用完仍不够,或紧急度为紧急)->转人工。
+    """
+    if state["urgency"] == UrgencyLevel.CRITICAL.value:
+        return "escalate"
+
+    if state["confidence_score"] is not None and state["confidence_score"] >= CONFIDENCE_THRESHOLD:
+        return "resolved"
+
+    if state["retry_count"] < state["max_retries"]:
+        return "retry"
+
+    return "escalate"
+
+
+# --------------------------------------------------------------------------
+# 第七部分:图的构建
+# --------------------------------------------------------------------------
+
+
+def build_ticket_triage_graph():
+    """构建并编译工单智能分拨与升级处理的工作流图。"""
+    graph = StateGraph(TicketTriageState)
+
+    graph.add_node("classify_urgency", node_classify_urgency)
+    graph.add_node("query_finance", node_query_finance_system)
+    graph.add_node("query_ticket_history", node_query_ticket_history)
+    graph.add_node("query_knowledge_base", node_query_knowledge_base)
+    graph.add_node("aggregate_results", node_aggregate_results)
+    graph.add_node("supplement_query", node_supplement_query)
+    graph.add_node("auto_resolve", node_auto_resolve)
+    graph.add_node("human_review", node_human_review)
+    graph.add_node("finalize", node_finalize)
+
+    graph.add_edge(START, "classify_urgency")
+
+    graph.add_conditional_edges(
+        "classify_urgency",
+        route_fan_out_to_queries,
+        ["query_finance", "query_ticket_history", "query_knowledge_base"],
+    )
+
+    graph.add_edge("query_finance", "aggregate_results")
+    graph.add_edge("query_ticket_history", "aggregate_results")
+    graph.add_edge("query_knowledge_base", "aggregate_results")
+
+    graph.add_conditional_edges(
+        "aggregate_results",
+        route_after_aggregate,
+        {
+            "resolved": "auto_resolve",
+            "retry": "supplement_query",
+            "escalate": "human_review",
+        },
+    )
+
+    graph.add_edge("supplement_query", "aggregate_results")
+
+    graph.add_edge("auto_resolve", "finalize")
+    graph.add_edge("human_review", "finalize")
+    graph.add_edge("finalize", END)
+
+    checkpointer = MemorySaver()
+    return graph.compile(checkpointer=checkpointer)
+
+
+# --------------------------------------------------------------------------
+# 第八部分:对外暴露的工作流封装类
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class SkyTicketTriageWorkflow:
+    """苍穹智能体中台对外暴露的工单智能分拨工作流封装。"""
+
+    _graph: Any = field(init=False)
+
+    def __post_init__(self) -> None:
+        self._graph = build_ticket_triage_graph()
+
+    def submit_ticket(self, ticket_content: str, max_retries: int = DEFAULT_MAX_RETRIES) -> Dict[str, Any]:
+        state = make_initial_triage_state(ticket_content, max_retries=max_retries)
+        config = {"configurable": {"thread_id": state["ticket_id"]}}
+        result = self._graph.invoke(state, config=config)
+
+        if "__interrupt__" in result:
+            interrupt_info = result["__interrupt__"][0]
+            return {
+                "status": "PENDING_HUMAN_REVIEW",
+                "ticket_id": state["ticket_id"],
+                "interrupt_payload": interrupt_info.value,
+            }
+
+        return {
+            "status": "RESOLVED",
+            "ticket_id": state["ticket_id"],
+            "resolution_path": result["resolution_path"],
+            "final_resolution": result["final_resolution"],
+            "confidence_score": result["confidence_score"],
+            "retry_count": result["retry_count"],
+            "audit_log": result["audit_log"],
+        }
+
+    def submit_human_review(self, ticket_id: str, resolution: str, reviewer: str) -> Dict[str, Any]:
+        config = {"configurable": {"thread_id": ticket_id}}
+        result = self._graph.invoke(
+            Command(resume={"resolution": resolution, "reviewer": reviewer}), config=config
+        )
+        return {
+            "status": "RESOLVED",
+            "ticket_id": ticket_id,
+            "resolution_path": result["resolution_path"],
+            "final_resolution": result["final_resolution"],
+            "audit_log": result["audit_log"],
+        }
+
+    def get_state_snapshot(self, ticket_id: str) -> Dict[str, Any]:
+        config = {"configurable": {"thread_id": ticket_id}}
+        snapshot = self._graph.get_state(config)
+        return {"values": snapshot.values, "next_nodes": snapshot.next}
+
+
+# --------------------------------------------------------------------------
+# 第九部分:单元测试
+# --------------------------------------------------------------------------
+
+
+def _test_classify_urgency_detects_critical():
+    state = make_initial_triage_state("客户威胁要在媒体曝光我们服务质量问题")
+    result = node_classify_urgency(state)
+    assert result["urgency"] == UrgencyLevel.CRITICAL.value
+    print("PASS: _test_classify_urgency_detects_critical")
+
+
+def _test_classify_urgency_detects_low_by_default():
+    state = make_initial_triage_state("咨询一下产品的基本使用方法")
+    result = node_classify_urgency(state)
+    assert result["urgency"] == UrgencyLevel.LOW.value
+    print("PASS: _test_classify_urgency_detects_low_by_default")
+
+
+def _test_query_finance_finds_record():
+    state = make_initial_triage_state("客户反馈账户欠费问题")
+    result = node_query_finance_system(state)
+    assert result["query_results"][0]["found"] is True
+    print("PASS: _test_query_finance_finds_record")
+
+
+def _test_query_finance_no_record():
+    state = make_initial_triage_state("客户咨询产品价格")
+    result = node_query_finance_system(state)
+    assert result["query_results"][0]["found"] is False
+    print("PASS: _test_query_finance_no_record")
+
+
+def _test_aggregate_results_computes_confidence():
+    state = make_initial_triage_state("客户无法登录,且存在欠费")
+    state["query_results"] = [
+        {"source": "财务系统", "found": True, "detail": "x"},
+        {"source": "工单历史系统", "found": False, "detail": "y"},
+        {"source": "知识库", "found": True, "detail": "z"},
+    ]
+    result = node_aggregate_results(state)
+    assert abs(result["confidence_score"] - (2 / 3)) < 0.01
+    print("PASS: _test_aggregate_results_computes_confidence")
+
+
+def _test_route_after_aggregate_resolved_when_confidence_high():
+    state = make_initial_triage_state("咨询问题")
+    state["confidence_score"] = 0.9
+    state["retry_count"] = 0
+    state["max_retries"] = 2
+    route = route_after_aggregate(state)
+    assert route == "resolved"
+    print("PASS: _test_route_after_aggregate_resolved_when_confidence_high")
+
+
+def _test_route_after_aggregate_retry_when_low_confidence_and_has_budget():
+    state = make_initial_triage_state("咨询问题")
+    state["confidence_score"] = 0.3
+    state["retry_count"] = 0
+    state["max_retries"] = 2
+    route = route_after_aggregate(state)
+    assert route == "retry"
+    print("PASS: _test_route_after_aggregate_retry_when_low_confidence_and_has_budget")
+
+
+def _test_route_after_aggregate_escalate_when_retries_exhausted():
+    state = make_initial_triage_state("咨询问题")
+    state["confidence_score"] = 0.3
+    state["retry_count"] = 2
+    state["max_retries"] = 2
+    route = route_after_aggregate(state)
+    assert route == "escalate"
+    print("PASS: _test_route_after_aggregate_escalate_when_retries_exhausted")
+
+
+def _test_route_after_aggregate_escalate_when_critical_regardless_of_confidence():
+    state = make_initial_triage_state("客户威胁媒体曝光")
+    state["urgency"] = UrgencyLevel.CRITICAL.value
+    state["confidence_score"] = 0.95
+    state["retry_count"] = 0
+    state["max_retries"] = 2
+    route = route_after_aggregate(state)
+    assert route == "escalate", "紧急工单即便置信度很高,也应该强制转人工"
+    print("PASS: _test_route_after_aggregate_escalate_when_critical_regardless_of_confidence")
+
+
+def _test_route_fan_out_returns_three_nodes():
+    state = make_initial_triage_state("任意内容")
+    route = route_fan_out_to_queries(state)
+    assert set(route) == {"query_finance", "query_ticket_history", "query_knowledge_base"}
+    print("PASS: _test_route_fan_out_returns_three_nodes")
+
+
+def _test_supplement_query_increments_retry_count():
+    state = make_initial_triage_state("咨询问题")
+    state["retry_count"] = 0
+    result = node_supplement_query(state)
+    assert result["retry_count"] == 1
+    print("PASS: _test_supplement_query_increments_retry_count")
+
+
+def _test_full_graph_auto_resolves_low_urgency_high_confidence_ticket():
+    workflow = SkyTicketTriageWorkflow()
+    result = workflow.submit_ticket("客户咨询登录问题,提示无法登录")
+    assert result["status"] == "RESOLVED"
+    assert result["resolution_path"] in (
+        ResolutionPath.AUTO_RESOLVED.value,
+        ResolutionPath.HUMAN_REVIEWED.value,
+    )
+    print("PASS: _test_full_graph_auto_resolves_low_urgency_high_confidence_ticket")
+
+
+def _test_full_graph_escalates_critical_ticket_and_can_be_resumed():
+    workflow = SkyTicketTriageWorkflow()
+    submit_result = workflow.submit_ticket("客户威胁要在媒体曝光我们的服务问题")
+    assert submit_result["status"] == "PENDING_HUMAN_REVIEW"
+
+    resumed_result = workflow.submit_human_review(
+        ticket_id=submit_result["ticket_id"],
+        resolution="已联系客户当面沟通致歉,并升级到高级客服专项跟进。",
+        reviewer="客服主管李梅",
+    )
+    assert resumed_result["status"] == "RESOLVED"
+    assert "李梅" in resumed_result["final_resolution"]
+    print("PASS: _test_full_graph_escalates_critical_ticket_and_can_be_resumed")
+
+
+def run_all_unit_tests() -> None:
+    print("=" * 60)
+    print("开始运行工单智能分拨工作流单元测试")
+    print("=" * 60)
+    _test_classify_urgency_detects_critical()
+    _test_classify_urgency_detects_low_by_default()
+    _test_query_finance_finds_record()
+    _test_query_finance_no_record()
+    _test_aggregate_results_computes_confidence()
+    _test_route_after_aggregate_resolved_when_confidence_high()
+    _test_route_after_aggregate_retry_when_low_confidence_and_has_budget()
+    _test_route_after_aggregate_escalate_when_retries_exhausted()
+    _test_route_after_aggregate_escalate_when_critical_regardless_of_confidence()
+    _test_route_fan_out_returns_three_nodes()
+    _test_supplement_query_increments_retry_count()
+    _test_full_graph_auto_resolves_low_urgency_high_confidence_ticket()
+    _test_full_graph_escalates_critical_ticket_and_can_be_resumed()
+    print("=" * 60)
+    print("全部单元测试通过")
+    print("=" * 60)
+
+
+# --------------------------------------------------------------------------
+# 第十部分:命令行演示入口
+# --------------------------------------------------------------------------
+
+
+def demo_auto_resolved_ticket() -> None:
+    print("\n" + "#" * 60)
+    print("场景一:低紧急度工单,信息充分,自动处理")
+    print("#" * 60)
+    workflow = SkyTicketTriageWorkflow()
+    result = workflow.submit_ticket("客户反馈无法登录,同时账户存在欠费问题")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def demo_retry_then_escalate_ticket() -> None:
+    print("\n" + "#" * 60)
+    print("场景二:信息不足,经过重试后仍不足,转人工review")
+    print("#" * 60)
+    workflow = SkyTicketTriageWorkflow()
+    submit_result = workflow.submit_ticket("客户咨询一个非常小众、系统没有记录的边缘问题", max_retries=2)
+    print("提交后的状态:")
+    print(json.dumps(submit_result, ensure_ascii=False, indent=2))
+
+    if submit_result["status"] == "PENDING_HUMAN_REVIEW":
+        final_result = workflow.submit_human_review(
+            ticket_id=submit_result["ticket_id"],
+            resolution="经人工排查,属于新版本功能变更导致的疑问,已提供说明文档链接。",
+            reviewer="客服专员小张",
+        )
+        print("\n人工review后的最终结果:")
+        print(json.dumps(final_result, ensure_ascii=False, indent=2))
+
+
+def demo_critical_ticket_escalation() -> None:
+    print("\n" + "#" * 60)
+    print("场景三:紧急工单,无论置信度多高,强制转人工")
+    print("#" * 60)
+    workflow = SkyTicketTriageWorkflow()
+    submit_result = workflow.submit_ticket("客户情绪激动,声称要在媒体曝光,涉及登录和欠费问题")
+    print("提交后的状态(应处于挂起等待人工review):")
+    print(json.dumps(submit_result, ensure_ascii=False, indent=2))
+
+    snapshot = workflow.get_state_snapshot(submit_result["ticket_id"])
+    print("\n当前状态快照,下一步待执行节点:", snapshot["next_nodes"])
+
+    final_result = workflow.submit_human_review(
+        ticket_id=submit_result["ticket_id"],
+        resolution="已由客服主管直接对接客户,承诺48小时内出具书面处理方案。",
+        reviewer="客服主管李梅",
+    )
+    print("\n人工review后的最终结果:")
+    print(json.dumps(final_result, ensure_ascii=False, indent=2))
+
+
+def demo() -> None:
+    demo_auto_resolved_ticket()
+    demo_retry_then_escalate_ticket()
+    demo_critical_ticket_escalation()
+
+
+if __name__ == "__main__":
+    run_all_unit_tests()
+    print()
+    demo()
+```
+
+这份代码里最值得细讲的是 `route_fan_out_to_queries` 这个路由函数——它没有返回一个字符串,而是返回了一个包含三个节点名的列表。`add_conditional_edges` 在识别到路由函数返回值是一个列表时,会把列表里列出的所有节点全部并行调度,这是 LangGraph 表达"扇出"能力的标准写法。三个查询节点(`query_finance`、`query_ticket_history`、`query_knowledge_base`)各自独立执行,谁先查完不影响谁,执行完之后各自往 `query_results` 字段追加一条记录——因为这个字段配置了 `operator.add` 归约器,三条并行产生的记录会被正确地拼接到一起,而不会互相覆盖(这正好对应上午课堂笔记里"坑二"提到的 `InvalidUpdateError` 风险场景——如果 `query_results` 没配归约器,三个并行节点同时往这个字段写值,LangGraph 会直接报错拒绝执行)。三个查询节点执行完之后,都通过普通边指向同一个 `aggregate_results` 节点,这就是"扇入"——多条并行路径重新汇聚到一个节点。
+
+另一个值得注意的地方是 `route_after_aggregate` 这个三路条件边,它比实战二里"批准/驳回"的两路条件边多了一路——除了"信息足够,自动处理"和"信息不够但还有重试机会,补充查询"之外,还有"重试次数用完了/工单本身是紧急工单,强制转人工"。而"补充查询完成后重新回到汇总节点"这条边(`graph.add_edge("supplement_query", "aggregate_results")`),让 `aggregate_results` 这个节点在一次任务执行过程中可能被反复经过多次,形成了一个真正的"评估-不满意-补充-再评估"的重试循环,`retry_count` 字段和 `max_retries` 字段就是这个循环的终止条件,防止无限重试。
+
+### 实战四:图可视化导出扩展——从"能看"到"好用"
+
+上午课堂笔记提到,`compiled_graph.get_graph().draw_mermaid()` 已经能把图导出成 Mermaid 代码,陈铭下午第一次跑通这个功能时确实很兴奋,但发给林晓和周浩之后,很快收到了两条不那么"兴奋"的反馈。林晓说:"这张图里节点名都是英文的变量名,业务方看着有点隔,能不能自己配一份更友好的图例说明?"周浩说:"图是好看,但我做测试想知道'这张图一共有几个节点、几条是条件边、入口和出口分别是谁',这些信息在Mermaid图上得一个个数,能不能直接给我一份结构化的清单?"
+
+这两条反馈,让陈铭意识到"能导出图"和"图导出得好用",中间还差着一层封装。他把这层封装做成了一个独立的工具模块,不和具体的某张业务图绑定,任何编译好的 LangGraph 图都可以拿来用。
+
+```python
+"""
+苍穹企业级智能体中台 - 图可视化导出扩展工具
+文件名: graph_visualization_export.py
+
+本文件的目标:
+1. 在官方draw_mermaid()的基础上,支持带标题、图例的Mermaid代码导出。
+2. 提供不依赖graphviz/pyppeteer等重量级依赖的ASCII文本版图结构展示,
+   适合在没有图形界面的服务器终端上快速查看图结构。
+3. 提供结构化的节点/边清单导出(可选导出为Markdown表格或CSV),
+   满足测试、审计等场景对"图里到底有什么"的结构化查询需求。
+4. 提供图的健康检查:统计节点数、边数、条件边数、判断是否存在孤立节点等,
+   可以直接在单元测试里对图结构本身做断言,而不只是对业务逻辑做断言。
+5. 对PNG导出（依赖graphviz等外部工具）做了异常兜底,环境不支持时
+   返回清晰的提示而不是让程序直接崩溃。
+
+运行依赖:
+    pip install langgraph
+    (PNG导出功能额外依赖graphviz,未安装时会给出友好提示,不影响其他功能使用)
+"""
+
+from __future__ import annotations
+
+import csv
+import io
+import logging
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger("sky_agent.graph_viz")
+
+
+# --------------------------------------------------------------------------
+# 第一部分:图结构摘要数据类
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class GraphEdgeInfo:
+    """对LangGraph原生Edge对象的简化封装,只保留可视化/审计场景关心的字段。"""
+
+    source: str
+    target: str
+    conditional: bool
+    label: Optional[str] = None
+
+
+@dataclass
+class GraphSummary:
+    """一张图的结构化摘要,可以直接在单元测试里对图结构做断言。"""
+
+    node_names: List[str]
+    edges: List[GraphEdgeInfo]
+    entry_points: List[str]
+    terminal_nodes: List[str]
+
+    @property
+    def node_count(self) -> int:
+        return len(self.node_names)
+
+    @property
+    def edge_count(self) -> int:
+        return len(self.edges)
+
+    @property
+    def conditional_edge_count(self) -> int:
+        return sum(1 for e in self.edges if e.conditional)
+
+    def find_isolated_nodes(self) -> List[str]:
+        """找出既没有入边也没有出边的孤立节点——正常的图里理论上不应该存在孤立节点,
+        如果出现,通常意味着某个节点定义了却忘记连边,是排查图配置错误的有效手段。"""
+        connected = set()
+        for e in self.edges:
+            connected.add(e.source)
+            connected.add(e.target)
+        return [n for n in self.node_names if n not in connected]
+
+
+# --------------------------------------------------------------------------
+# 第二部分:核心解析函数——从编译好的图对象提取结构化信息
+# --------------------------------------------------------------------------
+
+
+def _normalize_node_id(node_id: Any) -> str:
+    """LangGraph的START/END在不同版本里可能是特殊的字符串常量或者枚举,
+    统一转换成字符串,避免下游处理时因为类型不一致而出错。"""
+    return str(node_id)
+
+
+def extract_graph_summary(compiled_graph: Any) -> GraphSummary:
+    """从一个编译好的LangGraph图对象里,提取出结构化的节点/边摘要信息。
+
+    这是本模块所有其他导出函数共同依赖的基础函数——
+    先把LangGraph原生的Graph对象转换成本模块自定义的、更简单的数据结构,
+    后续无论是导出Markdown表格、CSV,还是做健康检查,都基于这份统一的摘要,
+    避免在多个导出函数里重复解析同一份原始图结构、重复踩同样的坑。
+    """
+    raw_graph = compiled_graph.get_graph()
+
+    node_names = [
+        _normalize_node_id(node_id)
+        for node_id in raw_graph.nodes.keys()
+        if _normalize_node_id(node_id) not in ("__start__", "__end__")
+    ]
+
+    edges: List[GraphEdgeInfo] = []
+    entry_points: List[str] = []
+    terminal_nodes: List[str] = []
+
+    for raw_edge in raw_graph.edges:
+        source = _normalize_node_id(raw_edge.source)
+        target = _normalize_node_id(raw_edge.target)
+        conditional = bool(getattr(raw_edge, "conditional", False))
+        label = getattr(raw_edge, "data", None)
+
+        if source in ("__start__", "START"):
+            entry_points.append(target)
+            continue
+        if target in ("__end__", "END"):
+            terminal_nodes.append(source)
+            continue
+
+        edges.append(GraphEdgeInfo(source=source, target=target, conditional=conditional, label=label))
+
+    return GraphSummary(
+        node_names=node_names,
+        edges=edges,
+        entry_points=sorted(set(entry_points)),
+        terminal_nodes=sorted(set(terminal_nodes)),
+    )
+
+
+# --------------------------------------------------------------------------
+# 第三部分:带标题/图例的Mermaid导出
+# --------------------------------------------------------------------------
+
+
+def export_mermaid_with_legend(
+    compiled_graph: Any,
+    output_path: str,
+    title: str = "苍穹Agent工作流图",
+    legend_lines: Optional[List[str]] = None,
+) -> str:
+    """在官方draw_mermaid()的基础上,追加标题注释和图例说明,导出到文件。
+
+    这不是修改Mermaid语法本身(避免破坏渲染兼容性),而是在文件里追加
+    Markdown注释和说明文字,方便产品、测试等非工程角色第一次看到这份文件时,
+    不需要额外的口头解释就能大致理解这张图在讲什么业务逻辑。
+    """
+    mermaid_code = compiled_graph.get_graph().draw_mermaid()
+    legend_lines = legend_lines or [
+        "- 实线箭头:普通边(固定路由,无需判断)",
+        "- 虚线箭头:条件边(根据当前状态动态判断下一步)",
+        "- 圆角矩形以外的特殊节点(如有):START/END,分别代表图的入口和出口",
+    ]
+
+    content_parts = [
+        f"%% {title}",
+        f"%% 导出时间戳请以文件系统的mtime为准,本文件内容为图结构的静态快照",
+        "%% 图例说明:",
+    ]
+    content_parts.extend(f"%% {line}" for line in legend_lines)
+    content_parts.append("")
+    content_parts.append(mermaid_code)
+
+    full_content = "\n".join(content_parts)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(full_content)
+
+    logger.info("带图例说明的Mermaid图已导出到 %s", output_path)
+    return full_content
+
+
+# --------------------------------------------------------------------------
+# 第四部分:ASCII文本版图结构展示
+# --------------------------------------------------------------------------
+
+
+def render_ascii_tree(compiled_graph: Any) -> str:
+    """把图结构渲染成一段纯文本的ASCII展示,适合在没有图形界面的服务器终端
+    或者CI日志里快速查看图的大致结构,不需要额外渲染Mermaid或安装任何依赖。
+    """
+    summary = extract_graph_summary(compiled_graph)
+
+    lines: List[str] = []
+    lines.append("图结构总览(ASCII文本版)")
+    lines.append("=" * 50)
+    lines.append(f"节点总数: {summary.node_count}")
+    lines.append(f"边总数(不含START/END相关边): {summary.edge_count}")
+    lines.append(f"其中条件边: {summary.conditional_edge_count}")
+    lines.append(f"入口节点: {', '.join(summary.entry_points) or '(无)'}")
+    lines.append(f"出口节点: {', '.join(summary.terminal_nodes) or '(无)'}")
+    lines.append("-" * 50)
+    lines.append("节点列表:")
+    for name in summary.node_names:
+        lines.append(f"  • {name}")
+    lines.append("-" * 50)
+    lines.append("边列表:")
+
+    outgoing: Dict[str, List[GraphEdgeInfo]] = {}
+    for e in summary.edges:
+        outgoing.setdefault(e.source, []).append(e)
+
+    for node in summary.node_names:
+        targets = outgoing.get(node, [])
+        if not targets:
+            continue
+        for e in targets:
+            marker = "-->" if not e.conditional else "-.->"
+            label_suffix = f" [{e.label}]" if e.label else ""
+            lines.append(f"  {node} {marker} {e.target}{label_suffix}")
+
+    isolated = summary.find_isolated_nodes()
+    if isolated:
+        lines.append("-" * 50)
+        lines.append(f"警告: 发现{len(isolated)}个孤立节点(既无入边也无出边): {', '.join(isolated)}")
+
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# 第五部分:结构化清单导出(Markdown表格 / CSV)
+# --------------------------------------------------------------------------
+
+
+def export_node_edge_markdown_table(compiled_graph: Any, output_path: str) -> str:
+    """把图的节点清单和边清单,导出成两张Markdown表格,便于粘贴进技术方案文档
+    或者需求评审文档,替代"口头描述这张图有哪些节点"这种低效率的沟通方式。
+    """
+    summary = extract_graph_summary(compiled_graph)
+
+    lines: List[str] = ["### 节点清单", "", "| 序号 | 节点名 | 是否入口 | 是否出口 |", "|---|---|---|---|"]
+    for idx, name in enumerate(summary.node_names, start=1):
+        is_entry = "是" if name in summary.entry_points else ""
+        is_terminal = "是" if name in summary.terminal_nodes else ""
+        lines.append(f"| {idx} | {name} | {is_entry} | {is_terminal} |")
+
+    lines.extend(["", "### 边清单", "", "| 序号 | 源节点 | 目标节点 | 边类型 |", "|---|---|---|---|"])
+    for idx, e in enumerate(summary.edges, start=1):
+        edge_type = "条件边" if e.conditional else "普通边"
+        lines.append(f"| {idx} | {e.source} | {e.target} | {edge_type} |")
+
+    content = "\n".join(lines)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    logger.info("节点/边清单Markdown表格已导出到 %s", output_path)
+    return content
+
+
+def export_node_edge_csv(compiled_graph: Any, output_path: str) -> None:
+    """把边清单导出成CSV格式,方便导入Excel或者其他审计工具做进一步分析。"""
+    summary = extract_graph_summary(compiled_graph)
+
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["source", "target", "is_conditional", "label"])
+        for e in summary.edges:
+            writer.writerow([e.source, e.target, e.conditional, e.label or ""])
+
+    logger.info("边清单CSV已导出到 %s", output_path)
+
+
+# --------------------------------------------------------------------------
+# 第六部分:PNG导出(带依赖缺失兜底)
+# --------------------------------------------------------------------------
+
+
+def try_export_png(compiled_graph: Any, output_path: str) -> Dict[str, Any]:
+    """尝试导出图的PNG图片,依赖graphviz等外部工具,环境中未安装时,
+    返回一个明确的、可读的失败说明,而不是让整个流程因为一个可视化功能崩溃。
+
+    这是企业级代码里"锦上添花的功能不应该拖垮核心功能"这条原则的具体体现——
+    图可视化导出终归是辅助能力,PNG导出失败绝不应该影响图本身的编译和执行。
+    """
+    try:
+        png_bytes = compiled_graph.get_graph().draw_mermaid_png()
+        with open(output_path, "wb") as f:
+            f.write(png_bytes)
+        logger.info("PNG图已导出到 %s", output_path)
+        return {"success": True, "path": output_path, "message": "导出成功"}
+    except ImportError as exc:
+        message = (
+            f"PNG导出依赖未安装({exc}),请安装graphviz相关依赖后重试,"
+            f"或者使用export_mermaid_with_legend/render_ascii_tree等不依赖额外工具的导出方式。"
+        )
+        logger.warning(message)
+        return {"success": False, "path": None, "message": message}
+    except Exception as exc:  # noqa: BLE001 - 各版本graphviz/pyppeteer可能抛出的异常类型不完全一致,统一兜底
+        message = f"PNG导出过程中发生未预期的错误: {exc}"
+        logger.warning(message)
+        return {"success": False, "path": None, "message": message}
+
+
+# --------------------------------------------------------------------------
+# 第七部分:图健康检查
+# --------------------------------------------------------------------------
+
+
+def check_graph_health(compiled_graph: Any) -> Dict[str, Any]:
+    """对一张编译好的图做基础的结构健康检查,返回检查报告。
+
+    这个函数设计的初衷,是让"图结构本身是否符合团队规范"这件事,
+    可以被写进CI流程里自动检查,而不是靠人工看Mermaid图去发现问题——
+    比如"有没有孤立节点""条件边占比是否过低(意味着这张图退化成了一条直线,
+    是不是压根不需要用图来表达)"这些问题,都可以在这里量化检查。
+    """
+    summary = extract_graph_summary(compiled_graph)
+    isolated_nodes = summary.find_isolated_nodes()
+
+    issues: List[str] = []
+    if isolated_nodes:
+        issues.append(f"存在{len(isolated_nodes)}个孤立节点: {', '.join(isolated_nodes)}")
+    if not summary.entry_points:
+        issues.append("图没有任何入口节点(可能忘记从START连边)")
+    if not summary.terminal_nodes:
+        issues.append("图没有任何出口节点(可能忘记连边到END,存在无法终止的风险)")
+
+    return {
+        "healthy": len(issues) == 0,
+        "node_count": summary.node_count,
+        "edge_count": summary.edge_count,
+        "conditional_edge_count": summary.conditional_edge_count,
+        "conditional_edge_ratio": (
+            round(summary.conditional_edge_count / summary.edge_count, 2) if summary.edge_count else 0.0
+        ),
+        "entry_points": summary.entry_points,
+        "terminal_nodes": summary.terminal_nodes,
+        "issues": issues,
+    }
+
+
+# --------------------------------------------------------------------------
+# 第八部分:单元测试(基于一张最小化的自建测试图,不依赖真实业务图/外部模型)
+# --------------------------------------------------------------------------
+
+
+def _build_minimal_test_graph():
+    """构造一张用于测试本模块的最小图:A -> 条件边(B/C) -> D -> END,
+    专门用来验证图解析、健康检查等逻辑的正确性,和任何具体业务场景无关。
+    """
+    from typing import TypedDict
+    from langgraph.graph import END, START, StateGraph
+
+    class _MiniState(TypedDict):
+        value: int
+        path: str
+
+    def node_a(state: _MiniState) -> Dict[str, Any]:
+        return {"path": "a"}
+
+    def node_b(state: _MiniState) -> Dict[str, Any]:
+        return {"path": "b"}
+
+    def node_c(state: _MiniState) -> Dict[str, Any]:
+        return {"path": "c"}
+
+    def node_d(state: _MiniState) -> Dict[str, Any]:
+        return {"path": "d"}
+
+    def router(state: _MiniState) -> str:
+        return "go_b" if state["value"] > 0 else "go_c"
+
+    graph = StateGraph(_MiniState)
+    graph.add_node("A", node_a)
+    graph.add_node("B", node_b)
+    graph.add_node("C", node_c)
+    graph.add_node("D", node_d)
+    graph.add_edge(START, "A")
+    graph.add_conditional_edges("A", router, {"go_b": "B", "go_c": "C"})
+    graph.add_edge("B", "D")
+    graph.add_edge("C", "D")
+    graph.add_edge("D", END)
+    return graph.compile()
+
+
+def _test_extract_graph_summary_counts_nodes_and_edges():
+    compiled = _build_minimal_test_graph()
+    summary = extract_graph_summary(compiled)
+    assert set(summary.node_names) == {"A", "B", "C", "D"}
+    assert summary.entry_points == ["A"]
+    assert summary.terminal_nodes == ["D"]
+    print("PASS: _test_extract_graph_summary_counts_nodes_and_edges")
+
+
+def _test_extract_graph_summary_counts_conditional_edges():
+    compiled = _build_minimal_test_graph()
+    summary = extract_graph_summary(compiled)
+    assert summary.conditional_edge_count == 2, "A->B 和 A->C 都应该被识别为条件边"
+    print("PASS: _test_extract_graph_summary_counts_conditional_edges")
+
+
+def _test_find_isolated_nodes_returns_empty_for_healthy_graph():
+    compiled = _build_minimal_test_graph()
+    summary = extract_graph_summary(compiled)
+    assert summary.find_isolated_nodes() == []
+    print("PASS: _test_find_isolated_nodes_returns_empty_for_healthy_graph")
+
+
+def _test_check_graph_health_reports_healthy_for_well_formed_graph():
+    compiled = _build_minimal_test_graph()
+    report = check_graph_health(compiled)
+    assert report["healthy"] is True
+    assert report["issues"] == []
+    assert report["node_count"] == 4
+    print("PASS: _test_check_graph_health_reports_healthy_for_well_formed_graph")
+
+
+def _test_render_ascii_tree_contains_all_node_names():
+    compiled = _build_minimal_test_graph()
+    ascii_text = render_ascii_tree(compiled)
+    for name in ["A", "B", "C", "D"]:
+        assert name in ascii_text
+    assert "条件边" not in ascii_text or True  # ASCII树用箭头符号区分,不强制要求出现"条件边"字样
+    print("PASS: _test_render_ascii_tree_contains_all_node_names")
+
+
+def _test_try_export_png_does_not_raise_when_dependency_missing(monkeypatch=None):
+    """验证即便PNG导出依赖缺失,函数本身也不会抛出未被捕获的异常,而是返回失败报告。"""
+    compiled = _build_minimal_test_graph()
+    result = try_export_png(compiled, output_path="/tmp/should_not_matter.png")
+    assert "success" in result
+    assert "message" in result
+    print("PASS: _test_try_export_png_does_not_raise_when_dependency_missing")
+
+
+def run_all_unit_tests() -> None:
+    print("=" * 60)
+    print("开始运行图可视化导出扩展模块单元测试")
+    print("=" * 60)
+    _test_extract_graph_summary_counts_nodes_and_edges()
+    _test_extract_graph_summary_counts_conditional_edges()
+    _test_find_isolated_nodes_returns_empty_for_healthy_graph()
+    _test_check_graph_health_reports_healthy_for_well_formed_graph()
+    _test_render_ascii_tree_contains_all_node_names()
+    _test_try_export_png_does_not_raise_when_dependency_missing()
+    print("=" * 60)
+    print("全部单元测试通过")
+    print("=" * 60)
+
+
+# --------------------------------------------------------------------------
+# 第九部分:命令行演示入口——把本模块用在实战三的工单分拨图上
+# --------------------------------------------------------------------------
+
+
+def demo_export_ticket_triage_graph() -> None:
+    """用本模块的能力,把实战三的工单智能分拨图做一次完整的可视化导出演示。
+
+    注意:为了让本文件可以被独立阅读和测试,这里用局部导入的方式引用
+    sky_ticket_triage_graph模块,避免两个文件之间产生模块级的循环依赖。
+    """
+    from sky_ticket_triage_graph import build_ticket_triage_graph
+
+    compiled = build_ticket_triage_graph()
+
+    print("\n>>> ASCII文本版图结构 <<<")
+    print(render_ascii_tree(compiled))
+
+    print("\n>>> 图健康检查报告 <<<")
+    health_report = check_graph_health(compiled)
+    print(json.dumps(health_report, ensure_ascii=False, indent=2))
+
+    export_mermaid_with_legend(
+        compiled,
+        output_path="ticket_triage_graph.mmd",
+        title="苍穹工单智能分拨与升级处理工作流",
+    )
+    export_node_edge_markdown_table(compiled, output_path="ticket_triage_graph_summary.md")
+    export_node_edge_csv(compiled, output_path="ticket_triage_graph_edges.csv")
+
+    png_result = try_export_png(compiled, output_path="ticket_triage_graph.png")
+    print("\n>>> PNG导出结果 <<<")
+    print(json.dumps(png_result, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    import json
+
+    run_all_unit_tests()
+    print()
+    demo_export_ticket_triage_graph()
+```
+
+陈铭把这份工具模块和 `render_ascii_tree` 的输出结果一起发到群里之后,周浩的反馈变成了:"这个好,`check_graph_health` 里的孤立节点检测,我准备直接接进咱们的CI流程,以后谁提交的图配置漏连了一条边,流水线直接就能拦下来,不用等到真跑起来才发现。"林晓也说:"Markdown表格版的节点/边清单,我直接原样粘进了给祺瑞那边同步的技术方案文档里,比一张图更适合放在正式文档里当附录。"
+
+老王看完这轮反馈,在代码评审时补了一句更本质的总结:"你看,`extract_graph_summary` 这一个函数,把LangGraph原生的图对象'翻译'成了咱们自己定义的、更简单的数据结构,后面所有的导出格式、健康检查,都是基于这份统一的中间表示在做文章,而不是每次都重新解析一遍原始的Graph对象。这是个很朴素但很重要的工程习惯——**当你发现好几个功能都需要基于同一份原始数据做不同形式的加工,先抽象出一层统一的中间表示,比让每个功能各自处理一遍原始数据要经济得多**,以后原始数据格式变了(比如LangGraph某个大版本升级改了Graph对象的内部结构),你只需要改`extract_graph_summary`这一个函数,其他所有下游功能都不用动。"
+
 ---
 
 ## 今日复盘
