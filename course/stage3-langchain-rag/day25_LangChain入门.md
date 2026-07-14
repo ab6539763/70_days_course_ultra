@@ -2687,6 +2687,1862 @@ if __name__ == "__main__":
 
 这28个测试用例(不含参数化展开的用例)跑起来全部通过,陈铭把测试报告截图发到项目群里,老王只回了一句:"这才是今天重构真正的交付物,不是main.py能跑起来这件事本身。"
 
+### 十八、消息类型体系实战:新旧消息格式双向转换工具
+
+苍穹0.1版数据库里存的历史消息,全部是普通字典格式(`{"role": "user", "content": "..."}`),这是手写版年代留下的数据。今天重构成LangChain之后,业务代码内部流转的是HumanMessage/AIMessage这类LangChain消息对象,但数据库表结构今天不做改动(PRD里明确写了"迁移过程中,数据库表结构保持不变"),这意味着"字典格式"和"LangChain消息对象格式"这两套表示方式,要长期共存。老王在代码评审时特别提醒:"这种'两套格式互相转换'的代码,看起来简单,但特别容易在边界情况上出岔子——今天把这层转换逻辑,当成一个独立的、有明确输入输出契约的小模块来写,而不是随手在crud.py里塞几行转换代码,长期看会省很多事。"
+
+```python
+"""
+app/llm/message_adapters.py
+==============================
+消息类型体系实战:新旧消息格式双向转换工具
+
+背景说明:
+    苍穹0.1版数据库里存的历史消息,全部是普通字典格式
+    ({"role": "user", "content": "..."}),这是手写版年代留下的数据。
+    今天重构成LangChain之后,业务代码内部流转的是HumanMessage/AIMessage
+    这类LangChain消息对象,但数据库表结构今天不做改动(PRD里明确写了
+    "迁移过程中,数据库表结构保持不变"),这意味着"字典格式"和
+    "LangChain消息对象格式"这两套表示方式,要长期共存——
+    读数据库出来是字典,交给ChatModel之前要转成消息对象;
+    模型返回的是AIMessage,存回数据库之前要转回字典。
+
+    老王在代码评审时特别提醒:"这种'两套格式互相转换'的代码,
+    看起来简单,但特别容易在边界情况上出岔子——比如历史数据里
+    混进了一条role字段拼写错误的脏数据,或者未来要支持工具调用之后,
+    多出了ToolMessage这种新类型,转换函数要不要跟着改?今天把这层
+    转换逻辑,当成一个独立的、有明确输入输出契约的小模块来写,
+    而不是随手在crud.py里塞几行转换代码,长期看会省很多事。"
+
+本模块解决的核心问题:
+    1. dict_to_message / message_to_dict:单条消息的双向转换;
+    2. dict_list_to_messages / messages_to_dict_list:批量转换;
+    3. 对未知role、缺失字段等异常输入,给出清晰的报错,而不是静默出错;
+    4. 为将来扩展ToolMessage/FunctionMessage预留统一的注册机制,
+       不需要每加一种新消息类型,就去改一遍所有调用点。
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Type
+
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    FunctionMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+
+
+class MessageConversionError(ValueError):
+    """消息格式转换失败时抛出的专用异常,便于调用方精确捕获这一类错误。"""
+
+
+# 苍穹平台数据库里"role"字段取值,与LangChain消息类的映射关系。
+# 新增一种消息类型时,只需要在这张表里补一条记录,不需要改动下面的转换函数。
+ROLE_TO_MESSAGE_CLASS: Dict[str, Type[BaseMessage]] = {
+    "system": SystemMessage,
+    "user": HumanMessage,
+    "assistant": AIMessage,
+    "tool": ToolMessage,
+    "function": FunctionMessage,
+}
+
+# 反向映射:LangChain消息类 -> 数据库role字段取值。
+# 用类型而不是字符串做key,是因为isinstance判断比字符串比较更不容易因为
+# 拼写错误而产生难以察觉的bug。
+MESSAGE_CLASS_TO_ROLE: Dict[Type[BaseMessage], str] = {
+    cls: role for role, cls in ROLE_TO_MESSAGE_CLASS.items()
+}
+
+
+def dict_to_message(raw: Dict[str, Any]) -> BaseMessage:
+    """
+    把数据库里查出来的一条历史消息字典,转换成对应的LangChain消息对象。
+
+    :param raw: 形如{"role": "user", "content": "你好"}的字典,
+                如果role是"tool",还需要携带"tool_call_id"字段。
+    :raises MessageConversionError: role字段缺失、取值未知,
+            或者content字段缺失时抛出
+    """
+    if "role" not in raw:
+        raise MessageConversionError(f"消息字典缺少role字段:{raw!r}")
+    if "content" not in raw:
+        raise MessageConversionError(f"消息字典缺少content字段:{raw!r}")
+
+    role = raw["role"]
+    if role not in ROLE_TO_MESSAGE_CLASS:
+        supported = ", ".join(ROLE_TO_MESSAGE_CLASS.keys())
+        raise MessageConversionError(
+            f"未知的role取值:「{role}」,当前苍穹平台仅支持:{supported}"
+        )
+
+    message_class = ROLE_TO_MESSAGE_CLASS[role]
+
+    if message_class is ToolMessage:
+        if "tool_call_id" not in raw:
+            raise MessageConversionError(
+                f"role为tool的消息必须携带tool_call_id字段,当前数据:{raw!r}"
+            )
+        return ToolMessage(content=raw["content"], tool_call_id=raw["tool_call_id"])
+
+    if message_class is FunctionMessage:
+        if "name" not in raw:
+            raise MessageConversionError(
+                f"role为function的消息必须携带name字段,当前数据:{raw!r}"
+            )
+        return FunctionMessage(content=raw["content"], name=raw["name"])
+
+    return message_class(content=raw["content"])
+
+
+def message_to_dict(message: BaseMessage) -> Dict[str, Any]:
+    """
+    把一个LangChain消息对象,转换回可以直接存入苍穹数据库的字典格式。
+
+    :param message: 任意一个受支持的LangChain消息对象
+    :raises MessageConversionError: 消息类型未在MESSAGE_CLASS_TO_ROLE里注册
+    """
+    message_class = type(message)
+    if message_class not in MESSAGE_CLASS_TO_ROLE:
+        raise MessageConversionError(
+            f"未注册的消息类型:{message_class.__name__},"
+            f"如果这是一种新的消息类型,请先在ROLE_TO_MESSAGE_CLASS里补充映射关系"
+        )
+
+    role = MESSAGE_CLASS_TO_ROLE[message_class]
+    result: Dict[str, Any] = {"role": role, "content": message.content}
+
+    if isinstance(message, ToolMessage):
+        result["tool_call_id"] = message.tool_call_id
+    if isinstance(message, FunctionMessage):
+        result["name"] = message.name
+
+    return result
+
+
+def dict_list_to_messages(raw_list: List[Dict[str, Any]]) -> List[BaseMessage]:
+    """
+    批量转换:把数据库查出来的整条历史消息列表,一次性转成消息对象列表。
+
+    这里刻意不用简单的列表推导式,而是逐条转换并在出错时附带索引信息,
+    方便真正出现脏数据的时候,能快速定位到是历史记录里的第几条出了问题,
+    而不是只看到一条笼统的"转换失败"报错。
+    """
+    result: List[BaseMessage] = []
+    for index, raw in enumerate(raw_list):
+        try:
+            result.append(dict_to_message(raw))
+        except MessageConversionError as error:
+            raise MessageConversionError(
+                f"批量转换在第{index}条记录时失败:{error}"
+            ) from error
+    return result
+
+
+def messages_to_dict_list(messages: List[BaseMessage]) -> List[Dict[str, Any]]:
+    """批量转换的反方向:把一组LangChain消息对象,转换成可以批量写入数据库的字典列表。"""
+    result: List[Dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        try:
+            result.append(message_to_dict(message))
+        except MessageConversionError as error:
+            raise MessageConversionError(
+                f"批量转换在第{index}条消息时失败:{error}"
+            ) from error
+    return result
+
+
+def round_trip_is_lossless(raw_list: List[Dict[str, Any]]) -> bool:
+    """
+    验证"字典 -> 消息对象 -> 字典"这一趟往返转换是否完全无损。
+
+    这个函数本身不参与业务逻辑,是给单元测试和调试时用的一个自检工具——
+    老王要求"任何一层格式转换代码,都要能自证'转过去转回来,数据没丢'",
+    这正是这条要求的具体落地。
+    """
+    messages = dict_list_to_messages(raw_list)
+    round_tripped = messages_to_dict_list(messages)
+    return round_tripped == raw_list
+
+
+# ------------------------------------------------------------------
+# demo:模拟从数据库读出一段真实历史记录,验证转换工具的行为
+# ------------------------------------------------------------------
+
+def print_section(title: str) -> None:
+    print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
+
+
+SAMPLE_DB_HISTORY = [
+    {"role": "system", "content": "你是蓬远科技旗下的苍穹智能助手。"},
+    {"role": "user", "content": "苍穹0.1版是什么时候上线的?"},
+    {"role": "assistant", "content": "苍穹0.1版是昨天晚上正式上线的。"},
+    {"role": "user", "content": "那它支持流式输出吗?"},
+    {"role": "assistant", "content": "支持的,前端会以打字机效果逐字显示回复内容。"},
+]
+
+
+def demo_basic_dict_to_message_conversion() -> None:
+    print_section("演示一:把数据库历史记录转换成LangChain消息对象")
+    messages = dict_list_to_messages(SAMPLE_DB_HISTORY)
+    for message in messages:
+        print(f"[{type(message).__name__}] {message.content[:30]}")
+
+    assert len(messages) == len(SAMPLE_DB_HISTORY)
+    assert isinstance(messages[0], SystemMessage)
+    assert isinstance(messages[1], HumanMessage)
+    assert isinstance(messages[2], AIMessage)
+    print("验证通过:字典列表被正确转换成了对应类型的LangChain消息对象序列,"
+          "role字段和消息类之间的映射关系符合ROLE_TO_MESSAGE_CLASS的定义。")
+
+
+def demo_round_trip_is_lossless() -> None:
+    print_section("演示二:字典->消息对象->字典的往返转换应该完全无损")
+    is_lossless = round_trip_is_lossless(SAMPLE_DB_HISTORY)
+    print(f"往返转换是否无损:{is_lossless}")
+    assert is_lossless
+    print("验证通过:这条自检逻辑保证了未来任何人改动message_adapters.py之后,"
+          "只要跑一遍这个自检,就能立刻知道自己有没有不小心破坏了转换的完整性。")
+
+
+def demo_tool_and_function_message_conversion() -> None:
+    print_section("演示三:ToolMessage/FunctionMessage这类需要额外字段的消息类型")
+    raw_with_tool = [
+        {"role": "user", "content": "帮我查一下今天的天气"},
+        {
+            "role": "tool",
+            "content": '{"weather": "晴", "temperature": 28}',
+            "tool_call_id": "call_abc123",
+        },
+        {"role": "function", "content": "北京今天晴,28度。", "name": "get_weather"},
+    ]
+    messages = dict_list_to_messages(raw_with_tool)
+    assert isinstance(messages[1], ToolMessage)
+    assert messages[1].tool_call_id == "call_abc123"
+    assert isinstance(messages[2], FunctionMessage)
+    assert messages[2].name == "get_weather"
+
+    round_tripped = messages_to_dict_list(messages)
+    assert round_tripped == raw_with_tool
+    print("验证通过:即使消息类型携带了content之外的额外字段(tool_call_id/name),"
+          "转换工具依然能正确地在两种格式之间无损往返,这为将来接入工具调用能力"
+          "预留了统一的转换入口,不需要到时候重新设计一套转换逻辑。")
+
+
+def demo_unknown_role_raises_clear_error() -> None:
+    print_section("演示四:遇到未知role的脏数据,应该主动报错而不是悄悄跳过")
+    broken_history = [
+        {"role": "user", "content": "正常消息"},
+        {"role": "unknown_role_typo", "content": "这是一条脏数据"},
+    ]
+    try:
+        dict_list_to_messages(broken_history)
+        raise AssertionError("这里应该抛出MessageConversionError,不应该走到这一行")
+    except MessageConversionError as error:
+        print(f"正确抛出错误:{error}")
+        assert "第1条记录" in str(error)
+
+    print("验证通过:批量转换函数在遇到脏数据时,不仅正确抛出了异常,"
+          "还在错误信息里带上了具体是第几条记录出了问题,这比一条笼统的"
+          "'转换失败'报错,能帮排查问题的人节省大量定位时间。")
+
+
+def demo_missing_required_field_raises_clear_error() -> None:
+    print_section("演示五:role为tool但缺少tool_call_id字段时应该明确报错")
+    broken_tool_message = [{"role": "tool", "content": "缺字段的工具调用结果"}]
+    try:
+        dict_list_to_messages(broken_tool_message)
+        raise AssertionError("这里应该抛出MessageConversionError")
+    except MessageConversionError as error:
+        print(f"正确抛出错误:{error}")
+        assert "tool_call_id" in str(error)
+
+    print("验证通过:不同消息类型有各自必须携带的字段,转换工具对每一种类型的"
+          "字段完整性都做了针对性校验,而不是简单地假设所有消息都只有content字段。")
+
+
+def run_all_demos() -> None:
+    demo_basic_dict_to_message_conversion()
+    demo_round_trip_is_lossless()
+    demo_tool_and_function_message_conversion()
+    demo_unknown_role_raises_clear_error()
+    demo_missing_required_field_raises_clear_error()
+    print("\n全部消息格式转换工具演示执行完毕。")
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+### 十九、模型调用重试与多厂商降级兜底
+
+今天下午联调的时候,陈铭故意把DeepSeek的API Key改成了一个错误值,观察到整个对话请求直接抛异常、前端弹出一片报错。老王看完说:"生产环境里,'某个厂商的接口临时抖动、超时、限流',是大概率会发生的正常情况,不是异常情况。今天PROVIDER_REGISTRY已经把厂商配置收敛成一张表了,顺理成章的下一步,是让调用逻辑具备'一个厂商不行,自动换下一个'的能力,而不是让用户直接看到一个裸的Exception。"需要特别说明:LangChain官方在Runnable层面提供了`with_fallbacks()`这个更优雅的组合式解决方案,但那是LCEL(Day26)的内容,今天还没有系统学过Runnable组合的写法,所以这个模块选择用最朴素的"手写重试循环+手写厂商轮转"来实现同样的效果,这也符合苍穹项目一直坚持的教学节奏:先搞懂手写一遍要处理哪些细节,明天学到框架提供的更优雅写法时,才能真正体会到框架帮我省了什么。
+
+```python
+"""
+app/llm/resilient_chat_caller.py
+===================================
+模型调用重试与多厂商降级兜底
+
+背景说明:
+    今天下午联调的时候,陈铭故意把DeepSeek的API Key改成了一个错误值,
+    观察到整个对话请求直接抛异常、前端弹出一片报错。老王看完说:
+    "生产环境里,'某个厂商的接口临时抖动、超时、限流',是大概率会发生的
+    正常情况,不是异常情况。今天PROVIDER_REGISTRY已经把厂商配置收敛成
+    一张表了,顺理成章的下一步,是让调用逻辑具备'一个厂商不行,
+    自动换下一个'的能力,而不是让用户直接看到一个裸的Exception。"
+
+    需要特别说明:LangChain官方在Runnable层面提供了`with_fallbacks()`
+    这个更优雅的组合式解决方案,但那是LCEL(Day26)的内容,今天(Day25)
+    还没有系统学过Runnable组合的写法。所以这个模块选择用最朴素的
+    "手写重试循环 + 手写厂商轮转"来实现同样的效果——这也符合苍穹项目
+    一直坚持的教学节奏:先搞懂"手写一遍要处理哪些细节",明天学到
+    框架提供的更优雅写法时,才能真正体会到"框架帮我省了什么"。
+
+本模块提供的核心能力:
+    1. 单个厂商调用失败时,按指数退避策略重试有限次数;
+    2. 重试次数耗尽后,自动切换到下一个候选厂商,而不是直接报错;
+    3. 记录完整的调用尝试轨迹(哪个厂商、第几次重试、耗时、是否成功),
+       方便定位"这次对话到底走了哪条路径才成功"。
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import Callable, List, Optional
+
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from langchain_core.messages import BaseMessage, HumanMessage
+
+
+class AllProvidersFailedError(RuntimeError):
+    """所有候选厂商都尝试失败后抛出的异常,携带完整的失败轨迹供排查。"""
+
+    def __init__(self, attempts: "List[CallAttempt]"):
+        self.attempts = attempts
+        summary = "; ".join(
+            f"{attempt.provider}(第{attempt.retry_index + 1}次尝试): {attempt.error}"
+            for attempt in attempts
+            if not attempt.success
+        )
+        super().__init__(f"全部候选厂商均调用失败,详细轨迹: {summary}")
+
+
+@dataclass
+class CallAttempt:
+    """一次具体的调用尝试记录,包含厂商、重试序号、耗时、是否成功、错误信息。"""
+
+    provider: str
+    retry_index: int
+    elapsed_seconds: float
+    success: bool
+    error: Optional[str] = None
+
+
+@dataclass
+class ResilientCallResult:
+    """一次完整的、可能经历了重试和厂商切换的调用最终结果。"""
+
+    reply_content: str
+    successful_provider: str
+    total_attempts: int
+    attempts: List[CallAttempt] = field(default_factory=list)
+
+
+def call_with_retry_and_fallback(
+    provider_order: List[str],
+    model_factory: Callable[[str], object],
+    messages: List[BaseMessage],
+    max_retries_per_provider: int = 2,
+    base_backoff_seconds: float = 0.01,
+) -> ResilientCallResult:
+    """
+    按厂商优先级顺序尝试调用,每个厂商内部允许重试若干次,
+    一个厂商彻底失败后自动切换到下一个候选厂商。
+
+    :param provider_order: 厂商代号的优先级列表,例如["deepseek", "qwen", "openai"]
+    :param model_factory: 一个函数,输入厂商代号,返回该厂商对应的ChatModel实例
+                          (真实场景对应chat_model_factory.get_chat_model)
+    :param messages: 本次要发送的消息列表
+    :param max_retries_per_provider: 单个厂商最多重试几次(不含首次调用)
+    :param base_backoff_seconds: 指数退避的基础等待时间,真实生产环境建议设置为1秒左右,
+                                  demo里用很小的值是为了让演示脚本跑得快
+    :raises AllProvidersFailedError: 所有候选厂商、所有重试次数都失败后抛出
+    """
+    attempts: List[CallAttempt] = []
+
+    for provider in provider_order:
+        chat_model = model_factory(provider)
+
+        for retry_index in range(max_retries_per_provider + 1):
+            start_time = time.monotonic()
+            try:
+                response = chat_model.invoke(messages)
+                elapsed = time.monotonic() - start_time
+                attempts.append(
+                    CallAttempt(
+                        provider=provider,
+                        retry_index=retry_index,
+                        elapsed_seconds=elapsed,
+                        success=True,
+                    )
+                )
+                return ResilientCallResult(
+                    reply_content=response.content,
+                    successful_provider=provider,
+                    total_attempts=len(attempts),
+                    attempts=attempts,
+                )
+            except Exception as error:  # noqa: BLE001 - 这里刻意捕获所有异常,因为不同厂商SDK抛出的异常类型不统一
+                elapsed = time.monotonic() - start_time
+                attempts.append(
+                    CallAttempt(
+                        provider=provider,
+                        retry_index=retry_index,
+                        elapsed_seconds=elapsed,
+                        success=False,
+                        error=str(error),
+                    )
+                )
+                if retry_index < max_retries_per_provider:
+                    backoff = base_backoff_seconds * (2 ** retry_index)
+                    time.sleep(backoff)
+                # 重试次数耗尽,跳出内层循环,尝试下一个厂商
+
+    raise AllProvidersFailedError(attempts)
+
+
+# ------------------------------------------------------------------
+# 用于demo和测试的可控故障模型:可以配置"调用第几次才成功",不依赖真实网络
+# ------------------------------------------------------------------
+
+class FlakyChatModel:
+    """
+    模拟一个"不太稳定"的模型客户端:调用次数达到fail_until_call_index之前
+    全部抛出异常,之后开始正常返回FakeListChatModel包装的固定回复。
+
+    这个类不是LangChain官方提供的,是专门为了在demo和单元测试里,
+    精确控制"厂商第几次调用才恢复正常",从而验证重试和厂商切换逻辑的正确性。
+    """
+
+    def __init__(self, fail_until_call_index: int, reply_text: str, failure_message: str = "模拟的网络超时"):
+        self.fail_until_call_index = fail_until_call_index
+        self._call_count = 0
+        self._underlying = FakeListChatModel(responses=[reply_text])
+        self.failure_message = failure_message
+
+    def invoke(self, messages: List[BaseMessage]):
+        self._call_count += 1
+        if self._call_count <= self.fail_until_call_index:
+            raise ConnectionError(f"{self.failure_message}(第{self._call_count}次调用)")
+        return self._underlying.invoke(messages)
+
+
+class AlwaysFailingChatModel:
+    """一直失败的模拟模型,用于验证"某个厂商彻底不可用,应该切换到下一个厂商"的场景。"""
+
+    def invoke(self, messages: List[BaseMessage]):
+        raise TimeoutError("模拟的持续超时,这个厂商当前完全不可用")
+
+
+# ------------------------------------------------------------------
+# demo
+# ------------------------------------------------------------------
+
+def print_section(title: str) -> None:
+    print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
+
+
+def demo_succeeds_on_first_try() -> None:
+    print_section("演示一:厂商第一次调用就成功,不需要重试或切换")
+
+    def factory(provider: str):
+        return FlakyChatModel(fail_until_call_index=0, reply_text=f"{provider}厂商的正常回复")
+
+    result = call_with_retry_and_fallback(
+        provider_order=["deepseek", "qwen"],
+        model_factory=factory,
+        messages=[HumanMessage(content="你好")],
+    )
+    print(f"最终使用厂商:{result.successful_provider}, 总尝试次数:{result.total_attempts}")
+    assert result.total_attempts == 1
+    assert result.successful_provider == "deepseek"
+    print("验证通过:第一次调用就成功的情况下,不会触发任何重试或厂商切换,"
+          "这是最常见的正常路径,重试兜底逻辑不应该给这条路径增加任何额外开销。")
+
+
+def demo_retries_then_succeeds_on_same_provider() -> None:
+    print_section("演示二:同一个厂商前两次失败,第三次(即第一次重试之后)成功")
+
+    def factory(provider: str):
+        return FlakyChatModel(fail_until_call_index=2, reply_text=f"{provider}厂商恢复正常后的回复")
+
+    result = call_with_retry_and_fallback(
+        provider_order=["deepseek", "qwen"],
+        model_factory=factory,
+        messages=[HumanMessage(content="你好")],
+        max_retries_per_provider=3,
+    )
+    print(f"最终使用厂商:{result.successful_provider}, 总尝试次数:{result.total_attempts}")
+    for attempt in result.attempts:
+        print(f"  第{attempt.retry_index + 1}次尝试[{attempt.provider}]: 成功={attempt.success}")
+
+    assert result.successful_provider == "deepseek"
+    assert result.total_attempts == 3
+    assert not result.attempts[0].success
+    assert not result.attempts[1].success
+    assert result.attempts[2].success
+    print("验证通过:前两次调用失败之后,没有过早放弃切换厂商,而是在同一个厂商内部"
+          "先完成允许的重试次数,第三次调用成功后立刻返回,没有浪费额外的重试机会,"
+          "也没有不必要地去打扰第二候选厂商。")
+
+
+def demo_falls_back_to_next_provider_when_first_exhausted() -> None:
+    print_section("演示三:第一候选厂商彻底不可用,自动切换到第二候选厂商")
+    call_log: List[str] = []
+
+    def factory(provider: str):
+        call_log.append(provider)
+        if provider == "deepseek":
+            return AlwaysFailingChatModel()
+        return FlakyChatModel(fail_until_call_index=0, reply_text=f"{provider}厂商的正常回复")
+
+    result = call_with_retry_and_fallback(
+        provider_order=["deepseek", "qwen", "openai"],
+        model_factory=factory,
+        messages=[HumanMessage(content="你好")],
+        max_retries_per_provider=1,
+    )
+    print(f"最终使用厂商:{result.successful_provider}")
+    print(f"厂商尝试顺序:{call_log}")
+
+    assert result.successful_provider == "qwen"
+    assert call_log == ["deepseek", "qwen"]
+    # deepseek配置了max_retries_per_provider=1,所以应该尝试了2次(首次+1次重试)才放弃
+    deepseek_attempts = [a for a in result.attempts if a.provider == "deepseek"]
+    assert len(deepseek_attempts) == 2
+    assert all(not a.success for a in deepseek_attempts)
+    print("验证通过:deepseek在用完了配置的重试次数之后,自动切换到了候选列表里"
+          "排在后面的qwen厂商,并且没有去尝试排在更后面的openai——这正是"
+          "'厂商优先级列表'这个设计的价值所在,总是优先用排在前面的厂商,"
+          "只有确认前面的厂商彻底不行了,才依次往后退。")
+
+
+def demo_all_providers_failing_raises_clear_error() -> None:
+    print_section("演示四:所有候选厂商都不可用时,应该抛出携带完整轨迹的明确异常")
+
+    def factory(provider: str):
+        return AlwaysFailingChatModel()
+
+    try:
+        call_with_retry_and_fallback(
+            provider_order=["deepseek", "qwen"],
+            model_factory=factory,
+            messages=[HumanMessage(content="你好")],
+            max_retries_per_provider=1,
+        )
+        raise AssertionError("这里应该抛出AllProvidersFailedError,不应该走到这一行")
+    except AllProvidersFailedError as error:
+        print(f"正确抛出错误,共记录了{len(error.attempts)}次尝试轨迹")
+        assert len(error.attempts) == 4  # 2个厂商 * 每个厂商(1次首次+1次重试)
+        providers_in_attempts = {a.provider for a in error.attempts}
+        assert providers_in_attempts == {"deepseek", "qwen"}
+
+    print("验证通过:当所有厂商都失败时,抛出的异常里携带了完整的失败轨迹"
+          "(每个厂商、每次尝试都记录在案),这比一条笼统的'调用失败,请重试'"
+          "报错,能给运维排查问题提供多得多的信息量。")
+
+
+def demo_exponential_backoff_increases_wait_time() -> None:
+    print_section("演示五:重试之间的等待时间,应该按指数退避策略递增")
+
+    def factory(provider: str):
+        return FlakyChatModel(fail_until_call_index=3, reply_text="最终成功的回复")
+
+    start = time.monotonic()
+    result = call_with_retry_and_fallback(
+        provider_order=["deepseek"],
+        model_factory=factory,
+        messages=[HumanMessage(content="你好")],
+        max_retries_per_provider=3,
+        base_backoff_seconds=0.02,
+    )
+    total_elapsed = time.monotonic() - start
+
+    print(f"总耗时约:{total_elapsed:.3f}秒,预期至少经历0.02+0.04+0.08=0.14秒的退避等待")
+    # 允许一定的执行开销误差,只验证总耗时不会低于理论上的最小退避时间
+    assert total_elapsed >= 0.02 + 0.04 + 0.08 - 0.01
+    assert result.successful_provider == "deepseek"
+    print("验证通过:重试之间的等待时间确实是随重试次数指数级增长的,"
+          "这个设计的意图是——如果对方服务只是短暂抖动,快速重试大概率能恢复;"
+          "但如果对方服务是真的在经历较长时间的故障,指数退避能避免"
+          "我们这一侧用密集的无效重试,给本就不稳定的对方服务造成额外压力。")
+
+
+def run_all_demos() -> None:
+    demo_succeeds_on_first_try()
+    demo_retries_then_succeeds_on_same_provider()
+    demo_falls_back_to_next_provider_when_first_exhausted()
+    demo_all_providers_failing_raises_clear_error()
+    demo_exponential_backoff_increases_wait_time()
+    print("\n全部模型调用重试与降级兜底演示执行完毕。")
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+### 二十、对话历史Token预算裁剪工具:官方trim_messages实战
+
+晚自习时陈铭想起Day15讲过的"上下文窗口管理"概念——历史消息不能无限累积,得有个裁剪策略。他正打算自己手写一个"按token预算截断"的函数,翻LangChain文档时发现`langchain_core.messages`模块里已经内置了一个`trim_messages`工具函数,专门解决这个问题。老王看到他准备重新手写一遍时说:"这正是我上午反复强调的'先问自己,没有这个组件我要自己写多少行代码'的最好例子——你已经在Day15手写过一遍token预算截断的逻辑了,原理你懂,现在看看框架提供的现成实现,好在哪里、和你当时的手写版有什么细节上的不同,这比重新写一遍更有价值。"
+
+```python
+"""
+app/llm/history_trimmer_demo.py
+==================================
+对话历史Token预算裁剪工具:官方trim_messages实战
+
+背景说明:
+    晚自习时陈铭想起Day15讲过的"上下文窗口管理"概念——历史消息不能
+    无限累积,得有个裁剪策略。他正打算自己手写一个"按token预算截断"
+    的函数,翻LangChain文档时发现`langchain_core.messages`模块里
+    已经内置了一个`trim_messages`工具函数,专门解决这个问题。
+
+    老王看到他准备重新手写一遍时说:"这正是我上午反复强调的
+    '先问自己,没有这个组件我要自己写多少行代码'的最好例子——
+    你已经在Day15手写过一遍token预算截断的逻辑了,原理你懂,
+    现在看看框架提供的现成实现,好在哪里、和你当时的手写版有什么
+    细节上的不同,这比重新写一遍更有价值。"
+
+本模块做的事情:
+    1. 演示`trim_messages`最常用的几种裁剪策略(按消息条数、按token数,
+       从头部裁剪还是从尾部裁剪、是否保留system消息);
+    2. 用一个自定义的token计数函数(复用Day15的近似估算思路)接入
+       `trim_messages`的token_counter参数,说明这个工具并不强制要求
+       接入真实的tiktoken编码器;
+    3. 对比"手写截断"与"trim_messages"在同一份对话历史上的裁剪结果,
+       验证两者行为一致,同时说明用官方工具能省掉自己维护的那部分代码。
+"""
+
+from __future__ import annotations
+
+import re
+from typing import List
+
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    trim_messages,
+)
+
+# ------------------------------------------------------------------
+# 第一部分:复用Day15的近似Token计数思路,作为trim_messages的token_counter
+# ------------------------------------------------------------------
+
+_CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+_WORD_PATTERN = re.compile(r"[A-Za-z0-9]+|[^\sA-Za-z0-9\u4e00-\u9fff]|[\u4e00-\u9fff]")
+
+
+def approximate_token_count(text: str) -> int:
+    count = 0
+    for chunk in _WORD_PATTERN.findall(text):
+        if _CJK_PATTERN.match(chunk):
+            count += 1
+        elif chunk.isalnum():
+            count += max(1, round(len(chunk) / 4))
+        else:
+            count += 1
+    return count
+
+
+def approximate_token_counter(messages: List[BaseMessage]) -> int:
+    """
+    trim_messages要求token_counter接受一个消息列表并返回总token数,
+    而不是像Day15那样直接接受一段纯文本——这里做一层薄薄的适配,
+    把每条消息的content文本长度累加起来。
+    """
+    return sum(approximate_token_count(message.content) for message in messages)
+
+
+# ------------------------------------------------------------------
+# 第二部分:构造一段模拟的、持续累积的客服对话历史
+# ------------------------------------------------------------------
+
+def build_sample_history() -> List[BaseMessage]:
+    return [
+        SystemMessage(content="你是蓬远科技旗下的苍穹智能助手,请用简洁专业的中文回答问题。"),
+        HumanMessage(content="你好,我想问一下我的订单什么时候能到?"),
+        AIMessage(content="您好,根据物流信息,预计还需要1-2个工作日送达。"),
+        HumanMessage(content="如果到时候还没到怎么办?"),
+        AIMessage(content="如果超过预计时间未送达,您可以联系人工客服协助查询物流详情。"),
+        HumanMessage(content="退货的话运费谁承担?"),
+        AIMessage(content="非质量问题退货,运费由买家承担;质量问题退货,运费由卖家承担。"),
+        HumanMessage(content="优惠券和满减可以叠加用吗?"),
+        AIMessage(content="优惠券和满减活动可以叠加使用,但每个订单限用一张优惠券。"),
+        HumanMessage(content="好的,谢谢,还有一个问题,发票怎么开?"),
+    ]
+
+
+# ------------------------------------------------------------------
+# 第三部分:demo——分别用"按条数"、"按token数"两种策略裁剪历史
+# ------------------------------------------------------------------
+
+def print_section(title: str) -> None:
+    print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
+
+
+def demo_trim_by_message_count() -> None:
+    print_section("演示一:按消息条数裁剪,只保留最近若干条,并强制保留system消息")
+    history = build_sample_history()
+
+    trimmed = trim_messages(
+        history,
+        max_tokens=4,  # 这里max_tokens的语义取决于token_counter,配合len作为计数器时就是"消息条数"
+        token_counter=len,
+        strategy="last",
+        include_system=True,
+    )
+
+    print(f"原始历史消息条数:{len(history)}")
+    print(f"裁剪后消息条数:{len(trimmed)}")
+    for message in trimmed:
+        print(f"  [{type(message).__name__}] {message.content[:25]}")
+
+    assert isinstance(trimmed[0], SystemMessage)
+    assert len(trimmed) == 4
+    print("验证通过:include_system=True确保了无论怎么裁剪,system消息(业务规则指令)"
+          "始终被保留在结果的第一位,这一点和Day15手写的build_context_sliding_window"
+          "里'system_prompt始终保留'的设计原则完全一致,只是这次是调用官方工具实现的。")
+
+
+def demo_trim_by_token_budget() -> None:
+    print_section("演示二:按token预算裁剪,复用Day15风格的近似token计数函数")
+    history = build_sample_history()
+
+    trimmed = trim_messages(
+        history,
+        max_tokens=60,
+        token_counter=approximate_token_counter,
+        strategy="last",
+        include_system=True,
+    )
+
+    total_tokens = approximate_token_counter(trimmed)
+    print(f"裁剪后消息条数:{len(trimmed)}, 估算token数:{total_tokens}")
+    for message in trimmed:
+        print(f"  [{type(message).__name__}] {message.content[:25]}")
+
+    assert total_tokens <= 60
+    assert isinstance(trimmed[0], SystemMessage)
+    print("验证通过:按token预算裁剪之后,剩余消息的总token数没有超过设定的预算上限,"
+          "这正是Day15讲过的'token预算截断策略比按轮数截断更精确'这个结论,"
+          "在官方工具trim_messages上的直接体现——传入不同的token_counter,"
+          "就能灵活切换'按条数'还是'按token数'的裁剪口径,不需要重新实现整套逻辑。")
+
+
+def demo_trim_strategy_first_vs_last() -> None:
+    print_section("演示三:strategy=\"first\" vs strategy=\"last\",裁剪方向完全相反")
+    history = build_sample_history()
+
+    trimmed_keep_recent = trim_messages(
+        history, max_tokens=4, token_counter=len, strategy="last", include_system=True,
+    )
+    # include_system只能配合strategy="last"使用,strategy="first"场景下
+    # LangChain要求显式不传这个参数(否则会抛出ValueError),这也是官方文档里
+    # 特别用一句话强调过的限制,今天顺手验证一下,比只看文档描述印象更深。
+    trimmed_keep_earliest = trim_messages(
+        history, max_tokens=4, token_counter=len, strategy="first",
+    )
+
+    print("strategy=last(保留最近的消息):")
+    for message in trimmed_keep_recent:
+        print(f"  {message.content[:20]}")
+    print("strategy=first(保留最早的消息):")
+    for message in trimmed_keep_earliest:
+        print(f"  {message.content[:20]}")
+
+    assert trimmed_keep_recent[-1].content == history[-1].content
+    assert trimmed_keep_earliest[0].content == history[0].content
+    assert trimmed_keep_earliest[-1].content == history[3].content
+    print("验证通过:strategy=\"last\"保留的是对话末尾最新的消息(通常是我们想要的,"
+          "因为最近的对话内容与当前问题最相关);strategy=\"first\"则反过来从最早的"
+          "消息开始保留——真实业务场景里几乎总是用\"last\",但今天专门对比一次,"
+          "能让陈铭清楚地知道这个参数到底在控制什么方向,不是死记参数名。")
+
+
+def demo_trim_matches_handwritten_sliding_window_behavior() -> None:
+    print_section("演示四:对比trim_messages与Day15手写滑动窗口的裁剪结果是否一致")
+    history = build_sample_history()
+    non_system_history = history[1:]  # 排除system消息,单独裁剪历史问答部分
+
+    window_size = 4
+    handwritten_result = non_system_history[-window_size:]
+
+    trimmed = trim_messages(
+        history,
+        max_tokens=window_size,
+        token_counter=len,
+        strategy="last",
+        include_system=False,
+    )
+
+    print(f"手写滑动窗口结果条数:{len(handwritten_result)}")
+    print(f"trim_messages(include_system=False)结果条数:{len(trimmed)}")
+
+    handwritten_contents = [m.content for m in handwritten_result]
+    trimmed_contents = [m.content for m in trimmed]
+    assert handwritten_contents == trimmed_contents
+    print("验证通过:在'不保留system消息、只按消息条数裁剪最近N条'这个最基础的场景下,"
+          "trim_messages和Day15手写的滑动窗口函数,产出的结果完全一致——"
+          "这说明官方工具的核心行为,和陈铭已经理解过的原理是同一套逻辑,"
+          "只是官方实现考虑了更多的边界情况和扩展参数(比如allow_partial、end_on等),"
+          "没必要自己重新造轮子。")
+
+
+def demo_empty_history_does_not_raise() -> None:
+    print_section("演示五:空历史(全新会话,还没有任何历史消息)不应该导致裁剪函数报错")
+    empty_history: List[BaseMessage] = [
+        SystemMessage(content="你是蓬远科技旗下的苍穹智能助手。"),
+    ]
+    trimmed = trim_messages(
+        empty_history, max_tokens=100, token_counter=approximate_token_counter,
+        strategy="last", include_system=True,
+    )
+    assert len(trimmed) == 1
+    assert isinstance(trimmed[0], SystemMessage)
+    print("验证通过:全新会话只有一条system消息时,裁剪函数依然能正常处理,"
+          "不会因为'历史部分为空'这种最简单的边界情况而抛异常。")
+
+
+def run_all_demos() -> None:
+    demo_trim_by_message_count()
+    demo_trim_by_token_budget()
+    demo_trim_strategy_first_vs_last()
+    demo_trim_matches_handwritten_sliding_window_behavior()
+    demo_empty_history_does_not_raise()
+    print("\n全部历史裁剪工具演示执行完毕。")
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+### 二十一、提示词配置热加载与多客户档案管理
+
+晚自习加练里,陈铭把不同客户的提示词配置写在了`CLIENT_PROMPT_PROFILES`这个Python字典常量里。老王复盘时指出一个问题:"这份配置写在代码里,意味着新增一个客户、或者调整某个客户的提示词措辞,都要改代码、走一遍代码发布流程。两周后海纳制造集团这单如果真的落地,业务侧调提示词的频率,大概率比你们改一次代码发布的频率高得多——这种'配置'性质的数据,应该放在配置文件里,让业务侧或者产品侧(比如林悦)不需要碰代码就能调整,而且最好能做到'改完配置文件,不用重启服务就生效'。"
+
+```python
+"""
+app/llm/prompt_profile_loader.py
+===================================
+提示词配置热加载与多客户档案管理
+
+背景说明:
+    今天晚自习加练(十六)里,陈铭把不同客户的提示词配置写在了
+    `CLIENT_PROMPT_PROFILES`这个Python字典常量里。老王复盘时指出一个
+    问题:"这份配置写在代码里,意味着新增一个客户、或者调整某个客户的
+    提示词措辞,都要改代码、走一遍代码发布流程。两周后海纳制造集团这单
+    如果真的落地,业务侧调提示词的频率,大概率比你们改一次代码发布的
+    频率高得多——这种'配置'性质的数据,应该放在配置文件里,让业务侧
+    或者产品侧(比如林悦)不需要碰代码就能调整,而且最好能做到
+    '改完配置文件,不用重启服务就生效'。"
+
+    今天这个模块,就是把"提示词配置"从Python代码里搬到JSON配置文件里,
+    并且实现一个简单的"热加载"机制——通过检测配置文件的修改时间,
+    自动判断是否需要重新读取配置,而不需要每次都重启进程。
+
+本模块提供的核心能力:
+    1. 从JSON配置文件加载客户提示词档案,并做结构校验;
+    2. 基于文件修改时间的缓存机制,避免每次调用都重新读盘解析;
+    3. 检测到配置文件被修改后,自动重新加载,做到"热更新";
+    4. 对配置文件缺失字段、格式错误等情况,给出清晰的报错信息。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Optional
+
+
+class PromptProfileConfigError(ValueError):
+    """提示词配置文件格式不合法时抛出,携带具体的文件路径和错误原因。"""
+
+
+@dataclass(frozen=True)
+class ClientPromptProfile:
+    """单个客户的提示词档案:客户标识、公司名、助手名、领域说明、语气风格。"""
+
+    client_key: str
+    company_name: str
+    assistant_name: str
+    domain_description: str
+    tone_style: str
+
+    def build_system_prompt(self) -> str:
+        """
+        根据本客户的档案信息,拼装出最终的system prompt文本。
+
+        这里刻意保持和十六里`build_dynamic_system_prompt`类似的拼装逻辑,
+        方便对照——区别在于十六的数据来源是硬编码的Python字典,
+        这里的数据来源是可以被业务侧直接编辑的JSON配置文件。
+        """
+        return (
+            f"你是{self.company_name}旗下的{self.assistant_name},"
+            f"专注于{self.domain_description}领域的问题解答。"
+            f"回答时请保持{self.tone_style}的语气,不确定的问题请明确说明,不要编造信息。"
+        )
+
+
+REQUIRED_PROFILE_FIELDS = (
+    "company_name",
+    "assistant_name",
+    "domain_description",
+    "tone_style",
+)
+
+
+def _validate_and_build_profile(client_key: str, raw: dict, source_path: Path) -> ClientPromptProfile:
+    missing_fields = [field for field in REQUIRED_PROFILE_FIELDS if field not in raw]
+    if missing_fields:
+        raise PromptProfileConfigError(
+            f"配置文件{source_path}中客户「{client_key}」的档案缺少必需字段:{missing_fields}"
+        )
+    return ClientPromptProfile(
+        client_key=client_key,
+        company_name=raw["company_name"],
+        assistant_name=raw["assistant_name"],
+        domain_description=raw["domain_description"],
+        tone_style=raw["tone_style"],
+    )
+
+
+class HotReloadingPromptProfileStore:
+    """
+    负责从JSON配置文件加载客户提示词档案,并支持热加载的存储类。
+
+    使用方式:
+        store = HotReloadingPromptProfileStore("prompt_profiles.json")
+        profile = store.get_profile("hina_manufacturing")
+
+    每次调用get_profile/get_all_profiles时,会先检查配置文件的修改时间,
+    如果文件在上一次加载之后被修改过,会自动重新读取解析,
+    调用方完全不需要关心"什么时候该重新加载"这件事。
+    """
+
+    def __init__(self, config_path: str):
+        self.config_path = Path(config_path)
+        self._cached_profiles: Dict[str, ClientPromptProfile] = {}
+        self._last_loaded_mtime: Optional[float] = None
+
+    def _reload_if_stale(self) -> None:
+        if not self.config_path.exists():
+            raise PromptProfileConfigError(f"提示词配置文件不存在:{self.config_path}")
+
+        current_mtime = os.path.getmtime(self.config_path)
+        if self._last_loaded_mtime is not None and current_mtime == self._last_loaded_mtime:
+            return  # 文件未发生变化,复用已缓存的解析结果,避免重复读盘解析
+
+        try:
+            raw_text = self.config_path.read_text(encoding="utf-8")
+            raw_data = json.loads(raw_text)
+        except json.JSONDecodeError as error:
+            raise PromptProfileConfigError(
+                f"配置文件{self.config_path}不是合法的JSON格式:{error}"
+            ) from error
+
+        if not isinstance(raw_data, dict):
+            raise PromptProfileConfigError(
+                f"配置文件{self.config_path}的顶层结构必须是一个JSON对象(客户标识到档案的映射)"
+            )
+
+        new_profiles: Dict[str, ClientPromptProfile] = {}
+        for client_key, raw_profile in raw_data.items():
+            if not isinstance(raw_profile, dict):
+                raise PromptProfileConfigError(
+                    f"配置文件{self.config_path}中客户「{client_key}」的档案必须是一个JSON对象"
+                )
+            new_profiles[client_key] = _validate_and_build_profile(
+                client_key, raw_profile, self.config_path
+            )
+
+        self._cached_profiles = new_profiles
+        self._last_loaded_mtime = current_mtime
+
+    def get_profile(self, client_key: str) -> ClientPromptProfile:
+        self._reload_if_stale()
+        if client_key not in self._cached_profiles:
+            available = ", ".join(self._cached_profiles.keys())
+            raise KeyError(f"未找到客户「{client_key}」的提示词档案,当前已配置的客户:{available}")
+        return self._cached_profiles[client_key]
+
+    def get_all_profiles(self) -> Dict[str, ClientPromptProfile]:
+        self._reload_if_stale()
+        return dict(self._cached_profiles)
+
+    def list_client_keys(self) -> list:
+        self._reload_if_stale()
+        return list(self._cached_profiles.keys())
+
+
+# ------------------------------------------------------------------
+# demo
+# ------------------------------------------------------------------
+
+def print_section(title: str) -> None:
+    print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
+
+
+SAMPLE_PROFILE_CONFIG = {
+    "pengyuan_default": {
+        "company_name": "蓬远科技",
+        "assistant_name": "苍穹智能助手",
+        "domain_description": "通用企业服务与产品咨询",
+        "tone_style": "简洁、专业、友好",
+    },
+    "hina_manufacturing": {
+        "company_name": "海纳制造集团",
+        "assistant_name": "海纳智能问答助手",
+        "domain_description": "设备操作规范与生产安全知识库问答",
+        "tone_style": "严谨、规范,涉及安全操作步骤时要格外谨慎明确",
+    },
+}
+
+
+def _write_sample_config(path: Path, config: dict) -> None:
+    path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def demo_basic_load_and_build_prompt(tmp_dir: Path) -> None:
+    print_section("演示一:从JSON配置文件加载客户档案,并拼装出system prompt")
+    config_path = tmp_dir / "prompt_profiles.json"
+    _write_sample_config(config_path, SAMPLE_PROFILE_CONFIG)
+
+    store = HotReloadingPromptProfileStore(str(config_path))
+    profile = store.get_profile("hina_manufacturing")
+    system_prompt = profile.build_system_prompt()
+
+    print(f"客户「{profile.client_key}」的system prompt:\n{system_prompt}")
+    assert "海纳制造集团" in system_prompt
+    assert "生产安全知识库问答" in system_prompt
+    print("验证通过:配置文件里的字段被正确读取,并拼装成了预期格式的system prompt文本。")
+
+
+def demo_hot_reload_picks_up_file_changes(tmp_dir: Path) -> None:
+    print_section("演示二:配置文件被修改后,不重启进程也能读到最新内容")
+    config_path = tmp_dir / "prompt_profiles_hotreload.json"
+    _write_sample_config(config_path, SAMPLE_PROFILE_CONFIG)
+
+    store = HotReloadingPromptProfileStore(str(config_path))
+    original_tone = store.get_profile("pengyuan_default").tone_style
+    print(f"修改前的语气风格配置:{original_tone}")
+
+    # 模拟业务侧(比如林悦)直接编辑了配置文件里的语气风格描述
+    updated_config = dict(SAMPLE_PROFILE_CONFIG)
+    updated_config["pengyuan_default"] = dict(SAMPLE_PROFILE_CONFIG["pengyuan_default"])
+    updated_config["pengyuan_default"]["tone_style"] = "更活泼、更贴近年轻用户的语气"
+    # 确保文件修改时间发生变化,不同文件系统的mtime精度可能只到秒级,
+    # 这里显式设置一个比原来更晚的时间戳,避免测试在极快的机器上因为
+    # 修改时间"看起来没变"而误判为文件未更新。
+    _write_sample_config(config_path, updated_config)
+    newer_mtime = os.path.getmtime(config_path) + 2
+    os.utime(config_path, (newer_mtime, newer_mtime))
+
+    updated_tone = store.get_profile("pengyuan_default").tone_style
+    print(f"修改后的语气风格配置:{updated_tone}")
+
+    assert updated_tone != original_tone
+    assert updated_tone == "更活泼、更贴近年轻用户的语气"
+    print("验证通过:同一个store实例,在配置文件被外部修改之后,下一次get_profile调用"
+          "就能读到最新内容,不需要重启服务、不需要重新创建store实例——"
+          "这正是老王要求的'改完配置文件,不用重启服务就生效'这一点的具体实现。")
+
+
+def demo_repeated_calls_without_file_change_avoid_reparsing(tmp_dir: Path) -> None:
+    print_section("演示三:配置文件未发生变化时,重复调用不会重新读盘解析")
+    config_path = tmp_dir / "prompt_profiles_cache.json"
+    _write_sample_config(config_path, SAMPLE_PROFILE_CONFIG)
+
+    store = HotReloadingPromptProfileStore(str(config_path))
+    store.get_profile("pengyuan_default")
+    mtime_after_first_load = store._last_loaded_mtime
+
+    # 连续多次调用,配置文件本身没有任何变化
+    for _ in range(5):
+        store.get_profile("pengyuan_default")
+
+    assert store._last_loaded_mtime == mtime_after_first_load
+    print("验证通过:文件修改时间没有变化的情况下,内部记录的_last_loaded_mtime"
+          "始终保持不变,说明缓存机制生效了,重复调用不会带来不必要的磁盘IO"
+          "和JSON解析开销——这在高并发场景下(比如每次对话请求都要查一次客户档案)"
+          "是一个不能忽视的性能细节。")
+
+
+def demo_missing_required_field_raises_clear_error(tmp_dir: Path) -> None:
+    print_section("演示四:配置文件里某个客户档案缺少必需字段时,应该明确报错")
+    config_path = tmp_dir / "prompt_profiles_broken.json"
+    broken_config = {
+        "broken_client": {
+            "company_name": "某个客户",
+            # 故意缺少assistant_name、domain_description、tone_style字段
+        }
+    }
+    _write_sample_config(config_path, broken_config)
+
+    store = HotReloadingPromptProfileStore(str(config_path))
+    try:
+        store.get_profile("broken_client")
+        raise AssertionError("这里应该抛出PromptProfileConfigError,不应该走到这一行")
+    except PromptProfileConfigError as error:
+        print(f"正确抛出错误:{error}")
+        assert "broken_client" in str(error)
+
+    print("验证通过:配置文件里的字段完整性,在加载阶段就被主动校验并报错,"
+          "不会等到真正拼装system prompt的时候,才因为某个字段是None而产出一份"
+          "不完整、甚至含有'None'字样的system prompt——错误应该尽早暴露,"
+          "而不是被悄悄地带到更下游的环节才发作。")
+
+
+def demo_missing_config_file_raises_clear_error(tmp_dir: Path) -> None:
+    print_section("演示五:配置文件路径根本不存在时,应该给出明确的报错而不是笼统的FileNotFoundError")
+    non_existent_path = tmp_dir / "this_file_does_not_exist.json"
+    store = HotReloadingPromptProfileStore(str(non_existent_path))
+
+    try:
+        store.get_profile("anything")
+        raise AssertionError("这里应该抛出PromptProfileConfigError")
+    except PromptProfileConfigError as error:
+        print(f"正确抛出错误:{error}")
+        assert str(non_existent_path) in str(error)
+
+    print("验证通过:配置文件路径写错、或者部署时忘记把配置文件一起拷贝过去,"
+          "这种运维层面很容易发生的失误,今天的实现给出的是一条包含具体文件路径的"
+          "明确报错,而不是一条让人摸不着头脑的FileNotFoundError堆栈。")
+
+
+def run_all_demos() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp_dir_str:
+        tmp_dir = Path(tmp_dir_str)
+        demo_basic_load_and_build_prompt(tmp_dir)
+        demo_hot_reload_picks_up_file_changes(tmp_dir)
+        demo_repeated_calls_without_file_change_avoid_reparsing(tmp_dir)
+        demo_missing_required_field_raises_clear_error(tmp_dir)
+        demo_missing_config_file_raises_clear_error(tmp_dir)
+    print("\n全部提示词配置热加载工具演示执行完毕。")
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+### 二十二、厂商健康度监控与动态优先级调整
+
+resilient_chat_caller.py解决了"某次调用失败了怎么办"的问题,但老王在代码评审时又抛出了一个更进一步的问题:"如果deepseek这个厂商最近半小时持续不稳定,每次调用都要先失败重试、再切换到qwen才成功,你的provider_order列表里deepseek还是排在第一位,这意味着每一次对话请求,都要先白白浪费一次失败尝试和一段退避等待时间,才能拿到真正能用的回复。有没有办法让系统'记住'最近的健康状况,自动把明显不稳定的厂商往后排,而不是每次都从头尝一遍?"这个模块实现了一个简化版的"厂商健康度监控器",与resilient_chat_caller配合使用,形成"监控->动态排序->调用"这样一条完整的链路。
+
+```python
+"""
+app/llm/provider_health_monitor.py
+=====================================
+厂商健康度监控与动态优先级调整
+
+背景说明:
+    resilient_chat_caller.py解决了"某次调用失败了怎么办"的问题,
+    但老王在代码评审时又抛出了一个更进一步的问题:"如果deepseek这个厂商
+    最近半小时持续不稳定,每次调用都要先失败重试、再切换到qwen才成功,
+    你的provider_order列表里deepseek还是排在第一位,这意味着每一次
+    对话请求,都要先白白浪费一次失败尝试和一段退避等待时间,才能拿到
+    真正能用的回复。有没有办法让系统'记住'最近的健康状况,
+    自动把明显不稳定的厂商往后排,而不是每次都从头尝一遍?"
+
+    这个模块实现了一个简化版的"厂商健康度监控器"——记录每个厂商
+    最近一段时间窗口内的调用成功/失败情况,计算出一个健康度分数,
+    并据此动态调整provider_order的优先级顺序,与resilient_chat_caller
+    配合使用,形成"监控 -> 动态排序 -> 调用" 这样一条完整的链路。
+
+    需要说明:这仍然是一个手写的、面向教学的简化实现,真实生产系统
+    通常会用更成熟的滑动窗口统计、甚至专门的服务网格(Service Mesh)
+    组件来做类似的事情,但今天这个手写版,足够把"健康度感知路由"
+    这个概念讲清楚。
+"""
+
+from __future__ import annotations
+
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Deque, Dict, List, Tuple
+
+
+@dataclass
+class CallOutcome:
+    """一次调用结果的最简记录:是否成功、发生的时间戳。"""
+
+    success: bool
+    timestamp: float
+
+
+@dataclass
+class ProviderHealthSnapshot:
+    """某个厂商在当前时刻的健康度快照,供日志打印和调试使用。"""
+
+    provider: str
+    window_call_count: int
+    success_count: int
+    health_score: float
+
+
+class ProviderHealthMonitor:
+    """
+    维护每个厂商最近window_seconds秒内的调用结果,并计算健康度分数。
+
+    健康度分数的计算规则:
+        - 没有任何调用记录的厂商,视为"未知但暂且信任",健康度记为1.0,
+          这样一个刚上线、还没积累调用数据的厂商,不会因为"没有数据"
+          就被误判为不健康而被排到最后;
+        - 有调用记录的厂商,健康度 = 成功次数 / 总调用次数,
+          单纯统计成功率,不做更复杂的加权(比如更看重最近的调用),
+          这是为了保持今天这个模块足够简单、容易讲清楚。
+    """
+
+    def __init__(self, window_seconds: float = 60.0):
+        self.window_seconds = window_seconds
+        self._records: Dict[str, Deque[CallOutcome]] = {}
+
+    def record_outcome(self, provider: str, success: bool, timestamp: float = None) -> None:
+        if timestamp is None:
+            timestamp = time.monotonic()
+        if provider not in self._records:
+            self._records[provider] = deque()
+        self._records[provider].append(CallOutcome(success=success, timestamp=timestamp))
+        self._evict_stale_records(provider, current_time=timestamp)
+
+    def _evict_stale_records(self, provider: str, current_time: float) -> None:
+        records = self._records[provider]
+        cutoff = current_time - self.window_seconds
+        while records and records[0].timestamp < cutoff:
+            records.popleft()
+
+    def health_score(self, provider: str, current_time: float = None) -> float:
+        if current_time is None:
+            current_time = time.monotonic()
+        if provider not in self._records:
+            return 1.0
+
+        self._evict_stale_records(provider, current_time=current_time)
+        records = self._records[provider]
+        if not records:
+            return 1.0
+
+        success_count = sum(1 for record in records if record.success)
+        return success_count / len(records)
+
+    def snapshot(self, provider: str, current_time: float = None) -> ProviderHealthSnapshot:
+        if current_time is None:
+            current_time = time.monotonic()
+        if provider in self._records:
+            self._evict_stale_records(provider, current_time=current_time)
+        records = self._records.get(provider, deque())
+        success_count = sum(1 for record in records if record.success)
+        return ProviderHealthSnapshot(
+            provider=provider,
+            window_call_count=len(records),
+            success_count=success_count,
+            health_score=self.health_score(provider, current_time=current_time),
+        )
+
+    def rank_providers(self, providers: List[str], current_time: float = None) -> List[str]:
+        """
+        根据健康度分数,对传入的厂商列表重新排序,健康度高的排在前面。
+
+        当两个厂商健康度分数相同时,保持它们在原始列表里的相对顺序不变
+        (稳定排序),这一点很重要——避免"健康度完全一样的两个厂商,
+        排序结果每次调用都随机跳动",这种不确定性会让线上问题难以复现排查。
+        """
+        if current_time is None:
+            current_time = time.monotonic()
+        scored: List[Tuple[float, int, str]] = [
+            (self.health_score(provider, current_time=current_time), index, provider)
+            for index, provider in enumerate(providers)
+        ]
+        # 按健康度降序排列;健康度相同时按原始索引升序,即"稳定排序"的手工实现
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [provider for _, _, provider in scored]
+
+
+# ------------------------------------------------------------------
+# demo
+# ------------------------------------------------------------------
+
+def print_section(title: str) -> None:
+    print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
+
+
+def demo_unknown_provider_defaults_to_fully_trusted() -> None:
+    print_section("演示一:从未记录过调用结果的厂商,健康度默认视为满分1.0")
+    monitor = ProviderHealthMonitor()
+    score = monitor.health_score("brand_new_provider")
+    print(f"从未调用过的厂商健康度分数:{score}")
+    assert score == 1.0
+    print("验证通过:一个刚接入、还没有任何调用历史的厂商,不会因为'数据为空'"
+          "就被误判为不健康,这避免了新厂商在刚上线时被不公平地排到最后面。")
+
+
+def demo_health_score_reflects_recent_success_rate() -> None:
+    print_section("演示二:健康度分数应该准确反映窗口内的真实成功率")
+    monitor = ProviderHealthMonitor(window_seconds=1000)
+    now = time.monotonic()
+
+    # 模拟deepseek最近10次调用里,7次成功、3次失败
+    for i in range(7):
+        monitor.record_outcome("deepseek", success=True, timestamp=now + i * 0.01)
+    for i in range(3):
+        monitor.record_outcome("deepseek", success=False, timestamp=now + (7 + i) * 0.01)
+
+    score = monitor.health_score("deepseek", current_time=now + 1)
+    print(f"deepseek最近10次调用的健康度分数:{score}")
+    assert abs(score - 0.7) < 1e-9
+    print("验证通过:健康度分数=成功次数/总调用次数,和统计学意义上的成功率完全对应,"
+          "没有引入任何让人难以直觉理解的复杂加权逻辑。")
+
+
+def demo_stale_records_outside_window_are_ignored() -> None:
+    print_section("演示三:超出时间窗口的历史调用记录,不应该继续影响当前健康度")
+    monitor = ProviderHealthMonitor(window_seconds=10)
+    now = time.monotonic()
+
+    # 很久以前(超出窗口)全部失败
+    for i in range(5):
+        monitor.record_outcome("qwen", success=False, timestamp=now - 100 + i)
+    # 最近(窗口内)全部成功
+    for i in range(5):
+        monitor.record_outcome("qwen", success=True, timestamp=now + i * 0.1)
+
+    score = monitor.health_score("qwen", current_time=now + 1)
+    print(f"qwen当前健康度分数(应忽略窗口外的历史失败记录):{score}")
+    assert score == 1.0
+    print("验证通过:窗口外的陈旧记录被正确剔除,健康度分数只反映'最近一段时间'"
+          "的真实表现,这正是'健康度监控'和'历史累计统计'最核心的区别——"
+          "厂商半年前的一次故障,不应该继续影响它今天的路由优先级。")
+
+
+def demo_rank_providers_puts_healthier_ones_first() -> None:
+    print_section("演示四:动态排序后,健康度更高的厂商应该排在更靠前的位置")
+    monitor = ProviderHealthMonitor(window_seconds=1000)
+    now = time.monotonic()
+
+    # deepseek健康度很差(1/5成功),qwen健康度很好(5/5成功),openai没有记录(默认满分)
+    for i in range(4):
+        monitor.record_outcome("deepseek", success=False, timestamp=now + i * 0.01)
+    monitor.record_outcome("deepseek", success=True, timestamp=now + 0.5)
+    for i in range(5):
+        monitor.record_outcome("qwen", success=True, timestamp=now + i * 0.01)
+
+    original_order = ["deepseek", "qwen", "openai"]
+    ranked = monitor.rank_providers(original_order, current_time=now + 1)
+    print(f"原始厂商顺序:{original_order}")
+    print(f"按健康度动态排序后的顺序:{ranked}")
+
+    assert ranked.index("deepseek") > ranked.index("qwen")
+    assert ranked.index("deepseek") > ranked.index("openai")
+    print("验证通过:健康度最差的deepseek被排到了最后,健康度好的qwen和从未失败过的"
+          "openai都排在了它前面——把这份排序结果传给resilient_chat_caller的"
+          "provider_order参数,就能让系统优先尝试当前更可靠的厂商,减少无意义的"
+          "失败重试次数。")
+
+
+def demo_equal_health_scores_preserve_original_relative_order() -> None:
+    print_section("演示五:健康度完全相同的厂商,排序结果应该保持稳定,不应该随机跳动")
+    monitor = ProviderHealthMonitor()
+    original_order = ["provider_a", "provider_b", "provider_c"]
+
+    # 三个厂商都没有任何调用记录,健康度都是默认值1.0,理应完全按原始顺序排列
+    ranked_first_time = monitor.rank_providers(original_order)
+    ranked_second_time = monitor.rank_providers(original_order)
+
+    print(f"第一次排序结果:{ranked_first_time}")
+    print(f"第二次排序结果:{ranked_second_time}")
+
+    assert ranked_first_time == original_order
+    assert ranked_second_time == original_order
+    print("验证通过:健康度打平的情况下,多次排序结果完全一致、且与原始顺序相同,"
+          "这个稳定性对调试线上问题非常重要——如果排序结果在健康度打平时随机跳动,"
+          "同样的输入在不同时刻跑出不同的路由结果,会让问题复现变得异常困难。")
+
+
+def demo_integration_with_resilient_caller() -> None:
+    print_section("演示六:与resilient_chat_caller组合使用的完整链路演示")
+    from resilient_chat_caller import call_with_retry_and_fallback, FlakyChatModel, AlwaysFailingChatModel
+    from langchain_core.messages import HumanMessage
+
+    monitor = ProviderHealthMonitor(window_seconds=1000)
+    now = time.monotonic()
+    # 提前记录deepseek最近的表现很差
+    for i in range(4):
+        monitor.record_outcome("deepseek", success=False, timestamp=now + i * 0.01)
+
+    original_order = ["deepseek", "qwen"]
+    dynamic_order = monitor.rank_providers(original_order, current_time=now + 1)
+    print(f"根据历史健康度,动态调整后的调用顺序:{dynamic_order}")
+
+    def factory(provider: str):
+        if provider == "deepseek":
+            return AlwaysFailingChatModel()
+        return FlakyChatModel(fail_until_call_index=0, reply_text="qwen的正常回复")
+
+    result = call_with_retry_and_fallback(
+        provider_order=dynamic_order,
+        model_factory=factory,
+        messages=[HumanMessage(content="你好")],
+        max_retries_per_provider=0,
+    )
+    print(f"最终使用厂商:{result.successful_provider}, 总尝试次数:{result.total_attempts}")
+
+    assert dynamic_order[0] == "qwen"
+    assert result.successful_provider == "qwen"
+    assert result.total_attempts == 1
+    print("验证通过:把健康度监控的排序结果,作为resilient_chat_caller的输入,"
+          "让原本排在第一位但已知不健康的deepseek被自动挪到了后面,"
+          "这次调用只用了1次尝试就成功,而不是像resilient_chat_caller单独使用时那样,"
+          "先在deepseek身上白白浪费一次失败尝试——这就是老王想要的"
+          "'监控->动态排序->调用'完整链路带来的实际收益。")
+
+
+def run_all_demos() -> None:
+    demo_unknown_provider_defaults_to_fully_trusted()
+    demo_health_score_reflects_recent_success_rate()
+    demo_stale_records_outside_window_are_ignored()
+    demo_rank_providers_puts_healthier_ones_first()
+    demo_equal_health_scores_preserve_original_relative_order()
+    demo_integration_with_resilient_caller()
+    print("\n全部厂商健康度监控演示执行完毕。")
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+### 二十三、配套单元测试:`test_day25_advanced_modules.py`
+
+老王看完晚自习加练的五个新模块后说:"跟前面补的`test_langchain_components.py`是同一个道理——今天这几个模块,每一个都涉及'边界情况处理是否正确'这种光靠肉眼看demo输出容易漏掉的细节,补一份测试,比你自己觉得'demo跑过了应该没问题'更可靠。"
+
+```python
+"""
+test_day25_advanced_modules.py
+=================================
+消息格式转换 / 重试降级 / 历史裁剪 / 提示词配置热加载 —— 配套单元测试
+
+老王看完晚自习加练的四个新模块后说:"跟Day25早些时候补的
+test_langchain_components.py是同一个道理——今天这几个模块,
+每一个都涉及'边界情况处理是否正确'这种光靠肉眼看demo输出容易漏掉的
+细节,补一份测试,比你自己觉得'demo跑过了应该没问题'更可靠。"
+
+覆盖范围:
+1. message_adapters:双向转换的正确性、异常路径、往返无损性
+2. resilient_chat_caller:重试与厂商切换的核心分支覆盖
+3. history_trimmer_demo:trim_messages不同策略参数下的行为
+4. prompt_profile_loader:配置加载、热更新、异常路径
+
+本文件同样保持自包含,复用被测模块里已经暴露的公共函数/类,
+不重复内联实现核心逻辑(这几个模块本身逻辑复杂度较高,
+重新内联一份反而更容易在两份实现之间出现不一致,
+所以这里选择直接import被测模块,与前面几天课件的自包含风格略有不同,
+这个取舍也是本文件开头要向读者说明的地方)。
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+from langchain_core.messages import (
+    AIMessage,
+    FunctionMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+
+from message_adapters import (
+    MessageConversionError,
+    dict_list_to_messages,
+    dict_to_message,
+    message_to_dict,
+    messages_to_dict_list,
+    round_trip_is_lossless,
+)
+from resilient_chat_caller import (
+    AllProvidersFailedError,
+    AlwaysFailingChatModel,
+    FlakyChatModel,
+    call_with_retry_and_fallback,
+)
+from history_trimmer_demo import approximate_token_counter, build_sample_history
+from langchain_core.messages import trim_messages
+from prompt_profile_loader import (
+    ClientPromptProfile,
+    HotReloadingPromptProfileStore,
+    PromptProfileConfigError,
+)
+from provider_health_monitor import ProviderHealthMonitor
+
+
+# ============================================================
+# 第一部分:message_adapters的测试
+# ============================================================
+
+
+class TestDictToMessage:
+    def test_converts_user_role_to_human_message(self):
+        message = dict_to_message({"role": "user", "content": "你好"})
+        assert isinstance(message, HumanMessage)
+        assert message.content == "你好"
+
+    def test_converts_assistant_role_to_ai_message(self):
+        message = dict_to_message({"role": "assistant", "content": "您好"})
+        assert isinstance(message, AIMessage)
+
+    def test_missing_role_field_raises_error(self):
+        with pytest.raises(MessageConversionError, match="缺少role字段"):
+            dict_to_message({"content": "没有role字段"})
+
+    def test_missing_content_field_raises_error(self):
+        with pytest.raises(MessageConversionError, match="缺少content字段"):
+            dict_to_message({"role": "user"})
+
+    def test_unknown_role_raises_error(self):
+        with pytest.raises(MessageConversionError, match="未知的role取值"):
+            dict_to_message({"role": "typo_role", "content": "内容"})
+
+    def test_tool_message_requires_tool_call_id(self):
+        with pytest.raises(MessageConversionError, match="tool_call_id"):
+            dict_to_message({"role": "tool", "content": "结果"})
+
+    def test_tool_message_with_valid_fields_converts_correctly(self):
+        message = dict_to_message({"role": "tool", "content": "结果", "tool_call_id": "abc"})
+        assert isinstance(message, ToolMessage)
+        assert message.tool_call_id == "abc"
+
+    def test_function_message_requires_name(self):
+        with pytest.raises(MessageConversionError, match="name"):
+            dict_to_message({"role": "function", "content": "结果"})
+
+
+class TestMessageToDict:
+    def test_human_message_converts_to_user_role_dict(self):
+        result = message_to_dict(HumanMessage(content="你好"))
+        assert result == {"role": "user", "content": "你好"}
+
+    def test_tool_message_includes_tool_call_id_field(self):
+        result = message_to_dict(ToolMessage(content="结果", tool_call_id="xyz"))
+        assert result["tool_call_id"] == "xyz"
+        assert result["role"] == "tool"
+
+
+class TestBatchConversion:
+    def test_dict_list_to_messages_preserves_order(self):
+        raw = [
+            {"role": "system", "content": "系统提示"},
+            {"role": "user", "content": "问题1"},
+            {"role": "assistant", "content": "回答1"},
+        ]
+        messages = dict_list_to_messages(raw)
+        assert [type(m).__name__ for m in messages] == ["SystemMessage", "HumanMessage", "AIMessage"]
+
+    def test_batch_conversion_error_includes_index(self):
+        raw = [
+            {"role": "user", "content": "正常"},
+            {"role": "user", "content": "正常2"},
+            {"role": "bad_role", "content": "第三条脏数据"},
+        ]
+        with pytest.raises(MessageConversionError, match="第2条记录"):
+            dict_list_to_messages(raw)
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            [{"role": "system", "content": "只有系统消息"}],
+            [{"role": "user", "content": "只有用户消息"}],
+            [
+                {"role": "system", "content": "系统"},
+                {"role": "user", "content": "用户"},
+                {"role": "assistant", "content": "助手"},
+            ],
+        ],
+    )
+    def test_round_trip_is_lossless_for_various_history_shapes(self, raw):
+        assert round_trip_is_lossless(raw) is True
+
+
+# ============================================================
+# 第二部分:resilient_chat_caller的测试
+# ============================================================
+
+
+class TestCallWithRetryAndFallback:
+    def test_success_on_first_attempt_uses_only_one_call(self):
+        def factory(provider):
+            return FlakyChatModel(fail_until_call_index=0, reply_text="ok")
+
+        result = call_with_retry_and_fallback(
+            provider_order=["deepseek"], model_factory=factory,
+            messages=[HumanMessage(content="hi")],
+        )
+        assert result.total_attempts == 1
+        assert result.successful_provider == "deepseek"
+
+    def test_retries_within_same_provider_before_switching(self):
+        def factory(provider):
+            return FlakyChatModel(fail_until_call_index=1, reply_text="ok")
+
+        result = call_with_retry_and_fallback(
+            provider_order=["deepseek", "qwen"], model_factory=factory,
+            messages=[HumanMessage(content="hi")], max_retries_per_provider=2,
+            base_backoff_seconds=0.001,
+        )
+        assert result.successful_provider == "deepseek"
+        assert result.total_attempts == 2
+
+    def test_switches_provider_after_exhausting_retries(self):
+        call_order = []
+
+        def factory(provider):
+            call_order.append(provider)
+            if provider == "deepseek":
+                return AlwaysFailingChatModel()
+            return FlakyChatModel(fail_until_call_index=0, reply_text="ok")
+
+        result = call_with_retry_and_fallback(
+            provider_order=["deepseek", "qwen"], model_factory=factory,
+            messages=[HumanMessage(content="hi")], max_retries_per_provider=0,
+            base_backoff_seconds=0.001,
+        )
+        assert result.successful_provider == "qwen"
+        assert call_order == ["deepseek", "qwen"]
+
+    def test_all_providers_failing_raises_with_full_trace(self):
+        def factory(provider):
+            return AlwaysFailingChatModel()
+
+        with pytest.raises(AllProvidersFailedError) as exc_info:
+            call_with_retry_and_fallback(
+                provider_order=["deepseek", "qwen"], model_factory=factory,
+                messages=[HumanMessage(content="hi")], max_retries_per_provider=0,
+                base_backoff_seconds=0.001,
+            )
+        assert len(exc_info.value.attempts) == 2
+        assert all(not a.success for a in exc_info.value.attempts)
+
+    def test_empty_provider_order_raises_all_providers_failed(self):
+        def factory(provider):
+            return AlwaysFailingChatModel()
+
+        with pytest.raises(AllProvidersFailedError) as exc_info:
+            call_with_retry_and_fallback(
+                provider_order=[], model_factory=factory,
+                messages=[HumanMessage(content="hi")],
+            )
+        assert exc_info.value.attempts == []
+
+
+# ============================================================
+# 第三部分:history_trimmer_demo的测试
+# ============================================================
+
+
+class TestHistoryTrimming:
+    def test_trim_by_count_keeps_expected_number_of_messages(self):
+        history = build_sample_history()
+        trimmed = trim_messages(
+            history, max_tokens=3, token_counter=len, strategy="last", include_system=True,
+        )
+        assert len(trimmed) == 3
+        assert isinstance(trimmed[0], SystemMessage)
+
+    def test_trim_by_token_budget_never_exceeds_budget(self):
+        history = build_sample_history()
+        trimmed = trim_messages(
+            history, max_tokens=30, token_counter=approximate_token_counter,
+            strategy="last", include_system=True,
+        )
+        assert approximate_token_counter(trimmed) <= 30
+
+    def test_include_system_false_drops_system_message(self):
+        history = build_sample_history()
+        trimmed = trim_messages(
+            history, max_tokens=3, token_counter=len, strategy="last", include_system=False,
+        )
+        assert all(not isinstance(m, SystemMessage) for m in trimmed)
+
+    def test_large_enough_budget_keeps_everything(self):
+        history = build_sample_history()
+        trimmed = trim_messages(
+            history, max_tokens=10_000, token_counter=approximate_token_counter,
+            strategy="last", include_system=True,
+        )
+        assert len(trimmed) == len(history)
+
+
+# ============================================================
+# 第四部分:prompt_profile_loader的测试
+# ============================================================
+
+
+@pytest.fixture
+def sample_config_path(tmp_path: Path) -> Path:
+    config_path = tmp_path / "profiles.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "client_a": {
+                    "company_name": "客户A公司",
+                    "assistant_name": "助手A",
+                    "domain_description": "领域A",
+                    "tone_style": "风格A",
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return config_path
+
+
+class TestHotReloadingPromptProfileStore:
+    def test_get_profile_returns_correct_profile(self, sample_config_path):
+        store = HotReloadingPromptProfileStore(str(sample_config_path))
+        profile = store.get_profile("client_a")
+        assert isinstance(profile, ClientPromptProfile)
+        assert profile.company_name == "客户A公司"
+
+    def test_build_system_prompt_contains_all_fields(self, sample_config_path):
+        store = HotReloadingPromptProfileStore(str(sample_config_path))
+        prompt = store.get_profile("client_a").build_system_prompt()
+        assert "客户A公司" in prompt
+        assert "助手A" in prompt
+        assert "领域A" in prompt
+        assert "风格A" in prompt
+
+    def test_unknown_client_key_raises_key_error(self, sample_config_path):
+        store = HotReloadingPromptProfileStore(str(sample_config_path))
+        with pytest.raises(KeyError, match="client_a"):
+            store.get_profile("not_exist_client")
+
+    def test_missing_config_file_raises_config_error(self, tmp_path):
+        store = HotReloadingPromptProfileStore(str(tmp_path / "does_not_exist.json"))
+        with pytest.raises(PromptProfileConfigError, match="不存在"):
+            store.get_profile("anything")
+
+    def test_invalid_json_raises_config_error(self, tmp_path):
+        bad_path = tmp_path / "bad.json"
+        bad_path.write_text("{ this is not valid json", encoding="utf-8")
+        store = HotReloadingPromptProfileStore(str(bad_path))
+        with pytest.raises(PromptProfileConfigError, match="不是合法的JSON格式"):
+            store.get_profile("anything")
+
+    def test_missing_required_field_raises_config_error(self, tmp_path):
+        broken_path = tmp_path / "broken.json"
+        broken_path.write_text(
+            json.dumps({"client_x": {"company_name": "只有公司名"}}), encoding="utf-8"
+        )
+        store = HotReloadingPromptProfileStore(str(broken_path))
+        with pytest.raises(PromptProfileConfigError, match="缺少必需字段"):
+            store.get_profile("client_x")
+
+    def test_list_client_keys_reflects_current_config(self, sample_config_path):
+        store = HotReloadingPromptProfileStore(str(sample_config_path))
+        assert store.list_client_keys() == ["client_a"]
+
+
+# ============================================================
+# 第五部分:provider_health_monitor的测试
+# ============================================================
+
+
+class TestProviderHealthMonitor:
+    def test_unrecorded_provider_defaults_to_full_trust(self):
+        monitor = ProviderHealthMonitor()
+        assert monitor.health_score("never_seen_provider") == 1.0
+
+    def test_health_score_equals_success_rate(self):
+        monitor = ProviderHealthMonitor(window_seconds=1000)
+        now = 1000.0
+        for i in range(3):
+            monitor.record_outcome("p", success=True, timestamp=now + i)
+        for i in range(1):
+            monitor.record_outcome("p", success=False, timestamp=now + 3 + i)
+        score = monitor.health_score("p", current_time=now + 10)
+        assert abs(score - 0.75) < 1e-9
+
+    def test_records_outside_window_are_evicted(self):
+        monitor = ProviderHealthMonitor(window_seconds=5)
+        monitor.record_outcome("p", success=False, timestamp=0.0)
+        score = monitor.health_score("p", current_time=100.0)
+        assert score == 1.0  # 唯一的记录已经过期,视为没有记录,回到默认满分
+
+    def test_rank_providers_orders_by_descending_health(self):
+        monitor = ProviderHealthMonitor(window_seconds=1000)
+        now = 0.0
+        monitor.record_outcome("bad", success=False, timestamp=now)
+        monitor.record_outcome("good", success=True, timestamp=now)
+        ranked = monitor.rank_providers(["bad", "good"], current_time=now + 1)
+        assert ranked == ["good", "bad"]
+
+    def test_rank_providers_is_stable_when_scores_tie(self):
+        monitor = ProviderHealthMonitor()
+        original = ["x", "y", "z"]
+        assert monitor.rank_providers(original) == original
+
+    def test_snapshot_reports_correct_counts(self):
+        monitor = ProviderHealthMonitor(window_seconds=1000)
+        now = 0.0
+        monitor.record_outcome("p", success=True, timestamp=now)
+        monitor.record_outcome("p", success=False, timestamp=now + 1)
+        snapshot = monitor.snapshot("p", current_time=now + 2)
+        assert snapshot.window_call_count == 2
+        assert snapshot.success_count == 1
+
+
+# ------------------------------------------------------------------
+# 第六部分:不依赖pytest的最小化自测(与前几天课件的兜底风格保持一致)
+# ------------------------------------------------------------------
+
+def run_minimal_self_check() -> None:
+    message = dict_to_message({"role": "user", "content": "自测"})
+    assert isinstance(message, HumanMessage)
+
+    def factory(provider):
+        return FlakyChatModel(fail_until_call_index=0, reply_text="ok")
+
+    result = call_with_retry_and_fallback(
+        provider_order=["deepseek"], model_factory=factory,
+        messages=[HumanMessage(content="hi")],
+    )
+    assert result.successful_provider == "deepseek"
+
+    history = build_sample_history()
+    trimmed = trim_messages(history, max_tokens=2, token_counter=len, strategy="last", include_system=True)
+    assert len(trimmed) == 2
+
+    print("最小化自测全部通过(不依赖pytest的兜底验证)。")
+
+
+if __name__ == "__main__":
+    run_minimal_self_check()
+```
+
+陈铭把这五个新模块和配套的37个测试用例都跑了一遍,凌晨时分在项目群里汇报了一句:"消息格式转换、重试降级、历史裁剪、提示词热加载、厂商健康监控,这五块拼起来,已经能覆盖'对话引擎在生产环境里会遇到的大部分意外情况'了。"老王第二天早上看到消息回复:"这才是重构真正该交付的东西——不是main.py能跑起来,而是main.py背后这些平时看不见、但出问题时刻救命的细节都补齐了。"
+
 ---
 
 ## 今日复盘
