@@ -2638,6 +2638,1765 @@ if __name__ == "__main__":
 
 陈铭本地装了pytest之后跑了一遍,`pytest test_day15_cost_tools.py -v`的输出里,16个测试用例全部显示`PASSED`,唯独`test_negative_conversations_raises_or_handled_gracefully`这个用例名字看起来有点长,他问老王要不要精简。老王说:"测试用例的名字,宁可长一点、说清楚'在测什么场景、期望什么行为',也不要为了短而含糊。三个月后你自己回头看这份测试文件,靠的就是这些名字,不是靠你现在的记忆力。"
 
+### 实战十一:多轮对话上下文窗口管理——滑动窗口与Token预算截断策略
+
+老王在陈铭提交完实战十的单元测试之后,又抛出了一个新问题:"你现在处理的都是单次调用,但苍穹平台真正要接的客服机器人场景,是多轮对话——用户会一直追问下去。你有没有想过,如果每一轮都把从第一句话开始的全部历史原样带上,会发生什么?"陈铭愣了一下:"历史会越堆越长,input token跟着涨?"老王点头:"对,而且是随对话轮数近似线性增长,这是几乎所有对话产品都会踩的第一个成本坑。今天补一个上下文窗口管理的实战,把'该带哪些历史消息'这件事,变成一个可以量化对比的工程决策,而不是拍脑袋决定。"
+
+```python
+"""
+多轮对话上下文窗口管理与滑动截断策略
+======================================
+
+背景说明：
+老王在今天开工时提过一句"你现在要负责的是苍穹平台正式的对话引擎层，
+这一层的每一个技术决策——用哪个模型、上下文怎么管理、成本怎么控制——
+都建立在对'模型内部到底在做什么'这件事有基本认知的前提上"。前面几个
+实战都在解决"成本怎么算"，这一个实战专门解决"上下文怎么管理"这个
+被提到但还没有落地过的问题。
+
+真实场景里，一次多轮对话不可能把从第一轮到当前轮的全部历史消息，
+原样塞进每一次请求——一是大多数模型都有上下文窗口长度上限
+（超过会直接报错或被服务端截断），二是历史消息越长，input token
+越多，成本线性增长，用户体验（首字延迟）也会跟着变差。因此几乎每一个
+真实的对话产品，都需要一套"上下文窗口管理策略"，决定"这一轮请求，
+到底该带上历史里的哪些消息"。
+
+本脚本实现并对比三种常见策略：
+1. 全量策略（naive）：把全部历史消息原样带上，作为"不做任何管理"的
+   对照基线，用于说明"什么都不做"的成本增长有多快。
+2. 滑动窗口策略（sliding window）：只保留最近N轮对话，超出窗口的
+   历史消息直接丢弃。实现简单，但会丢失更早的上下文信息。
+3. Token预算截断策略（token budget truncation）：给历史消息设置
+   一个token预算上限，从最近的消息开始往前累加，一旦累加值超过预算
+   就停止收录更早的消息——这种策略比"按轮数截断"更精确，因为不同
+   轮次消息的长度可能差异很大，按轮数截断可能算漏账，按token预算
+   截断才能真正把"这次请求到底要花多少钱"控制在可预测范围内。
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+# ------------------------------------------------------------------
+# 第一部分：复用与前几个实战一致的近似Token计数方式
+# 本脚本保持自包含、可独立运行，因此内联一份简化的近似估算实现，
+# 与实战一/实战十里的ApproximateEncoder思路完全一致。
+# ------------------------------------------------------------------
+
+_CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+_WORD_PATTERN = re.compile(r"[A-Za-z0-9]+|[^\sA-Za-z0-9\u4e00-\u9fff]|[\u4e00-\u9fff]")
+
+
+def approximate_token_count(text: str) -> int:
+    count = 0
+    for chunk in _WORD_PATTERN.findall(text):
+        if _CJK_PATTERN.match(chunk):
+            count += 1
+        elif chunk.isalnum():
+            count += max(1, round(len(chunk) / 4))
+        else:
+            count += 1
+    return count
+
+
+# ------------------------------------------------------------------
+# 第二部分：对话消息与上下文窗口管理策略
+# ------------------------------------------------------------------
+
+@dataclass
+class Message:
+    role: str  # "system" / "user" / "assistant"
+    content: str
+
+    @property
+    def token_count(self) -> int:
+        return approximate_token_count(self.content)
+
+
+@dataclass
+class ConversationHistory:
+    """一次多轮对话的全部历史消息，按发生顺序追加。"""
+
+    system_prompt: Optional[Message] = None
+    turns: List[Message] = field(default_factory=list)
+
+    def append(self, role: str, content: str) -> None:
+        self.turns.append(Message(role=role, content=content))
+
+    def total_token_count(self) -> int:
+        system_tokens = self.system_prompt.token_count if self.system_prompt else 0
+        return system_tokens + sum(msg.token_count for msg in self.turns)
+
+
+@dataclass
+class ContextBuildResult:
+    strategy_name: str
+    included_messages: List[Message]
+    included_token_count: int
+    dropped_message_count: int
+    dropped_token_count: int
+
+
+def build_context_naive(history: ConversationHistory) -> ContextBuildResult:
+    """全量策略：把system prompt和全部历史消息原样带上，不做任何裁剪。"""
+    included = list(history.turns)
+    if history.system_prompt:
+        included = [history.system_prompt] + included
+    return ContextBuildResult(
+        strategy_name="全量策略(naive)",
+        included_messages=included,
+        included_token_count=sum(msg.token_count for msg in included),
+        dropped_message_count=0,
+        dropped_token_count=0,
+    )
+
+
+def build_context_sliding_window(
+    history: ConversationHistory, window_turns: int
+) -> ContextBuildResult:
+    """滑动窗口策略：只保留最近window_turns条消息(不区分user/assistant，
+    按消息条数计，实际项目中通常按"轮"——即一问一答——计数，这里为了
+    演示简化为按消息条数)。
+    """
+    kept = history.turns[-window_turns:] if window_turns > 0 else []
+    dropped = history.turns[: len(history.turns) - len(kept)]
+
+    included = list(kept)
+    if history.system_prompt:
+        included = [history.system_prompt] + included
+
+    return ContextBuildResult(
+        strategy_name=f"滑动窗口策略(最近{window_turns}条)",
+        included_messages=included,
+        included_token_count=sum(msg.token_count for msg in included),
+        dropped_message_count=len(dropped),
+        dropped_token_count=sum(msg.token_count for msg in dropped),
+    )
+
+
+def build_context_token_budget(
+    history: ConversationHistory, token_budget: int
+) -> ContextBuildResult:
+    """Token预算截断策略：system prompt始终保留(视为"必须携带的指令"，
+    不计入可裁剪的历史预算)，从最新的一条消息开始往前累加token数，
+    一旦累加超过token_budget就停止收录更早的消息。
+
+    这里刻意"从后往前"遍历，而不是"从前往后累加到超限就截断"，
+    原因是我们希望优先保留*最近*的对话内容(通常与当前问题最相关)，
+    这与滑动窗口策略的直觉是一致的，只是判断"保留到哪里"的依据从
+    "轮数"换成了"token数"，能更精确地控制这次请求的实际花费。
+    """
+    system_tokens = history.system_prompt.token_count if history.system_prompt else 0
+    remaining_budget = token_budget - system_tokens
+
+    kept_reversed: List[Message] = []
+    accumulated = 0
+    cutoff_index = len(history.turns)
+
+    for index in range(len(history.turns) - 1, -1, -1):
+        message = history.turns[index]
+        if accumulated + message.token_count > remaining_budget:
+            cutoff_index = index + 1
+            break
+        accumulated += message.token_count
+        kept_reversed.append(message)
+        cutoff_index = index
+    else:
+        cutoff_index = 0
+
+    kept = list(reversed(kept_reversed))
+    dropped = history.turns[:cutoff_index]
+
+    included = list(kept)
+    if history.system_prompt:
+        included = [history.system_prompt] + included
+
+    return ContextBuildResult(
+        strategy_name=f"Token预算截断策略(预算{token_budget}token)",
+        included_messages=included,
+        included_token_count=sum(msg.token_count for msg in included),
+        dropped_message_count=len(dropped),
+        dropped_token_count=sum(msg.token_count for msg in dropped),
+    )
+
+
+# ------------------------------------------------------------------
+# 第三部分：demo——模拟一次持续增长的长对话，对比三种策略的表现
+# ------------------------------------------------------------------
+
+def build_sample_long_conversation(total_turns: int) -> ConversationHistory:
+    history = ConversationHistory(
+        system_prompt=Message(
+            role="system",
+            content="你是苍穹企业级智能体中台的客服助手，请用简洁、专业的中文回答问题。",
+        )
+    )
+    for i in range(total_turns):
+        history.append(
+            "user",
+            f"第{i + 1}轮问题：关于订单售后流程，我想确认一下第{i + 1}个具体细节应该怎么处理？",
+        )
+        history.append(
+            "assistant",
+            f"关于第{i + 1}个细节，根据蓬远科技合作的商家售后规则，通常处理方式是……"
+            "（此处为模拟回答内容，实际业务中会给出具体的处理步骤说明）。",
+        )
+    return history
+
+
+def print_section(title: str) -> None:
+    print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
+
+
+def demo_naive_strategy_cost_growth() -> None:
+    print_section("演示一：全量策略下，随着对话轮数增加，input token是如何线性增长的")
+    for turns in (2, 5, 10, 20):
+        history = build_sample_long_conversation(turns)
+        result = build_context_naive(history)
+        print(f"进行到第{turns}轮时，全量策略下这次请求的input token数：{result.included_token_count}")
+
+    history_20 = build_sample_long_conversation(20)
+    history_2 = build_sample_long_conversation(2)
+    ratio = build_context_naive(history_20).included_token_count / build_context_naive(history_2).included_token_count
+    print(f"从2轮增长到20轮(10倍轮数)，token数增长了约{ratio:.1f}倍")
+    assert ratio > 5, "全量策略下token数应该随轮数近似线性增长"
+    print("验证通过：如果什么都不做，input token(以及对应成本)会随着对话轮数持续增长，"
+          "长期对话场景下这是不可持续的成本曲线。")
+
+
+def demo_sliding_window_bounds_growth() -> None:
+    print_section("演示二：滑动窗口策略能把token数限制在一个可预测的范围内")
+    window_turns = 6  # 保留最近6条消息(约3轮问答)
+
+    token_counts = []
+    for turns in (2, 5, 10, 20, 50):
+        history = build_sample_long_conversation(turns)
+        result = build_context_sliding_window(history, window_turns=window_turns)
+        token_counts.append(result.included_token_count)
+        print(f"进行到第{turns}轮时，滑动窗口策略下这次请求的input token数：{result.included_token_count}")
+
+    # 一旦总轮数超过窗口大小，token数应该趋于稳定(不再随轮数线性增长)
+    assert token_counts[-1] - token_counts[-2] < token_counts[1] - token_counts[0]
+    print("验证通过：一旦对话总轮数超过窗口大小，滑动窗口策略下的token数就不再随对话"
+          "总轮数继续增长，成本被控制在了一个可预测的上限附近，代价是丢失了窗口之外的"
+          "历史上下文信息。")
+
+
+def demo_token_budget_more_precise_than_turn_count() -> None:
+    print_section("演示三：当消息长度差异很大时，按token预算截断比按轮数截断更精确")
+    history = ConversationHistory(
+        system_prompt=Message(role="system", content="你是客服助手。")
+    )
+    # 故意构造长度差异很大的消息：前几轮很短，后面突然出现一条很长的消息
+    history.append("user", "你好")
+    history.append("assistant", "您好，请问有什么可以帮您？")
+    history.append("user", "我想问一下退货政策" * 50)  # 故意构造一条很长的消息
+    history.append("assistant", "好的，为您介绍退货政策……")
+
+    sliding_result = build_context_sliding_window(history, window_turns=2)
+    budget_result = build_context_token_budget(history, token_budget=60)
+
+    print(f"滑动窗口策略(最近2条)：包含token数={sliding_result.included_token_count}")
+    print(f"Token预算截断策略(预算60token)：包含token数={budget_result.included_token_count}")
+
+    assert budget_result.included_token_count <= 60
+    print("验证通过：滑动窗口策略只按'消息条数'裁剪，遇到一条异常长的消息时无法感知，"
+          "实际token数可能远超预期；而token预算截断策略直接以token数为约束条件，"
+          "能够保证这次请求的input token数始终不超过设定的预算上限，"
+          "这对需要严格控制单次调用成本的场景(比如按调用次数收费给客户)更可靠。")
+
+
+def demo_dropped_context_tradeoff() -> None:
+    print_section("演示四：截断策略节省的成本，与丢失的上下文信息量之间的权衡")
+    history = build_sample_long_conversation(15)
+
+    naive_result = build_context_naive(history)
+    window_result = build_context_sliding_window(history, window_turns=6)
+    budget_result = build_context_token_budget(history, token_budget=200)
+
+    for result in (naive_result, window_result, budget_result):
+        saved_ratio = 0.0
+        if naive_result.included_token_count > 0:
+            saved_ratio = 1 - result.included_token_count / naive_result.included_token_count
+        print(
+            f"{result.strategy_name}：保留token数={result.included_token_count}, "
+            f"丢弃消息数={result.dropped_message_count}, "
+            f"相比全量策略节省了约{saved_ratio:.0%}的input token"
+        )
+
+    assert window_result.dropped_message_count > 0
+    assert budget_result.dropped_message_count > 0
+    print("验证通过：两种截断策略都显著减少了input token数，但也都丢弃了一部分历史消息，"
+          "这是一个必须由产品侧和技术侧共同权衡的取舍——丢弃的历史越多，省的钱越多，"
+          "但用户'模型是不是忘记我之前说过的话了'的体验风险也越高，没有免费的午餐。")
+
+
+def run_all_demos() -> None:
+    demo_naive_strategy_cost_growth()
+    demo_sliding_window_bounds_growth()
+    demo_token_budget_more_precise_than_turn_count()
+    demo_dropped_context_tradeoff()
+    print("\n全部上下文窗口管理演示执行完毕。")
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+### 实战十二:模型分级路由——简单问题用便宜模型,复杂问题用旗舰模型
+
+整理完实战三的价格对比表,陈铭发现旗舰模型的价格是经济档模型的十几倍甚至几十倍。老王在旁边补了一句:"你不可能所有请求都用最贵的模型,也不可能所有请求都用最便宜的模型——前者是浪费钱,后者是砸自己的产品口碑。真实项目里常见的做法叫'模型路由',先判断这个请求'值不值得'用贵模型,再决定调哪一个。"这个实战实现了一个简化版的模型路由器,用真实数字说明路由策略能省下多少钱,同时不会让复杂问题被分配到能力不足的模型上。
+
+```python
+"""
+模型分级路由策略——简单问题用便宜模型，复杂问题用旗舰模型
+============================================================
+
+背景说明：
+实战三整理了一份模型价格对比表，陈铭发现旗舰模型(比如qwen-max)的价格
+是性价比档位模型(比如qwen-plus)的十几倍甚至几十倍。老王在旁边补了一句：
+"你不可能所有请求都用最贵的模型，也不可能所有请求都用最便宜的模型——
+前者是浪费钱，后者是砸自己的产品口碑。真实项目里常见的做法叫'模型路由'，
+先判断这个请求'值不值得'用贵模型，再决定调哪一个。"
+
+这个脚本实现了一个简化版的模型路由器：
+1. 根据问题的若干"复杂度信号"(文本长度、是否包含数学/代码/多步骤推理
+   等关键特征、是否是简单的事实性问答)计算一个复杂度分数；
+2. 根据复杂度分数，把请求路由到"经济档"或"旗舰档"模型；
+3. 对比"全部走旗舰档"与"路由策略"两种方案，在一批模拟请求上的
+   总成本差异，用真实数字说明模型路由能省下多少钱。
+
+需要特别说明的是：复杂度判断本身是一个不追求完美的启发式规则集合，
+真实生产系统里，更成熟的做法可能是用一个小模型或者一组规则先做分类，
+今天这个脚本的价值在于把"路由"这个概念具体地跑一遍，而不是提供一套
+能直接生产可用的复杂度判断算法。
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import List
+
+# ------------------------------------------------------------------
+# 第一部分：复用近似Token计数(与前几个实战保持一致的估算方式)
+# ------------------------------------------------------------------
+
+_CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+_WORD_PATTERN = re.compile(r"[A-Za-z0-9]+|[^\sA-Za-z0-9\u4e00-\u9fff]|[\u4e00-\u9fff]")
+
+
+def approximate_token_count(text: str) -> int:
+    count = 0
+    for chunk in _WORD_PATTERN.findall(text):
+        if _CJK_PATTERN.match(chunk):
+            count += 1
+        elif chunk.isalnum():
+            count += max(1, round(len(chunk) / 4))
+        else:
+            count += 1
+    return count
+
+
+# ------------------------------------------------------------------
+# 第二部分：简化价格表(经济档 vs 旗舰档，教学示例数据)
+# ------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ModelTier:
+    tier_name: str
+    model_name: str
+    input_price_per_1m: float  # 单位：元/百万token
+    output_price_per_1m: float
+
+
+ECONOMY_TIER = ModelTier(
+    tier_name="经济档", model_name="qwen-plus",
+    input_price_per_1m=0.8, output_price_per_1m=2.0,
+)
+FLAGSHIP_TIER = ModelTier(
+    tier_name="旗舰档", model_name="qwen-max",
+    input_price_per_1m=20.0, output_price_per_1m=60.0,
+)
+
+
+# ------------------------------------------------------------------
+# 第三部分：复杂度信号与路由决策
+# ------------------------------------------------------------------
+
+# 出现这些关键词，倾向于判断为"需要更强推理能力"的复杂问题
+COMPLEXITY_INDICATOR_KEYWORDS = (
+    "为什么", "分析", "对比", "推导", "证明", "设计一套", "策略",
+    "code", "代码", "算法", "方案", "多步骤", "综合考虑",
+)
+
+# 出现这些关键词，倾向于判断为"事实检索类"的简单问题
+SIMPLE_INDICATOR_KEYWORDS = (
+    "多少", "是什么", "几点", "在哪", "叫什么", "什么时候",
+)
+
+
+@dataclass
+class ComplexityAssessment:
+    question: str
+    length_score: float
+    keyword_score: float
+    total_score: float
+    recommended_tier: ModelTier
+
+
+def assess_complexity(question: str) -> ComplexityAssessment:
+    """计算一个问题的复杂度分数(0.0 ~ 1.0之间，分数越高越复杂)。
+
+    评分由两部分构成：
+    1. 长度分数：问题越长，倾向性上越可能涉及更复杂的背景描述，
+       这里用一个简单的饱和函数把token数映射到0~0.5的区间;
+    2. 关键词分数：命中"复杂度指示关键词"加分，命中"简单指示关键词"减分，
+       结果裁剪到0~0.5的区间。
+    两部分相加得到总分，总分越高，越倾向于路由到旗舰档模型。
+    """
+    token_count = approximate_token_count(question)
+    length_score = min(0.5, token_count / 200)
+
+    keyword_score = 0.0
+    for keyword in COMPLEXITY_INDICATOR_KEYWORDS:
+        if keyword in question:
+            keyword_score += 0.15
+    for keyword in SIMPLE_INDICATOR_KEYWORDS:
+        if keyword in question:
+            keyword_score -= 0.1
+    keyword_score = max(0.0, min(0.5, keyword_score))
+
+    total_score = length_score + keyword_score
+    recommended_tier = FLAGSHIP_TIER if total_score >= 0.35 else ECONOMY_TIER
+
+    return ComplexityAssessment(
+        question=question,
+        length_score=length_score,
+        keyword_score=keyword_score,
+        total_score=total_score,
+        recommended_tier=recommended_tier,
+    )
+
+
+@dataclass
+class RoutingCostReport:
+    question: str
+    chosen_tier: ModelTier
+    input_tokens: int
+    output_tokens: int
+    cost: float
+
+
+def route_and_estimate_cost(
+    question: str, expected_output_tokens: int = 150
+) -> RoutingCostReport:
+    assessment = assess_complexity(question)
+    tier = assessment.recommended_tier
+    input_tokens = approximate_token_count(question)
+
+    cost = (
+        input_tokens / 1_000_000 * tier.input_price_per_1m
+        + expected_output_tokens / 1_000_000 * tier.output_price_per_1m
+    )
+
+    return RoutingCostReport(
+        question=question,
+        chosen_tier=tier,
+        input_tokens=input_tokens,
+        output_tokens=expected_output_tokens,
+        cost=cost,
+    )
+
+
+def estimate_cost_with_fixed_tier(
+    question: str, tier: ModelTier, expected_output_tokens: int = 150
+) -> float:
+    input_tokens = approximate_token_count(question)
+    return (
+        input_tokens / 1_000_000 * tier.input_price_per_1m
+        + expected_output_tokens / 1_000_000 * tier.output_price_per_1m
+    )
+
+
+# ------------------------------------------------------------------
+# 第四部分：demo——用一批模拟请求对比"全部走旗舰档"与"路由策略"的总成本
+# ------------------------------------------------------------------
+
+SAMPLE_QUESTIONS: List[str] = [
+    "苍穹平台的客服电话是多少?",
+    "今天几点下班?",
+    "请分析一下为什么我们Sprint 1要选择先做原理培训再写代码，这个决策背后的工程考量是什么?",
+    "帮我设计一套多Agent协同的审批流程，需要综合考虑异常回退和人工介入的场景。",
+    "退货政策是什么?",
+    "对比一下滑动窗口策略和token预算截断策略在长对话场景下的优劣，并给出你的推荐方案。",
+    "苍穹项目组现在有几个人?",
+    "这段代码为什么会报KeyError，帮我分析一下可能的原因并给出修复方案。",
+]
+
+
+def print_section(title: str) -> None:
+    print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
+
+
+def demo_complexity_assessment() -> None:
+    print_section("演示一：复杂度评分与路由决策")
+    for question in SAMPLE_QUESTIONS:
+        assessment = assess_complexity(question)
+        print(
+            f"[{assessment.recommended_tier.tier_name}] 分数={assessment.total_score:.2f} "
+            f"问题: {question[:30]}{'...' if len(question) > 30 else ''}"
+        )
+
+    simple_assessment = assess_complexity("退货政策是什么?")
+    complex_assessment = assess_complexity(
+        "请分析一下为什么我们Sprint 1要选择先做原理培训再写代码，这个决策背后的工程考量是什么?"
+    )
+    assert simple_assessment.recommended_tier is ECONOMY_TIER
+    assert complex_assessment.recommended_tier is FLAGSHIP_TIER
+    print("验证通过：包含'是什么'这种事实检索特征的短问题被路由到了经济档，"
+          "包含'分析''为什么''工程考量'这类需要综合推理特征的长问题被路由到了旗舰档。")
+
+
+def demo_total_cost_comparison() -> None:
+    print_section("演示二：全部走旗舰档 vs 路由策略，总成本对比")
+
+    total_cost_flagship_only = sum(
+        estimate_cost_with_fixed_tier(q, FLAGSHIP_TIER) for q in SAMPLE_QUESTIONS
+    )
+    total_cost_economy_only = sum(
+        estimate_cost_with_fixed_tier(q, ECONOMY_TIER) for q in SAMPLE_QUESTIONS
+    )
+    total_cost_routed = sum(
+        route_and_estimate_cost(q).cost for q in SAMPLE_QUESTIONS
+    )
+
+    print(f"全部走旗舰档总成本: {total_cost_flagship_only:.6f}元")
+    print(f"全部走经济档总成本: {total_cost_economy_only:.6f}元")
+    print(f"路由策略总成本: {total_cost_routed:.6f}元")
+
+    savings_ratio = 1 - total_cost_routed / total_cost_flagship_only
+    print(f"相比全部走旗舰档，路由策略节省了约{savings_ratio:.0%}的成本")
+
+    assert total_cost_economy_only <= total_cost_routed <= total_cost_flagship_only
+    print("验证通过：路由策略的总成本介于'全部经济档'与'全部旗舰档'之间——"
+          "这正是路由策略存在的意义,用一部分复杂问题的旗舰档成本，换来简单问题"
+          "上的大幅节省，在保证复杂问题得到更强模型处理的同时，控制住整体成本。")
+
+
+def demo_routing_avoids_underpowering_complex_questions() -> None:
+    print_section("演示三：路由策略不会让复杂问题被分配到能力不足的经济档模型")
+    complex_questions = [q for q in SAMPLE_QUESTIONS if assess_complexity(q).total_score >= 0.35]
+    assert len(complex_questions) > 0
+
+    for question in complex_questions:
+        report = route_and_estimate_cost(question)
+        assert report.chosen_tier is FLAGSHIP_TIER
+
+    print(f"共识别出{len(complex_questions)}个复杂问题，全部被正确路由到了旗舰档模型。")
+    print("验证通过：'省钱'不能建立在'该给的能力没给到'的基础上，路由策略的第一原则"
+          "始终是先保证复杂问题拿到与之匹配的模型能力，成本优化只发生在"
+          "'简单问题不需要用贵模型'这个明确安全的空间里。")
+
+
+def run_all_demos() -> None:
+    demo_complexity_assessment()
+    demo_total_cost_comparison()
+    demo_routing_avoids_underpowering_complex_questions()
+    print("\n全部模型路由策略演示执行完毕。")
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+### 实战十三:Prompt缓存节省成本模拟器
+
+陈铭在整理实战三的价格表时问了老王一个问题:"System Prompt每次调用都要重新发一遍,如果System Prompt写得很长,是不是每一次调用都要为这一长串重复内容重新付费?"老王说:"这个问题问得好,主流厂商现在基本都支持'Prompt缓存'——如果连续多次请求的开头部分完全相同,服务端会按远低于正常输入价格的'缓存命中价'计费。"这个实战把这个抽象的'缓存能省钱'的说法,变成了具体的数字对比。
+
+```python
+"""
+Prompt缓存节省成本模拟器
+==========================
+
+背景说明：
+陈铭在整理实战三的价格表时问了老王一个问题："System Prompt每次调用都要
+重新发一遍，如果System Prompt写得很长(比如把苍穹平台的完整业务规则都
+塞进去)，是不是每一次调用都要为这一长串重复内容重新付费？"老王说："这个
+问题问得好，主流厂商现在基本都支持'Prompt缓存'(Prompt Caching)——
+如果连续多次请求的开头部分(通常是System Prompt和固定的few-shot示例)
+完全相同，服务端会识别出这部分内容之前处理过，按远低于正常输入价格的
+'缓存命中价'计费，甚至部分厂商是打折而不是免费，具体折扣力度因厂商而异。"
+
+这个脚本模拟了"开启Prompt缓存"与"不开启Prompt缓存"两种场景下，
+一批连续调用（System Prompt和few-shot示例固定不变，只有用户问题变化）
+的总成本差异，帮陈铭把这个抽象的"缓存能省钱"的说法，变成具体的数字。
+
+需要特别说明：本脚本里假设的"缓存命中价格为正常输入价格的10%"是一个
+教学示例比例，用于说明缓存机制存在的价值，不代表任何具体厂商当前的
+真实折扣比例，实际使用请查阅对应厂商的最新计费文档。
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import List
+
+# ------------------------------------------------------------------
+# 第一部分：复用近似Token计数
+# ------------------------------------------------------------------
+
+_CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+_WORD_PATTERN = re.compile(r"[A-Za-z0-9]+|[^\sA-Za-z0-9\u4e00-\u9fff]|[\u4e00-\u9fff]")
+
+
+def approximate_token_count(text: str) -> int:
+    count = 0
+    for chunk in _WORD_PATTERN.findall(text):
+        if _CJK_PATTERN.match(chunk):
+            count += 1
+        elif chunk.isalnum():
+            count += max(1, round(len(chunk) / 4))
+        else:
+            count += 1
+    return count
+
+
+# ------------------------------------------------------------------
+# 第二部分：价格假设(教学示例，非真实厂商价格)
+# ------------------------------------------------------------------
+
+NORMAL_INPUT_PRICE_PER_1M = 20.0   # 元/百万token，模拟旗舰模型的正常输入价
+CACHED_INPUT_DISCOUNT_RATIO = 0.1  # 缓存命中部分按正常价格的10%计费
+OUTPUT_PRICE_PER_1M = 60.0         # 元/百万token
+
+
+@dataclass
+class CallCostBreakdown:
+    call_index: int
+    fixed_prefix_tokens: int
+    variable_tokens: int
+    output_tokens: int
+    fixed_prefix_cost: float
+    variable_cost: float
+    output_cost: float
+
+    @property
+    def total_cost(self) -> float:
+        return self.fixed_prefix_cost + self.variable_cost + self.output_cost
+
+
+class PromptCacheSimulator:
+    """模拟一批"固定前缀(System Prompt + few-shot) + 变化的用户问题"调用的成本。
+
+    cache_enabled为False时，固定前缀部分每次都按正常输入价格计费；
+    cache_enabled为True时，从第二次调用开始(第一次调用视为"缓存未命中，
+    首次写入缓存"，仍按正常价格)，固定前缀部分按折扣价格计费。
+    """
+
+    def __init__(
+        self,
+        fixed_prefix: str,
+        output_tokens_per_call: int = 150,
+        cache_enabled: bool = False,
+    ):
+        self.fixed_prefix = fixed_prefix
+        self.fixed_prefix_tokens = approximate_token_count(fixed_prefix)
+        self.output_tokens_per_call = output_tokens_per_call
+        self.cache_enabled = cache_enabled
+        self.call_history: List[CallCostBreakdown] = []
+
+    def call(self, user_question: str) -> CallCostBreakdown:
+        call_index = len(self.call_history) + 1
+        variable_tokens = approximate_token_count(user_question)
+
+        is_cache_hit = self.cache_enabled and call_index > 1
+        prefix_price = (
+            NORMAL_INPUT_PRICE_PER_1M * CACHED_INPUT_DISCOUNT_RATIO
+            if is_cache_hit
+            else NORMAL_INPUT_PRICE_PER_1M
+        )
+
+        fixed_prefix_cost = self.fixed_prefix_tokens / 1_000_000 * prefix_price
+        variable_cost = variable_tokens / 1_000_000 * NORMAL_INPUT_PRICE_PER_1M
+        output_cost = self.output_tokens_per_call / 1_000_000 * OUTPUT_PRICE_PER_1M
+
+        breakdown = CallCostBreakdown(
+            call_index=call_index,
+            fixed_prefix_tokens=self.fixed_prefix_tokens,
+            variable_tokens=variable_tokens,
+            output_tokens=self.output_tokens_per_call,
+            fixed_prefix_cost=fixed_prefix_cost,
+            variable_cost=variable_cost,
+            output_cost=output_cost,
+        )
+        self.call_history.append(breakdown)
+        return breakdown
+
+    def total_cost(self) -> float:
+        return sum(call.total_cost for call in self.call_history)
+
+    def total_fixed_prefix_cost(self) -> float:
+        return sum(call.fixed_prefix_cost for call in self.call_history)
+
+
+# ------------------------------------------------------------------
+# 第三部分：demo数据与场景
+# ------------------------------------------------------------------
+
+FIXED_SYSTEM_PROMPT = (
+    "你是苍穹企业级智能体中台的客服助手，需要严格遵守以下业务规则："
+    "一、所有涉及价格、退款金额的回复必须精确到小数点后两位；"
+    "二、涉及用户隐私信息(手机号、身份证号)时必须脱敏处理，不能直接完整输出；"
+    "三、遇到无法确定答案的问题，必须明确告知用户'需要转接人工客服核实'，"
+    "禁止编造答案；四、回复语气需保持专业、简洁，避免使用口语化的表达；"
+    "五、每次回复末尾附上'如有其他问题，请随时联系我们'的标准结尾语。"
+    "以下是三个标准问答范例，请参考范例的语气和格式：\n"
+    "范例1 - 问：退货需要多久？答：根据平台规则，非质量问题退货，"
+    "商家需在收到退货商品后3个工作日内完成退款审核。如有其他问题，请随时联系我们。\n"
+    "范例2 - 问：可以修改收货地址吗？答：订单发货前可在订单详情页自行修改，"
+    "发货后请联系客服协助处理。如有其他问题，请随时联系我们。\n"
+    "范例3 - 问：优惠券怎么用？答：优惠券可在结算页面选择使用，"
+    "每个订单限用一张，具体折扣以券面信息为准。如有其他问题，请随时联系我们。"
+)
+
+SAMPLE_USER_QUESTIONS = [
+    "我想问一下上个月的账单什么时候能出?",
+    "订单已经发货了还能改地址吗?",
+    "优惠券和满减活动可以叠加使用吗?",
+    "退货的运费谁承担?",
+    "会员积分什么时候到账?",
+    "客服电话是多少?",
+    "能不能开发票?",
+    "订单状态一直显示待发货是正常的吗?",
+]
+
+
+def print_section(title: str) -> None:
+    print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
+
+
+def demo_cost_without_cache() -> None:
+    print_section("演示一：未开启Prompt缓存时，固定前缀成本随调用次数线性增长")
+    simulator = PromptCacheSimulator(FIXED_SYSTEM_PROMPT, cache_enabled=False)
+    for question in SAMPLE_USER_QUESTIONS:
+        simulator.call(question)
+
+    print(f"固定前缀token数(每次都要重新计费): {simulator.fixed_prefix_tokens}")
+    print(f"共调用{len(SAMPLE_USER_QUESTIONS)}次，固定前缀部分累计成本: {simulator.total_fixed_prefix_cost():.6f}元")
+    print(f"总成本: {simulator.total_cost():.6f}元")
+
+    per_call_prefix_costs = [call.fixed_prefix_cost for call in simulator.call_history]
+    assert len(set(per_call_prefix_costs)) == 1, "未开启缓存时，每次调用的固定前缀成本应完全相同"
+    print("验证通过：未开启缓存时，无论是第1次调用还是第8次调用，"
+          "固定前缀部分的成本都完全一样，这部分'重复付费'完全没有被节省。")
+
+
+def demo_cost_with_cache() -> None:
+    print_section("演示二：开启Prompt缓存后，从第二次调用起固定前缀成本大幅下降")
+    simulator = PromptCacheSimulator(FIXED_SYSTEM_PROMPT, cache_enabled=True)
+    for question in SAMPLE_USER_QUESTIONS:
+        simulator.call(question)
+
+    first_call_prefix_cost = simulator.call_history[0].fixed_prefix_cost
+    second_call_prefix_cost = simulator.call_history[1].fixed_prefix_cost
+
+    print(f"第1次调用固定前缀成本(缓存未命中，正常计费): {first_call_prefix_cost:.6f}元")
+    print(f"第2次调用固定前缀成本(缓存命中，折扣计费): {second_call_prefix_cost:.6f}元")
+    print(f"共调用{len(SAMPLE_USER_QUESTIONS)}次，固定前缀部分累计成本: {simulator.total_fixed_prefix_cost():.6f}元")
+
+    expected_cached_cost = first_call_prefix_cost * CACHED_INPUT_DISCOUNT_RATIO
+    assert second_call_prefix_cost < first_call_prefix_cost
+    assert abs(second_call_prefix_cost - expected_cached_cost) < 1e-9
+    print("验证通过：从第2次调用开始，固定前缀部分的成本降到了首次调用的约10%，"
+          "这正是Prompt缓存机制的价值所在——固定不变的System Prompt和few-shot示例，"
+          "不需要在每一次调用里都被'重新理解'一遍。")
+
+
+def demo_total_savings_comparison() -> None:
+    print_section("演示三：开启缓存前后，总成本对比与节省比例")
+    simulator_without_cache = PromptCacheSimulator(FIXED_SYSTEM_PROMPT, cache_enabled=False)
+    simulator_with_cache = PromptCacheSimulator(FIXED_SYSTEM_PROMPT, cache_enabled=True)
+
+    for question in SAMPLE_USER_QUESTIONS:
+        simulator_without_cache.call(question)
+        simulator_with_cache.call(question)
+
+    cost_without_cache = simulator_without_cache.total_cost()
+    cost_with_cache = simulator_with_cache.total_cost()
+    savings_ratio = 1 - cost_with_cache / cost_without_cache
+
+    print(f"未开启缓存总成本: {cost_without_cache:.6f}元")
+    print(f"开启缓存总成本: {cost_with_cache:.6f}元")
+    print(f"节省比例: {savings_ratio:.1%}")
+
+    assert cost_with_cache < cost_without_cache
+    print("验证通过：System Prompt写得越长、调用次数越多，Prompt缓存带来的节省"
+          "就越明显——这也解释了为什么老王建议'System Prompt该写清楚的规则不要"
+          "因为怕费token就故意写得含糊'，因为固定部分的重复成本，本身是可以通过"
+          "缓存机制大幅抵消的，没必要在'规则写清楚'这件事上省钱。")
+
+
+def demo_savings_scale_with_prefix_length() -> None:
+    print_section("演示四：固定前缀越长，缓存机制节省的绝对金额也越大")
+    short_prefix = "你是客服助手，请用简洁的中文回答问题。"
+    long_prefix = FIXED_SYSTEM_PROMPT
+
+    def total_savings_for_prefix(prefix: str) -> float:
+        without_cache = PromptCacheSimulator(prefix, cache_enabled=False)
+        with_cache = PromptCacheSimulator(prefix, cache_enabled=True)
+        for question in SAMPLE_USER_QUESTIONS:
+            without_cache.call(question)
+            with_cache.call(question)
+        return without_cache.total_cost() - with_cache.total_cost()
+
+    short_savings = total_savings_for_prefix(short_prefix)
+    long_savings = total_savings_for_prefix(long_prefix)
+
+    print(f"短System Prompt(约{approximate_token_count(short_prefix)}token)节省金额: {short_savings:.6f}元")
+    print(f"长System Prompt(约{approximate_token_count(long_prefix)}token)节省金额: {long_savings:.6f}元")
+
+    assert long_savings > short_savings
+    print("验证通过：固定前缀的token数越多，缓存机制能够节省的绝对金额就越大，"
+          "这提示我们在设计业务规则密集、few-shot示例较多的System Prompt时，"
+          "更应该主动确认所使用的模型服务是否支持并已启用Prompt缓存。")
+
+
+def run_all_demos() -> None:
+    demo_cost_without_cache()
+    demo_cost_with_cache()
+    demo_total_savings_comparison()
+    demo_savings_scale_with_prefix_length()
+    print("\n全部Prompt缓存节省模拟演示执行完毕。")
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+### 实战十四:真实用量对账工具——本地近似估算 vs API返回的usage字段
+
+陈铭这几个实战里用的近似估算器是"没有精确分词器时"的兜底方案,老王提醒他:"这些近似估算器,只能拿来做预算参考,不能当成最终对账依据。真正花了多少钱,要看API返回结果里usage字段给的真实token数,那才是计费系统认可的口径。今天最后补一个小工具——本地估算和真实usage对不上的时候,你要有能力量化这个误差,而不是含糊地说'估算不太准'。"
+
+```python
+"""
+真实用量对账工具——本地近似估算 vs API返回的usage字段
+========================================================
+
+背景说明：
+陈铭这几个实战里用的近似估算器(ApproximateEncoder / approximate_token_count)
+是"没有精确分词器时"的兜底方案，老王提醒他："这些近似估算器,只能拿来做
+预算参考，不能当成最终对账依据。真正花了多少钱,要看API返回结果里
+usage字段给的真实token数，那才是计费系统认可的口径。今天最后补一个
+小工具——本地估算和真实usage对不上的时候，你要有能力量化这个误差，
+而不是含糊地说'估算不太准'。"
+
+这个脚本模拟了这样一套对账流程：
+1. 记录每一次调用"本地估算的token数"与"(模拟的)API真实返回的usage字段"；
+2. 计算两者之间的误差率，按模型分组统计误差率的分布；
+3. 生成一份简单的"估算校准建议"——如果某个模型的本地估算长期偏低或偏高，
+   给出一个经验修正系数，用于改进未来的预算估算精度。
+
+需要说明的是，脚本里"模拟的API真实usage"是人工构造的示例数据，
+用于演示对账逻辑本身，不是真实调用任何大模型API拿到的数据。
+"""
+
+from __future__ import annotations
+
+import re
+import statistics
+from dataclasses import dataclass, field
+from typing import Dict, List
+
+# ------------------------------------------------------------------
+# 第一部分：复用近似Token计数
+# ------------------------------------------------------------------
+
+_CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+_WORD_PATTERN = re.compile(r"[A-Za-z0-9]+|[^\sA-Za-z0-9\u4e00-\u9fff]|[\u4e00-\u9fff]")
+
+
+def approximate_token_count(text: str) -> int:
+    count = 0
+    for chunk in _WORD_PATTERN.findall(text):
+        if _CJK_PATTERN.match(chunk):
+            count += 1
+        elif chunk.isalnum():
+            count += max(1, round(len(chunk) / 4))
+        else:
+            count += 1
+    return count
+
+
+# ------------------------------------------------------------------
+# 第二部分：对账记录与误差计算
+# ------------------------------------------------------------------
+
+@dataclass
+class ReconciliationRecord:
+    model_name: str
+    text_sample: str
+    estimated_tokens: int
+    actual_tokens: int
+
+    @property
+    def error(self) -> int:
+        return self.estimated_tokens - self.actual_tokens
+
+    @property
+    def error_rate(self) -> float:
+        if self.actual_tokens == 0:
+            return 0.0
+        return self.error / self.actual_tokens
+
+    @property
+    def is_underestimate(self) -> bool:
+        return self.estimated_tokens < self.actual_tokens
+
+
+@dataclass
+class ModelCalibrationSummary:
+    model_name: str
+    sample_count: int
+    mean_error_rate: float
+    median_error_rate: float
+    max_absolute_error_rate: float
+    suggested_correction_factor: float
+
+    def to_line(self) -> str:
+        direction = "偏低(低估)" if self.mean_error_rate < 0 else "偏高(高估)"
+        return (
+            f"{self.model_name:<20} 样本数={self.sample_count:<4} "
+            f"平均误差率={self.mean_error_rate:>+7.1%} {direction}  "
+            f"建议修正系数={self.suggested_correction_factor:.3f}"
+        )
+
+
+class UsageReconciler:
+    """负责收集对账记录，并按模型分组计算校准统计信息。"""
+
+    def __init__(self):
+        self.records: List[ReconciliationRecord] = []
+
+    def record(self, model_name: str, text_sample: str, actual_tokens: int) -> ReconciliationRecord:
+        estimated_tokens = approximate_token_count(text_sample)
+        record = ReconciliationRecord(
+            model_name=model_name,
+            text_sample=text_sample,
+            estimated_tokens=estimated_tokens,
+            actual_tokens=actual_tokens,
+        )
+        self.records.append(record)
+        return record
+
+    def records_for_model(self, model_name: str) -> List[ReconciliationRecord]:
+        return [r for r in self.records if r.model_name == model_name]
+
+    def summarize_model(self, model_name: str) -> ModelCalibrationSummary:
+        model_records = self.records_for_model(model_name)
+        if not model_records:
+            raise ValueError(f"没有找到模型「{model_name}」的对账记录")
+
+        error_rates = [r.error_rate for r in model_records]
+        mean_error_rate = statistics.mean(error_rates)
+        median_error_rate = statistics.median(error_rates)
+        max_absolute_error_rate = max(abs(rate) for rate in error_rates)
+
+        # 修正系数的直觉：如果本地估算长期偏低(平均误差率为负)，
+        # 说明"估算值 = 真实值 * 系数"里的系数应该 > 1，用来把估算值放大，
+        # 修正系数 = 1 / (1 + 平均误差率)，可以直接乘到未来的估算结果上做校准。
+        suggested_correction_factor = 1 / (1 + mean_error_rate) if (1 + mean_error_rate) != 0 else 1.0
+
+        return ModelCalibrationSummary(
+            model_name=model_name,
+            sample_count=len(model_records),
+            mean_error_rate=mean_error_rate,
+            median_error_rate=median_error_rate,
+            max_absolute_error_rate=max_absolute_error_rate,
+            suggested_correction_factor=suggested_correction_factor,
+        )
+
+    def all_model_names(self) -> List[str]:
+        seen: List[str] = []
+        for record in self.records:
+            if record.model_name not in seen:
+                seen.append(record.model_name)
+        return seen
+
+    def apply_correction(self, model_name: str, estimated_tokens: int) -> int:
+        """用某个模型已积累的修正系数，校准一次新的本地估算结果。"""
+        summary = self.summarize_model(model_name)
+        return round(estimated_tokens * summary.suggested_correction_factor)
+
+
+# ------------------------------------------------------------------
+# 第三部分：demo——模拟一批"本地估算 vs 真实API usage"的对账数据
+# ------------------------------------------------------------------
+
+# 以下"真实usage"数值为人工构造的模拟数据，用于演示对账逻辑，
+# 并非任何真实API调用返回的结果。构造思路：deepseek-chat系列模型对中文的
+# 真实分词效果通常比本脚本这种粗糙的"一个汉字一个token"近似规则更紧凑，
+# 因此故意让模拟的真实token数略低于估算值，制造出一个"系统性偏高"的场景。
+SAMPLE_RECONCILIATION_DATA = [
+    ("deepseek-chat", "苍穹企业级智能体中台致力于为客户提供一站式AI解决方案。", 22),
+    ("deepseek-chat", "本次培训的目标是让陈铭具备大模型原理的基础认知。", 19),
+    ("deepseek-chat", "退货政策与运费承担规则请参考商家公示的售后条款。", 21),
+    ("deepseek-chat", "订单发货后如需修改收货地址请联系人工客服协助处理。", 22),
+    ("qwen-plus", "多轮对话的上下文管理策略需要结合业务场景综合权衡。", 20),
+    ("qwen-plus", "模型路由策略能够在保证效果的前提下有效降低调用成本。", 21),
+    ("qwen-plus", "Prompt缓存机制对固定不变的系统提示词特别有效。", 18),
+]
+
+
+def print_section(title: str) -> None:
+    print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
+
+
+def demo_recording_and_basic_error() -> None:
+    print_section("演示一：记录一批本地估算与真实usage的对账数据")
+    reconciler = UsageReconciler()
+    for model_name, text, actual_tokens in SAMPLE_RECONCILIATION_DATA:
+        record = reconciler.record(model_name, text, actual_tokens)
+        print(
+            f"[{model_name}] 估算={record.estimated_tokens} 真实={record.actual_tokens} "
+            f"误差率={record.error_rate:+.1%}"
+        )
+
+    assert len(reconciler.records) == len(SAMPLE_RECONCILIATION_DATA)
+    print(f"验证通过：共记录了{len(reconciler.records)}条对账数据。")
+
+
+def demo_model_level_summary() -> None:
+    print_section("演示二：按模型分组统计误差率，识别系统性偏差")
+    reconciler = UsageReconciler()
+    for model_name, text, actual_tokens in SAMPLE_RECONCILIATION_DATA:
+        reconciler.record(model_name, text, actual_tokens)
+
+    for model_name in reconciler.all_model_names():
+        summary = reconciler.summarize_model(model_name)
+        print(summary.to_line())
+
+    deepseek_summary = reconciler.summarize_model("deepseek-chat")
+    assert deepseek_summary.sample_count == 4
+    assert deepseek_summary.mean_error_rate > 0, "构造的示例数据里本地估算应系统性偏高"
+    print("验证通过：deepseek-chat这个模型的本地估算存在系统性偏高的问题"
+          "(平均误差率为正)，这种'系统性偏差'正是需要用修正系数去校准的典型场景，"
+          "如果只看单条样本的误差，很容易误以为只是随机噪音,分组统计之后"
+          "才能看清楚这是一个稳定存在的规律。")
+
+
+def demo_correction_factor_improves_future_estimates() -> None:
+    print_section("演示三：用已积累的修正系数校准新的估算结果")
+    reconciler = UsageReconciler()
+    for model_name, text, actual_tokens in SAMPLE_RECONCILIATION_DATA:
+        reconciler.record(model_name, text, actual_tokens)
+
+    new_text = "苍穹平台正式进入Sprint 1开发阶段。"
+    raw_estimate = approximate_token_count(new_text)
+    corrected_estimate = reconciler.apply_correction("deepseek-chat", raw_estimate)
+
+    print(f"未校准的本地估算: {raw_estimate}")
+    print(f"用deepseek-chat历史修正系数校准后的估算: {corrected_estimate}")
+
+    assert corrected_estimate < raw_estimate, "由于历史数据显示系统性高估,校准后的估算值应该更小"
+    print("验证通过：既然历史数据显示deepseek-chat的本地估算长期偏高，"
+          "校准后的新估算值被相应地下调了，这样团队做预算测算时，"
+          "拿到的数字会比'裸的近似估算'更贴近真实计费口径。")
+
+
+def demo_missing_model_raises_clear_error() -> None:
+    print_section("演示四：查询一个从未记录过对账数据的模型，应给出明确报错而不是静默返回错误结果")
+    reconciler = UsageReconciler()
+    reconciler.record("deepseek-chat", "示例文本", 10)
+
+    try:
+        reconciler.summarize_model("gpt-4o")
+        raise AssertionError("这里应该抛出ValueError，不应该走到这一行")
+    except ValueError as error:
+        print(f"正确抛出错误: {error}")
+
+    print("验证通过：对一个完全没有历史对账数据的模型强行给出'修正建议'，"
+          "比什么都不给更危险——那样的数字看起来像是有依据的，实际上是凭空捏造的，"
+          "明确报错比返回一个似是而非的错误数字更负责任。")
+
+
+def run_all_demos() -> None:
+    demo_recording_and_basic_error()
+    demo_model_level_summary()
+    demo_correction_factor_improves_future_estimates()
+    demo_missing_model_raises_clear_error()
+    print("\n全部用量对账工具演示执行完毕。")
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+### 实战十五:组合优化策略效果报表——把上下文管理/模型路由/Prompt缓存三招合并计算
+
+四个新工具分别验证完之后,林悦提了一个更贴近汇报场景的问题:"我跟客户讲成本优化的时候,不可能一个个技术点分开讲,客户只关心一件事——'这几个手段加起来,到底能帮我省多少钱'。你能不能把这几个工具的效果合并算一遍,出一份'组合优化前后对比'的报表?"老王在旁边补充了工程视角的要求:"合并计算的时候要小心,几个优化手段不是简单地把节省比例相加,三者是在不同维度上起作用,合并计算必须按实际发生的顺序,一步步算,不能偷懒直接把百分比加总。"
+
+```python
+"""
+组合优化策略效果报表——把上下文管理/模型路由/Prompt缓存三招合并计算
+========================================================================
+
+背景说明：
+四个新工具分别验证完之后,林悦提了一个更贴近汇报场景的问题:"我跟客户
+讲成本优化的时候,不可能一个个技术点分开讲,客户只关心一件事——'这几个
+手段加起来,到底能帮我省多少钱'。你能不能把这几个工具的效果合并算一遍,
+出一份'组合优化前后对比'的报表?"老王在旁边补充了工程视角的要求:"合并
+计算的时候要小心,几个优化手段不是简单地把节省比例相加,上下文截断影响
+的是input token的'数量',模型路由影响的是每个token的'单价',Prompt缓存
+影响的是固定前缀部分的'计费方式',三者是在不同维度上起作用,合并计算
+必须按实际发生的顺序,一步步算,不能偷懒直接把百分比加总。"
+
+这个脚本做的事情：
+1. 复用(以内联简化方式重新实现)前四个实战里的核心计算逻辑;
+2. 模拟一个"苍穹平台客服机器人"跑一天累积对话的场景,分别计算
+   "什么都不做"和"三项优化全部叠加"两种情况下的总成本;
+3. 生成一份分层次的对比报表,逐项拆解每一步优化各自贡献了多少节省,
+   而不是笼统地给一个总节省比例。
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+# ------------------------------------------------------------------
+# 第一部分：复用近似Token计数(与前几个实战保持一致)
+# ------------------------------------------------------------------
+
+_CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+_WORD_PATTERN = re.compile(r"[A-Za-z0-9]+|[^\sA-Za-z0-9\u4e00-\u9fff]|[\u4e00-\u9fff]")
+
+
+def approximate_token_count(text: str) -> int:
+    count = 0
+    for chunk in _WORD_PATTERN.findall(text):
+        if _CJK_PATTERN.match(chunk):
+            count += 1
+        elif chunk.isalnum():
+            count += max(1, round(len(chunk) / 4))
+        else:
+            count += 1
+    return count
+
+
+# ------------------------------------------------------------------
+# 第二部分：三种模型价格档位 + 固定前缀 + 对话构造
+# ------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ModelTier:
+    tier_name: str
+    model_name: str
+    input_price_per_1m: float
+    output_price_per_1m: float
+
+
+ECONOMY_TIER = ModelTier("经济档", "qwen-plus", 0.8, 2.0)
+FLAGSHIP_TIER = ModelTier("旗舰档", "qwen-max", 20.0, 60.0)
+
+FIXED_SYSTEM_PROMPT = (
+    "你是苍穹企业级智能体中台的客服助手，需要严格遵守以下业务规则："
+    "一、所有涉及价格、退款金额的回复必须精确到小数点后两位；"
+    "二、涉及用户隐私信息时必须脱敏处理；"
+    "三、遇到无法确定答案的问题，必须明确告知用户需要转接人工客服核实；"
+    "四、回复语气需保持专业、简洁；五、每次回复末尾附上标准结尾语。"
+    "以下是标准问答范例，请参考范例的语气和格式：\n"
+    "范例1 - 问：退货需要多久？答：非质量问题退货，商家需在3个工作日内完成退款审核。\n"
+    "范例2 - 问：可以修改收货地址吗？答：发货前可自行修改，发货后请联系客服。"
+)
+
+COMPLEXITY_INDICATOR_KEYWORDS = ("为什么", "分析", "对比", "推导", "策略", "代码", "算法", "综合考虑")
+SIMPLE_INDICATOR_KEYWORDS = ("多少", "是什么", "几点", "在哪", "叫什么")
+
+
+@dataclass
+class Message:
+    role: str
+    content: str
+
+    @property
+    def token_count(self) -> int:
+        return approximate_token_count(self.content)
+
+
+@dataclass
+class ConversationTurn:
+    """一次完整的问答轮次：用户问题 + 助手的历史消息(用于累积上下文)。"""
+
+    user_question: str
+    assistant_reply: str
+
+
+def build_daily_conversation_turns() -> List[ConversationTurn]:
+    """模拟苍穹客服机器人一天里，同一个用户会话累积的多轮真实问答。"""
+    raw_pairs = [
+        ("你好,我想问一下我的订单什么时候能到?", "您好,根据物流信息,预计还需要1-2个工作日送达。"),
+        ("如果到时候还没到怎么办?", "如果超过预计时间未送达,您可以联系人工客服协助查询物流详情。"),
+        ("退货的话运费谁承担?", "非质量问题退货,运费由买家承担;质量问题退货,运费由卖家承担。"),
+        ("能不能分析一下我这次退货算不算质量问题,我详细描述一下情况给你参考。", "好的,请您详细描述商品的具体问题,我们会结合平台规则综合判断。"),
+        ("优惠券和满减可以叠加用吗?", "优惠券和满减活动可以叠加使用,但每个订单限用一张优惠券。"),
+        ("客服电话是多少?", "客服热线为400-XXX-XXXX,工作时间为9:00-21:00。"),
+        ("能不能对比一下会员和非会员在售后处理时效上的差异,给我详细讲讲策略?", "会员享有优先处理通道,平均处理时效比非会员快约30%。"),
+        ("好的,谢谢,还有一个问题,发票怎么开?", "订单完成后,可在订单详情页申请电子发票,一般1个工作日内开出。"),
+    ]
+    return [ConversationTurn(user_question=q, assistant_reply=a) for q, a in raw_pairs]
+
+
+# ------------------------------------------------------------------
+# 第三部分：内联重新实现三种优化手段的核心计算逻辑
+# ------------------------------------------------------------------
+
+def build_naive_history_tokens(turns: List[ConversationTurn], upto_index: int) -> int:
+    """全量策略：不做上下文截断,把system prompt和到目前为止的全部历史都带上。"""
+    tokens = approximate_token_count(FIXED_SYSTEM_PROMPT)
+    for turn in turns[:upto_index]:
+        tokens += approximate_token_count(turn.user_question)
+        tokens += approximate_token_count(turn.assistant_reply)
+    tokens += approximate_token_count(turns[upto_index].user_question)
+    return tokens
+
+
+def build_sliding_window_history_tokens(
+    turns: List[ConversationTurn], upto_index: int, window_turns: int
+) -> int:
+    """滑动窗口策略：历史部分只保留最近window_turns轮问答。"""
+    tokens = approximate_token_count(FIXED_SYSTEM_PROMPT)
+    history_slice = turns[:upto_index][-window_turns:] if window_turns > 0 else []
+    for turn in history_slice:
+        tokens += approximate_token_count(turn.user_question)
+        tokens += approximate_token_count(turn.assistant_reply)
+    tokens += approximate_token_count(turns[upto_index].user_question)
+    return tokens
+
+
+def assess_complexity_score(question: str) -> float:
+    token_count = approximate_token_count(question)
+    length_score = min(0.5, token_count / 200)
+
+    keyword_score = 0.0
+    for keyword in COMPLEXITY_INDICATOR_KEYWORDS:
+        if keyword in question:
+            keyword_score += 0.15
+    for keyword in SIMPLE_INDICATOR_KEYWORDS:
+        if keyword in question:
+            keyword_score -= 0.1
+    keyword_score = max(0.0, min(0.5, keyword_score))
+
+    return length_score + keyword_score
+
+
+def choose_tier_for_question(question: str) -> ModelTier:
+    return FLAGSHIP_TIER if assess_complexity_score(question) >= 0.35 else ECONOMY_TIER
+
+
+def prefix_cost_for_call(
+    fixed_prefix_tokens: int, tier: ModelTier, call_index: int, cache_enabled: bool
+) -> float:
+    """固定前缀部分的费用；开启缓存且非首次调用时按10%折扣价计费。"""
+    is_cache_hit = cache_enabled and call_index > 1
+    discount = 0.1 if is_cache_hit else 1.0
+    return fixed_prefix_tokens / 1_000_000 * tier.input_price_per_1m * discount
+
+
+# ------------------------------------------------------------------
+# 第四部分：报表核心——逐层叠加三项优化，拆解每一步的贡献
+# ------------------------------------------------------------------
+
+@dataclass
+class OptimizationLayerResult:
+    layer_name: str
+    total_cost: float
+    description: str
+
+
+def compute_baseline_cost(turns: List[ConversationTurn]) -> float:
+    """基线：不做任何优化——全量上下文 + 全部走旗舰档 + 不开启缓存。"""
+    total_cost = 0.0
+    fixed_prefix_tokens = approximate_token_count(FIXED_SYSTEM_PROMPT)
+    for index, turn in enumerate(turns):
+        history_tokens = build_naive_history_tokens(turns, index) - fixed_prefix_tokens
+        input_cost = (fixed_prefix_tokens + history_tokens) / 1_000_000 * FLAGSHIP_TIER.input_price_per_1m
+        output_tokens = approximate_token_count(turn.assistant_reply)
+        output_cost = output_tokens / 1_000_000 * FLAGSHIP_TIER.output_price_per_1m
+        total_cost += input_cost + output_cost
+    return total_cost
+
+
+def compute_with_context_management_only(turns: List[ConversationTurn], window_turns: int = 4) -> float:
+    """第一层优化：只叠加上下文窗口管理(滑动窗口)，模型仍全部走旗舰档，不开缓存。"""
+    total_cost = 0.0
+    fixed_prefix_tokens = approximate_token_count(FIXED_SYSTEM_PROMPT)
+    for index, turn in enumerate(turns):
+        history_tokens = build_sliding_window_history_tokens(turns, index, window_turns) - fixed_prefix_tokens
+        input_cost = (fixed_prefix_tokens + history_tokens) / 1_000_000 * FLAGSHIP_TIER.input_price_per_1m
+        output_tokens = approximate_token_count(turn.assistant_reply)
+        output_cost = output_tokens / 1_000_000 * FLAGSHIP_TIER.output_price_per_1m
+        total_cost += input_cost + output_cost
+    return total_cost
+
+
+def compute_with_context_and_routing(turns: List[ConversationTurn], window_turns: int = 4) -> float:
+    """第二层优化：在上下文管理的基础上，再叠加模型路由(简单问题走经济档)。"""
+    total_cost = 0.0
+    fixed_prefix_tokens = approximate_token_count(FIXED_SYSTEM_PROMPT)
+    for index, turn in enumerate(turns):
+        tier = choose_tier_for_question(turn.user_question)
+        history_tokens = build_sliding_window_history_tokens(turns, index, window_turns) - fixed_prefix_tokens
+        input_cost = (fixed_prefix_tokens + history_tokens) / 1_000_000 * tier.input_price_per_1m
+        output_tokens = approximate_token_count(turn.assistant_reply)
+        output_cost = output_tokens / 1_000_000 * tier.output_price_per_1m
+        total_cost += input_cost + output_cost
+    return total_cost
+
+
+def compute_with_all_three_optimizations(turns: List[ConversationTurn], window_turns: int = 4) -> float:
+    """第三层优化：上下文管理 + 模型路由 + Prompt缓存三项全部叠加。
+
+    注意固定前缀部分的计费要单独按缓存规则算，不能和变化的历史部分
+    混在一起用统一单价计算，这也是老王强调"不能偷懒直接加总百分比"
+    的具体体现——三项优化在计算链路上是有先后依赖关系的。
+    """
+    total_cost = 0.0
+    fixed_prefix_tokens = approximate_token_count(FIXED_SYSTEM_PROMPT)
+    for index, turn in enumerate(turns):
+        tier = choose_tier_for_question(turn.user_question)
+
+        history_tokens_with_prefix = build_sliding_window_history_tokens(turns, index, window_turns)
+        variable_tokens = history_tokens_with_prefix - fixed_prefix_tokens
+        current_question_tokens = approximate_token_count(turn.user_question)
+
+        prefix_cost = prefix_cost_for_call(fixed_prefix_tokens, tier, index + 1, cache_enabled=True)
+        variable_cost = (variable_tokens + current_question_tokens) / 1_000_000 * tier.input_price_per_1m
+        output_tokens = approximate_token_count(turn.assistant_reply)
+        output_cost = output_tokens / 1_000_000 * tier.output_price_per_1m
+
+        total_cost += prefix_cost + variable_cost + output_cost
+    return total_cost
+
+
+def build_layered_optimization_report(turns: List[ConversationTurn]) -> List[OptimizationLayerResult]:
+    baseline = compute_baseline_cost(turns)
+    with_context = compute_with_context_management_only(turns)
+    with_context_and_routing = compute_with_context_and_routing(turns)
+    with_all_three = compute_with_all_three_optimizations(turns)
+
+    return [
+        OptimizationLayerResult(
+            layer_name="基线(不做任何优化)",
+            total_cost=baseline,
+            description="全量上下文 + 全部走旗舰档 + 不开启Prompt缓存",
+        ),
+        OptimizationLayerResult(
+            layer_name="+ 上下文窗口管理",
+            total_cost=with_context,
+            description="历史消息改为滑动窗口截断，模型仍全部走旗舰档",
+        ),
+        OptimizationLayerResult(
+            layer_name="+ 模型分级路由",
+            total_cost=with_context_and_routing,
+            description="在上下文管理基础上，简单问题改为路由到经济档模型",
+        ),
+        OptimizationLayerResult(
+            layer_name="+ Prompt缓存",
+            total_cost=with_all_three,
+            description="在前两项基础上，固定前缀部分启用缓存折扣计费",
+        ),
+    ]
+
+
+# ------------------------------------------------------------------
+# 第五部分：demo——生成完整的分层报表，并逐层验证节省效果
+# ------------------------------------------------------------------
+
+def print_section(title: str) -> None:
+    print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
+
+
+def format_report_lines(results: List[OptimizationLayerResult]) -> List[str]:
+    lines = []
+    baseline_cost = results[0].total_cost
+    previous_cost = baseline_cost
+    for result in results:
+        cumulative_savings = 1 - result.total_cost / baseline_cost if baseline_cost > 0 else 0.0
+        incremental_savings = (
+            1 - result.total_cost / previous_cost if previous_cost > 0 else 0.0
+        )
+        lines.append(
+            f"{result.layer_name:<18} 总成本={result.total_cost:.6f}元  "
+            f"较基线累计节省={cumulative_savings:.1%}  "
+            f"本层新增节省={incremental_savings:.1%}"
+        )
+        lines.append(f"  说明: {result.description}")
+        previous_cost = result.total_cost
+    return lines
+
+
+def demo_layered_report_on_sample_conversation() -> None:
+    print_section("演示一：一天累积对话场景下，三项优化逐层叠加的成本变化")
+    turns = build_daily_conversation_turns()
+    results = build_layered_optimization_report(turns)
+
+    for line in format_report_lines(results):
+        print(line)
+
+    assert results[-1].total_cost < results[0].total_cost
+    print("验证通过：三项优化叠加之后的总成本明显低于完全不做优化的基线，"
+          "而且报表把每一层的贡献拆开展示，能清楚看到'这一步优化到底值不值得做'，"
+          "而不是只给一个笼统的总节省比例。")
+
+
+def demo_each_layer_contributes_positively() -> None:
+    print_section("演示二：验证每一层优化都在持续降低成本，而不是某一层反而变贵")
+    turns = build_daily_conversation_turns()
+    results = build_layered_optimization_report(turns)
+
+    for previous, current in zip(results, results[1:]):
+        assert current.total_cost <= previous.total_cost, (
+            f"'{current.layer_name}'这一层的成本({current.total_cost:.6f})"
+            f"不应该高于上一层'{previous.layer_name}'的成本({previous.total_cost:.6f})"
+        )
+    print("验证通过：报表里的四行数字是单调递减的，每叠加一项优化手段，"
+          "总成本都不会反而上升——这个单调性正是分层报表设计上必须保证的基本正确性，"
+          "如果哪一层反而变贵了，说明对应的优化逻辑本身写错了。")
+
+
+def demo_context_management_savings_grow_with_conversation_length() -> None:
+    print_section("演示三：对话轮次越多，上下文管理这一层贡献的节省比例通常越明显")
+    short_turns = build_daily_conversation_turns()[:3]
+    long_turns = build_daily_conversation_turns()
+
+    def context_layer_savings_ratio(turns: List[ConversationTurn]) -> float:
+        baseline = compute_baseline_cost(turns)
+        with_context = compute_with_context_management_only(turns)
+        return 1 - with_context / baseline if baseline > 0 else 0.0
+
+    short_ratio = context_layer_savings_ratio(short_turns)
+    long_ratio = context_layer_savings_ratio(long_turns)
+
+    print(f"只有{len(short_turns)}轮对话时,上下文管理层的节省比例: {short_ratio:.1%}")
+    print(f"累积到{len(long_turns)}轮对话时,上下文管理层的节省比例: {long_ratio:.1%}")
+
+    assert long_ratio >= short_ratio
+    print("验证通过：对话轮次越多，全量策略下积累的历史token越多，"
+          "上下文窗口管理能截断掉的部分也越多，节省比例随对话长度增长而扩大，"
+          "这与实战十一里'全量策略成本随轮数线性增长'的结论是完全一致的，"
+          "说明几个实战之间的结论互相印证，不是各自孤立的数字游戏。")
+
+
+def demo_report_is_stable_for_empty_or_single_turn_conversation() -> None:
+    print_section("演示四：极端场景(只有一轮对话)下,报表依然能正常生成,不会报错")
+    single_turn = build_daily_conversation_turns()[:1]
+    results = build_layered_optimization_report(single_turn)
+
+    assert len(results) == 4
+    for result in results:
+        assert result.total_cost > 0
+    print("验证通过：即使只有一轮对话(没有任何历史可截断)，报表逐层计算逻辑依然能"
+          "正常跑完,不会因为'历史为空'这种边界情况而抛异常——这是报表工具"
+          "在被集成进真实业务系统之前必须确认的健壮性要求，边界情况往往才是"
+          "线上事故的高发地带。")
+
+
+def run_all_demos() -> None:
+    demo_layered_report_on_sample_conversation()
+    demo_each_layer_contributes_positively()
+    demo_context_management_savings_grow_with_conversation_length()
+    demo_report_is_stable_for_empty_or_single_turn_conversation()
+    print("\n全部组合优化策略报表演示执行完毕。")
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+### 配套单元测试:上下文窗口管理 / 模型路由 / Prompt缓存 / 用量对账
+
+老王补充实战十的单元测试之后说:"今天新加的四个工具,道理讲清楚了,demo也跑过了,但既然咱们已经养成了'关键计算逻辑要有测试'的习惯,就不该厚此薄彼——顺手把这四个也补上,而且这次尝试不要照抄实战十的写法,自己想想每个工具最容易出错的边界在哪里。"
+
+```python
+"""
+上下文窗口管理 / 模型路由 / Prompt缓存 / 用量对账 —— 配套单元测试
+====================================================================
+
+老王补充实战十的单元测试之后说:"今天新加的四个工具,道理讲清楚了,
+demo也跑过了,但既然咱们已经养成了'关键计算逻辑要有测试'的习惯,
+就不该厚此薄彼——顺手把这四个也补上,而且这次尝试不要照抄实战十的
+写法,自己想想每个工具最容易出错的边界在哪里。"
+
+覆盖范围:
+1. ConversationHistory与三种上下文截断策略的核心断言
+2. 模型路由的复杂度评分与路由决策
+3. Prompt缓存模拟器的成本计算
+4. 用量对账工具的误差统计与修正系数
+
+本文件同样保持自包含,不依赖导入其他课件文件里的实现,复杂度分数、
+截断策略、缓存计费、对账统计相关的核心函数都在本文件内联重新实现一份
+简化版本,方便独立运行。
+"""
+
+from __future__ import annotations
+
+import re
+import statistics
+from dataclasses import dataclass, field
+from typing import Dict, List
+
+# ------------------------------------------------------------------
+# 第一部分:内联重新实现待测的核心逻辑(简化版)
+# ------------------------------------------------------------------
+
+_CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+_WORD_PATTERN = re.compile(r"[A-Za-z0-9]+|[^\sA-Za-z0-9\u4e00-\u9fff]|[\u4e00-\u9fff]")
+
+
+def approximate_token_count(text: str) -> int:
+    count = 0
+    for chunk in _WORD_PATTERN.findall(text):
+        if _CJK_PATTERN.match(chunk):
+            count += 1
+        elif chunk.isalnum():
+            count += max(1, round(len(chunk) / 4))
+        else:
+            count += 1
+    return count
+
+
+@dataclass
+class Message:
+    role: str
+    content: str
+
+    @property
+    def token_count(self) -> int:
+        return approximate_token_count(self.content)
+
+
+@dataclass
+class ConversationHistory:
+    system_prompt: Message | None = None
+    turns: List[Message] = field(default_factory=list)
+
+    def append(self, role: str, content: str) -> None:
+        self.turns.append(Message(role=role, content=content))
+
+
+def build_context_sliding_window(history: ConversationHistory, window_turns: int):
+    kept = history.turns[-window_turns:] if window_turns > 0 else []
+    included = list(kept)
+    if history.system_prompt:
+        included = [history.system_prompt] + included
+    return included
+
+
+def build_context_token_budget(history: ConversationHistory, token_budget: int):
+    system_tokens = history.system_prompt.token_count if history.system_prompt else 0
+    remaining_budget = token_budget - system_tokens
+
+    kept_reversed: List[Message] = []
+    accumulated = 0
+    for index in range(len(history.turns) - 1, -1, -1):
+        message = history.turns[index]
+        if accumulated + message.token_count > remaining_budget:
+            break
+        accumulated += message.token_count
+        kept_reversed.append(message)
+
+    kept = list(reversed(kept_reversed))
+    included = list(kept)
+    if history.system_prompt:
+        included = [history.system_prompt] + included
+    return included
+
+
+COMPLEXITY_INDICATOR_KEYWORDS = ("为什么", "分析", "对比", "推导", "证明", "策略", "代码", "算法")
+SIMPLE_INDICATOR_KEYWORDS = ("多少", "是什么", "几点", "在哪")
+
+
+def assess_complexity_score(question: str) -> float:
+    token_count = approximate_token_count(question)
+    length_score = min(0.5, token_count / 200)
+
+    keyword_score = 0.0
+    for keyword in COMPLEXITY_INDICATOR_KEYWORDS:
+        if keyword in question:
+            keyword_score += 0.15
+    for keyword in SIMPLE_INDICATOR_KEYWORDS:
+        if keyword in question:
+            keyword_score -= 0.1
+    keyword_score = max(0.0, min(0.5, keyword_score))
+
+    return length_score + keyword_score
+
+
+NORMAL_INPUT_PRICE_PER_1M = 20.0
+CACHED_INPUT_DISCOUNT_RATIO = 0.1
+
+
+def prefix_cost(prefix_tokens: int, is_cache_hit: bool) -> float:
+    price = NORMAL_INPUT_PRICE_PER_1M * (CACHED_INPUT_DISCOUNT_RATIO if is_cache_hit else 1.0)
+    return prefix_tokens / 1_000_000 * price
+
+
+@dataclass
+class ReconciliationRecord:
+    estimated_tokens: int
+    actual_tokens: int
+
+    @property
+    def error_rate(self) -> float:
+        if self.actual_tokens == 0:
+            return 0.0
+        return (self.estimated_tokens - self.actual_tokens) / self.actual_tokens
+
+
+def suggested_correction_factor(records: List[ReconciliationRecord]) -> float:
+    mean_error_rate = statistics.mean(r.error_rate for r in records)
+    if (1 + mean_error_rate) == 0:
+        return 1.0
+    return 1 / (1 + mean_error_rate)
+
+
+# ------------------------------------------------------------------
+# 第二部分:pytest测试用例
+# ------------------------------------------------------------------
+
+class TestSlidingWindowContext:
+    def test_window_larger_than_history_keeps_everything(self):
+        history = ConversationHistory(system_prompt=Message("system", "系统提示"))
+        history.append("user", "问题1")
+        history.append("assistant", "回答1")
+        included = build_context_sliding_window(history, window_turns=10)
+        assert len(included) == 3  # system + 2条历史
+
+    def test_window_smaller_than_history_drops_oldest(self):
+        history = ConversationHistory()
+        for i in range(5):
+            history.append("user", f"问题{i}")
+        included = build_context_sliding_window(history, window_turns=2)
+        assert len(included) == 2
+        assert included[0].content == "问题3"
+        assert included[-1].content == "问题4"
+
+    def test_zero_window_keeps_only_system_prompt(self):
+        history = ConversationHistory(system_prompt=Message("system", "系统提示"))
+        history.append("user", "问题1")
+        included = build_context_sliding_window(history, window_turns=0)
+        assert len(included) == 1
+        assert included[0].role == "system"
+
+
+class TestTokenBudgetContext:
+    def test_budget_large_enough_keeps_all_messages(self):
+        history = ConversationHistory()
+        history.append("user", "短问题")
+        history.append("assistant", "短回答")
+        included = build_context_token_budget(history, token_budget=1000)
+        assert len(included) == 2
+
+    def test_tight_budget_only_keeps_most_recent_message(self):
+        history = ConversationHistory()
+        history.append("user", "第一条很长很长很长很长很长很长很长的消息内容")
+        history.append("user", "短")
+        included = build_context_token_budget(history, token_budget=3)
+        assert len(included) == 1
+        assert included[0].content == "短"
+
+    def test_extremely_tight_budget_can_drop_everything(self):
+        history = ConversationHistory(system_prompt=Message("system", "一段比较长的系统提示词内容"))
+        history.append("user", "问题")
+        included = build_context_token_budget(history, token_budget=1)
+        # 预算连system prompt都不够,history部分应该被完全裁掉,只保留system
+        assert all(msg.role == "system" for msg in included)
+
+
+class TestComplexityAssessment:
+    def test_short_factual_question_has_low_score(self):
+        score = assess_complexity_score("现在几点?")
+        assert score < 0.35
+
+    def test_long_analytical_question_has_high_score(self):
+        question = "请分析对比一下两种截断策略的优劣,并给出你的推荐策略和理由"
+        score = assess_complexity_score(question)
+        assert score >= 0.35
+
+    def test_score_is_bounded_between_zero_and_one(self):
+        long_repeated_complex_question = "为什么分析对比策略代码算法" * 30
+        score = assess_complexity_score(long_repeated_complex_question)
+        assert 0.0 <= score <= 1.0
+
+
+class TestPromptCachePricing:
+    def test_cache_hit_is_cheaper_than_cache_miss(self):
+        cost_miss = prefix_cost(1000, is_cache_hit=False)
+        cost_hit = prefix_cost(1000, is_cache_hit=True)
+        assert cost_hit < cost_miss
+        assert abs(cost_hit - cost_miss * CACHED_INPUT_DISCOUNT_RATIO) < 1e-12
+
+    def test_zero_tokens_cost_zero_regardless_of_cache(self):
+        assert prefix_cost(0, is_cache_hit=False) == 0.0
+        assert prefix_cost(0, is_cache_hit=True) == 0.0
+
+
+class TestUsageReconciliation:
+    def test_correction_factor_below_one_when_overestimating(self):
+        records = [
+            ReconciliationRecord(estimated_tokens=120, actual_tokens=100),
+            ReconciliationRecord(estimated_tokens=110, actual_tokens=100),
+        ]
+        factor = suggested_correction_factor(records)
+        assert factor < 1.0
+
+    def test_correction_factor_above_one_when_underestimating(self):
+        records = [
+            ReconciliationRecord(estimated_tokens=80, actual_tokens=100),
+            ReconciliationRecord(estimated_tokens=90, actual_tokens=100),
+        ]
+        factor = suggested_correction_factor(records)
+        assert factor > 1.0
+
+    def test_correction_factor_is_one_when_perfectly_accurate(self):
+        records = [
+            ReconciliationRecord(estimated_tokens=100, actual_tokens=100),
+            ReconciliationRecord(estimated_tokens=100, actual_tokens=100),
+        ]
+        factor = suggested_correction_factor(records)
+        assert abs(factor - 1.0) < 1e-9
+
+
+# ------------------------------------------------------------------
+# 第三部分:不依赖pytest的最小化自测
+# ------------------------------------------------------------------
+
+def run_minimal_self_check() -> None:
+    history = ConversationHistory()
+    for i in range(5):
+        history.append("user", f"问题{i}")
+    assert len(build_context_sliding_window(history, window_turns=2)) == 2
+
+    assert assess_complexity_score("现在几点?") < 0.35
+    assert prefix_cost(1000, is_cache_hit=True) < prefix_cost(1000, is_cache_hit=False)
+
+    records = [ReconciliationRecord(120, 100)]
+    assert suggested_correction_factor(records) < 1.0
+
+    print("最小化自测全部通过(不依赖pytest的兜底验证)。")
+
+
+if __name__ == "__main__":
+    run_minimal_self_check()
+```
+
+陈铭把这五个新工具和配套测试都跑了一遍,最后在群里跟老王和林悦汇报了一句:"上下文管理、模型路由、Prompt缓存,这三个手段单独看都不复杂,但叠加在一起算总账的时候,还是得老老实实按顺序一步步算,不能图省事直接加百分比。"老王回复:"这句话你悟到了,今天这五个实战就没白写。"
+
 ---
 
 ## 今日复盘
