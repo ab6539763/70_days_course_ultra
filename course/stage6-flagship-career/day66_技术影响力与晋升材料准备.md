@@ -1770,6 +1770,1451 @@ if __name__ == "__main__":
 
 两个脚本写完并本地测试跑通后,陈铭在仓库根目录下执行了一次统计,看到终端输出的代码总行数和提交次数时,他愣了一下——原来这七十天里,他在cangqiong-platform相关代码库里积累下来的东西,用数字说出来是这个体量。老王在旁边看着,只说了一句:"这就是了,别人问你做了什么,你现在有底气甩数字过去,而不是含糊地说'做了不少东西'。"
 
+晚饭前,老王又追加了三个"作业"——他说光有README和统计脚本还不够扎实,陈铭还需要三样东西:一是一套能把口述的STAR案例结构化沉淀下来、并自动校验"老王三条常见错误"的工具,避免材料评审的时候还要人肉逐条核对;二是一套能让Wiki文档体系"自己长大"而不是全靠手写的生成与新鲜度巡检工具,毕竟老王见过太多团队Wiki写完第一版就再也没人维护,半年后全是过期信息;三是把项目统计脚本再往前推一步,做成能做"多次快照对比"和"异常commit识别"的增强版本,这样陈铭以后每次汇报进展,都能拿出"相比上次,增长了多少"这种更有说服力的对比数据,而不是每次只给一个孤立的绝对数字。
+
+陈铭花了整个晚上把这三样工具写完,过程中他发现,写这些"面向自己和团队"的工具,跟写面向客户的功能代码,心态上有一点微妙的不同——客户项目的代码,他会本能地反复推敲边界情况、异常处理,因为背后是合同和验收标准;而这类内部工具,一开始他有点想"能跑就行"。但老王看了他第一版的草稿后提了一句:"你给自己用的工具,标准反而应该更高,因为这些工具以后要伴随你很长时间,而且很可能会被团队里其他人直接拿去用——工具的可靠性,某种程度上也是你技术判断力的延伸。"陈铭听完,把几个偷懒的地方重新补上了异常处理和边界校验。
+
+### 四、STAR案例结构化管理工具
+
+老王的原话是:"你今天口述了五个项目的STAR案例,我在白板上帮你记,但白板拍完照就是死的了,没法再校验、没法再迭代。你得把这些案例变成结构化数据,存下来之后既能自动检查有没有踩到我说的那三条常见错误,又能一键渲染成Markdown或者拼进PPT大纲。"于是陈铭设计了下面这套工具,把STAR案例定义为结构化的数据模型,内置了老王反复强调的三条自查规则(情境是否具体、行动是否体现判断、结果是否分层量化),并支持批量校验与导出。
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+star_case_builder.py
+
+苍穹企业级智能体中台 - STAR项目案例结构化管理工具
+
+背景:
+    陈铭在准备P6→P7晋升材料时,需要将口述整理的五个项目案例(苍穹0.1版对话产品、
+    海纳制造集团RAG项目、祺瑞集团多Agent办公助手项目、御风金融私有化部署项目、
+    寰宇集团旗舰项目)沉淀为结构化数据,而不是散落在白板照片和笔记本里的文字。
+
+功能:
+    1. 定义STAR案例的结构化数据模型(情境/任务/行动/结果 + 元信息)
+    2. 内置"老王三条常见错误"自查规则,对每个案例自动打分与给出修改建议
+    3. 支持从JSON批量加载/保存案例集合
+    4. 支持将案例集合渲染为面向不同受众的Markdown文档
+        (晋升答辩详版 / 技术分享精简版 / 360评估摘要版)
+    5. 支持个人贡献度校验——要求团队项目必须显式标注"主导部分"与"参与部分"
+
+使用方式:
+    python scripts/star_case_builder.py --input star_cases.json --render promotion
+    python scripts/star_case_builder.py --input star_cases.json --lint
+
+作者: 陈铭
+审阅: 王振宇
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+from typing import Dict, List, Optional, Tuple
+
+
+# ---------------------------------------------------------------------------
+# 常量与规则配置
+# ---------------------------------------------------------------------------
+
+# 情境描述中容易出现的"空话"关键词库,命中越多说明情境写得越空泛
+VAGUE_SITUATION_PHRASES: Tuple[str, ...] = (
+    "公司业务发展需要",
+    "为了提升效率",
+    "为了更好地服务客户",
+    "响应公司战略",
+    "顺应行业趋势",
+)
+
+# 行动描述中体现"技术判断"的信号词,命中说明这段行动很可能包含了取舍过程
+JUDGEMENT_SIGNAL_PHRASES: Tuple[str, ...] = (
+    "评估了",
+    "对比了",
+    "权衡",
+    "放弃了",
+    "最终选择",
+    "之所以",
+    "综合考虑",
+    "取舍",
+)
+
+# 结果描述中三层量化对应的关键词库,用于粗粒度检测结果是否覆盖三层
+RESULT_LAYER_KEYWORDS: Dict[str, Tuple[str, ...]] = {
+    "业务结果": ("节省", "缩短", "满意度", "成本", "收入", "续约", "损失"),
+    "技术结果": ("准确率", "延迟", "响应时间", "吞吐", "并发", "稳定性", "覆盖率"),
+    "方法论沉淀": ("复用", "沉淀", "标准", "规范", "推广", "组件"),
+}
+
+# 单条案例至少需要包含几个关键行动,少于该数量会被判定为"行动过于单薄"
+MIN_ACTION_COUNT = 2
+MAX_ACTION_COUNT = 6
+
+
+class LintSeverity(str, Enum):
+    """自查问题的严重程度分级"""
+
+    BLOCKER = "阻断级"       # 必须修改才能提交
+    WARNING = "警告级"       # 建议修改,不强制阻断
+    INFO = "提示级"          # 仅作提示,不影响提交
+
+
+@dataclass
+class LintIssue:
+    """一条自查发现的问题"""
+
+    severity: LintSeverity
+    field_name: str
+    message: str
+    suggestion: str = ""
+
+
+@dataclass
+class ContributionSplit:
+    """团队项目中,个人贡献度的显式拆分说明"""
+
+    led_parts: List[str] = field(default_factory=list)         # 本人主导的部分
+    participated_parts: List[str] = field(default_factory=list)  # 本人参与但非主导的部分
+    teammates_note: str = ""                                     # 关于协作同事贡献的说明
+
+    def is_declared(self) -> bool:
+        """判断是否已经显式声明了贡献度拆分,而不是笼统地说'我做的'"""
+        return bool(self.led_parts) or bool(self.participated_parts)
+
+
+@dataclass
+class DataPoint:
+    """一条量化数据,区分"实测数据"与"估算数据",避免数据来源被混淆"""
+
+    metric_name: str
+    value: str
+    source_type: str  # "实测" 或 "估算"
+    source_detail: str = ""
+
+    def validate(self) -> List[str]:
+        errors = []
+        if self.source_type not in ("实测", "估算"):
+            errors.append(
+                f"数据点[{self.metric_name}]的source_type必须是'实测'或'估算',当前为'{self.source_type}'"
+            )
+        if self.source_type == "估算" and not self.source_detail:
+            errors.append(
+                f"数据点[{self.metric_name}]标注为估算数据,但缺少source_detail说明估算依据"
+            )
+        return errors
+
+
+@dataclass
+class StarCase:
+    """一份完整的STAR项目案例"""
+
+    project_id: str
+    project_name: str
+    is_team_project: bool
+
+    situation: str
+    task: str
+    actions: List[str] = field(default_factory=list)
+    result_business: str = ""
+    result_technical: str = ""
+    result_methodology: str = ""
+
+    data_points: List[DataPoint] = field(default_factory=list)
+    contribution: ContributionSplit = field(default_factory=ContributionSplit)
+
+    narrative_priority: int = 0  # 用于排定在PPT/答辩中的呈现顺序,数字越小越靠前
+
+    def to_dict(self) -> Dict:
+        payload = asdict(self)
+        return payload
+
+    @staticmethod
+    def from_dict(payload: Dict) -> "StarCase":
+        data_points = [DataPoint(**dp) for dp in payload.get("data_points", [])]
+        contribution_payload = payload.get("contribution", {}) or {}
+        contribution = ContributionSplit(
+            led_parts=contribution_payload.get("led_parts", []),
+            participated_parts=contribution_payload.get("participated_parts", []),
+            teammates_note=contribution_payload.get("teammates_note", ""),
+        )
+        case = StarCase(
+            project_id=payload["project_id"],
+            project_name=payload["project_name"],
+            is_team_project=payload.get("is_team_project", False),
+            situation=payload.get("situation", ""),
+            task=payload.get("task", ""),
+            actions=payload.get("actions", []),
+            result_business=payload.get("result_business", ""),
+            result_technical=payload.get("result_technical", ""),
+            result_methodology=payload.get("result_methodology", ""),
+            data_points=data_points,
+            contribution=contribution,
+            narrative_priority=payload.get("narrative_priority", 0),
+        )
+        return case
+
+
+# ---------------------------------------------------------------------------
+# 自查规则引擎:对应"老王三条常见错误"
+# ---------------------------------------------------------------------------
+
+class StarCaseLinter:
+    """对STAR案例执行结构化自查,复现老王在课堂上强调的三条常见错误检查规则"""
+
+    def lint(self, case: StarCase) -> List[LintIssue]:
+        issues: List[LintIssue] = []
+        issues.extend(self._check_situation_specificity(case))
+        issues.extend(self._check_action_judgement(case))
+        issues.extend(self._check_result_layers(case))
+        issues.extend(self._check_data_point_integrity(case))
+        issues.extend(self._check_contribution_declared(case))
+        issues.extend(self._check_action_count(case))
+        return issues
+
+    def _check_situation_specificity(self, case: StarCase) -> List[LintIssue]:
+        """规则一:情境部分不能写成放在哪个项目都适用的空话"""
+
+        issues: List[LintIssue] = []
+        hit_phrases = [p for p in VAGUE_SITUATION_PHRASES if p in case.situation]
+        if hit_phrases:
+            issues.append(
+                LintIssue(
+                    severity=LintSeverity.WARNING,
+                    field_name="situation",
+                    message=f"情境描述中命中了空泛表述: {'、'.join(hit_phrases)}",
+                    suggestion="请补充这个项目独有的、具体的业务痛点与技术现状,"
+                    "回答'业务背景是什么/技术现状是什么/紧迫性体现在哪'三个问题。",
+                )
+            )
+        if len(case.situation) < 60:
+            issues.append(
+                LintIssue(
+                    severity=LintSeverity.WARNING,
+                    field_name="situation",
+                    message="情境描述篇幅过短,可能缺乏足够的具体细节",
+                    suggestion="建议补充客户规模、原有做法的具体痛点、量化的业务损失等细节。",
+                )
+            )
+        return issues
+
+    def _check_action_judgement(self, case: StarCase) -> List[LintIssue]:
+        """规则二:行动部分不能只是技术名词罗列,至少要有一处体现"判断"的表述"""
+
+        issues: List[LintIssue] = []
+        combined_actions = " ".join(case.actions)
+        hit_signals = [s for s in JUDGEMENT_SIGNAL_PHRASES if s in combined_actions]
+        if not hit_signals:
+            issues.append(
+                LintIssue(
+                    severity=LintSeverity.BLOCKER,
+                    field_name="actions",
+                    message="行动描述中未检测到任何体现技术判断/方案取舍的信号词",
+                    suggestion="至少补充一处'我评估了A方案和B方案,因为什么原因选择了B方案'"
+                    "这样的表述,不能全篇都是'我用了什么技术做了什么'。",
+                )
+            )
+        return issues
+
+    def _check_result_layers(self, case: StarCase) -> List[LintIssue]:
+        """规则三:结果部分需要覆盖业务结果、技术结果、方法论沉淀三层"""
+
+        issues: List[LintIssue] = []
+        result_texts = {
+            "业务结果": case.result_business,
+            "技术结果": case.result_technical,
+            "方法论沉淀": case.result_methodology,
+        }
+        for layer_name, text in result_texts.items():
+            if not text.strip():
+                severity = (
+                    LintSeverity.BLOCKER
+                    if layer_name in ("业务结果", "技术结果")
+                    else LintSeverity.WARNING
+                )
+                issues.append(
+                    LintIssue(
+                        severity=severity,
+                        field_name=f"result_{layer_name}",
+                        message=f"结果部分缺失'{layer_name}'维度的描述",
+                        suggestion=f"请补充{layer_name}维度的具体量化描述,"
+                        f"可参考关键词: {'、'.join(RESULT_LAYER_KEYWORDS.get(layer_name, ()))}",
+                    )
+                )
+        return issues
+
+    def _check_data_point_integrity(self, case: StarCase) -> List[LintIssue]:
+        """校验量化数据点的来源标注是否完整,避免估算数据被包装成实测数据"""
+
+        issues: List[LintIssue] = []
+        if not case.data_points:
+            issues.append(
+                LintIssue(
+                    severity=LintSeverity.WARNING,
+                    field_name="data_points",
+                    message="该案例未附任何结构化量化数据点",
+                    suggestion="建议至少补充2-3个可核实的量化数据点,增强材料可信度。",
+                )
+            )
+        for dp in case.data_points:
+            for error_message in dp.validate():
+                issues.append(
+                    LintIssue(
+                        severity=LintSeverity.BLOCKER,
+                        field_name="data_points",
+                        message=error_message,
+                        suggestion="估算数据必须标注可追溯的估算依据,不能与实测数据混淆呈现。",
+                    )
+                )
+        return issues
+
+    def _check_contribution_declared(self, case: StarCase) -> List[LintIssue]:
+        """校验团队项目是否已显式声明个人贡献度边界"""
+
+        issues: List[LintIssue] = []
+        if case.is_team_project and not case.contribution.is_declared():
+            issues.append(
+                LintIssue(
+                    severity=LintSeverity.BLOCKER,
+                    field_name="contribution",
+                    message="该案例标注为团队项目,但未显式声明个人主导/参与部分的贡献度拆分",
+                    suggestion="请按'责任范围'与'产出类型'两个维度,分别列出本人主导的部分"
+                    "与参与但非主导的部分,避免评委质疑'贡献含糊'。",
+                )
+            )
+        return issues
+
+    def _check_action_count(self, case: StarCase) -> List[LintIssue]:
+        """行动数量过少说明展开不足,过多说明重点不聚焦"""
+
+        issues: List[LintIssue] = []
+        count = len(case.actions)
+        if count < MIN_ACTION_COUNT:
+            issues.append(
+                LintIssue(
+                    severity=LintSeverity.WARNING,
+                    field_name="actions",
+                    message=f"关键行动数量为{count}条,低于建议下限{MIN_ACTION_COUNT}条",
+                    suggestion="建议补充至少两个关键行动,充分展开技术决策过程。",
+                )
+            )
+        elif count > MAX_ACTION_COUNT:
+            issues.append(
+                LintIssue(
+                    severity=LintSeverity.INFO,
+                    field_name="actions",
+                    message=f"关键行动数量为{count}条,超过建议上限{MAX_ACTION_COUNT}条",
+                    suggestion="建议聚焦三到五个最体现技术判断力的关键动作,避免稀释重点。",
+                )
+            )
+        return issues
+
+
+@dataclass
+class LintReport:
+    """一次批量自查的汇总报告"""
+
+    case_issue_map: Dict[str, List[LintIssue]] = field(default_factory=dict)
+
+    def has_blocker(self) -> bool:
+        return any(
+            issue.severity == LintSeverity.BLOCKER
+            for issues in self.case_issue_map.values()
+            for issue in issues
+        )
+
+    def blocker_count(self) -> int:
+        return sum(
+            1
+            for issues in self.case_issue_map.values()
+            for issue in issues
+            if issue.severity == LintSeverity.BLOCKER
+        )
+
+    def render_text(self) -> str:
+        lines: List[str] = ["=" * 60, "STAR案例自查报告", "=" * 60]
+        for project_id, issues in self.case_issue_map.items():
+            lines.append("")
+            lines.append(f"【项目: {project_id}】")
+            if not issues:
+                lines.append("  未发现问题,案例结构完整度良好。")
+                continue
+            for issue in sorted(issues, key=lambda x: x.severity.value):
+                lines.append(f"  [{issue.severity.value}] {issue.field_name}: {issue.message}")
+                if issue.suggestion:
+                    lines.append(f"      建议: {issue.suggestion}")
+        lines.append("")
+        lines.append("-" * 60)
+        lines.append(
+            f"汇总: 共检查{len(self.case_issue_map)}个案例,"
+            f"其中包含阻断级问题{self.blocker_count()}项。"
+        )
+        if self.has_blocker():
+            lines.append("存在阻断级问题,建议修改后再提交晋升材料评审。")
+        else:
+            lines.append("未发现阻断级问题,可以提交导师评审。")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 案例集合管理与渲染
+# ---------------------------------------------------------------------------
+
+class StarCaseCollection:
+    """管理一组STAR案例,支持加载、保存、批量校验与多受众渲染"""
+
+    def __init__(self, cases: Optional[List[StarCase]] = None) -> None:
+        self.cases: List[StarCase] = cases or []
+
+    @classmethod
+    def load_from_json(cls, file_path: str) -> "StarCaseCollection":
+        with open(file_path, "r", encoding="utf-8") as f:
+            raw_payload = json.load(f)
+        cases = [StarCase.from_dict(item) for item in raw_payload.get("cases", [])]
+        cases.sort(key=lambda c: c.narrative_priority)
+        return cls(cases=cases)
+
+    def save_to_json(self, file_path: str) -> None:
+        payload = {"cases": [case.to_dict() for case in self.cases]}
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    def lint_all(self) -> LintReport:
+        linter = StarCaseLinter()
+        report = LintReport()
+        for case in self.cases:
+            report.case_issue_map[case.project_id] = linter.lint(case)
+        return report
+
+    def render_promotion_markdown(self) -> str:
+        """渲染晋升答辩详版:包含完整的STAR四段式+数据点+贡献度拆分"""
+
+        sections: List[str] = ["# 晋升材料 · STAR项目案例集(详版)", ""]
+        for case in sorted(self.cases, key=lambda c: c.narrative_priority):
+            sections.append(f"## {case.project_name}")
+            sections.append("")
+            sections.append(f"**情境(Situation)**\n\n{case.situation}")
+            sections.append("")
+            sections.append(f"**任务(Task)**\n\n{case.task}")
+            sections.append("")
+            sections.append("**行动(Action)**\n")
+            for idx, action in enumerate(case.actions, start=1):
+                sections.append(f"{idx}. {action}")
+            sections.append("")
+            sections.append("**结果(Result)**\n")
+            if case.result_business:
+                sections.append(f"- 业务结果: {case.result_business}")
+            if case.result_technical:
+                sections.append(f"- 技术结果: {case.result_technical}")
+            if case.result_methodology:
+                sections.append(f"- 方法论沉淀: {case.result_methodology}")
+            if case.data_points:
+                sections.append("")
+                sections.append("**关键量化数据**\n")
+                sections.append("| 指标 | 数值 | 来源类型 | 来源说明 |")
+                sections.append("|---|---|---|---|")
+                for dp in case.data_points:
+                    sections.append(
+                        f"| {dp.metric_name} | {dp.value} | {dp.source_type} | {dp.source_detail or '-'} |"
+                    )
+            if case.is_team_project:
+                sections.append("")
+                sections.append("**个人贡献度说明**\n")
+                if case.contribution.led_parts:
+                    sections.append("主导部分:")
+                    for item in case.contribution.led_parts:
+                        sections.append(f"- {item}")
+                if case.contribution.participated_parts:
+                    sections.append("参与部分:")
+                    for item in case.contribution.participated_parts:
+                        sections.append(f"- {item}")
+                if case.contribution.teammates_note:
+                    sections.append(f"\n协作说明: {case.contribution.teammates_note}")
+            sections.append("")
+            sections.append("---")
+            sections.append("")
+        return "\n".join(sections)
+
+    def render_sharing_markdown(self) -> str:
+        """渲染技术周会分享精简版:弱化个人证明色彩,强化方法论可复用性"""
+
+        sections: List[str] = ["# 技术分享 · 项目方法论速览", ""]
+        for case in sorted(self.cases, key=lambda c: c.narrative_priority):
+            sections.append(f"## {case.project_name}")
+            sections.append("")
+            sections.append(f"**遇到的问题**: {case.situation[:120]}...")
+            sections.append("")
+            sections.append("**可复用的方法**:")
+            for action in case.actions:
+                sections.append(f"- {action}")
+            if case.result_methodology:
+                sections.append("")
+                sections.append(f"**可迁移性说明**: {case.result_methodology}")
+            sections.append("")
+            sections.append("---")
+            sections.append("")
+        return "\n".join(sections)
+
+    def render_summary_table(self) -> str:
+        """渲染面向360评估/HR的一页速览表,不展开细节,只给结论性数字"""
+
+        lines = ["| 项目 | 是否团队项目 | 关键量化数据数量 | 关键行动数量 |", "|---|---|---|---|"]
+        for case in sorted(self.cases, key=lambda c: c.narrative_priority):
+            lines.append(
+                f"| {case.project_name} | {'是' if case.is_team_project else '否'} "
+                f"| {len(case.data_points)} | {len(case.actions)} |"
+            )
+        return "\n".join(lines)
+
+
+RENDER_MODE_MAP = {
+    "promotion": StarCaseCollection.render_promotion_markdown,
+    "sharing": StarCaseCollection.render_sharing_markdown,
+    "summary": StarCaseCollection.render_summary_table,
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="STAR项目案例结构化管理工具")
+    parser.add_argument("--input", type=str, required=True, help="案例集合的JSON文件路径")
+    parser.add_argument(
+        "--lint", action="store_true", help="对案例集合执行自查校验,不做渲染"
+    )
+    parser.add_argument(
+        "--render",
+        type=str,
+        choices=list(RENDER_MODE_MAP.keys()),
+        default=None,
+        help="渲染模式: promotion(晋升详版) / sharing(分享精简版) / summary(速览表)",
+    )
+    parser.add_argument("--output", type=str, default=None, help="渲染结果输出路径,缺省打印到终端")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    collection = StarCaseCollection.load_from_json(args.input)
+
+    if args.lint or args.render is None:
+        report = collection.lint_all()
+        print(report.render_text())
+        if args.lint:
+            sys.exit(1 if report.has_blocker() else 0)
+
+    if args.render:
+        render_func = RENDER_MODE_MAP[args.render]
+        content = render_func(collection)
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write(content)
+            print(f"[完成] 已输出渲染结果至: {args.output}")
+        else:
+            print(content)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+写完这套工具后,陈铭第一次拿自己白天口述的五个项目案例整理成JSON跑了一遍`--lint`,结果祺瑞集团项目和御风金融项目各被标了一条"阻断级"问题——一条是行动描述里没有检测到判断信号词(后来发现是他把"经过论证选择了主控-子Agent架构"这句话在整理JSON时漏抄了关键的"之所以放弃……是因为……"这段取舍表述),另一条是御风金融项目虽然主要由陈铭主导,但工具依然提示"团队项目未声明贡献度拆分"——因为陈铭最初偷懒把`is_team_project`统一设成了`True`却没有填贡献度字段。修复这两处之后,五个案例全部通过了自查,陈铭觉得这种"代码帮你挑错"的体验,比自己肉眼一条条对照笔记本核对靠谱多了。
+
+### 五、Wiki文档自动生成与新鲜度巡检工具
+
+下午整理Wiki文档体系时,老王提了一个陈铭没想到的问题:"你今天写的这几篇ADR和案例归档质量都不错,但半年后呢?你敢保证半年后团队里新加了功能、换了技术方案,还会有人记得回来更新这些文档吗?"陈铭老实说没底。老王接着说:"这就是为什么大部分团队的Wiki最后都会变成'考古现场'——不是没人愿意写,是写完了没有机制提醒大家'这篇文档已经过期了,该更新了'。你既然要把文档规范化,顺手把这个机制也一起补上。"于是陈铭在`gen_wiki_index.py`的基础上,扩展出了一套支持模板化创建新文档、并能巡检文档新鲜度的工具。
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+wiki_doc_generator.py
+
+苍穹企业级智能体中台 - Wiki文档自动生成与新鲳度巡检工具
+
+功能:
+    1. 提供四类标准Wiki文档模板(ADR / 客户案例归档 / 排障手册 / 新人指南)的
+       结构化生成能力,避免每次新建文档都要从零复制格式
+    2. 从文档的Front Matter元信息(最近更新日期、负责人、复审周期)中,
+       自动巡检哪些文档已经"过期未复审",生成新鲜度巡检报告
+    3. 支持将巡检结果与gen_wiki_index.py生成的索引联动,
+       在索引页上直接标注文档的新鲜度状态(健康/待复审/已过期)
+
+使用方式:
+    # 基于模板创建一篇新的ADR文档
+    python scripts/wiki_doc_generator.py new adr \\
+        --title "混合检索动态权重策略设计" --owner 陈铭
+
+    # 巡检wiki目录下所有文档的新鲜度
+    python scripts/wiki_doc_generator.py audit --wiki-path wiki --max-age-days 180
+
+作者: 陈铭
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import os
+import re
+import sys
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+
+
+# ---------------------------------------------------------------------------
+# 文档模板定义
+# ---------------------------------------------------------------------------
+
+FRONT_MATTER_PATTERN = re.compile(
+    r"^---\s*\n(?P<body>.*?)\n---\s*\n", re.DOTALL
+)
+
+ADR_TEMPLATE = """---
+doc_type: adr
+title: {title}
+owner: {owner}
+status: 草案
+last_reviewed: {today}
+review_cycle_days: 180
+---
+
+# ADR: {title}
+
+- **状态**: 草案
+- **决策日期**: (待补充)
+- **决策人**: {owner}
+
+### 背景
+
+(请描述触发本次技术决策的业务或技术背景)
+
+### 考虑过的方案
+
+**方案A**: (请描述方案A及其优缺点)
+
+**方案B**: (请描述方案B及其优缺点)
+
+### 决策
+
+(请明确最终采纳的方案)
+
+### 理由
+
+(请说明为什么选择该方案,以及放弃其他方案的具体原因)
+
+### 影响范围
+
+(请说明该决策会影响到哪些模块/项目/团队)
+"""
+
+CASE_STUDY_TEMPLATE = """---
+doc_type: case-study
+title: {title}
+owner: {owner}
+status: 草案
+last_reviewed: {today}
+review_cycle_days: 365
+---
+
+# 客户交付案例: {title}
+
+### 客户背景
+
+(请描述客户规模、行业、业务背景)
+
+### 项目周期
+
+(请填写项目起止时间与关键里程碑)
+
+### 核心技术难点
+
+1. (请列出核心技术难点)
+
+### 解决方案摘要
+
+- (请概述采用的技术方案)
+
+### 验收结果
+
+- (请填写量化的验收指标数据)
+
+### 复用情况
+
+(请说明该项目沉淀的方案是否被复用到其他项目)
+"""
+
+RUNBOOK_TEMPLATE = """---
+doc_type: runbook
+title: {title}
+owner: {owner}
+status: 草案
+last_reviewed: {today}
+review_cycle_days: 90
+---
+
+# 排障手册: {title}
+
+### 现象描述
+
+(请描述故障的典型表现)
+
+### 排查步骤
+
+1. (请填写具体排查命令与判断依据)
+
+### 常见原因与处理方式
+
+| 原因 | 处理方式 |
+|---|---|
+| (待补充) | (待补充) |
+
+### 升级路径
+
+(请说明何时需要升级联系谁)
+"""
+
+ONBOARDING_TEMPLATE = """---
+doc_type: onboarding
+title: {title}
+owner: {owner}
+status: 草案
+last_reviewed: {today}
+review_cycle_days: 180
+---
+
+# 新人上手指南: {title}
+
+### 第一天
+
+(请描述新人第一天需要完成的环境搭建与权限申请事项)
+
+### 第一周代码导览建议路径
+
+(请给出建议的代码阅读顺序,并说明理由)
+
+### 常见问题
+
+(请链接到FAQ文档或直接列出常见问题)
+
+### 找谁求助
+
+(请列出各模块的负责人联系方式)
+"""
+
+DOC_TYPE_TEMPLATES: Dict[str, str] = {
+    "adr": ADR_TEMPLATE,
+    "case-study": CASE_STUDY_TEMPLATE,
+    "runbook": RUNBOOK_TEMPLATE,
+    "onboarding": ONBOARDING_TEMPLATE,
+}
+
+DOC_TYPE_SUBDIR: Dict[str, str] = {
+    "adr": "adr",
+    "case-study": "case-studies",
+    "runbook": "runbook",
+    "onboarding": "onboarding",
+}
+
+
+def slugify(title: str) -> str:
+    """将标题转换为适合作为文件名的slug,保留中文但替换空白与特殊字符"""
+
+    slug = title.strip()
+    slug = re.sub(r"[\\/:*?\"<>|]", "", slug)
+    slug = re.sub(r"\s+", "-", slug)
+    return slug
+
+
+def next_sequence_number(target_dir: str, doc_type: str) -> int:
+    """为ADR等需要编号的文档类型,扫描已有文档计算下一个可用编号"""
+
+    if not os.path.isdir(target_dir):
+        return 1
+
+    max_seq = 0
+    pattern = re.compile(r"^(\d{4})-")
+    for filename in os.listdir(target_dir):
+        match = pattern.match(filename)
+        if match:
+            max_seq = max(max_seq, int(match.group(1)))
+    return max_seq + 1
+
+
+def create_document(
+    wiki_path: str, doc_type: str, title: str, owner: str
+) -> str:
+    """基于模板创建一篇新的Wiki文档,返回生成文件的路径"""
+
+    if doc_type not in DOC_TYPE_TEMPLATES:
+        raise ValueError(f"未知的文档类型: {doc_type}, 支持的类型: {list(DOC_TYPE_TEMPLATES.keys())}")
+
+    subdir = DOC_TYPE_SUBDIR[doc_type]
+    target_dir = os.path.join(wiki_path, subdir)
+    os.makedirs(target_dir, exist_ok=True)
+
+    today_str = datetime.date.today().isoformat()
+    content = DOC_TYPE_TEMPLATES[doc_type].format(title=title, owner=owner, today=today_str)
+
+    slug = slugify(title)
+    if doc_type == "adr":
+        seq = next_sequence_number(target_dir, doc_type)
+        filename = f"{seq:04d}-{slug}.md"
+    else:
+        filename = f"{slug}.md"
+
+    file_path = os.path.join(target_dir, filename)
+    if os.path.exists(file_path):
+        raise FileExistsError(f"目标文档已存在,避免覆盖: {file_path}")
+
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    return file_path
+
+
+# ---------------------------------------------------------------------------
+# 新鲜度巡检部分
+# ---------------------------------------------------------------------------
+
+class FreshnessStatus:
+    HEALTHY = "健康"
+    NEEDS_REVIEW = "待复审"
+    EXPIRED = "已过期"
+    UNKNOWN = "无法判断"
+
+
+@dataclass
+class DocFreshnessRecord:
+    """单篇文档的新鲜度巡检结果"""
+
+    relative_path: str
+    doc_type: str
+    owner: str
+    last_reviewed: Optional[datetime.date]
+    review_cycle_days: Optional[int]
+    status: str
+    days_since_review: Optional[int] = None
+
+
+def parse_front_matter(file_path: str) -> Dict[str, str]:
+    """从Markdown文档头部的Front Matter区块中解析元信息"""
+
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+    except (OSError, IOError):
+        return {}
+
+    match = FRONT_MATTER_PATTERN.match(content)
+    if not match:
+        return {}
+
+    body = match.group("body")
+    metadata: Dict[str, str] = {}
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        metadata[key.strip()] = value.strip()
+    return metadata
+
+
+def evaluate_freshness(
+    metadata: Dict[str, str], relative_path: str, today: Optional[datetime.date] = None
+) -> DocFreshnessRecord:
+    """根据Front Matter元信息计算文档的新鲜度状态"""
+
+    today = today or datetime.date.today()
+
+    doc_type = metadata.get("doc_type", "未知")
+    owner = metadata.get("owner", "未知")
+
+    last_reviewed_raw = metadata.get("last_reviewed")
+    review_cycle_raw = metadata.get("review_cycle_days")
+
+    last_reviewed: Optional[datetime.date] = None
+    if last_reviewed_raw:
+        try:
+            last_reviewed = datetime.date.fromisoformat(last_reviewed_raw)
+        except ValueError:
+            last_reviewed = None
+
+    review_cycle_days: Optional[int] = None
+    if review_cycle_raw:
+        try:
+            review_cycle_days = int(review_cycle_raw)
+        except ValueError:
+            review_cycle_days = None
+
+    if last_reviewed is None or review_cycle_days is None:
+        return DocFreshnessRecord(
+            relative_path=relative_path,
+            doc_type=doc_type,
+            owner=owner,
+            last_reviewed=last_reviewed,
+            review_cycle_days=review_cycle_days,
+            status=FreshnessStatus.UNKNOWN,
+        )
+
+    days_since_review = (today - last_reviewed).days
+    warning_threshold = int(review_cycle_days * 0.8)
+
+    if days_since_review >= review_cycle_days:
+        status = FreshnessStatus.EXPIRED
+    elif days_since_review >= warning_threshold:
+        status = FreshnessStatus.NEEDS_REVIEW
+    else:
+        status = FreshnessStatus.HEALTHY
+
+    return DocFreshnessRecord(
+        relative_path=relative_path,
+        doc_type=doc_type,
+        owner=owner,
+        last_reviewed=last_reviewed,
+        review_cycle_days=review_cycle_days,
+        status=status,
+        days_since_review=days_since_review,
+    )
+
+
+def audit_wiki_freshness(wiki_path: str) -> List[DocFreshnessRecord]:
+    """扫描wiki目录下所有Markdown文档,批量执行新鲜度巡检"""
+
+    records: List[DocFreshnessRecord] = []
+    for root, _dirs, files in os.walk(wiki_path):
+        for filename in files:
+            if not filename.lower().endswith(".md"):
+                continue
+            full_path = os.path.join(root, filename)
+            relative_path = os.path.relpath(full_path, wiki_path).replace(os.sep, "/")
+            metadata = parse_front_matter(full_path)
+            if not metadata:
+                continue
+            record = evaluate_freshness(metadata, relative_path)
+            records.append(record)
+
+    status_order = {
+        FreshnessStatus.EXPIRED: 0,
+        FreshnessStatus.NEEDS_REVIEW: 1,
+        FreshnessStatus.UNKNOWN: 2,
+        FreshnessStatus.HEALTHY: 3,
+    }
+    records.sort(key=lambda r: status_order.get(r.status, 99))
+    return records
+
+
+def render_freshness_report(records: List[DocFreshnessRecord]) -> str:
+    """将新鲜度巡检结果渲染为Markdown报告"""
+
+    lines = ["# Wiki文档新鲜度巡检报告", ""]
+
+    expired = [r for r in records if r.status == FreshnessStatus.EXPIRED]
+    needs_review = [r for r in records if r.status == FreshnessStatus.NEEDS_REVIEW]
+    healthy = [r for r in records if r.status == FreshnessStatus.HEALTHY]
+    unknown = [r for r in records if r.status == FreshnessStatus.UNKNOWN]
+
+    lines.append(
+        f"总文档数: {len(records)} | 已过期: {len(expired)} | "
+        f"待复审: {len(needs_review)} | 健康: {len(healthy)} | 无法判断: {len(unknown)}"
+    )
+    lines.append("")
+    lines.append("| 文档 | 类型 | 负责人 | 状态 | 距上次复审天数 | 复审周期 |")
+    lines.append("|---|---|---|---|---|---|")
+    for record in records:
+        lines.append(
+            "| {path} | {doc_type} | {owner} | {status} | {days} | {cycle} |".format(
+                path=record.relative_path,
+                doc_type=record.doc_type,
+                owner=record.owner,
+                status=record.status,
+                days=record.days_since_review if record.days_since_review is not None else "-",
+                cycle=record.review_cycle_days if record.review_cycle_days is not None else "-",
+            )
+        )
+
+    if expired:
+        lines.append("")
+        lines.append("## 需要优先处理的已过期文档")
+        for record in expired:
+            lines.append(
+                f"- `{record.relative_path}` (负责人: {record.owner}, "
+                f"已 {record.days_since_review} 天未复审,超出周期 {record.review_cycle_days} 天)"
+            )
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 命令行入口
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Wiki文档自动生成与新鲜度巡检工具")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    new_parser = subparsers.add_parser("new", help="基于模板创建新的Wiki文档")
+    new_parser.add_argument("doc_type", choices=list(DOC_TYPE_TEMPLATES.keys()))
+    new_parser.add_argument("--title", type=str, required=True)
+    new_parser.add_argument("--owner", type=str, required=True)
+    new_parser.add_argument("--wiki-path", type=str, default="wiki")
+
+    audit_parser = subparsers.add_parser("audit", help="巡检Wiki文档新鲜度")
+    audit_parser.add_argument("--wiki-path", type=str, default="wiki")
+    audit_parser.add_argument("--output", type=str, default=None)
+    audit_parser.add_argument(
+        "--fail-on-expired",
+        action="store_true",
+        help="若存在已过期文档,则以非零退出码结束,便于接入CI流水线",
+    )
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.command == "new":
+        file_path = create_document(args.wiki_path, args.doc_type, args.title, args.owner)
+        print(f"[完成] 已创建新文档: {file_path}")
+        return
+
+    if args.command == "audit":
+        if not os.path.isdir(args.wiki_path):
+            print(f"[错误] Wiki目录不存在: {args.wiki_path}", file=sys.stderr)
+            sys.exit(1)
+
+        records = audit_wiki_freshness(args.wiki_path)
+        report = render_freshness_report(records)
+
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write(report)
+            print(f"[完成] 巡检报告已生成: {args.output}")
+        else:
+            print(report)
+
+        expired_count = sum(1 for r in records if r.status == FreshnessStatus.EXPIRED)
+        if args.fail_on_expired and expired_count > 0:
+            sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+陈铭把这套工具接入之后,顺手给`wiki/`目录下现有的四篇文档(ADR、案例归档、排障手册、新人指南)都补上了Front Matter元信息,并把`review_cycle_days`分别设置成180天、365天、90天、180天——他解释这个设定逻辑给老王听:"排障手册对应的是运行环境,变化最快,所以周期设最短;客户案例归档基本是历史事实,不会轻易过期,周期可以设最长。"老王评价:"这个差异化设定,本身就是一种很有技术含量的判断,你可以把这条也写进你的STAR案例行动部分。"
+
+### 六、项目统计报告增强脚本:多次快照对比与异常提交识别
+
+最后,陈铭回头补全了老王中午提到的那两个诉求——一是让统计报告支持"跟上一次快照对比",二是自动识别课后作业第4题里讨论过的"规模异常突增的commit"。他没有直接改`project_stats.py`原有的代码,而是新增了一个独立的扩展模块,通过复用原脚本里已经定义好的数据结构来做二次加工,这样两个脚本可以独立演进,不互相牵连。
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+project_stats_extensions.py
+
+苍穹企业级智能体中台 - 项目统计报告增强模块
+
+背景:
+    project_stats.py 已经能够生成单次的项目统计报告,但陈铭在准备晋升材料以及
+    后续常态化的团队汇报中,发现两个进一步的诉求:
+    1. 单次快照的绝对数字缺乏对比感,需要能够跟"上一次统计快照"做对比,
+       呈现"相比上次,增长了多少"这种更有说服力的趋势数据;
+    2. 需要自动识别"规模异常突增的commit",提示团队复核,
+       避免不小心把第三方依赖或生成文件提交进了版本库。
+
+本模块依赖 project_stats.py 中已定义的 CommitInfo 数据结构与
+run_git_command 工具函数,通过导入复用避免重复实现底层git交互逻辑。
+
+使用方式:
+    python scripts/project_stats_extensions.py compare \\
+        --repo-path . --baseline snapshots/2026-05-01.json --output compare_report.md
+
+    python scripts/project_stats_extensions.py detect-anomaly \\
+        --repo-path . --since 2026-01-01 --output anomaly_report.md
+
+作者: 陈铭
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import statistics
+import subprocess
+import sys
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from typing import Dict, List, Optional
+
+try:
+    from project_stats import (
+        CommitInfo,
+        parse_git_log,
+        run_git_command,
+        walk_repository,
+        summarize_by_language,
+        LanguageSummary,
+    )
+except ImportError:
+    # 允许该模块在未与project_stats.py放置于同一目录时,仍能独立运行部分功能
+    CommitInfo = None
+    parse_git_log = None
+    run_git_command = None
+    walk_repository = None
+    summarize_by_language = None
+    LanguageSummary = None
+
+
+# ---------------------------------------------------------------------------
+# 快照数据结构:用于统计结果的持久化与跨时间点对比
+# ---------------------------------------------------------------------------
+
+@dataclass
+class StatsSnapshot:
+    """某一时间点的统计快照,可持久化为JSON以支持后续对比"""
+
+    snapshot_date: str
+    total_code_lines: int
+    total_files: int
+    total_commits: int
+    contributor_count: int
+    language_breakdown: Dict[str, int]  # 语言 -> 代码行数
+
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+    @staticmethod
+    def from_dict(payload: Dict) -> "StatsSnapshot":
+        return StatsSnapshot(
+            snapshot_date=payload["snapshot_date"],
+            total_code_lines=payload["total_code_lines"],
+            total_files=payload["total_files"],
+            total_commits=payload["total_commits"],
+            contributor_count=payload["contributor_count"],
+            language_breakdown=payload.get("language_breakdown", {}),
+        )
+
+    def save(self, file_path: str) -> None:
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def load(file_path: str) -> "StatsSnapshot":
+        with open(file_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return StatsSnapshot.from_dict(payload)
+
+
+def build_current_snapshot(repo_path: str) -> StatsSnapshot:
+    """基于当前仓库状态,构建一份统计快照"""
+
+    if walk_repository is None:
+        raise RuntimeError("未能导入project_stats模块,请确认两个脚本位于同一目录")
+
+    file_stats = walk_repository(repo_path)
+    language_summaries = summarize_by_language(file_stats)
+    commits = parse_git_log(repo_path)
+
+    contributor_emails = {c.email or c.author for c in commits}
+
+    return StatsSnapshot(
+        snapshot_date=datetime.now().strftime("%Y-%m-%d"),
+        total_code_lines=sum(s.code_lines for s in language_summaries),
+        total_files=sum(s.file_count for s in language_summaries),
+        total_commits=len(commits),
+        contributor_count=len(contributor_emails),
+        language_breakdown={s.language: s.code_lines for s in language_summaries},
+    )
+
+
+# ---------------------------------------------------------------------------
+# 快照对比部分
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MetricDelta:
+    """单个指标的前后对比结果"""
+
+    metric_name: str
+    baseline_value: float
+    current_value: float
+
+    @property
+    def delta(self) -> float:
+        return self.current_value - self.baseline_value
+
+    @property
+    def growth_rate(self) -> Optional[float]:
+        if self.baseline_value == 0:
+            return None
+        return self.delta / self.baseline_value * 100
+
+
+def compare_snapshots(baseline: StatsSnapshot, current: StatsSnapshot) -> List[MetricDelta]:
+    """对比两份快照,生成各核心指标的变化情况"""
+
+    deltas = [
+        MetricDelta("代码总行数", baseline.total_code_lines, current.total_code_lines),
+        MetricDelta("文件总数", baseline.total_files, current.total_files),
+        MetricDelta("提交总次数", baseline.total_commits, current.total_commits),
+        MetricDelta("贡献者人数", baseline.contributor_count, current.contributor_count),
+    ]
+
+    all_languages = set(baseline.language_breakdown.keys()) | set(current.language_breakdown.keys())
+    for language in sorted(all_languages):
+        deltas.append(
+            MetricDelta(
+                f"{language}代码行数",
+                baseline.language_breakdown.get(language, 0),
+                current.language_breakdown.get(language, 0),
+            )
+        )
+
+    return deltas
+
+
+def render_comparison_report(
+    baseline: StatsSnapshot, current: StatsSnapshot, deltas: List[MetricDelta]
+) -> str:
+    """将快照对比结果渲染为Markdown报告"""
+
+    lines = [
+        "# 项目统计快照对比报告",
+        "",
+        f"基线快照日期: {baseline.snapshot_date}",
+        f"当前快照日期: {current.snapshot_date}",
+        "",
+        "| 指标 | 基线值 | 当前值 | 变化量 | 增长率 |",
+        "|---|---|---|---|---|",
+    ]
+    for delta in deltas:
+        growth_rate_str = (
+            f"{delta.growth_rate:+.1f}%" if delta.growth_rate is not None else "N/A"
+        )
+        sign = "+" if delta.delta >= 0 else ""
+        lines.append(
+            f"| {delta.metric_name} | {delta.baseline_value:,.0f} | {delta.current_value:,.0f} "
+            f"| {sign}{delta.delta:,.0f} | {growth_rate_str} |"
+        )
+
+    lines.append("")
+    lines.append("## 摘要解读")
+    code_delta = next(d for d in deltas if d.metric_name == "代码总行数")
+    commit_delta = next(d for d in deltas if d.metric_name == "提交总次数")
+    lines.append(
+        f"- 相比基线快照,代码总行数变化 {code_delta.delta:+,.0f} 行"
+        f"(增长率 {code_delta.growth_rate:+.1f}%),"
+        f"提交总次数变化 {commit_delta.delta:+,.0f} 次。"
+    )
+    lines.append(
+        "- 本报告可直接作为晋升材料或团队汇报中'阶段性进展对比'部分的数据支撑,"
+        "避免每次汇报只给孤立的绝对数字。"
+    )
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 异常commit识别部分
+# ---------------------------------------------------------------------------
+
+# 命中以下路径特征的新增文件,提高其被判定为"疑似误提交"的权重
+SUSPICIOUS_PATH_KEYWORDS: List[str] = [
+    "node_modules",
+    "vendor",
+    "dist/",
+    "build/",
+    ".min.js",
+    "package-lock.json",
+    ".egg-info",
+]
+
+
+@dataclass
+class CommitSizeRecord:
+    """单条commit的规模统计信息"""
+
+    commit_hash: str
+    subject: str
+    author: str
+    insertions: int
+    deletions: int
+    files_changed: int
+    suspicious_paths: List[str]
+
+    @property
+    def total_changes(self) -> int:
+        return self.insertions + self.deletions
+
+
+def get_commit_numstat(repo_path: str, commit_hash: str) -> List[str]:
+    """获取单条commit的numstat原始输出行"""
+
+    if run_git_command is None:
+        return []
+    output = run_git_command(repo_path, ["show", "--numstat", "--format=", commit_hash])
+    return [line for line in output.splitlines() if line.strip()]
+
+
+def build_commit_size_records(repo_path: str, commits: List) -> List[CommitSizeRecord]:
+    """为每条commit构建规模统计记录,用于后续异常检测"""
+
+    records: List[CommitSizeRecord] = []
+
+    for commit in commits:
+        numstat_lines = get_commit_numstat(repo_path, commit.commit_hash)
+        insertions = 0
+        deletions = 0
+        suspicious_paths: List[str] = []
+
+        for line in numstat_lines:
+            parts = line.split("\t")
+            if len(parts) != 3:
+                continue
+            add_str, del_str, file_path = parts
+            insertions += int(add_str) if add_str.isdigit() else 0
+            deletions += int(del_str) if del_str.isdigit() else 0
+            if any(keyword in file_path for keyword in SUSPICIOUS_PATH_KEYWORDS):
+                suspicious_paths.append(file_path)
+
+        records.append(
+            CommitSizeRecord(
+                commit_hash=commit.commit_hash,
+                subject=commit.subject,
+                author=commit.author,
+                insertions=insertions,
+                deletions=deletions,
+                files_changed=len(numstat_lines),
+                suspicious_paths=suspicious_paths,
+            )
+        )
+
+    return records
+
+
+def detect_size_anomalies(
+    records: List[CommitSizeRecord], stddev_multiplier: float = 3.0
+) -> List[CommitSizeRecord]:
+    """基于统计学异常阈值(均值 + N倍标准差),识别规模异常突增的commit"""
+
+    if len(records) < 5:
+        # 样本量过小时,统计学阈值不可靠,直接跳过纯规模判断,仅保留路径特征判断
+        return [r for r in records if r.suspicious_paths]
+
+    total_changes_list = [r.total_changes for r in records]
+    mean_value = statistics.mean(total_changes_list)
+    stddev_value = statistics.pstdev(total_changes_list)
+    threshold = mean_value + stddev_multiplier * stddev_value
+
+    anomalies = [
+        r for r in records if r.total_changes > threshold or r.suspicious_paths
+    ]
+    return anomalies
+
+
+def render_anomaly_report(
+    all_records: List[CommitSizeRecord], anomalies: List[CommitSizeRecord]
+) -> str:
+    """渲染异常commit识别报告"""
+
+    lines = [
+        "# 疑似异常规模Commit识别报告",
+        "",
+        f"共扫描 {len(all_records)} 条提交,识别出 {len(anomalies)} 条疑似异常提交。",
+        "",
+        "说明: 本报告基于'变更规模统计学异常阈值'与'可疑路径特征匹配'两类信号联合判断,",
+        "仅作提示与人工复核参考,不会自动删除或拦截任何提交。",
+        "",
+    ]
+
+    if not anomalies:
+        lines.append("未发现疑似异常提交。")
+        return "\n".join(lines)
+
+    lines.append("| Commit | 作者 | 新增行 | 删除行 | 涉及文件数 | 可疑路径命中 |")
+    lines.append("|---|---|---|---|---|---|")
+    for record in anomalies:
+        suspicious_display = "、".join(record.suspicious_paths[:3]) or "-"
+        lines.append(
+            f"| {record.commit_hash[:8]} {record.subject[:24]} | {record.author} "
+            f"| {record.insertions} | {record.deletions} | {record.files_changed} "
+            f"| {suspicious_display} |"
+        )
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 命令行入口
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="项目统计报告增强模块")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    compare_parser = subparsers.add_parser("compare", help="对比当前快照与基线快照")
+    compare_parser.add_argument("--repo-path", type=str, default=".")
+    compare_parser.add_argument("--baseline", type=str, required=True, help="基线快照JSON文件路径")
+    compare_parser.add_argument("--save-current", type=str, default=None, help="将当前快照保存为新的基线文件")
+    compare_parser.add_argument("--output", type=str, default=None)
+
+    anomaly_parser = subparsers.add_parser("detect-anomaly", help="识别规模异常突增的commit")
+    anomaly_parser.add_argument("--repo-path", type=str, default=".")
+    anomaly_parser.add_argument("--since", type=str, default=None)
+    anomaly_parser.add_argument("--stddev-multiplier", type=float, default=3.0)
+    anomaly_parser.add_argument("--output", type=str, default=None)
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.command == "compare":
+        baseline = StatsSnapshot.load(args.baseline)
+        current = build_current_snapshot(args.repo_path)
+        deltas = compare_snapshots(baseline, current)
+        report = render_comparison_report(baseline, current, deltas)
+
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write(report)
+            print(f"[完成] 对比报告已生成: {args.output}")
+        else:
+            print(report)
+
+        if args.save_current:
+            current.save(args.save_current)
+            print(f"[完成] 当前快照已保存为新基线: {args.save_current}")
+
+    elif args.command == "detect-anomaly":
+        if parse_git_log is None:
+            print("[错误] 未能导入project_stats模块", file=sys.stderr)
+            sys.exit(1)
+        commits = parse_git_log(args.repo_path, since=args.since)
+        size_records = build_commit_size_records(args.repo_path, commits)
+        anomalies = detect_size_anomalies(size_records, args.stddev_multiplier)
+        report = render_anomaly_report(size_records, anomalies)
+
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write(report)
+            print(f"[完成] 异常识别报告已生成: {args.output}")
+        else:
+            print(report)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+陈铭跑完`detect-anomaly`之后,还真的在历史提交里揪出了一条"漏网之鱼"——半年前团队某次调试时,有个同事不小心把一个本地生成的模型缓存目录提交进了仓库,当时commit信息只写了"临时保存",行数暴增但一直没人注意。老王看到报告后笑了:"你看,这就是这类内部工具的价值——它不需要你时刻盯着,但关键时刻能帮你捞出平时肉眼扫commit列表根本发现不了的问题。这条经验,你完全可以写进课后作业第4题的答案里,而且比纯理论描述更有说服力,因为你是真的用代码验证过这个思路可行。"
+
 ---
 
 ## 今日复盘
