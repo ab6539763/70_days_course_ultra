@@ -2008,6 +2008,955 @@ if __name__ == "__main__":
     print("\n报告已导出为JSON文件: /tmp/huanyu_acceptance_report.json")
 ```
 
+答辩结束之后的那天晚上,赵磊又把这份验收测试报告脚本翻出来看了一遍,他跟陈铭说了一个想法:"今天答辩现场,冉总和贺总问的很多问题,其实答案都在这份报告里,但报告目前的呈现方式还是纯文本,如果客户以后要拿着这份报告去内部汇报,或者我们自己想快速看一下'这一轮测试和上一轮比到底是变好了还是变差了',现在的脚本还做不到。"陈铭觉得这个想法很有价值,尤其是考虑到售后支持期还要持续做回归测试,如果每一轮测试报告都是孤立的,团队很难看出"6条未通过的边缘场景到底有没有被真正修复"这种纵向的变化趋势。同时,老王也提到,今天答辩中周维汉追问的"双点故障"场景和贺天成关心的"消息队列积压"场景,团队目前的降级方案代码里还没有完整覆盖,只在测试报告里用模拟数据"讲了一遍故事",这在下一阶段的售后交付材料里必须补齐成真正可运行的代码,而不能一直停留在"口头说清楚了"的阶段。两人商量之后,决定趁着这几天的空档,把验收测试报告脚本和降级方案代码都再往前推一步。
+
+### 四、验收测试报告脚本扩展:多轮次趋势对比、缺陷分布统计与HTML报告导出
+
+赵磊主导设计了这一部分的扩展,核心目标是让验收测试报告不再是"一次性快照",而是能够跨多个测试轮次做对比,同时补充缺陷严重程度分布统计(帮助团队判断"未通过的用例里,有没有阻塞级别的问题"),并且支持导出成可以直接在浏览器打开、贴进汇报PPT截图的HTML格式,而不是只有终端打印的纯文本。
+
+```python
+"""
+苍穹1.0 - 验收测试报告扩展模块:趋势对比、缺陷分布与HTML导出
+文件: acceptance_test_report_extensions.py
+作者: 赵磊(测试工程师)
+
+设计说明:
+    在 acceptance_test_report_generator.py 已有能力基础上,补充三块能力:
+        1. TestRunHistory: 保存多轮测试运行的汇总快照,支持轮次间对比,
+           解决"这一轮和上一轮相比到底是变好还是变差"这个问题。
+        2. DefectDistributionAnalyzer: 按严重级别、按测试类别统计未通过
+           用例的分布情况,帮助团队快速判断"当前未通过项里有没有阻塞级
+           问题",而不是只看一个笼统的通过率数字。
+        3. HTMLReportRenderer: 将报告渲染为可以直接在浏览器打开的HTML
+           页面,包含简单的样式,方便作为售后交付材料或汇报素材使用。
+"""
+
+from __future__ import annotations
+
+import json
+import statistics
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from enum import Enum
+from typing import Dict, List, Optional, Any
+
+from acceptance_test_report_generator import (
+    AcceptanceTestSuite,
+    TestCategory,
+    TestStatus,
+    TestCase,
+)
+
+
+class SeverityLevel(str, Enum):
+    """缺陷严重级别,与测试用例的severity字段保持同一套词汇表"""
+    BLOCKER = "blocker"      # 阻塞验收,必须修复才能通过
+    CRITICAL = "critical"    # 严重,建议修复后再上线,但不阻塞验收本身
+    NORMAL = "normal"        # 一般性问题
+    MINOR = "minor"          # 轻微问题,可在后续迭代处理
+
+
+SEVERITY_ORDER = [SeverityLevel.BLOCKER, SeverityLevel.CRITICAL, SeverityLevel.NORMAL, SeverityLevel.MINOR]
+
+
+@dataclass
+class TestRunSnapshot:
+    """单次测试运行的汇总快照,用于跨轮次对比"""
+    run_id: str
+    run_label: str                # 人类可读的轮次标签,如"验收前第3轮回归"
+    executed_at: float
+    overall_pass_rate: float
+    total_cases: int
+    failed_case_ids: List[str] = field(default_factory=list)
+    category_pass_rates: Dict[str, float] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "run_id": self.run_id,
+            "run_label": self.run_label,
+            "executed_at": datetime.fromtimestamp(self.executed_at).strftime("%Y-%m-%d %H:%M:%S"),
+            "overall_pass_rate": self.overall_pass_rate,
+            "total_cases": self.total_cases,
+            "failed_case_ids": self.failed_case_ids,
+            "category_pass_rates": self.category_pass_rates,
+        }
+
+
+class TestRunHistory:
+    """
+    多轮测试运行历史管理器。
+    负责从AcceptanceTestSuite生成快照、保存历史、并计算轮次间的差异,
+    这是解决"报告只是一次性快照"这个局限的核心组件。
+    """
+
+    def __init__(self):
+        self._snapshots: List[TestRunSnapshot] = []
+
+    def capture(self, suite: AcceptanceTestSuite, run_id: str, run_label: str) -> TestRunSnapshot:
+        category_pass_rates = {
+            category.value: suite.get_pass_rate(category) for category in TestCategory
+        }
+        snapshot = TestRunSnapshot(
+            run_id=run_id,
+            run_label=run_label,
+            executed_at=suite.generated_at,
+            overall_pass_rate=suite.get_pass_rate(),
+            total_cases=len(suite.test_cases),
+            failed_case_ids=[c.case_id for c in suite.get_failed_cases()],
+            category_pass_rates=category_pass_rates,
+        )
+        self._snapshots.append(snapshot)
+        return snapshot
+
+    def get_all(self) -> List[TestRunSnapshot]:
+        return list(self._snapshots)
+
+    def compare_latest_two(self) -> Optional[Dict[str, Any]]:
+        """
+        对比最近两轮测试运行的差异,给出量化的变化趋势。
+        这个方法直接回应了赵磊提出的"这一轮和上一轮比到底是变好还是变差"
+        这个问题——不再需要人工去翻两份报告做对比,脚本直接给出结论。
+        """
+        if len(self._snapshots) < 2:
+            return None
+
+        previous, latest = self._snapshots[-2], self._snapshots[-1]
+
+        pass_rate_delta = round(latest.overall_pass_rate - previous.overall_pass_rate, 2)
+
+        newly_failed = set(latest.failed_case_ids) - set(previous.failed_case_ids)
+        newly_fixed = set(previous.failed_case_ids) - set(latest.failed_case_ids)
+        still_failing = set(latest.failed_case_ids) & set(previous.failed_case_ids)
+
+        return {
+            "previous_run": previous.run_label,
+            "latest_run": latest.run_label,
+            "pass_rate_delta": pass_rate_delta,
+            "trend": "改善" if pass_rate_delta > 0 else ("持平" if pass_rate_delta == 0 else "退步"),
+            "newly_failed_cases": sorted(newly_failed),
+            "newly_fixed_cases": sorted(newly_fixed),
+            "still_failing_cases": sorted(still_failing),
+        }
+
+    def get_trend_series(self) -> List[Dict[str, Any]]:
+        """返回按时间顺序排列的通过率趋势序列,便于绘制趋势图"""
+        return [
+            {"run_label": s.run_label, "overall_pass_rate": s.overall_pass_rate, "total_cases": s.total_cases}
+            for s in self._snapshots
+        ]
+
+
+class DefectDistributionAnalyzer:
+    """
+    缺陷分布分析器。
+    仅看"整体通过率98.6%"这样一个数字,无法判断剩下1.4%的问题有多严重,
+    这个分析器把未通过用例按严重级别和测试类别交叉统计,
+    帮助团队(以及客户方评委,如果需要展示的话)快速判断风险集中在哪里。
+    """
+
+    def __init__(self, suite: AcceptanceTestSuite):
+        self.suite = suite
+
+    def analyze(self) -> Dict[str, Any]:
+        failed_cases = self.suite.get_failed_cases()
+
+        by_severity: Dict[str, int] = {level.value: 0 for level in SeverityLevel}
+        by_category_severity: Dict[str, Dict[str, int]] = {}
+
+        for case in failed_cases:
+            severity = case.severity if case.severity in by_severity else SeverityLevel.NORMAL.value
+            by_severity[severity] += 1
+
+            category_key = case.category.value
+            by_category_severity.setdefault(category_key, {level.value: 0 for level in SeverityLevel})
+            by_category_severity[category_key][severity] += 1
+
+        has_blocker = by_severity.get(SeverityLevel.BLOCKER.value, 0) > 0
+        risk_conclusion = (
+            "存在阻塞级缺陷,不建议在未修复前签署验收" if has_blocker
+            else "无阻塞级缺陷,未通过项均为可接受范围内的边缘场景问题"
+        )
+
+        return {
+            "total_failed": len(failed_cases),
+            "by_severity": by_severity,
+            "by_category_severity": by_category_severity,
+            "has_blocker_defect": has_blocker,
+            "risk_conclusion": risk_conclusion,
+        }
+
+    def get_pareto_analysis(self) -> List[Dict[str, Any]]:
+        """
+        帕累托(二八法则)分析:统计导致未通过问题最集中的测试类别,
+        用于指导售后支持阶段的整改资源优先投向哪里最划算。
+        """
+        failed_cases = self.suite.get_failed_cases()
+        category_counts: Dict[str, int] = {}
+        for case in failed_cases:
+            key = case.category.value
+            category_counts[key] = category_counts.get(key, 0) + 1
+
+        total = sum(category_counts.values()) or 1
+        sorted_items = sorted(category_counts.items(), key=lambda x: -x[1])
+
+        result = []
+        cumulative = 0
+        for category, count in sorted_items:
+            cumulative += count
+            result.append({
+                "category": category,
+                "count": count,
+                "percentage": round(count / total * 100, 1),
+                "cumulative_percentage": round(cumulative / total * 100, 1),
+            })
+        return result
+
+
+class ExecutiveSummaryGenerator:
+    """
+    面向非技术背景干系人(如郭建军汇报给公司管理层,或客户方运营副总裁
+    这类业务背景的评委)的执行摘要生成器。
+    与详细的测试报告不同,执行摘要只保留最关键的结论性信息,
+    用尽量少的技术术语讲清楚"这套系统到底靠不靠得住"这个核心问题。
+    """
+
+    def __init__(self, suite: AcceptanceTestSuite, defect_analysis: Dict[str, Any]):
+        self.suite = suite
+        self.defect_analysis = defect_analysis
+
+    def generate(self) -> str:
+        pass_rate = self.suite.get_pass_rate()
+        total = len(self.suite.test_cases)
+        failed = len(self.suite.get_failed_cases())
+
+        risk_line = self.defect_analysis["risk_conclusion"]
+        perf_metrics = self.suite.get_performance_summary()
+        p95_entries = perf_metrics.get("P95响应时延", [])
+        latest_p95 = p95_entries[-1] if p95_entries else None
+
+        lines = [
+            f"【验收测试执行摘要】",
+            f"本次共执行 {total} 项测试用例,整体通过率 {pass_rate}%,{failed} 项未通过。",
+            f"缺陷风险结论: {risk_line}",
+        ]
+        if latest_p95:
+            lines.append(
+                f"性能表现: 在{latest_p95['concurrent_users']}并发用户场景下,"
+                f"响应时延P95为{latest_p95['value']}秒"
+                f"(验收标准为不超过{latest_p95['threshold']}秒,"
+                f"{'达标' if latest_p95['passed'] else '未达标'})。"
+            )
+        security_summary = self.suite.get_security_summary()
+        lines.append(
+            f"安全合规检查: 共{security_summary['total_items']}项,"
+            f"通过{security_summary['passed_items']}项,通过率{security_summary['pass_rate']}%。"
+        )
+        lines.append("结论: 系统已具备生产环境上线条件。" if not self.defect_analysis["has_blocker_defect"]
+                     else "结论: 存在阻塞级问题,建议修复后再行上线。")
+        return "\n".join(lines)
+
+
+class HTMLReportRenderer:
+    """
+    HTML格式报告渲染器。
+    输出的HTML文件不依赖任何前端框架或CDN资源,纯内联样式,
+    这个设计选择是有意为之的——寰宇集团这类客户的内网环境往往访问
+    不了外部CDN,报告如果依赖外部资源,打开可能样式全部丢失,
+    纯内联、零外部依赖是私有化交付场景下更稳妥的做法。
+    """
+
+    def __init__(self, suite: AcceptanceTestSuite, defect_analysis: Dict[str, Any],
+                 trend_comparison: Optional[Dict[str, Any]] = None):
+        self.suite = suite
+        self.defect_analysis = defect_analysis
+        self.trend_comparison = trend_comparison
+
+    def _render_severity_table(self) -> str:
+        rows = []
+        for level in SEVERITY_ORDER:
+            count = self.defect_analysis["by_severity"].get(level.value, 0)
+            color = {"blocker": "#d9534f", "critical": "#f0ad4e", "normal": "#5bc0de", "minor": "#5cb85c"}[level.value]
+            rows.append(
+                f'<tr><td style="color:{color};font-weight:bold;">{level.value}</td><td>{count}</td></tr>'
+            )
+        return "\n".join(rows)
+
+    def _render_trend_section(self) -> str:
+        if not self.trend_comparison:
+            return "<p>暂无多轮次对比数据(至少需要两轮测试记录)。</p>"
+        tc = self.trend_comparison
+        return f"""
+        <table>
+            <tr><td>对比轮次</td><td>{tc['previous_run']} → {tc['latest_run']}</td></tr>
+            <tr><td>通过率变化</td><td>{tc['pass_rate_delta']:+}% ({tc['trend']})</td></tr>
+            <tr><td>新增未通过用例</td><td>{', '.join(tc['newly_failed_cases']) or '无'}</td></tr>
+            <tr><td>本轮已修复用例</td><td>{', '.join(tc['newly_fixed_cases']) or '无'}</td></tr>
+            <tr><td>持续未通过用例</td><td>{', '.join(tc['still_failing_cases']) or '无'}</td></tr>
+        </table>
+        """
+
+    def render(self) -> str:
+        pass_rate = self.suite.get_pass_rate()
+        html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>{self.suite.project_name} - 验收测试报告</title>
+<style>
+    body {{ font-family: "Microsoft YaHei", Arial, sans-serif; margin: 40px; color: #333; }}
+    h1 {{ color: #1a3e6f; border-bottom: 3px solid #1a3e6f; padding-bottom: 10px; }}
+    h2 {{ color: #1a3e6f; margin-top: 30px; }}
+    table {{ border-collapse: collapse; width: 100%; margin: 15px 0; }}
+    td, th {{ border: 1px solid #ddd; padding: 8px 12px; text-align: left; }}
+    th {{ background-color: #1a3e6f; color: white; }}
+    .pass-rate {{ font-size: 28px; font-weight: bold; color: #2e8b57; }}
+    .summary-box {{ background-color: #f5f7fa; border-left: 4px solid #1a3e6f; padding: 15px; margin: 15px 0; }}
+</style>
+</head>
+<body>
+<h1>{self.suite.project_name} - 验收测试报告</h1>
+<p>客户名称: {self.suite.customer_name} | 生成时间: {datetime.fromtimestamp(self.suite.generated_at).strftime('%Y-%m-%d %H:%M:%S')}</p>
+
+<div class="summary-box">
+    <p>整体通过率: <span class="pass-rate">{pass_rate}%</span></p>
+    <p>{self.defect_analysis['risk_conclusion']}</p>
+</div>
+
+<h2>一、缺陷严重级别分布</h2>
+<table>
+    <tr><th>严重级别</th><th>数量</th></tr>
+    {self._render_severity_table()}
+</table>
+
+<h2>二、多轮次趋势对比</h2>
+{self._render_trend_section()}
+
+<h2>三、安全合规审计汇总</h2>
+<table>
+    <tr><th>指标</th><th>数值</th></tr>
+    <tr><td>审计项总数</td><td>{self.suite.get_security_summary()['total_items']}</td></tr>
+    <tr><td>通过项数</td><td>{self.suite.get_security_summary()['passed_items']}</td></tr>
+    <tr><td>通过率</td><td>{self.suite.get_security_summary()['pass_rate']}%</td></tr>
+</table>
+
+</body>
+</html>"""
+        return html
+
+    def save(self, filepath: str) -> None:
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(self.render())
+
+
+def demo_multi_round_report():
+    """
+    演示函数:模拟两轮测试运行(验收前一周的回归测试 + 本次正式验收测试),
+    展示趋势对比、缺陷分布分析、执行摘要和HTML报告的完整生成流程。
+    """
+    from acceptance_test_report_generator import build_huanyu_acceptance_report
+
+    history = TestRunHistory()
+
+    # 第一轮: 模拟验收前一周的回归测试,人为让通过率略低一些
+    first_round_suite = build_huanyu_acceptance_report()
+    # 模拟当时还有更多未通过用例(比如FC-017也还没修复好)
+    for case in first_round_suite.test_cases:
+        if case.case_id == "FC-017":
+            case.status = TestStatus.FAILED
+    history.capture(first_round_suite, run_id="run_001", run_label="验收前一周回归测试")
+
+    # 第二轮: 正式验收测试(FC-017已修复,但新出现了一个之前没发现的问题)
+    second_round_suite = build_huanyu_acceptance_report()
+    for case in second_round_suite.test_cases:
+        if case.case_id == "FC-401":
+            case.status = TestStatus.FAILED
+            case.severity = "minor"
+            case.notes = "新发现的边缘场景问题,已记录待修复"
+    history.capture(second_round_suite, run_id="run_002", run_label="正式验收测试")
+
+    print("=== 多轮次趋势对比 ===")
+    comparison = history.compare_latest_two()
+    print(json.dumps(comparison, ensure_ascii=False, indent=2))
+
+    print("\n=== 通过率趋势序列 ===")
+    for point in history.get_trend_series():
+        print(f"  {point['run_label']}: {point['overall_pass_rate']}% (共{point['total_cases']}项)")
+
+    analyzer = DefectDistributionAnalyzer(second_round_suite)
+    defect_analysis = analyzer.analyze()
+    print("\n=== 缺陷严重级别分布 ===")
+    print(json.dumps(defect_analysis, ensure_ascii=False, indent=2))
+
+    print("\n=== 帕累托分析(未通过问题最集中的类别) ===")
+    for item in analyzer.get_pareto_analysis():
+        print(f"  {item['category']}: {item['count']}项 ({item['percentage']}%, 累计{item['cumulative_percentage']}%)")
+
+    summary_generator = ExecutiveSummaryGenerator(second_round_suite, defect_analysis)
+    print("\n=== 面向非技术干系人的执行摘要 ===")
+    print(summary_generator.generate())
+
+    html_renderer = HTMLReportRenderer(second_round_suite, defect_analysis, comparison)
+    html_renderer.save("/tmp/huanyu_acceptance_report.html")
+    print("\nHTML报告已生成: /tmp/huanyu_acceptance_report.html")
+
+
+if __name__ == "__main__":
+    demo_multi_round_report()
+```
+
+赵磊看到执行摘要生成器输出的那段话时,笑着说:"这个东西早该有了,今天上午如果贺总直接问'你们能不能用一句话告诉我这系统到底行不行',我们这份摘要就能直接怼上去,比现场临时组织语言靠谱多了。"陈铭也补充说,他打算把这份执行摘要的生成逻辑,作为下一个项目验收答辩前的标准动作沉淀下来——"不是每次都要等到答辩前一晚才手忙脚乱地想'怎么跟业务方讲清楚这堆测试数据',应该让脚本自动把技术报告'翻译'成业务语言的结论"。
+
+### 五、降级方案更多场景代码:模型推理服务熔断降级与消息队列积压治理
+
+老王提出的另一块缺口,是团队在答辩现场"讲了故事但没有代码"的两个场景——模型推理服务实例异常后的熔断降级、消息队列积压后的自动扩容治理。这两个场景在验收测试报告里都只是`ChaosReliabilityTestRunner`模拟出来的一组数字,并没有真正的控制逻辑支撑。陈铭决定把这两块也做成完整的、可以单独运行和测试的模块,同时顺手把课后作业第7题里提到的"降级模式自动恢复检测"也一并实现出来,不再停留在纸面的设计思路上。
+
+```python
+"""
+苍穹1.0 - 模型推理服务熔断降级与消息队列积压治理
+文件: inference_circuit_breaker_and_mq_governance.py
+
+设计说明:
+    补充答辩现场提到、但代码实战部分尚未覆盖的两个降级场景:
+        1. 模型推理服务熔断器(Circuit Breaker):当模型推理服务实例
+           出现连续异常时,自动熔断该实例的流量,转发到备用实例或
+           更轻量的兜底模型,并在熔断期结束后自动尝试半开状态探测恢复。
+        2. 消息队列积压治理器:当异步任务队列出现积压(消费速度低于
+           生产速度)时,自动触发扩容建议或限流保护,避免队列无限
+           膨胀导致内存溢出或任务处理时效性彻底失控。
+    同时实现课后作业第7题提到的"降级模式自动恢复检测"机制,
+    将其抽象为可以复用于任意降级场景的通用组件 RecoveryWatcher。
+"""
+
+from __future__ import annotations
+
+import time
+import logging
+import threading
+from collections import deque
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable, Deque, Dict, List, Optional, Any
+
+logger = logging.getLogger("cangqiong.circuit_breaker")
+
+
+# ------------------------------------------------------------------
+# 第一部分: 通用的"降级自动恢复检测"组件
+# 这是对课后作业第7题设计思路的真正代码实现,不再只是文字描述
+# ------------------------------------------------------------------
+
+class RecoveryWatcher:
+    """
+    通用降级恢复探测器。
+
+    设计原则(呼应课后作业第7题参考答案):
+        1. 恢复判断要比降级判断更谨慎,需要连续多次探测成功才算"确认恢复"。
+        2. 引入冷却观察期,避免"降级-恢复-降级"的抖动(flapping)现象。
+        3. 探测逻�辑与具体的业务场景(向量数据库/模型服务/消息队列)解耦,
+           通过传入的 probe_fn 回调函数适配任意场景,这是本组件可以被
+           多个降级控制器复用的关键设计。
+    """
+
+    def __init__(
+        self,
+        probe_fn: Callable[[], bool],
+        on_recovered: Callable[[], None],
+        confirm_success_count: int = 5,
+        cooldown_seconds: float = 20.0,
+        probe_interval_seconds: float = 2.0,
+    ):
+        self.probe_fn = probe_fn
+        self.on_recovered = on_recovered
+        self.confirm_success_count = confirm_success_count
+        self.cooldown_seconds = cooldown_seconds
+        self.probe_interval_seconds = probe_interval_seconds
+
+        self._consecutive_success = 0
+        self._state = "probing"   # probing | cooldown | idle
+        self._cooldown_start_ts: Optional[float] = None
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._state = "probing"
+
+        def _loop():
+            while self._running:
+                self._tick()
+                time.sleep(self.probe_interval_seconds)
+
+        self._thread = threading.Thread(target=_loop, daemon=True, name="recovery-watcher")
+        self._thread.start()
+        logger.info("恢复探测器已启动,确认恢复所需连续成功次数=%d,冷却期=%ss",
+                     self.confirm_success_count, self.cooldown_seconds)
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def _tick(self):
+        with self._lock:
+            if self._state == "idle":
+                return
+
+            success = False
+            try:
+                success = self.probe_fn()
+            except Exception as exc:
+                logger.debug("恢复探测过程中探测函数本身抛出异常: %s", exc)
+                success = False
+
+            if self._state == "probing":
+                if success:
+                    self._consecutive_success += 1
+                    if self._consecutive_success >= self.confirm_success_count:
+                        self._state = "cooldown"
+                        self._cooldown_start_ts = time.time()
+                        logger.info("连续%d次探测成功,进入冷却观察期(%ss)", self._consecutive_success, self.cooldown_seconds)
+                else:
+                    if self._consecutive_success > 0:
+                        logger.debug("探测失败,重置连续成功计数(原计数=%d)", self._consecutive_success)
+                    self._consecutive_success = 0
+
+            elif self._state == "cooldown":
+                if not success:
+                    logger.warning("冷却观察期内探测失败,退回初始探测状态,重新开始计数")
+                    self._state = "probing"
+                    self._consecutive_success = 0
+                    self._cooldown_start_ts = None
+                else:
+                    elapsed = time.time() - (self._cooldown_start_ts or time.time())
+                    if elapsed >= self.cooldown_seconds:
+                        logger.info("冷却观察期(%.1fs)全部通过,确认已恢复,触发自动切回", elapsed)
+                        self._state = "idle"
+                        self._consecutive_success = 0
+                        self._cooldown_start_ts = None
+                        try:
+                            self.on_recovered()
+                        except Exception as exc:
+                            logger.error("执行恢复回调时发生异常: %s", exc)
+
+    def reset_to_probing(self):
+        """当上层控制器再次检测到故障时,调用此方法重新激活探测(比如系统又一次降级)"""
+        with self._lock:
+            self._state = "probing"
+            self._consecutive_success = 0
+            self._cooldown_start_ts = None
+
+    def get_state(self) -> str:
+        with self._lock:
+            return self._state
+
+
+# ------------------------------------------------------------------
+# 第二部分: 模型推理服务熔断器
+# ------------------------------------------------------------------
+
+class CircuitState(Enum):
+    CLOSED = "closed"        # 正常状态,请求正常通过
+    OPEN = "open"             # 熔断状态,请求直接被拒绝/转发到备用通道
+    HALF_OPEN = "half_open"   # 半开状态,允许少量试探请求验证是否恢复
+
+
+@dataclass
+class InferenceCallResult:
+    success: bool
+    latency_ms: float
+    response: Optional[str] = None
+    error: Optional[str] = None
+
+
+@dataclass
+class CircuitBreakerMetrics:
+    total_calls: int = 0
+    total_failures: int = 0
+    total_fallback_calls: int = 0
+    state_transitions: List[Dict[str, Any]] = field(default_factory=list)
+
+
+class ModelInferenceCircuitBreaker:
+    """
+    模型推理服务熔断器。
+
+    对应答辩测试报告中"模型推理服务实例异常自动重启"这一容灾场景,
+    在真正的重启动作完成之前,熔断器负责把流量从异常实例引导到
+    备用实例(轻量兜底模型),避免用户请求持续打在已经异常的实例上,
+    这是经典的熔断器模式(Circuit Breaker Pattern)在AI推理服务场景下的应用。
+    """
+
+    def __init__(
+        self,
+        primary_infer_fn: Callable[[str], InferenceCallResult],
+        fallback_infer_fn: Callable[[str], InferenceCallResult],
+        failure_rate_threshold: float = 0.5,
+        min_calls_before_evaluation: int = 10,
+        window_size: int = 20,
+        open_duration_seconds: float = 30.0,
+        half_open_trial_count: int = 3,
+    ):
+        self.primary_infer_fn = primary_infer_fn
+        self.fallback_infer_fn = fallback_infer_fn
+        self.failure_rate_threshold = failure_rate_threshold
+        self.min_calls_before_evaluation = min_calls_before_evaluation
+        self.window_size = window_size
+        self.open_duration_seconds = open_duration_seconds
+        self.half_open_trial_count = half_open_trial_count
+
+        self._state = CircuitState.CLOSED
+        self._recent_results: Deque[bool] = deque(maxlen=window_size)
+        self._opened_at: Optional[float] = None
+        self._half_open_success_count = 0
+        self._half_open_trial_done = 0
+        self._lock = threading.Lock()
+        self.metrics = CircuitBreakerMetrics()
+
+    def _record_call(self, success: bool):
+        self._recent_results.append(success)
+        self.metrics.total_calls += 1
+        if not success:
+            self.metrics.total_failures += 1
+
+    def _current_failure_rate(self) -> float:
+        if len(self._recent_results) < self.min_calls_before_evaluation:
+            return 0.0
+        failures = sum(1 for r in self._recent_results if not r)
+        return failures / len(self._recent_results)
+
+    def _transition_to(self, new_state: CircuitState, reason: str):
+        old_state = self._state
+        self._state = new_state
+        self.metrics.state_transitions.append({
+            "from": old_state.value, "to": new_state.value, "reason": reason, "at": time.time(),
+        })
+        logger.warning("熔断器状态切换: %s -> %s, 原因: %s", old_state.value, new_state.value, reason)
+
+    def call(self, prompt: str) -> InferenceCallResult:
+        """
+        统一的推理调用入口,内部根据当前熔断状态决定实际调用路径。
+        """
+        with self._lock:
+            state = self._state
+
+        if state == CircuitState.OPEN:
+            if self._opened_at is not None and (time.time() - self._opened_at) >= self.open_duration_seconds:
+                with self._lock:
+                    self._transition_to(CircuitState.HALF_OPEN, "熔断超时已到,进入半开状态尝试恢复")
+                    self._half_open_success_count = 0
+                    self._half_open_trial_done = 0
+            else:
+                self.metrics.total_fallback_calls += 1
+                return self.fallback_infer_fn(prompt)
+
+        if self._state == CircuitState.HALF_OPEN:
+            return self._call_in_half_open(prompt)
+
+        # CLOSED状态,正常调用主推理服务
+        result = self._safe_call(self.primary_infer_fn, prompt)
+        with self._lock:
+            self._record_call(result.success)
+            failure_rate = self._current_failure_rate()
+            if failure_rate >= self.failure_rate_threshold:
+                self._transition_to(
+                    CircuitState.OPEN,
+                    f"最近{len(self._recent_results)}次调用失败率{failure_rate:.0%},超过阈值{self.failure_rate_threshold:.0%}",
+                )
+                self._opened_at = time.time()
+
+        if not result.success:
+            self.metrics.total_fallback_calls += 1
+            return self.fallback_infer_fn(prompt)
+        return result
+
+    def _call_in_half_open(self, prompt: str) -> InferenceCallResult:
+        with self._lock:
+            if self._half_open_trial_done >= self.half_open_trial_count:
+                # 半开试探次数已用完但还没做出判断,保守起见退回OPEN状态重新计时
+                self._transition_to(CircuitState.OPEN, "半开状态试探次数用尽仍未确认恢复,退回熔断状态")
+                self._opened_at = time.time()
+                self.metrics.total_fallback_calls += 1
+                return self.fallback_infer_fn(prompt)
+            self._half_open_trial_done += 1
+
+        result = self._safe_call(self.primary_infer_fn, prompt)
+
+        with self._lock:
+            if result.success:
+                self._half_open_success_count += 1
+                if self._half_open_success_count >= self.half_open_trial_count:
+                    self._transition_to(CircuitState.CLOSED, "半开状态试探全部成功,确认恢复,关闭熔断")
+                    self._recent_results.clear()
+            else:
+                self._transition_to(CircuitState.OPEN, "半开状态试探请求失败,重新进入熔断状态")
+                self._opened_at = time.time()
+
+        if not result.success:
+            self.metrics.total_fallback_calls += 1
+            return self.fallback_infer_fn(prompt)
+        return result
+
+    def _safe_call(self, fn: Callable[[str], InferenceCallResult], prompt: str) -> InferenceCallResult:
+        try:
+            return fn(prompt)
+        except Exception as exc:
+            return InferenceCallResult(success=False, latency_ms=-1, error=str(exc))
+
+    def get_state(self) -> CircuitState:
+        with self._lock:
+            return self._state
+
+    def get_metrics_summary(self) -> Dict[str, Any]:
+        return {
+            "current_state": self._state.value,
+            "total_calls": self.metrics.total_calls,
+            "total_failures": self.metrics.total_failures,
+            "total_fallback_calls": self.metrics.total_fallback_calls,
+            "failure_rate": round(self.metrics.total_failures / self.metrics.total_calls, 4) if self.metrics.total_calls else 0.0,
+            "state_transition_count": len(self.metrics.state_transitions),
+        }
+
+
+# ------------------------------------------------------------------
+# 第三部分: 消息队列积压治理器
+# ------------------------------------------------------------------
+
+@dataclass
+class QueueSnapshot:
+    timestamp: float
+    queue_depth: int
+    consume_rate_per_second: float
+    produce_rate_per_second: float
+
+
+class BacklogSeverity(str, Enum):
+    NORMAL = "normal"
+    WARNING = "warning"
+    CRITICAL = "critical"
+
+
+@dataclass
+class BacklogAction:
+    severity: BacklogSeverity
+    suggested_consumer_delta: int   # 建议新增(正数)或减少(负数)的消费者实例数
+    should_throttle_producers: bool
+    message: str
+
+
+class MessageQueueBacklogGovernor:
+    """
+    消息队列积压治理器。
+
+    对应答辩测试报告中"消息队列积压后自动扩容消费者"这一容灾场景,
+    这里实现的是"积压程度评估 + 扩容/限流建议决策"的核心逻辑,
+    真实生产环境中,扩容动作最终会调用Kubernetes HPA或者具体的
+    消费者进程管理接口来执行,这里的实现聚焦决策逻辑本身,
+    执行动作以回调函数抽象出来,方便接入不同的编排平台。
+    """
+
+    def __init__(
+        self,
+        warning_backlog_seconds: float = 60.0,
+        critical_backlog_seconds: float = 300.0,
+        max_consumer_instances: int = 20,
+        scale_up_step: int = 2,
+        history_window: int = 30,
+    ):
+        self.warning_backlog_seconds = warning_backlog_seconds
+        self.critical_backlog_seconds = critical_backlog_seconds
+        self.max_consumer_instances = max_consumer_instances
+        self.scale_up_step = scale_up_step
+        self._history: Deque[QueueSnapshot] = deque(maxlen=history_window)
+        self._current_consumer_count = 4
+
+    def record_snapshot(self, queue_depth: int, consume_rate: float, produce_rate: float) -> QueueSnapshot:
+        snapshot = QueueSnapshot(
+            timestamp=time.time(),
+            queue_depth=queue_depth,
+            consume_rate_per_second=consume_rate,
+            produce_rate_per_second=produce_rate,
+        )
+        self._history.append(snapshot)
+        return snapshot
+
+    def _estimate_backlog_clear_seconds(self, snapshot: QueueSnapshot) -> float:
+        """
+        估算按当前消费速度清空积压所需的时间(单位: 秒)。
+        如果消费速度小于等于生产速度,理论上积压永远无法被清空,
+        返回一个非常大的数值表示"无法收敛",而不是返回负数或除零错误。
+        """
+        net_consume_rate = snapshot.consume_rate_per_second - snapshot.produce_rate_per_second
+        if net_consume_rate <= 0:
+            return float("inf")
+        return snapshot.queue_depth / net_consume_rate
+
+    def evaluate(self, snapshot: QueueSnapshot) -> BacklogAction:
+        clear_seconds = self._estimate_backlog_clear_seconds(snapshot)
+
+        if clear_seconds == float("inf"):
+            return BacklogAction(
+                severity=BacklogSeverity.CRITICAL,
+                suggested_consumer_delta=self.scale_up_step * 2,
+                should_throttle_producers=True,
+                message=(
+                    f"当前消费速度({snapshot.consume_rate_per_second}/s)"
+                    f"低于或等于生产速度({snapshot.produce_rate_per_second}/s),"
+                    f"积压将持续增长,建议立即大幅扩容消费者并同时限流生产端"
+                ),
+            )
+
+        if clear_seconds >= self.critical_backlog_seconds:
+            return BacklogAction(
+                severity=BacklogSeverity.CRITICAL,
+                suggested_consumer_delta=self.scale_up_step,
+                should_throttle_producers=True,
+                message=f"预计需要{clear_seconds:.0f}秒才能清空积压,超过严重阈值{self.critical_backlog_seconds}秒,"
+                        f"建议扩容{self.scale_up_step}个消费者实例,同时对非核心生产端限流",
+            )
+
+        if clear_seconds >= self.warning_backlog_seconds:
+            return BacklogAction(
+                severity=BacklogSeverity.WARNING,
+                suggested_consumer_delta=max(1, self.scale_up_step // 2),
+                should_throttle_producers=False,
+                message=f"预计需要{clear_seconds:.0f}秒才能清空积压,超过预警阈值{self.warning_backlog_seconds}秒,"
+                        f"建议适度扩容消费者,暂不需要限流生产端",
+            )
+
+        return BacklogAction(
+            severity=BacklogSeverity.NORMAL,
+            suggested_consumer_delta=0,
+            should_throttle_producers=False,
+            message="队列积压水平正常,消费速度可以在合理时间内消化当前积压",
+        )
+
+    def apply_scaling_decision(self, action: BacklogAction, scale_executor: Callable[[int], None]) -> int:
+        """
+        应用扩容决策,调用实际的扩容执行回调(如Kubernetes API客户端)。
+        返回扩容后的消费者实例数,并保证不超过预设的最大实例上限,
+        避免因为极端积压场景导致扩容动作失控地消耗过多资源。
+        """
+        if action.suggested_consumer_delta == 0:
+            return self._current_consumer_count
+
+        new_count = min(
+            self._current_consumer_count + action.suggested_consumer_delta,
+            self.max_consumer_instances,
+        )
+        if new_count != self._current_consumer_count:
+            scale_executor(new_count)
+            logger.info("消费者实例数已从%d调整为%d(建议增量=%d)",
+                         self._current_consumer_count, new_count, action.suggested_consumer_delta)
+            self._current_consumer_count = new_count
+        else:
+            logger.warning("已达到最大消费者实例上限(%d),无法继续扩容,建议排查是否存在消息处理逻辑本身的性能瓶颈",
+                            self.max_consumer_instances)
+        return self._current_consumer_count
+
+    def get_trend(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "timestamp": s.timestamp,
+                "queue_depth": s.queue_depth,
+                "consume_rate": s.consume_rate_per_second,
+                "produce_rate": s.produce_rate_per_second,
+            }
+            for s in self._history
+        ]
+
+
+def demo_circuit_breaker_and_mq_governance():
+    """演示函数: 展示模型推理熔断器、恢复探测器、消息队列积压治理器的完整工作流程"""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+    call_counter = {"count": 0}
+
+    def flaky_primary_infer(prompt: str) -> InferenceCallResult:
+        call_counter["count"] += 1
+        # 模拟前15次调用中有连续多次失败,之后逐渐恢复正常
+        if 5 <= call_counter["count"] <= 15:
+            return InferenceCallResult(success=False, latency_ms=-1, error="模拟推理服务实例异常")
+        return InferenceCallResult(success=True, latency_ms=850, response=f"关于'{prompt}'的推理结果")
+
+    def fallback_infer(prompt: str) -> InferenceCallResult:
+        return InferenceCallResult(success=True, latency_ms=200, response=f"[轻量兜底模型] 关于'{prompt}'的简化回答")
+
+    breaker = ModelInferenceCircuitBreaker(
+        primary_infer_fn=flaky_primary_infer,
+        fallback_infer_fn=fallback_infer,
+        failure_rate_threshold=0.5,
+        min_calls_before_evaluation=5,
+        window_size=10,
+        open_duration_seconds=1.0,   # 演示环境缩短熔断时长,方便快速观察状态切换
+        half_open_trial_count=2,
+    )
+
+    print("=== 模拟模型推理服务熔断与恢复过程 ===")
+    for i in range(25):
+        result = breaker.call(f"query-{i}")
+        state = breaker.get_state()
+        print(f"  第{i+1}次调用: 成功={result.success}, 当前熔断状态={state.value}")
+        if state == CircuitState.OPEN:
+            time.sleep(0.3)
+
+    print("\n熔断器指标汇总:")
+    print(breaker.get_metrics_summary())
+
+    print("\n=== 模拟消息队列积压治理 ===")
+    governor = MessageQueueBacklogGovernor(warning_backlog_seconds=30, critical_backlog_seconds=120)
+
+    scenarios = [
+        (500, 20.0, 15.0),    # 消费快于生产,正常
+        (3000, 10.0, 12.0),   # 消费慢于生产,持续恶化
+        (8000, 8.0, 9.0),     # 更严重的持续恶化
+    ]
+    for depth, consume_rate, produce_rate in scenarios:
+        snapshot = governor.record_snapshot(depth, consume_rate, produce_rate)
+        action = governor.evaluate(snapshot)
+        print(f"  队列深度={depth}, 消费速度={consume_rate}/s, 生产速度={produce_rate}/s")
+        print(f"    -> 严重级别: {action.severity.value}, 建议: {action.message}")
+
+        def fake_scale_executor(new_count: int):
+            print(f"    -> [模拟扩容执行] 消费者实例数调整为: {new_count}")
+
+        governor.apply_scaling_decision(action, fake_scale_executor)
+
+    print("\n=== 通用恢复探测器演示(模拟向量数据库故障后自动恢复) ===")
+    probe_state = {"healthy_from": 3}  # 模拟从第3次探测开始恢复健康
+    probe_count = {"n": 0}
+
+    def probe_fn() -> bool:
+        probe_count["n"] += 1
+        return probe_count["n"] >= probe_state["healthy_from"]
+
+    recovered_flag = {"recovered": False}
+
+    def on_recovered():
+        recovered_flag["recovered"] = True
+        print("    -> [恢复回调触发] 系统已自动从降级模式切回正常模式")
+
+    watcher = RecoveryWatcher(
+        probe_fn=probe_fn,
+        on_recovered=on_recovered,
+        confirm_success_count=3,
+        cooldown_seconds=1.0,
+        probe_interval_seconds=0.2,
+    )
+    watcher.start()
+    time.sleep(3)
+    watcher.stop()
+    print(f"    最终恢复状态: {'已恢复' if recovered_flag['recovered'] else '未恢复(演示时长可能不足)'}")
+
+
+if __name__ == "__main__":
+    demo_circuit_breaker_and_mq_governance()
+```
+
+陈铭把这份代码跑通之后,特意把`ModelInferenceCircuitBreaker`的状态切换日志截图发给了老王,附言写道:"这个熔断器加上恢复探测器,应该能把今天答辩里冉总和周总问到的几个'万一XX也挂了怎么办'的场景,从'我们有预案'升级成'我们有能拿出来跑的代码',下次遇到更挑剔的评委,材料会更扎实。"老王回复很简短:"这才是验收通过之后该做的事——不是松一口气就完事,是把答辩时讲出去的话,变成经得起长期运行检验的东西。这些代码,以后不只是给寰宇集团用,苍穹平台往后接的每一个强稳定性要求的客户,都能直接复用这套熔断和积压治理的设计。"
+
 ---
 
 ## 今日复盘
