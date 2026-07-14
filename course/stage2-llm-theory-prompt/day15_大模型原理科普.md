@@ -1122,6 +1122,643 @@ if __name__ == "__main__":
 
 跑完这份脚本,场景化初筛的结果给陈铭上了一课:在"预算敏感+需要长上下文"这个筛选条件下,GPT-4o和Claude 3.5 Sonnet被排除在推荐候选之外,留下的是DeepSeek-V3、DeepSeek-R1、通义千问Qwen2.5-72B、Llama 3.1 70B和GLM-4。老王指出这背后有一个容易踩的坑:"如果你偷懒,直接拿GPT-4o标的'2.5美元'和判断门槛'5块钱'比大小,会得出'2.5小于5,所以GPT-4o也算便宜'这个错误结论——这正是刚才计费脚本里强调过的跨币种陷阱,写代码的时候一定要先统一单位再比较,这不是小题大做,是真实会出现在报价环节的低级错误。"月度成本估算的结果也很直观——同样的调用规模,通义千问Qwen-Max一个月预估要五百四十元,而DeepSeek-V3只要不到二十元,价格差距接近三十倍,这进一步印证了下午课堂上讲过的"选型不是选'最强',是选'匹配场景'"这句话背后的真实分量。
 
+跑完这三个实操,陈铭以为下午的代码环节就结束了,老王却把椅子往陈铭工位这边挪了挪:"你现在写的这几个工具,都还停留在'一次性算一算'的阶段——给定一段文字算个成本,给定几个模型比个价格。但苍穹项目真正要接的客户,场景往往比这复杂得多:客户可能一次甩过来几十份合同文档要求批量处理,平台上线之后每天有真实调用在跑,你得知道有没有异常调用把成本悄悄拉高,而且回头给客户做方案讲解的时候,一份纯文字表格远不如一张图直观。这三个问题,今天顺手都解决一遍,免得以后现踩现造。"林悦在旁边补了一句:"这三个工具以后会被反复用到,尤其是给客户做批量文档处理报价、日常运营监控告警、方案汇报配图,你现在打磨扎实,比以后每次现场现造省事得多。"
+
+### 实战四:批量文档成本预算与预警工具
+
+老王先抛出的场景是:"假设一个制造业客户,一次性要求你们批量处理三十份设备维护合同,要求生成摘要——你怎么在下单跑批之前,就把总成本摸清楚,而不是等账单出来才后悔?而且如果预算是有上限的,系统应该主动提醒你'这批快超支了',不能全靠人肉盯着。"
+
+```python
+"""
+批量文档成本预算与预警工具
+================================
+
+背景：老王在下午实操收尾时，追加了一个更贴近实际项目场景的问题——
+"如果客户一次性甩过来几十份合同文档，要求批量跑摘要或者批量问答，
+你怎么在下单之前，就把总成本和风险都摸清楚，而不是等账单出来才后悔？"
+这正是本脚本要解决的问题：批量估算一批文档在不同模型下的总成本，
+并在预计费用超出预算上限时主动预警，而不是让预算超支这件事，
+变成月底财务对账时才被发现的意外。
+
+本脚本在`token_cost_estimator.py`的价格表与近似估算逻辑基础上，
+做了三点企业级增强：
+1. 支持一次性传入多份文档（批量场景），逐份计算并汇总成本；
+2. 支持同时对比多个模型的批量总成本，方便做选型决策；
+3. 引入预算阈值机制，超过阈值时生成明确的预警信息，而不是
+   简单打印一个数字让人自己去判断"贵不贵"。
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Optional
+
+try:
+    import tiktoken  # type: ignore
+
+    _TIKTOKEN_AVAILABLE = True
+except ImportError:
+    _TIKTOKEN_AVAILABLE = False
+
+
+# ------------------------------------------------------------------
+# 第一部分：价格表（与token_cost_estimator.py保持一致的结构，
+# 独立成文件，避免两份教学脚本之间产生隐式依赖）
+# ------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ModelPrice:
+    vendor: str
+    currency: str  # "USD" 或 "CNY"
+    input_price_per_1m: float
+    output_price_per_1m: float
+    tiktoken_encoding: Optional[str]  # None表示没有官方公开编码，需要走近似估算
+
+
+BATCH_PRICE_TABLE: dict[str, ModelPrice] = {
+    "gpt-4o-mini": ModelPrice("OpenAI", "USD", 0.15, 0.6, "o200k_base"),
+    "deepseek-chat": ModelPrice("深度求索", "CNY", 1.0, 2.0, None),
+    "qwen-plus": ModelPrice("阿里云", "CNY", 0.8, 2.0, None),
+    "glm-4": ModelPrice("智谱AI", "CNY", 5.0, 5.0, None),
+}
+
+RMB_PER_USD = 7.2  # 教学用示例汇率，与前面几份脚本保持一致，便于跨脚本对照
+
+
+# ------------------------------------------------------------------
+# 第二部分：Token计数（近似估算兜底，逻辑与实战一保持一致）
+# ------------------------------------------------------------------
+
+_CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+_WORD_PATTERN = re.compile(r"[A-Za-z0-9]+|[^\sA-Za-z0-9\u4e00-\u9fff]|[\u4e00-\u9fff]")
+
+
+def _approximate_token_count(text: str) -> int:
+    """没有tiktoken时的兜底估算，规则与实战一的ApproximateEncoder保持一致。"""
+    count = 0
+    for chunk in _WORD_PATTERN.findall(text):
+        if _CJK_PATTERN.match(chunk):
+            count += 1
+        elif chunk.isalnum():
+            count += max(1, round(len(chunk) / 4))
+        else:
+            count += 1
+    return count
+
+
+def count_tokens(text: str, model_name: str) -> int:
+    price = BATCH_PRICE_TABLE[model_name]
+    if _TIKTOKEN_AVAILABLE:
+        encoding_name = price.tiktoken_encoding or "cl100k_base"
+        try:
+            encoder = tiktoken.get_encoding(encoding_name)
+            return len(encoder.encode(text))
+        except Exception:
+            pass
+    return _approximate_token_count(text)
+
+
+# ------------------------------------------------------------------
+# 第三部分：批量文档结构与批量估算逻辑
+# ------------------------------------------------------------------
+
+@dataclass
+class DocumentJob:
+    """一份待处理的文档任务：输入是文档正文，输出是预估的模型回复长度。"""
+
+    doc_name: str
+    input_text: str
+    expected_output_tokens: int = 300  # 摘要/问答类场景，输出长度相对稳定，可按经验值预设
+
+
+@dataclass
+class BatchCostResult:
+    model_name: str
+    per_doc_costs: list[tuple[str, float]] = field(default_factory=list)
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    currency: str = "CNY"
+
+    @property
+    def total_cost(self) -> float:
+        return sum(cost for _, cost in self.per_doc_costs)
+
+    def total_cost_in_rmb(self) -> float:
+        if self.currency == "CNY":
+            return self.total_cost
+        return self.total_cost * RMB_PER_USD
+
+
+def estimate_batch_cost(jobs: list[DocumentJob], model_name: str) -> BatchCostResult:
+    price = BATCH_PRICE_TABLE[model_name]
+    result = BatchCostResult(model_name=model_name, currency=price.currency)
+
+    for job in jobs:
+        input_tokens = count_tokens(job.input_text, model_name)
+        output_tokens = job.expected_output_tokens
+        cost = (
+            input_tokens / 1_000_000 * price.input_price_per_1m
+            + output_tokens / 1_000_000 * price.output_price_per_1m
+        )
+        result.per_doc_costs.append((job.doc_name, cost))
+        result.total_input_tokens += input_tokens
+        result.total_output_tokens += output_tokens
+
+    return result
+
+
+# ------------------------------------------------------------------
+# 第四部分：预算预警机制
+# ------------------------------------------------------------------
+
+@dataclass
+class BudgetAlert:
+    model_name: str
+    total_cost_rmb: float
+    budget_ceiling_rmb: float
+
+    @property
+    def is_over_budget(self) -> bool:
+        return self.total_cost_rmb > self.budget_ceiling_rmb
+
+    @property
+    def usage_ratio(self) -> float:
+        if self.budget_ceiling_rmb <= 0:
+            return float("inf")
+        return self.total_cost_rmb / self.budget_ceiling_rmb
+
+    def to_message(self) -> str:
+        ratio_pct = self.usage_ratio * 100
+        if self.is_over_budget:
+            return (
+                f"[预警] {self.model_name}：预估费用{self.total_cost_rmb:.4f}元，"
+                f"已超出预算上限{self.budget_ceiling_rmb:.2f}元"
+                f"（占预算{ratio_pct:.1f}%），建议更换更低价模型或拆分批次执行"
+            )
+        if ratio_pct >= 80:
+            return (
+                f"[提醒] {self.model_name}：预估费用{self.total_cost_rmb:.4f}元，"
+                f"已达到预算的{ratio_pct:.1f}%，接近上限，请留意后续调用量"
+            )
+        return (
+            f"[正常] {self.model_name}：预估费用{self.total_cost_rmb:.4f}元，"
+            f"占预算{ratio_pct:.1f}%，处于安全区间"
+        )
+
+
+def check_budget(result: BatchCostResult, budget_ceiling_rmb: float) -> BudgetAlert:
+    return BudgetAlert(
+        model_name=result.model_name,
+        total_cost_rmb=result.total_cost_in_rmb(),
+        budget_ceiling_rmb=budget_ceiling_rmb,
+    )
+
+
+# ------------------------------------------------------------------
+# 第五部分：demo数据与主程序
+# ------------------------------------------------------------------
+
+def build_sample_jobs(count: int) -> list[DocumentJob]:
+    """
+    模拟一批客户合同文档任务：这里用重复拼接的方式模拟"几十页文档"的
+    量级，真实场景中应该是从文档解析模块拿到的真实正文文本。
+    """
+    base_paragraph = (
+        "本合同项下，甲方委托乙方提供企业级智能体中台相关的技术开发与"
+        "运维服务，服务范围包括但不限于对话引擎搭建、知识库问答系统"
+        "部署与调优、模型接入层设计等内容，具体交付标准与验收方式"
+        "详见本合同附件一《项目实施计划书》。"
+    )
+    jobs = []
+    for i in range(count):
+        doc_text = base_paragraph * (3 + i % 5)  # 让每份文档长度略有差异，更贴近真实批量场景
+        jobs.append(
+            DocumentJob(
+                doc_name=f"合同文档_{i + 1:02d}",
+                input_text=doc_text,
+                expected_output_tokens=250,
+            )
+        )
+    return jobs
+
+
+def main() -> None:
+    print("=" * 78)
+    print("苍穹对话引擎小组 · 批量文档成本预算与预警工具")
+    print(f"当前环境tiktoken可用：{_TIKTOKEN_AVAILABLE}")
+    print("=" * 78)
+
+    jobs = build_sample_jobs(count=30)
+    print(f"\n模拟批量任务：共{len(jobs)}份合同文档待处理\n")
+
+    budget_ceiling_rmb = 50.0
+    for model_name in BATCH_PRICE_TABLE:
+        result = estimate_batch_cost(jobs, model_name)
+        alert = check_budget(result, budget_ceiling_rmb)
+        print(
+            f"{model_name:<16}输入合计{result.total_input_tokens:>8}token  "
+            f"输出合计{result.total_output_tokens:>8}token  "
+            f"总费用{result.total_cost:.4f}{result.currency}"
+            f"（折合{result.total_cost_in_rmb():.4f}元人民币）"
+        )
+        print(f"  -> {alert.to_message()}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+跑完这份脚本,陈铭发现三十份合同文档批量处理下来,gpt-4o-mini折算成人民币的总费用比deepseek-chat和qwen-plus高出不少,而glm-4的输出单价虽然只有5元/1M token,但因为总量放大之后,四个模型里最终触发"预警"级别提示的正是glm-4。老王看到这个结果,补充了一个容易被忽略的教训:"批量场景最怕的就是'单次看起来便宜,量一放大就完全不一样了',这也是为什么这份工具一定要在下单前跑一遍,而不是拍脑袋估个大概数——三十份文档的差距现在看着还能接受,如果客户的真实量级是三千份,这个价格差距会直接决定这笔生意能不能盈利。"陈铭还注意到,预警信息分成了"预警""提醒""正常"三档,而不是简单的"超没超预算"两档,他追问原因,老王解释:"只做'是否超支'的二元判断,团队往往是在真正超支之后才反应过来;加一档'接近上限的提醒',能给团队留出提前调整的窗口,这是工程上'提前预警'和'事后报警'的差别,苍穹项目里凡是涉及预算、资源占用这类会随时间累积的指标,都应该默认设计成这种多档预警,而不是非黑即白的单一阈值判断。"
+
+### 实战五:Token使用监控与预警工具
+
+批量估算解决的是"下单前"的问题,老王紧接着抛出下一个场景:"苍穹平台真正上线之后,你面对的不再是'一批文档处理前先算一算',而是每时每刻都有真实调用在发生。你怎么知道今天到底花了多少钱,有没有哪个客户的调用量突然异常飙升?这不能靠你隔三差五手动去翻账单,得有一个实时盯着的机制。"
+
+```python
+"""
+Token使用监控与预警工具
+==========================
+
+背景：老王在批量成本估算工具之后，补充了一个更贴近"线上运行时"
+场景的需求——"批量估算解决的是下单前的预算问题，但苍穹平台
+上线之后，真正需要盯着的是运行时的实时消耗——今天到底花了多少钱，
+有没有哪个客户的调用量突然异常飙升，这些问题不能靠事后翻账单，
+得有一个实时监控的机制。"
+
+本脚本模拟一个最简化版的Token使用监控看板：
+1. 记录每一次真实调用产生的Token消耗与费用（模拟"调用日志"）；
+2. 按客户、按模型汇总消耗，与预设的日预算、月预算对比；
+3. 识别"异常调用"：单次调用消耗远超该客户历史平均值时触发预警；
+4. 按当前消耗速度线性外推出月度费用预估，提前判断是否需要降本。
+
+这不是一个生产级的监控系统（真实系统通常会用时序数据库、消息队列、
+告警平台等专业组件），但核心的监控思路——"记录、汇总、对比阈值、
+识别异常"——是通用的，日后接入真实监控系统时可以直接复用这套设计思路。
+"""
+
+from __future__ import annotations
+
+import statistics
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+
+
+# ------------------------------------------------------------------
+# 第一部分：调用记录与统计结构
+# ------------------------------------------------------------------
+
+@dataclass
+class CallRecord:
+    """一次真实API调用的记录，字段模拟从真实响应的usage字段里能拿到的信息。"""
+
+    timestamp: datetime
+    client_name: str
+    model_name: str
+    input_tokens: int
+    output_tokens: int
+    cost_rmb: float
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
+@dataclass
+class UsageMonitor:
+    """Token使用监控器：负责接收调用记录、维护统计数据、判断是否需要预警。"""
+
+    daily_budget_rmb: float
+    monthly_budget_rmb: float
+    anomaly_multiplier: float = 3.0  # 单次调用成本超过历史均值的这个倍数，视为异常
+    records: list[CallRecord] = field(default_factory=list)
+
+    def record_call(self, record: CallRecord) -> list[str]:
+        """
+        记录一次调用，并立即返回本次调用触发的预警信息列表
+        （可能为空列表，表示一切正常）。这种"边记录边检测"的
+        设计，是为了让预警尽可能实时，而不是等到每天汇总时才发现问题。
+        """
+        alerts: list[str] = []
+
+        history_costs = [r.cost_rmb for r in self.records if r.client_name == record.client_name]
+        if len(history_costs) >= 3:
+            avg_cost = statistics.mean(history_costs)
+            if avg_cost > 0 and record.cost_rmb > avg_cost * self.anomaly_multiplier:
+                alerts.append(
+                    f"[异常调用] 客户「{record.client_name}」本次调用费用"
+                    f"{record.cost_rmb:.4f}元，是其历史均值{avg_cost:.4f}元的"
+                    f"{record.cost_rmb / avg_cost:.1f}倍，建议核查是否存在异常大文档、"
+                    f"死循环重试或者恶意调用"
+                )
+
+        self.records.append(record)
+
+        recent_cost = self._cost_since(record.timestamp - timedelta(hours=24))
+        if recent_cost > self.daily_budget_rmb:
+            alerts.append(
+                f"[超出日预算] 最近24小时累计费用{recent_cost:.4f}元，"
+                f"已超出日预算{self.daily_budget_rmb:.2f}元"
+            )
+
+        return alerts
+
+    def _cost_since(self, since: datetime) -> float:
+        return sum(r.cost_rmb for r in self.records if r.timestamp >= since)
+
+    def summarize_by_client(self) -> dict[str, dict[str, float]]:
+        summary: dict[str, dict[str, float]] = {}
+        for record in self.records:
+            bucket = summary.setdefault(
+                record.client_name, {"calls": 0, "tokens": 0, "cost": 0.0}
+            )
+            bucket["calls"] += 1
+            bucket["tokens"] += record.total_tokens
+            bucket["cost"] += record.cost_rmb
+        return summary
+
+    def summarize_by_model(self) -> dict[str, dict[str, float]]:
+        summary: dict[str, dict[str, float]] = {}
+        for record in self.records:
+            bucket = summary.setdefault(
+                record.model_name, {"calls": 0, "tokens": 0, "cost": 0.0}
+            )
+            bucket["calls"] += 1
+            bucket["tokens"] += record.total_tokens
+            bucket["cost"] += record.cost_rmb
+        return summary
+
+    def monthly_projection(self, days_elapsed: int) -> float:
+        """
+        用"当前已产生的总费用 / 已经过去的天数 * 30"这个最朴素的
+        线性外推方式，估算本月费用可能达到的量级，帮助团队提前判断
+        是否需要在月中就采取降本措施，而不是等到月底账单出来才发现
+        严重超支。这是一个粗略的估算，真实业务量往往有周期性波动
+        （比如工作日与周末调用量不同），更精细的预测应该考虑这些
+        周期性因素，这里保留最简单的版本用于教学演示。
+        """
+        if days_elapsed <= 0:
+            return 0.0
+        total_cost = sum(r.cost_rmb for r in self.records)
+        return total_cost / days_elapsed * 30
+
+
+# ------------------------------------------------------------------
+# 第二部分：demo模拟一天的调用流水
+# ------------------------------------------------------------------
+
+def build_sample_call_stream() -> list[CallRecord]:
+    """
+    模拟苍穹平台某一天内，几个不同客户产生的调用流水，其中故意在
+    中途插入一条"异常调用"（某个客户突然发起一次超大文档处理请求），
+    用来验证监控器能不能正确识别出来。
+    """
+    base_time = datetime(2026, 3, 2, 9, 0, 0)
+    stream: list[CallRecord] = []
+
+    normal_clients = ["制造业客户A", "零售客户B", "制造业客户A", "零售客户B"]
+    for i, client in enumerate(normal_clients * 4):
+        stream.append(
+            CallRecord(
+                timestamp=base_time + timedelta(minutes=15 * i),
+                client_name=client,
+                model_name="deepseek-chat",
+                input_tokens=300 + (i % 5) * 20,
+                output_tokens=200 + (i % 3) * 15,
+                cost_rmb=0.0008 + (i % 5) * 0.00005,
+            )
+        )
+
+    # 人为插入一条异常调用：某客户发起了一次远超日常量级的大文档处理请求
+    stream.insert(
+        10,
+        CallRecord(
+            timestamp=base_time + timedelta(minutes=150),
+            client_name="制造业客户A",
+            model_name="deepseek-chat",
+            input_tokens=180_000,
+            output_tokens=6_000,
+            cost_rmb=0.192,
+        ),
+    )
+
+    return stream
+
+
+def main() -> None:
+    print("=" * 78)
+    print("苍穹对话引擎小组 · Token使用监控与预警工具")
+    print("=" * 78)
+
+    monitor = UsageMonitor(daily_budget_rmb=0.15, monthly_budget_rmb=10.0)
+    call_stream = build_sample_call_stream()
+
+    print(f"\n模拟接入{len(call_stream)}条调用流水，逐条送入监控器：\n")
+    for record in call_stream:
+        alerts = monitor.record_call(record)
+        for alert in alerts:
+            print(f"  {record.timestamp.strftime('%H:%M')}  {alert}")
+
+    print("\n" + "-" * 78)
+    print("按客户汇总：")
+    for client, stats in monitor.summarize_by_client().items():
+        print(
+            f"  {client:<12} 调用{stats['calls']:>3.0f}次  "
+            f"消耗{stats['tokens']:>10.0f}token  合计{stats['cost']:.4f}元"
+        )
+
+    print("\n按模型汇总：")
+    for model_name, stats in monitor.summarize_by_model().items():
+        print(
+            f"  {model_name:<16} 调用{stats['calls']:>3.0f}次  "
+            f"消耗{stats['tokens']:>10.0f}token  合计{stats['cost']:.4f}元"
+        )
+
+    projection = monitor.monthly_projection(days_elapsed=1)
+    print(f"\n按当前消耗速度线性外推的月度预估费用：约{projection:.2f}元")
+    if projection > monitor.monthly_budget_rmb:
+        print(
+            f"  [预警] 按当前速度外推，月度费用将超出预算"
+            f"{monitor.monthly_budget_rmb:.2f}元，建议排查是否有异常调用拉高了均值"
+        )
+
+
+if __name__ == "__main__":
+    main()
+```
+
+这段代码跑起来之后,陈铭很直观地看到了"异常调用"预警是怎么被触发的——那条被人为插入的、消耗了十八万输入Token的超大文档请求,一出现就被监控器标记成"是历史均值数十倍"的异常,紧接着又因为单笔费用直接推高了近24小时的累计消耗,连带触发了"超出日预算"的提示。老王指着这两条连续出现的预警说:"你看,这就是真实运营里最容易被忽略、但代价最高的一类问题——不是稳定的日常调用把预算花超了,往往是某一次异常(可能是客户端bug导致的死循环重试,也可能是有人误传了一份特别大的文档)突然把成本推高。如果没有这种实时监控,这种异常可能要等到月底账单出来,团队才会一脸茫然地问'这个月怎么突然贵了这么多'。"陈铭又追问了一句:"那这个'历史均值的三倍'这个阈值,是怎么定出来的?"老王坦言这本身也是一个需要持续调优的参数:"三倍是一个教学演示里给的经验值,真实项目里,这类阈值往往需要结合具体业务特点反复试调——阈值定得太敏感,会有大量正常的波动被误报成异常,搞得团队疲于奔命;定得太宽松,又会让真正的异常被漏掉。这也是为什么很多成熟的监控系统会引入更复杂的统计方法(比如基于历史数据分布动态调整阈值),而不是用一个固定倍数一刀切,你现在只需要理解这个'纪律'——阈值本身也需要被持续验证和调整,不是设一次就一劳永逸的。"
+
+### 实战六:主流模型能力与价格对比可视化脚本
+
+最后一个实操,林悦提出的需求相对朴素:"给客户讲方案的时候,一份纯文字表格,客户听着容易走神,你们能不能顺手加一个能生成图表的小工具?哪怕简单一点,能让人一眼看出'谁贵谁便宜'就行。"老王把这个需求接了过来,同时提出了和上午一模一样的要求:"离线兜底还是要有——很多客户现场环境不一定装了matplotlib,甚至可能没有图形界面,装了就画真图存成图片,没装就退化成字符拼出来的条形图,不能因为一个可选依赖没装上,整个演示就卡死。"
+
+```python
+"""
+主流模型能力与价格对比可视化脚本
+====================================
+
+背景：整理出`model_landscape_compare.py`那份结构化对比表之后，
+林悦提出了一个建议——"给客户讲方案的时候，一份纯文字表格远不如
+一张一眼就能看出价格差距的图直观，你们能不能顺手加一个可视化的
+小工具？" 老王认可了这个建议，并且提出了同样的"离线兜底"要求：
+"很多客户现场环境不一定装了matplotlib，甚至可能没有图形界面，
+你这个工具得两条腿走路——装了matplotlib就画真正的图表并保存成
+图片文件，没装的话就退化成一个用字符画出来的ASCII条形图，
+好歹能在终端里让人直观感受到价格差距，不能因为一个可选依赖
+没装上，整个演示就卡死。"
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+try:
+    import matplotlib
+
+    matplotlib.use("Agg")  # 无图形界面的环境（比如服务器、CI）下也能正常保存图片文件
+    import matplotlib.pyplot as plt
+
+    _MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    _MATPLOTLIB_AVAILABLE = False
+
+
+RMB_PER_USD = 7.2
+
+
+@dataclass(frozen=True)
+class PricePoint:
+    display_name: str
+    currency: str
+    input_price_per_1m: float
+    output_price_per_1m: float
+    context_window_k: int
+
+    def input_price_rmb(self) -> float:
+        if self.currency == "CNY":
+            return self.input_price_per_1m
+        return self.input_price_per_1m * RMB_PER_USD
+
+    def output_price_rmb(self) -> float:
+        if self.currency == "CNY":
+            return self.output_price_per_1m
+        return self.output_price_per_1m * RMB_PER_USD
+
+
+PRICE_POINTS: list[PricePoint] = [
+    PricePoint("GPT-4o", "USD", 2.5, 10.0, 128),
+    PricePoint("Claude 3.5 Sonnet", "USD", 3.0, 15.0, 200),
+    PricePoint("DeepSeek-V3", "CNY", 1.0, 2.0, 64),
+    PricePoint("DeepSeek-R1", "CNY", 4.0, 16.0, 64),
+    PricePoint("Qwen-Max", "CNY", 20.0, 60.0, 32),
+    PricePoint("Qwen2.5-72B(开源自部署)", "CNY", 0.0, 0.0, 128),
+    PricePoint("GLM-4", "CNY", 5.0, 5.0, 128),
+]
+
+
+# ------------------------------------------------------------------
+# 第一部分：ASCII条形图兜底方案
+# ------------------------------------------------------------------
+
+def render_ascii_bar_chart(points: list[PricePoint]) -> None:
+    """
+    没有matplotlib时的兜底方案：用字符拼出一个横向条形图，条形长度
+    按输出价格（统一折算为人民币）等比例缩放，方便在任意终端里直观
+    比较各模型的价格差异，不依赖任何图形库。
+    """
+    print("\n[无matplotlib环境，使用ASCII条形图兜底展示价格对比]\n")
+    max_price = max(p.output_price_rmb() for p in points) or 1.0
+    bar_width_limit = 50
+
+    for point in points:
+        price_rmb = point.output_price_rmb()
+        bar_length = int(price_rmb / max_price * bar_width_limit) if max_price else 0
+        bar = "█" * max(bar_length, 1 if price_rmb > 0 else 0)
+        print(f"  {point.display_name:<26}{bar} {price_rmb:.2f}元/1M token（输出价）")
+
+
+# ------------------------------------------------------------------
+# 第二部分：matplotlib图表方案
+# ------------------------------------------------------------------
+
+def render_matplotlib_chart(points: list[PricePoint], output_path: str) -> None:
+    """
+    用matplotlib画一张双子图：左图是各模型输入/输出价格对比的分组柱状图
+    （统一折算成人民币），右图是各模型支持的上下文窗口大小对比，两张图
+    放在一起，方便同时评估"贵不贵"和"能处理多长的文本"这两个客户最
+    关心的维度。
+    """
+    names = [p.display_name for p in points]
+    input_prices = [p.input_price_rmb() for p in points]
+    output_prices = [p.output_price_rmb() for p in points]
+    context_windows = [p.context_window_k for p in points]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+
+    x_positions = range(len(names))
+    bar_width = 0.35
+    ax1.bar(
+        [x - bar_width / 2 for x in x_positions],
+        input_prices,
+        width=bar_width,
+        label="输入价格(元/1M token)",
+    )
+    ax1.bar(
+        [x + bar_width / 2 for x in x_positions],
+        output_prices,
+        width=bar_width,
+        label="输出价格(元/1M token)",
+    )
+    ax1.set_xticks(list(x_positions))
+    ax1.set_xticklabels(names, rotation=45, ha="right")
+    ax1.set_ylabel("价格（元，已统一折算为人民币）")
+    ax1.set_title("主流大模型输入/输出价格对比")
+    ax1.legend()
+
+    ax2.barh(names, context_windows, color="steelblue")
+    ax2.set_xlabel("上下文窗口（K token）")
+    ax2.set_title("主流大模型上下文窗口对比")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"\n[已生成对比图表，保存至：{output_path}]")
+
+
+# ------------------------------------------------------------------
+# 第三部分：统一入口
+# ------------------------------------------------------------------
+
+def visualize_model_landscape(
+    points: list[PricePoint], output_path: str = "model_price_comparison.png"
+) -> None:
+    sorted_points = sorted(points, key=lambda p: p.output_price_rmb())
+
+    if _MATPLOTLIB_AVAILABLE:
+        try:
+            render_matplotlib_chart(sorted_points, output_path)
+            return
+        except Exception as exc:  # pragma: no cover - 兜底容错，比如无写入权限等环境问题
+            print(f"[matplotlib绘图失败，自动降级为ASCII图表。原因：{exc}]")
+
+    render_ascii_bar_chart(sorted_points)
+
+
+def main() -> None:
+    print("=" * 78)
+    print("苍穹对话引擎小组 · 主流大模型价格与能力可视化对比")
+    print(f"当前环境matplotlib可用：{_MATPLOTLIB_AVAILABLE}")
+    print("=" * 78)
+    visualize_model_landscape(PRICE_POINTS)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+这份脚本在陈铭的电脑上跑出的是真实的图表文件,双子图左边一眼能看出GPT-4o和Claude的输出价格明显高出DeepSeek-V3一大截,右边的上下文窗口对比里Claude 3.5 Sonnet的两百K token条形明显最长。老王特意让陈铭把环境里的matplotlib临时卸载,重新跑了一遍,确认ASCII条形图兜底方案也能正常输出,一整排用"█"字符拼出来的条形,虽然不如真图美观,但价格差距的相对关系依然一目了然。老王总结这三个新增工具时说了一句话:"你会发现,这三个工具背后其实是同一套思考方式在反复出现——先假设'理想情况下工具应该怎么用',再倒回来问一句'如果依赖的东西不齐全,这个工具是不是就彻底瘫痪了',然后专门为'不齐全'这种情况设计一条退路。这不是额外的负担,这是任何要交给客户环境去跑的工具,都必须具备的基本素质,你今天写的每一份代码,都在练这个习惯。"
+
 ---
 
 ## 今日复盘
