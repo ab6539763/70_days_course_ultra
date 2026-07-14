@@ -2710,6 +2710,1802 @@ if __name__ == "__main__":
     sys.exit(run())
 ```
 
+晚自习十点半,综合实战的四份代码都提交之后,老王没有立刻结束今天的内容——他打开投影,说还有几个标准库模块今天只是在需求里被"暗示"了一下,没有真正腾出时间讲透,趁大家还没散场,抓紧再补一轮。他的原话是: "今天知识点数量多是没办法的事,但每一个标准库模块,都对应着以后写工程代码时一个真实会遇到的场景——你们不需要现在就能背下所有API,但至少要知道'这个场景该找哪个模块',剩下的细节,用的时候翻文档就行。"
+
+### 文件九:`shutil_archive_demo.py`(shutil模块——文件复制/移动/删除与压缩打包)
+
+老王晚自习巡场时问了一句:"批量文档读取工具跑完之后,reports目录下的报告,如果我想打包成一个zip文件直接发邮件,现在的代码能做到吗?"四个人翻遍了今天上午和下午的笔记,发现os和pathlib都没有直接提供"打包压缩"这个能力——这正是shutil模块要登场的地方。张凡把shutil在"更高层次"的文件/目录操作能力(复制目录树、移动、删除、打包解包、磁盘空间查询)系统练习了一遍。
+
+```python
+"""
+文件名: shutil_archive_demo.py
+作者: 张凡
+说明:
+    今天上午和下午分别学了os和pathlib两种"单个文件/目录"层面的操作方式,
+    但老王在晚自习巡场时提了一句:"你们批量文档读取工具跑完之后,报告
+    生成在reports目录下,如果我想把整个reports目录打包成一个zip文件,
+    方便直接发邮件给同事,现在的代码能做到吗?"四个人翻了一遍今天的
+    笔记,发现os和pathlib都没有直接提供"打包压缩"这个能力——这正是
+    标准库shutil模块和zipfile模块要登场的地方。
+
+    shutil(shell utilities)专门负责"更高层次"的文件/目录操作——不是
+    单个文件的读写,而是复制整棵目录树、移动文件、打包压缩、查询磁盘
+    空间这类更接近"文件管理器"的操作,os和pathlib更偏向"底层文件系统
+    调用"的封装,shutil则是在这些底层能力之上,又包了一层更方便的
+    高级接口。
+
+    本文件覆盖:
+    1. shutil.copy / copy2 / copytree —— 文件与目录树的复制;
+    2. shutil.move —— 文件/目录的移动(也可以用来实现"重命名");
+    3. shutil.rmtree —— 递归删除整个目录树;
+    4. shutil.make_archive / shutil.unpack_archive —— 打包与解包压缩包;
+    5. shutil.disk_usage —— 查询磁盘空间占用情况。
+"""
+
+from __future__ import annotations
+
+import shutil
+import tempfile
+from pathlib import Path
+
+
+def print_section(title: str) -> None:
+    """打印一个分隔标题,让终端输出更容易分辨每个演示的边界。"""
+    print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
+
+
+def setup_playground() -> Path:
+    """
+    在系统临时目录下创建一个本次演示专用的工作区,里面预先放好
+    几个模拟的"文档"文件,用tempfile.mkdtemp()而不是硬编码一个固定路径,
+    是为了避免多人同时在同一台机器上跑这份演示脚本时互相冲突。
+    """
+    playground = Path(tempfile.mkdtemp(prefix="shutil_demo_"))
+    docs_dir = playground / "sample_docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+
+    (docs_dir / "device_manual.txt").write_text(
+        "设备型号XJ3200A使用说明书\n工作温度范围:-10到60摄氏度\n", encoding="utf-8"
+    )
+    (docs_dir / "maintenance_log.csv").write_text(
+        "日期,设备编号,处理人,故障描述\n2024-01-10,XJ3200A-001,韩露,轴承异响\n", encoding="utf-8"
+    )
+    subdir = docs_dir / "attachments"
+    subdir.mkdir(exist_ok=True)
+    (subdir / "note.txt").write_text("这是一份附件说明。\n", encoding="utf-8")
+
+    return playground
+
+
+def demo_copy_single_file(playground: Path) -> None:
+    """演示shutil.copy与shutil.copy2的区别——后者会额外保留文件的元数据(修改时间等)。"""
+    print_section("演示一:shutil.copy / copy2 —— 单个文件复制")
+
+    source = playground / "sample_docs" / "device_manual.txt"
+    target_plain = playground / "device_manual_copy_plain.txt"
+    target_with_metadata = playground / "device_manual_copy_metadata.txt"
+
+    shutil.copy(source, target_plain)
+    shutil.copy2(source, target_with_metadata)
+
+    print(f"shutil.copy 复制结果存在: {target_plain.exists()}")
+    print(f"shutil.copy2 复制结果存在: {target_with_metadata.exists()}")
+
+    original_mtime = source.stat().st_mtime
+    copy2_mtime = target_with_metadata.stat().st_mtime
+    plain_mtime = target_plain.stat().st_mtime
+
+    print(f"原文件修改时间: {original_mtime}")
+    print(f"copy2副本修改时间(应与原文件一致): {copy2_mtime}")
+    print(f"copy普通副本修改时间(通常是复制发生的那一刻,不等于原文件): {plain_mtime}")
+
+    assert target_plain.read_text(encoding="utf-8") == source.read_text(encoding="utf-8"), \
+        "复制后的文件内容应该与原文件完全一致"
+    assert abs(copy2_mtime - original_mtime) < 0.01, "copy2()应该保留原文件的修改时间元数据,允许极小的浮点误差"
+    print("验证通过: copy()只复制文件内容, copy2()在复制内容的同时还保留了修改时间等元数据。")
+
+
+def demo_copytree(playground: Path) -> None:
+    """演示shutil.copytree —— 递归复制整棵目录树,包括所有子目录和文件。"""
+    print_section("演示二:shutil.copytree —— 整棵目录树复制")
+
+    source_dir = playground / "sample_docs"
+    target_dir = playground / "sample_docs_backup"
+
+    shutil.copytree(source_dir, target_dir)
+
+    original_files = sorted(p.relative_to(source_dir) for p in source_dir.rglob("*") if p.is_file())
+    backup_files = sorted(p.relative_to(target_dir) for p in target_dir.rglob("*") if p.is_file())
+
+    print(f"原目录下的文件清单(相对路径): {original_files}")
+    print(f"备份目录下的文件清单(相对路径): {backup_files}")
+
+    assert original_files == backup_files, "copytree()之后,备份目录里的文件结构应该与原目录完全一致"
+    print("验证通过: copytree()正确复制了包含子目录(attachments)的完整目录树。")
+
+    try:
+        shutil.copytree(source_dir, target_dir)
+        assert False, "对一个已经存在的目标目录再次copytree()理应报错(默认不允许覆盖), 这一行不该被执行到"
+    except FileExistsError as error:
+        print(f"再次对已存在的目标目录执行copytree(), 正确抛出了异常: {error}")
+
+    shutil.copytree(source_dir, target_dir, dirs_exist_ok=True)
+    print("使用dirs_exist_ok=True参数后, 再次copytree()到已存在目录不再报错(适用于'增量同步'场景)。")
+
+
+def demo_move(playground: Path) -> None:
+    """演示shutil.move —— 文件/目录的移动,也常被用来实现"重命名"这个效果。"""
+    print_section("演示三:shutil.move —— 移动文件与目录")
+
+    archive_dir = playground / "archived"
+    archive_dir.mkdir(exist_ok=True)
+
+    source_file = playground / "device_manual_copy_plain.txt"
+    destination = archive_dir / source_file.name
+
+    shutil.move(str(source_file), str(destination))
+
+    assert not source_file.exists(), "移动之后,原路径上的文件应该不再存在"
+    assert destination.exists(), "移动之后,文件应该出现在目标路径上"
+    print(f"文件已从 {source_file} 移动到 {destination}")
+
+    renamed_target = archive_dir / "device_manual_renamed.txt"
+    shutil.move(str(destination), str(renamed_target))
+    assert renamed_target.exists() and not destination.exists(), \
+        "在同一目录内move()到一个新文件名,效果等价于重命名"
+    print(f"在同一目录内move()到新文件名{renamed_target.name}, 效果等价于重命名。")
+
+
+def demo_rmtree(playground: Path) -> None:
+    """演示shutil.rmtree —— 递归删除整个目录树,这是一个"不可逆"的危险操作,使用时要格外小心。"""
+    print_section("演示四:shutil.rmtree —— 递归删除目录树")
+
+    backup_dir = playground / "sample_docs_backup"
+    assert backup_dir.exists(), "备份目录应该存在,才能演示删除操作"
+
+    shutil.rmtree(backup_dir)
+    assert not backup_dir.exists(), "rmtree()之后,整个目录树(包括所有子目录和文件)都应该被删除"
+    print(f"目录 {backup_dir} 及其全部内容已被递归删除。")
+
+    non_existent_dir = playground / "does_not_exist"
+    try:
+        shutil.rmtree(non_existent_dir)
+        assert False, "对不存在的目录调用rmtree()理应抛出异常,这一行不该被执行到"
+    except FileNotFoundError as error:
+        print(f"对不存在的目录调用rmtree(), 正确抛出了异常: {error}")
+
+    # ignore_errors=True可以让rmtree()"温和"地忽略掉这类错误,
+    # 生产代码里如果"目录本来存不存在都无所谓,删掉就行",可以用这个参数简化异常处理逻辑
+    shutil.rmtree(non_existent_dir, ignore_errors=True)
+    print("使用ignore_errors=True参数后, 对不存在的目录调用rmtree()不再抛出异常。")
+
+
+def demo_make_and_unpack_archive(playground: Path) -> None:
+    """演示shutil.make_archive与shutil.unpack_archive —— 打包压缩与解包。"""
+    print_section("演示五:shutil.make_archive / unpack_archive —— 打包与解包")
+
+    docs_dir = playground / "sample_docs"
+    archive_base_name = str(playground / "sample_docs_package")
+
+    # make_archive第一个参数是"不带后缀名"的输出路径, 第二个参数是格式(zip/tar/gztar等),
+    # 第三个参数是要打包的根目录, 返回值是实际生成的压缩包完整路径(会自动带上对应后缀)
+    archive_path_str = shutil.make_archive(archive_base_name, "zip", root_dir=docs_dir)
+    archive_path = Path(archive_path_str)
+
+    print(f"打包生成的压缩包路径: {archive_path}")
+    assert archive_path.exists(), "make_archive()之后, 压缩包文件应该被创建出来"
+    assert archive_path.suffix == ".zip", "指定format='zip'时, 生成的文件后缀应该是.zip"
+
+    extract_dir = playground / "sample_docs_extracted"
+    shutil.unpack_archive(archive_path, extract_dir=extract_dir)
+
+    extracted_files = sorted(p.relative_to(extract_dir) for p in extract_dir.rglob("*") if p.is_file())
+    original_files = sorted(p.relative_to(docs_dir) for p in docs_dir.rglob("*") if p.is_file())
+
+    print(f"打包前的文件清单: {original_files}")
+    print(f"解包后的文件清单: {extracted_files}")
+    assert extracted_files == original_files, "解包后的文件结构应该与打包前完全一致"
+    print("验证通过: make_archive()打包与unpack_archive()解包, 数据没有丢失或损坏。")
+
+    # 支持的打包格式可以通过get_archive_formats()查询, 这是一个容易被忽略但很实用的自省接口
+    supported_formats = [name for name, _ in shutil.get_archive_formats()]
+    print(f"当前Python环境支持的打包格式: {supported_formats}")
+    assert "zip" in supported_formats, "zip格式理应是所有平台都默认支持的打包格式"
+
+
+def demo_disk_usage(playground: Path) -> None:
+    """演示shutil.disk_usage —— 查询磁盘空间占用情况,常用于"磁盘快满了要不要报警"这类监控场景。"""
+    print_section("演示六:shutil.disk_usage —— 磁盘空间查询")
+
+    usage = shutil.disk_usage(playground)
+    total_gb = usage.total / (1024 ** 3)
+    used_gb = usage.used / (1024 ** 3)
+    free_gb = usage.free / (1024 ** 3)
+
+    print(f"总空间: {total_gb:.2f} GB")
+    print(f"已用空间: {used_gb:.2f} GB")
+    print(f"剩余空间: {free_gb:.2f} GB")
+
+    # 注意: 在很多类Unix文件系统上, total并不总是精确等于used+free,
+    # 因为文件系统通常会为超级用户保留一小部分"预留空间"
+    # (比如ext4默认保留5%给root使用), 这部分保留空间不计入free,
+    # 所以更准确的断言是"used+free不会超过total", 而不是"恰好相等"。
+    assert usage.used + usage.free <= usage.total, "已用空间加剩余空间, 不应该超过磁盘总空间"
+    assert usage.total > 0, "磁盘总空间理应是一个正数"
+    print("验证通过: disk_usage()返回的total/used/free三者数值关系符合预期(考虑文件系统预留空间后)。")
+
+    # 一个简化版的"磁盘告警"业务逻辑示范: 剩余空间占比低于阈值时提示告警
+    free_ratio = usage.free / usage.total
+    warning_threshold = 0.05
+    if free_ratio < warning_threshold:
+        print(f"[告警] 剩余空间占比仅{free_ratio:.1%}, 低于{warning_threshold:.0%}阈值, 应触发磁盘告警。")
+    else:
+        print(f"当前剩余空间占比{free_ratio:.1%}, 高于告警阈值{warning_threshold:.0%}, 磁盘空间正常。")
+
+
+def cleanup_playground(playground: Path) -> None:
+    """演示结束后,清理掉本次创建的整个临时工作区,不在系统里留下垃圾文件。"""
+    shutil.rmtree(playground, ignore_errors=True)
+    print(f"\n已清理演示工作区: {playground}")
+
+
+def run_all_demos() -> None:
+    """依次运行本文件中的全部演示。"""
+    playground = setup_playground()
+    try:
+        demo_copy_single_file(playground)
+        demo_copytree(playground)
+        demo_move(playground)
+        demo_rmtree(playground)
+        demo_make_and_unpack_archive(playground)
+        demo_disk_usage(playground)
+    finally:
+        cleanup_playground(playground)
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+### 文件十:`logging_practical_demo.py`(logging模块——企业级日志实践替代print)
+
+苏梦发现自己写的批量处理提示信息全部靠print(),扫描进度、警告、错误混在一起,出了问题很难在一堆输出里定位具体是哪一步出的错。老王顺手补了一课: 生产代码几乎不会直接用print(),而是用标准库自带的logging模块——可以分级别过滤、可以同时输出到终端和文件、自带时间和模块名等上下文信息。苏梦把日志级别体系、终端与文件双路输出、RotatingFileHandler日志切割、异常堆栈记录几个要点都练习了一遍。
+
+```python
+"""
+文件名: logging_practical_demo.py
+作者: 苏梦
+说明:
+    今天写批量文档读取工具的过程中,苏梦发现自己写的所有提示信息全部
+    靠print()——扫描进度、警告信息、错误信息混在一起,终端刷得飞快,
+    出了问题很难在一堆输出里定位具体是哪一步、哪个文件出的错。老王
+    晚自习巡场时看到这个情况,顺手补了一课:"生产代码几乎不会直接用
+    print(), 而是用标准库自带的logging模块——它比print()多出的能力,
+    主要在三点: 一是可以分级别(DEBUG/INFO/WARNING/ERROR/CRITICAL),
+    按需过滤; 二是可以同时输出到多个地方(终端、文件、甚至远程日志
+    平台), 而不需要改动业务代码; 三是自带时间、模块名、行号这些上下文
+    信息, 不用自己手动拼接。"
+
+    本文件覆盖:
+    1. 日志级别体系与getLogger()的基本用法;
+    2. 同时配置"输出到终端"和"输出到文件"两个Handler;
+    3. Formatter自定义日志格式(时间、级别、模块名、消息);
+    4. RotatingFileHandler —— 日志文件按大小自动切割, 避免单个日志
+       文件无限增长撑爆磁盘;
+    5. 在批量处理场景中用logging替代print(), 对比两种方式的实际效果;
+    6. 用exception()方法记录完整的异常堆栈信息, 而不是只记录一句话。
+"""
+
+from __future__ import annotations
+
+import logging
+import shutil
+import tempfile
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+
+def print_section(title: str) -> None:
+    print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
+
+
+# ---------------------------------------------------------------------------
+# 第一部分: 日志级别体系
+# ---------------------------------------------------------------------------
+
+
+def demo_logging_levels() -> None:
+    """演示logging五个标准级别的含义与默认过滤行为。"""
+    print_section("演示一: 日志级别体系")
+
+    logger = logging.getLogger("cangqiong.demo.levels")
+    logger.setLevel(logging.DEBUG)
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    logger.addHandler(handler)
+    logger.propagate = False  # 避免这条日志同时被根logger的默认handler重复打印一遍
+
+    logger.debug("这是DEBUG级别: 用于开发调试阶段的细节信息, 生产环境通常会关闭")
+    logger.info("这是INFO级别: 用于记录正常的业务流程节点, 比如'开始扫描目录'")
+    logger.warning("这是WARNING级别: 用于记录不影响主流程, 但值得关注的异常情况")
+    logger.error("这是ERROR级别: 用于记录导致某个操作失败的错误")
+    logger.critical("这是CRITICAL级别: 用于记录导致整个程序无法继续运行的严重错误")
+
+    # 级别本质上是数字, 数字越大越严重, setLevel()决定了"低于这个数字的日志会被直接丢弃"
+    level_values = [logging.DEBUG, logging.INFO, logging.WARNING, logging.ERROR, logging.CRITICAL]
+    assert level_values == sorted(level_values), "五个级别对应的数值理应是严格递增的"
+    print(f"\n五个级别对应的数值: DEBUG={logging.DEBUG}, INFO={logging.INFO}, "
+          f"WARNING={logging.WARNING}, ERROR={logging.ERROR}, CRITICAL={logging.CRITICAL}")
+
+    logger.setLevel(logging.WARNING)
+    print("\n把logger级别调整为WARNING之后, 再打印一遍(DEBUG和INFO应该被过滤掉):")
+    logger.debug("这条DEBUG不应该出现在输出里")
+    logger.info("这条INFO不应该出现在输出里")
+    logger.warning("这条WARNING应该正常出现")
+
+    logger.removeHandler(handler)
+
+
+# ---------------------------------------------------------------------------
+# 第二部分: 同时输出到终端与文件, 且各自可以配置不同的级别与格式
+# ---------------------------------------------------------------------------
+
+
+def build_dual_output_logger(log_file_path: Path, logger_name: str) -> logging.Logger:
+    """
+    构建一个"终端 + 文件"双路输出的logger:
+    - 终端只输出INFO及以上级别, 格式简洁, 方便实时盯着终端看进度;
+    - 文件记录DEBUG及以上级别的全部细节, 方便事后排查问题;
+
+    这是苍穹平台实际的日志配置策略——终端给人看, 文件给"以后排查问题的人"看,
+    两者对"详细程度"的需求是不一样的, 不应该用同一套配置糊弄两种场景。
+    """
+    logger = logging.getLogger(logger_name)
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    logger.handlers.clear()  # 避免重复调用本函数时, 同一个logger被反复挂上多个handler
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter("%(levelname)-8s | %(message)s"))
+    logger.addHandler(console_handler)
+
+    file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(
+        logging.Formatter(
+            fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(filename)s:%(lineno)d | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    logger.addHandler(file_handler)
+
+    return logger
+
+
+def demo_dual_output(work_dir: Path) -> None:
+    """演示双路输出logger: 终端只看到INFO及以上, 文件里能看到完整的DEBUG细节。"""
+    print_section("演示二: 终端 + 文件双路输出, 各自独立控制级别")
+
+    log_file = work_dir / "batch_process.log"
+    logger = build_dual_output_logger(log_file, "cangqiong.demo.dual_output")
+
+    logger.debug("开始加载配置文件(这条DEBUG只会出现在日志文件里, 不会显示在终端)")
+    logger.info("开始扫描目录 sample_docs")
+    logger.info("扫描完成, 共发现5份文档")
+    logger.warning("文档 broken_encoding.txt 存在编码异常, 已跳过")
+    logger.error("文档 corrupted.json 解析失败, 已记录到失败清单")
+
+    log_content = log_file.read_text(encoding="utf-8")
+    print(f"\n日志文件内容(共{len(log_content.splitlines())}行):")
+    for line in log_content.splitlines():
+        print(f"  {line}")
+
+    assert "开始加载配置文件" in log_content, "DEBUG级别的日志应该被完整记录到文件里"
+    assert log_file.exists(), "日志文件应该已经被创建"
+    print("\n验证通过: 终端只显示了INFO及以上级别的简洁信息, 文件里保留了包括DEBUG的完整细节。")
+
+
+# ---------------------------------------------------------------------------
+# 第三部分: RotatingFileHandler —— 日志文件按大小自动切割
+# ---------------------------------------------------------------------------
+
+
+def demo_rotating_file_handler(work_dir: Path) -> None:
+    """
+    演示RotatingFileHandler: 当日志文件超过指定大小时, 自动切割成
+    log.1、log.2……等历史文件, 主日志文件始终维持在一个可控的大小内,
+    避免"忘记清理日志导致磁盘被撑爆"这种在真实生产环境里屡见不鲜的事故。
+    """
+    print_section("演示三: RotatingFileHandler —— 日志按大小自动切割")
+
+    log_path = work_dir / "rotating.log"
+    logger = logging.getLogger("cangqiong.demo.rotating")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.handlers.clear()
+
+    # maxBytes设置得很小(200字节), backupCount=3表示最多保留3份历史文件,
+    # 这里故意设置得很小, 只是为了让演示能在几十次日志调用内就触发切割效果,
+    # 真实生产环境通常会设置成几十MB甚至上百MB
+    rotating_handler = RotatingFileHandler(log_path, maxBytes=200, backupCount=3, encoding="utf-8")
+    rotating_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
+    logger.addHandler(rotating_handler)
+
+    for i in range(1, 31):
+        logger.info(f"这是第{i}条模拟日志, 用于填充日志文件触发自动切割逻辑")
+
+    rotated_files = sorted(work_dir.glob("rotating.log*"))
+    print(f"日志目录下产生的文件: {[f.name for f in rotated_files]}")
+
+    assert log_path.exists(), "主日志文件应该始终存在"
+    assert len(rotated_files) > 1, "写入足够多的日志之后, 应该触发至少一次切割, 产生历史备份文件"
+    assert len(rotated_files) <= 4, "backupCount=3意味着最多保留3份历史文件加1份主文件, 一共不超过4份"
+    print(f"验证通过: 日志被自动切割成了{len(rotated_files)}份文件, 未超过backupCount+1的上限。")
+
+    logger.removeHandler(rotating_handler)
+    rotating_handler.close()
+
+
+# ---------------------------------------------------------------------------
+# 第四部分: 用logging.exception()记录完整堆栈信息
+# ---------------------------------------------------------------------------
+
+
+def demo_exception_logging(work_dir: Path) -> None:
+    """
+    演示logger.exception() —— 在except块内调用, 会自动把完整的异常堆栈
+    (traceback)一起记录下来, 这对排查"这个错误到底是从哪一行代码抛出来的"
+    至关重要, 比单纯用logger.error(str(e))记录一句话包含的信息丰富得多。
+    """
+    print_section("演示四: logger.exception() —— 记录完整异常堆栈")
+
+    log_path = work_dir / "exception_demo.log"
+    logger = logging.getLogger("cangqiong.demo.exception")
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    logger.handlers.clear()
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    logger.addHandler(file_handler)
+
+    def parse_temperature_field(raw_value: str) -> float:
+        """一个会在特定输入下抛出异常的函数, 专门用来触发exception()演示。"""
+        return float(raw_value)
+
+    problematic_inputs = ["36.5", "not_a_number", "58.2"]
+    parsed_results = []
+    for raw_value in problematic_inputs:
+        try:
+            parsed_results.append(parse_temperature_field(raw_value))
+        except ValueError:
+            logger.exception(f"解析温度字段失败, 原始值: {raw_value!r}")
+            parsed_results.append(None)
+
+    print(f"解析结果: {parsed_results}")
+
+    log_content = log_path.read_text(encoding="utf-8")
+    print(f"\n日志文件中记录的内容片段:\n{log_content}")
+
+    assert "Traceback" in log_content, "logger.exception()应该在日志里包含完整的Traceback堆栈信息"
+    assert "ValueError" in log_content, "日志里应该能看到具体的异常类型"
+    assert parsed_results == [36.5, None, 58.2], "解析失败的那一项应该被记录为None, 其余项应该正常解析成功"
+    print("验证通过: logger.exception()完整记录了异常的堆栈轨迹, 而不只是一句笼统的错误描述。")
+
+    logger.removeHandler(file_handler)
+    file_handler.close()
+
+
+# ---------------------------------------------------------------------------
+# 第五部分: 用logging重写批量处理流程中的进度提示, 与print()版本做直观对比
+# ---------------------------------------------------------------------------
+
+
+def batch_process_with_print(file_names: list[str]) -> None:
+    """用print()实现的批量处理进度提示(改造前的写法)。"""
+    for name in file_names:
+        print(f"正在处理: {name}")
+        if "broken" in name:
+            print(f"警告: {name} 存在异常, 已跳过")
+        else:
+            print(f"完成: {name}")
+
+
+def batch_process_with_logging(file_names: list[str], logger: logging.Logger) -> None:
+    """用logging重写后的批量处理进度提示(改造后的写法), 天然带有时间戳、级别、模块信息。"""
+    for name in file_names:
+        logger.info(f"正在处理: {name}")
+        if "broken" in name:
+            logger.warning(f"{name} 存在异常, 已跳过")
+        else:
+            logger.info(f"完成: {name}")
+
+
+def demo_print_vs_logging_comparison(work_dir: Path) -> None:
+    """对比print()版本与logging版本, 在"事后能不能追溯到具体哪个时间点处理了哪个文件"这件事上的差异。"""
+    print_section("演示五: print() vs logging, 批量处理场景下的实际对比")
+
+    file_names = ["device_manual.txt", "broken_encoding.txt", "maintenance_log.csv"]
+
+    print("----- print()版本输出 -----")
+    batch_process_with_print(file_names)
+
+    print("\n----- logging版本输出(同时写入文件) -----")
+    log_path = work_dir / "batch_comparison.log"
+    logger = build_dual_output_logger(log_path, "cangqiong.demo.comparison")
+    batch_process_with_logging(file_names, logger)
+
+    log_content = log_path.read_text(encoding="utf-8")
+    lines_with_timestamp = [line for line in log_content.splitlines() if line.strip()]
+    print(f"\nlogging版本额外写入到文件的{len(lines_with_timestamp)}行, 每一行都带有精确到秒的时间戳,")
+    print("这意味着即使事后才发现某份文档处理有问题, 也能立刻查到'当时具体是几点几分处理的'——")
+    print("而print()版本的历史输出, 一旦终端窗口关闭, 这些信息就彻底丢失了, 除非提前手动做了重定向。")
+
+    assert len(lines_with_timestamp) == len(file_names) * 2, \
+        "每个文件在批处理过程中都会产生两条日志(一条'正在处理', 一条'完成'或'警告'), 总数应该是文件数的两倍"
+
+
+def run_all_demos() -> None:
+    """依次运行本文件中的全部演示, 使用临时目录存放过程中产生的日志文件。"""
+    work_dir = Path(tempfile.mkdtemp(prefix="logging_demo_"))
+    try:
+        demo_logging_levels()
+        demo_dual_output(work_dir)
+        demo_rotating_file_handler(work_dir)
+        demo_exception_logging(work_dir)
+        demo_print_vs_logging_comparison(work_dir)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        print(f"\n已清理演示产生的临时日志目录: {work_dir}")
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+### 文件十一:`collections_itertools_demo.py`(collections与itertools——容器与迭代器工具箱)
+
+陈铭写keyword_stats模块统计关键词频率时,手动维护了一个"词->次数"的字典,每次还要写一句"如果不在字典里,先初始化成0"的兜底逻辑。老王看完提了一句: "你知道collections模块里有个Counter,天生就是干这个的吗?" 陈铭这才发现自己一直在用字典手搓一些标准库已经封装好的常见模式,顺手把Counter、defaultdict、namedtuple、deque,以及itertools的groupby、chain、product、islice都系统练习了一遍。
+
+```python
+"""
+文件名: collections_itertools_demo.py
+作者: 陈铭
+说明:
+    今天写keyword_stats模块统计关键词频率的时候, 陈铭手动维护了一个
+    "词 -> 出现次数"的字典, 每次统计前还要写一句"如果这个词不在字典里,
+    先给它初始化成0"这样的兜底逻辑。老王看完提了一句:"你知道
+    collections模块里有个Counter, 天生就是干这个的吗?" 陈铭这才发现,
+    自己一直在用字典"手搓"一些标准库已经封装好的常见模式。
+
+    collections是标准库里"容器数据类型"的加强包, 提供了几种在dict/list
+    基础之上, 针对特定场景做了专门优化和便利封装的容器; itertools则
+    提供了一批"迭代器代数"工具, 用于高效地组合、切片、分组各种可迭代
+    对象, 二者结合起来, 能用很少的代码写出既清晰又高效的数据处理逻辑。
+
+    本文件覆盖:
+    1. collections.Counter —— 计数统计的专用容器, 自带most_common();
+    2. collections.defaultdict —— 自动初始化默认值的字典, 省掉手写兜底;
+    3. collections.namedtuple —— 轻量级的"字段有名字的元组", 比普通元组
+       更易读, 比自定义类更轻量;
+    4. collections.deque —— 双端队列, 两端操作的时间复杂度都是O(1);
+    5. collections.OrderedDict在Python3.7+的地位变化;
+    6. itertools.groupby —— 按连续分组;
+    7. itertools.chain —— 把多个可迭代对象串联成一个;
+    8. itertools.product —— 多个可迭代对象的笛卡尔积;
+    9. itertools.islice —— 对迭代器做切片, 支持无限迭代器。
+"""
+
+from __future__ import annotations
+
+import itertools
+from collections import Counter, OrderedDict, defaultdict, deque, namedtuple
+
+
+def print_section(title: str) -> None:
+    print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
+
+
+# ---------------------------------------------------------------------------
+# 第一部分: Counter —— 专门为"计数"设计的字典子类
+# ---------------------------------------------------------------------------
+
+
+def demo_counter() -> None:
+    """演示Counter的基础用法: 从一份文档的关键词列表中, 直接得到频率统计与排行榜。"""
+    print_section("演示一: collections.Counter —— 关键词计数统计")
+
+    keyword_occurrences = [
+        "故障", "维护", "故障", "巡检", "异常", "维护", "故障", "正常", "维护", "报警",
+    ]
+
+    # 用手写字典实现同样的效果(改造前的写法), 作为对比基准
+    manual_counter: dict[str, int] = {}
+    for word in keyword_occurrences:
+        if word not in manual_counter:
+            manual_counter[word] = 0
+        manual_counter[word] += 1
+
+    # 用Counter实现(改造后的写法), 一行代码就能完成同样的统计
+    counter = Counter(keyword_occurrences)
+
+    print(f"手写字典统计结果: {manual_counter}")
+    print(f"Counter统计结果: {dict(counter)}")
+    assert dict(counter) == manual_counter, "Counter的统计结果应该与手写字典完全一致"
+
+    top_3 = counter.most_common(3)
+    print(f"出现频率最高的3个关键词: {top_3}")
+    assert top_3[0] == ("故障", 3), "出现频率最高的词理应是'故障', 出现了3次"
+
+    # Counter支持像集合一样做加减运算, 常用于"合并两批文档的关键词统计结果"这种场景
+    counter_batch_two = Counter(["故障", "巡检", "巡检", "更换"])
+    merged = counter + counter_batch_two
+    print(f"合并两批统计结果: {dict(merged)}")
+    assert merged["故障"] == 4, "合并后'故障'的总次数应该是两批统计结果相加"
+    assert merged["巡检"] == 3, "合并后'巡检'的总次数应该是1+2=3"
+
+    # Counter对"访问一个不存在的键"格外友好: 不会像普通dict那样抛出KeyError, 而是返回0
+    print(f"查询一个从未出现过的词'升级'的计数: {counter['升级']}(不会抛出KeyError, 直接返回0)")
+    assert counter["升级"] == 0, "Counter对不存在的键, 应该返回0而不是抛出异常"
+    print("验证通过: Counter作为dict的子类, 天生具备计数、排行、合并、安全查询等能力, 比手写字典更省心。")
+
+
+# ---------------------------------------------------------------------------
+# 第二部分: defaultdict —— 自动初始化默认值, 省掉手写兜底逻辑
+# ---------------------------------------------------------------------------
+
+
+def demo_defaultdict() -> None:
+    """演示defaultdict: 按文档类型对关键词进行分组统计, 不需要手写"key不存在先初始化"的逻辑。"""
+    print_section("演示二: collections.defaultdict —— 自动初始化默认值")
+
+    # 模拟场景: 每条记录是(文档类型, 关键词)元组, 需要按文档类型分组, 汇总每种类型下出现过的关键词
+    records = [
+        ("txt", "故障"), ("csv", "维护"), ("txt", "异常"),
+        ("json", "报警"), ("csv", "维护"), ("txt", "故障"),
+    ]
+
+    # 改造前: 手写"key不存在就先初始化成空列表"的兜底逻辑
+    manual_grouped: dict[str, list[str]] = {}
+    for doc_type, keyword in records:
+        if doc_type not in manual_grouped:
+            manual_grouped[doc_type] = []
+        manual_grouped[doc_type].append(keyword)
+
+    # 改造后: defaultdict(list)会在访问不存在的key时, 自动用list()生成一个空列表作为默认值
+    auto_grouped: defaultdict[str, list[str]] = defaultdict(list)
+    for doc_type, keyword in records:
+        auto_grouped[doc_type].append(keyword)
+
+    print(f"手写兜底逻辑分组结果: {manual_grouped}")
+    print(f"defaultdict分组结果: {dict(auto_grouped)}")
+    assert dict(auto_grouped) == manual_grouped, "两种写法的分组结果应该完全一致"
+
+    # defaultdict可以配合任意"零参数可调用对象"作为默认值工厂, 不局限于list
+    nested_counter: defaultdict[str, Counter] = defaultdict(Counter)
+    for doc_type, keyword in records:
+        nested_counter[doc_type][keyword] += 1
+    print(f"defaultdict(Counter)嵌套统计结果: {[(k, dict(v)) for k, v in nested_counter.items()]}")
+    assert nested_counter["txt"]["故障"] == 2, "txt类型文档里'故障'关键词应该出现了2次"
+    print("验证通过: defaultdict(list)/defaultdict(Counter)都能省掉手写的初始化兜底逻辑, 代码更简洁。")
+
+
+# ---------------------------------------------------------------------------
+# 第三部分: namedtuple —— 字段有名字的轻量级元组
+# ---------------------------------------------------------------------------
+
+
+def demo_namedtuple() -> None:
+    """
+    演示namedtuple: 用一个"设备巡检记录"的场景, 对比普通元组(靠位置区分字段)
+    和namedtuple(靠名字区分字段)在可读性上的差异。
+    """
+    print_section("演示三: collections.namedtuple —— 字段有名字的元组")
+
+    # 普通元组: 必须靠记住"第0个是设备编号, 第1个是巡检人, 第2个是结果"这种约定,
+    # 代码里出现record[1]这种写法, review的人很难一眼看出这是"巡检人"
+    plain_tuple_record = ("XJ3200A-001", "韩露", "正常")
+    print(f"普通元组记录: {plain_tuple_record}, 巡检人是{plain_tuple_record[1]}(必须记住下标1代表巡检人)")
+
+    InspectionRecord = namedtuple("InspectionRecord", ["device_id", "inspector", "result"])
+    named_record = InspectionRecord(device_id="XJ3200A-001", inspector="韩露", result="正常")
+    print(f"namedtuple记录: {named_record}, 巡检人是{named_record.inspector}(直接用字段名访问, 一目了然)")
+
+    assert named_record.device_id == plain_tuple_record[0]
+    assert named_record.inspector == plain_tuple_record[1]
+    assert named_record[2] == named_record.result, "namedtuple既支持按名字访问, 也兼容普通元组按下标访问的方式"
+
+    # namedtuple依然是不可变的(元组的核心特性没有丢), 尝试修改会抛出AttributeError
+    try:
+        named_record.inspector = "苏梦"
+        assert False, "namedtuple理应不可修改, 这一行不该被执行到"
+    except AttributeError as error:
+        print(f"尝试修改namedtuple字段, 正确抛出了异常: {error}")
+
+    # _replace()可以基于原记录, 创建一份"只改了某个字段"的新记录, 不违反不可变性
+    updated_record = named_record._replace(inspector="苏梦")
+    print(f"用_replace()创建的新记录: {updated_record}")
+    assert updated_record.inspector == "苏梦" and named_record.inspector == "韩露", \
+        "_replace()应该返回一个新对象, 不应该修改原记录"
+
+    # 一批namedtuple记录, 可以直接用于排序、筛选, 可读性比一堆裸元组好得多
+    records = [
+        InspectionRecord("XJ3200A-001", "韩露", "正常"),
+        InspectionRecord("XJ3200A-002", "陈铭", "异常"),
+        InspectionRecord("XJ3200A-003", "苏梦", "正常"),
+    ]
+    abnormal_records = [r for r in records if r.result == "异常"]
+    print(f"筛选出的异常记录: {abnormal_records}")
+    assert len(abnormal_records) == 1 and abnormal_records[0].device_id == "XJ3200A-002"
+    print("验证通过: namedtuple兼具元组的不可变性与轻量性, 又用字段名解决了'只能靠下标猜测含义'的可读性问题。")
+
+
+# ---------------------------------------------------------------------------
+# 第四部分: deque —— 双端队列, 两端操作都是O(1)
+# ---------------------------------------------------------------------------
+
+
+def demo_deque() -> None:
+    """
+    演示deque相较于普通list, 在"两端都需要频繁增删"场景下的行为与性能优势。
+    上午案例(list模拟队列)提到过list.pop(0)性能不好, deque正是官方给出的
+    正式替代方案。
+    """
+    print_section("演示四: collections.deque —— 双端队列")
+
+    dq: deque[str] = deque()
+    dq.append("任务A")       # 从右端追加, 与list.append()等价
+    dq.append("任务B")
+    dq.appendleft("任务0")   # 从左端追加, list没有这个能力(只能用insert(0, ...)模拟, 效率很差)
+    print(f"当前队列: {list(dq)}")
+    assert list(dq) == ["任务0", "任务A", "任务B"]
+
+    left_item = dq.popleft()  # 从左端弹出, 时间复杂度O(1), 对应list.pop(0)的O(n)
+    right_item = dq.pop()     # 从右端弹出, 与list.pop()等价
+    print(f"popleft()弹出: {left_item}, pop()弹出: {right_item}, 剩余队列: {list(dq)}")
+    assert left_item == "任务0" and right_item == "任务B"
+    assert list(dq) == ["任务A"]
+
+    # maxlen参数可以让deque自动变成一个"固定长度的滑动窗口", 超出长度时自动丢弃最旧的元素,
+    # 这是一个非常适合用来实现"最近N条操作记录"这类需求的特性
+    recent_operations: deque[str] = deque(maxlen=3)
+    for i in range(1, 6):
+        recent_operations.append(f"操作{i}")
+        print(f"追加操作{i}后, 当前保留的最近记录: {list(recent_operations)}")
+
+    assert list(recent_operations) == ["操作3", "操作4", "操作5"], \
+        "maxlen=3的deque, 追加第4、5个元素后, 应该自动丢弃最旧的元素, 只保留最近3个"
+    print("验证通过: deque的appendleft/popleft两端操作都是O(1), 且maxlen参数天然适合实现滑动窗口。")
+
+
+# ---------------------------------------------------------------------------
+# 第五部分: OrderedDict在现代Python里的地位变化
+# ---------------------------------------------------------------------------
+
+
+def demo_ordereddict_relevance() -> None:
+    """
+    演示: 从Python3.7开始, 普通dict本身就保证了插入顺序, OrderedDict在
+    "记住插入顺序"这一点上已经不再是必需品, 但它仍然保留了一个dict没有
+    的特殊能力——move_to_end(), 常用于实现LRU缓存这类场景。
+    """
+    print_section("演示五: OrderedDict —— 现代Python里的定位变化")
+
+    plain_dict = {}
+    plain_dict["c"] = 3
+    plain_dict["a"] = 1
+    plain_dict["b"] = 2
+    print(f"普通dict的键顺序(Python3.7+保证与插入顺序一致): {list(plain_dict.keys())}")
+    assert list(plain_dict.keys()) == ["c", "a", "b"], "现代Python的普通dict已经天然保持插入顺序"
+
+    ordered = OrderedDict()
+    ordered["c"] = 3
+    ordered["a"] = 1
+    ordered["b"] = 2
+    ordered.move_to_end("c")
+    print(f"OrderedDict在move_to_end('c')之后的键顺序: {list(ordered.keys())}")
+    assert list(ordered.keys()) == ["a", "b", "c"], "move_to_end()应该把指定键移动到末尾, 这是普通dict不具备的能力"
+
+    print("结论: 如果只是需要'记住插入顺序', 现代Python直接用普通dict就够了;")
+    print("只有在真的需要move_to_end()这类'调整顺序'的能力时(比如手写LRU缓存), 才需要OrderedDict。")
+
+
+# ---------------------------------------------------------------------------
+# 第六部分: itertools —— 高效组合迭代器的工具箱
+# ---------------------------------------------------------------------------
+
+
+def demo_itertools_groupby() -> None:
+    """
+    演示itertools.groupby: 按"连续相同的分组键"对一个已排序的序列做分组,
+    这是一个容易被误用的函数——它只对"紧挨着的连续元素"分组, 使用前
+    通常需要先按分组键排序, 否则同一个分组键出现在不连续的位置时,
+    会被错误地拆分成多个分组。
+    """
+    print_section("演示六: itertools.groupby —— 按连续分组")
+
+    inspection_records = [
+        ("XJ3200A", "正常"), ("XJ3200A", "正常"), ("XJ3200A", "异常"),
+        ("XJ5100B", "正常"), ("XJ5100B", "异常"), ("XJ5100B", "异常"),
+    ]
+
+    print("直接对未排序(但本例中恰好已按设备类型连续排列)的数据分组:")
+    for device_type, group in itertools.groupby(inspection_records, key=lambda record: record[0]):
+        results = [r[1] for r in group]
+        print(f"  设备类型{device_type}: {results}")
+
+    # 故意构造一个"分组键不连续"的反例, 展示groupby的常见陷阱
+    unsorted_records = [
+        ("XJ3200A", "正常"), ("XJ5100B", "正常"), ("XJ3200A", "异常"),
+    ]
+    print("\n对分组键不连续的数据直接分组(容易踩坑的反例):")
+    grouped_result = []
+    for device_type, group in itertools.groupby(unsorted_records, key=lambda record: record[0]):
+        grouped_result.append((device_type, [r[1] for r in group]))
+    print(f"  分组结果: {grouped_result}")
+    assert len(grouped_result) == 3, \
+        "由于XJ3200A的两条记录不连续, groupby会把它们错误地拆成两个独立的分组, 一共产生3个分组而不是2个"
+
+    print("\n正确做法: 先按分组键排序, 再groupby:")
+    sorted_records = sorted(unsorted_records, key=lambda record: record[0])
+    grouped_after_sort = []
+    for device_type, group in itertools.groupby(sorted_records, key=lambda record: record[0]):
+        grouped_after_sort.append((device_type, [r[1] for r in group]))
+    print(f"  分组结果: {grouped_after_sort}")
+    assert len(grouped_after_sort) == 2, "排序之后再分组, XJ3200A的两条记录应该被正确合并成一个分组"
+    print("验证通过: groupby必须配合'先排序'才能得到符合直觉的分组结果, 这是使用它时最容易踩的坑。")
+
+
+def demo_itertools_chain_and_product() -> None:
+    """演示itertools.chain(串联多个可迭代对象)与itertools.product(笛卡尔积)。"""
+    print_section("演示七: itertools.chain与itertools.product")
+
+    txt_keywords = ["故障", "维护"]
+    csv_keywords = ["巡检", "更换"]
+    json_keywords = ["报警"]
+
+    # chain可以把多个列表"串联"成一个统一的迭代序列, 不需要先用+号拼接成一个新列表
+    all_keywords = list(itertools.chain(txt_keywords, csv_keywords, json_keywords))
+    print(f"chain串联三份关键词列表: {all_keywords}")
+    assert all_keywords == txt_keywords + csv_keywords + json_keywords, \
+        "chain()串联的结果应该与用+号拼接列表的结果完全一致, 但chain()不需要额外创建中间列表, 更省内存"
+
+    device_types = ["XJ3200A", "XJ5100B"]
+    severities = ["轻微", "严重"]
+    combinations = list(itertools.product(device_types, severities))
+    print(f"设备类型与严重程度的笛卡尔积组合: {combinations}")
+    assert len(combinations) == len(device_types) * len(severities), \
+        "笛卡尔积的组合总数, 应该等于两个可迭代对象长度的乘积"
+    assert ("XJ3200A", "严重") in combinations
+    print("验证通过: chain()避免了拼接列表产生的额外内存开销, product()一行代码生成了全部组合场景, 省去了手写双重循环。")
+
+
+def demo_itertools_islice() -> None:
+    """
+    演示itertools.islice: 对(可能是无限的)迭代器做切片, 这是普通列表切片
+    语法list[start:stop]无法直接用在生成器/迭代器上的场景。
+    """
+    print_section("演示八: itertools.islice —— 对迭代器做切片")
+
+    def infinite_device_id_generator():
+        """一个永远不会自己停止的生成器, 模拟'设备编号自动生成器'这种无限序列。"""
+        index = 1
+        while True:
+            yield f"XJ-AUTO-{index:04d}"
+            index += 1
+
+    generator = infinite_device_id_generator()
+    first_five_ids = list(itertools.islice(generator, 5))
+    print(f"从无限生成器中取出的前5个设备编号: {first_five_ids}")
+    assert first_five_ids == ["XJ-AUTO-0001", "XJ-AUTO-0002", "XJ-AUTO-0003", "XJ-AUTO-0004", "XJ-AUTO-0005"]
+
+    # islice还支持start/stop/step三个参数, 用法与列表切片的语义类似
+    another_generator = infinite_device_id_generator()
+    every_other_id = list(itertools.islice(another_generator, 0, 10, 2))
+    print(f"从无限生成器中取出下标0到10、步长为2的编号: {every_other_id}")
+    assert every_other_id == ["XJ-AUTO-0001", "XJ-AUTO-0003", "XJ-AUTO-0005", "XJ-AUTO-0007", "XJ-AUTO-0009"]
+    print("验证通过: islice()让'对无限序列做切片'这个原本不可能用普通语法实现的操作, 变成了可能。")
+
+
+def run_all_demos() -> None:
+    """依次运行本文件中的全部演示。"""
+    demo_counter()
+    demo_defaultdict()
+    demo_namedtuple()
+    demo_deque()
+    demo_ordereddict_relevance()
+    demo_itertools_groupby()
+    demo_itertools_chain_and_product()
+    demo_itertools_islice()
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+### 文件十二:`subprocess_hashlib_demo.py`(subprocess与hashlib——调用外部命令与文件哈希去重)
+
+老王追加了两个"时间充裕可以顺手练一下"的话题: 一是"如果文档是压缩包发过来的,想不想直接调用系统里的解压命令,而不是自己在Python里重新实现"; 二是"同一份文档改了个文件名混进待处理目录,我们怎么知道它和之前处理过的是不是同一份内容"。韩露分别用subprocess模块(调用外部命令、超时控制、标准输入输出管道)和hashlib模块(文件内容哈希指纹)解决了这两个问题,并综合实现了一个基于内容哈希的文档去重辅助函数。
+
+```python
+"""
+文件名: subprocess_hashlib_demo.py
+作者: 韩露
+说明:
+    今天晚自习综合实战里, doc_toolkit工具已经能批量读取文档、统计关键词,
+    但老王追加了两个"如果你们时间充裕, 可以顺手练一下"的额外话题:
+    一是"如果这批文档是压缩包发过来的, 先得解压, 而咱们系统里已经装了
+    unzip命令行工具, 想不想试试直接调用外部命令来解压, 而不是自己在
+    Python里重新实现一遍解压逻辑"; 二是"如果同一份文档改了个文件名,
+    又混进了待处理目录, 我们怎么知道它跟之前处理过的是不是同一份内容,
+    而不是靠比较文件名或者逐字节比较文件内容"。这两个问题分别对应
+    标准库的subprocess模块和hashlib模块。
+
+    本文件覆盖:
+    1. subprocess.run —— 调用外部命令并捕获输出, 这是Python"调用系统
+       命令"的现代推荐写法, 取代了更老旧的os.system()/os.popen();
+    2. subprocess的返回码检查与check=True的异常行为;
+    3. subprocess的超时控制, 避免外部命令卡死拖垮整个批处理流程;
+    4. hashlib —— 计算文件内容的哈希值(指纹), 用于判断"两份文件内容
+       是否完全相同", 而不依赖文件名或路径;
+    5. 结合两者, 实现一个简化版的"文档去重"辅助函数。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+def print_section(title: str) -> None:
+    print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
+
+
+# ---------------------------------------------------------------------------
+# 第一部分: subprocess.run —— 调用外部命令并捕获输出
+# ---------------------------------------------------------------------------
+
+
+def demo_subprocess_basic() -> None:
+    """
+    演示subprocess.run的基础用法: 调用一个简单的外部命令(这里用Python
+    自身作为"外部命令", 保证演示在任何操作系统上都能稳定跑通, 而不依赖
+    某个特定操作系统才有的命令), 捕获它的标准输出与返回码。
+    """
+    print_section("演示一: subprocess.run —— 基础调用与输出捕获")
+
+    result = subprocess.run(
+        [sys.executable, "-c", "print('来自子进程的问候')"],
+        capture_output=True,
+        text=True,
+    )
+
+    print(f"子进程标准输出: {result.stdout!r}")
+    print(f"子进程返回码: {result.returncode}")
+
+    assert result.returncode == 0, "正常执行的命令, 返回码理应是0"
+    assert "来自子进程的问候" in result.stdout, "捕获到的标准输出里应该包含子进程打印的内容"
+    print("验证通过: subprocess.run()正确捕获了子进程的标准输出与返回码。")
+
+
+def demo_subprocess_check_true() -> None:
+    """
+    演示check=True参数: 子进程返回非0退出码时, 主动抛出
+    CalledProcessError异常, 而不是让调用方自己再去判断returncode是否为0。
+    """
+    print_section("演示二: subprocess.run(check=True) —— 失败时主动抛异常")
+
+    failing_script = "import sys; sys.exit(1)"
+
+    result_without_check = subprocess.run(
+        [sys.executable, "-c", failing_script], capture_output=True, text=True
+    )
+    print(f"不加check参数时, 子进程失败后仍正常返回, returncode={result_without_check.returncode}")
+    assert result_without_check.returncode == 1
+
+    try:
+        subprocess.run([sys.executable, "-c", failing_script], check=True)
+        assert False, "check=True时, 子进程返回非0退出码理应抛出异常, 这一行不该被执行到"
+    except subprocess.CalledProcessError as error:
+        print(f"加了check=True参数后, 正确抛出了异常: {error}")
+        assert error.returncode == 1
+
+    print("验证通过: check=True能让'外部命令是否执行成功'这件事, 用标准的异常处理流程来对待,")
+    print("而不需要每次调用之后, 都手动写一句if result.returncode != 0的兜底判断。")
+
+
+def demo_subprocess_timeout() -> None:
+    """
+    演示subprocess的timeout参数: 外部命令如果卡住不返回(比如遇到网络
+    请求超时、死循环), 不加超时控制会让整个批处理流程被一个子进程
+    无限期地拖住, timeout参数能强制在指定时间后放弃等待并抛出异常。
+    """
+    print_section("演示三: subprocess的timeout超时控制")
+
+    slow_script = "import time; time.sleep(5)"
+
+    try:
+        subprocess.run([sys.executable, "-c", slow_script], timeout=0.5)
+        assert False, "子进程运行时间超过timeout设定值, 理应抛出TimeoutExpired异常, 这一行不该被执行到"
+    except subprocess.TimeoutExpired as error:
+        print(f"子进程运行超时, 正确抛出了异常: {error}")
+
+    print("验证通过: timeout参数能防止一个卡死的外部命令, 无限期地拖住整个批处理流程。")
+    print("苍穹平台的批处理任务里, 任何涉及调用外部命令或者外部服务的地方, 都应该设置合理的超时时间。")
+
+
+def demo_subprocess_input_and_pipe() -> None:
+    """
+    演示如何向子进程的标准输入传递数据, 并获取它处理后的标准输出——
+    这是模拟"调用一个外部文本处理工具"的常见用法(比如某些命令行压缩、
+    转码、格式转换工具, 都支持从标准输入读数据、往标准输出写结果)。
+    """
+    print_section("演示四: 向子进程传递标准输入, 并读取处理结果")
+
+    # 用一个简单的Python脚本模拟"外部文本处理工具": 读取标准输入, 把每一行转成大写后输出
+    uppercase_script = (
+        "import sys\n"
+        "for line in sys.stdin:\n"
+        "    sys.stdout.write(line.upper())\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", uppercase_script],
+        input="hello cangqiong\nfault detected\n",
+        capture_output=True,
+        text=True,
+    )
+
+    print(f"子进程处理后的输出:\n{result.stdout}")
+    assert result.stdout == "HELLO CANGQIONG\nFAULT DETECTED\n"
+    print("验证通过: 通过input参数,可以把数据喂给子进程的标准输入,并从标准输出拿到处理结果,")
+    print("这种'管道式'调用方式,是Python与许多现有命令行工具协作的基础模式。")
+
+
+# ---------------------------------------------------------------------------
+# 第二部分: hashlib —— 计算文件内容的哈希指纹
+# ---------------------------------------------------------------------------
+
+
+def compute_file_hash(file_path: Path, algorithm: str = "sha256", chunk_size: int = 8192) -> str:
+    """
+    计算一份文件的哈希值(十六进制字符串形式)。
+
+    之所以用chunk_size分块读取, 而不是一次性read()整个文件内容,
+    是为了避免文件本身很大(比如几百MB的日志文件)时, 一次性把全部
+    内容读入内存造成不必要的内存压力——哈希算法本身天然支持"边读边算",
+    不需要先拿到完整内容才能开始计算。
+
+    :param file_path: 待计算哈希的文件路径
+    :param algorithm: 哈希算法名称, 默认使用sha256(安全性和速度的常见折中选择)
+    :param chunk_size: 每次读取的字节数
+    :return: 该文件内容对应的十六进制哈希字符串
+    """
+    hasher = hashlib.new(algorithm)
+    with file_path.open("rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def demo_hashlib_basic(work_dir: Path) -> None:
+    """演示hashlib的基础用法: 同样内容的两份文件(即使文件名不同), 哈希值应该完全一致。"""
+    print_section("演示五: hashlib —— 文件内容哈希指纹")
+
+    content = "设备型号XJ3200A使用说明书\n工作温度范围: -10到60摄氏度\n"
+
+    file_a = work_dir / "device_manual_v1.txt"
+    file_b = work_dir / "device_manual_renamed_copy.txt"  # 文件名不同, 但内容完全相同
+    file_c = work_dir / "device_manual_v2_updated.txt"    # 内容有细微差异
+
+    file_a.write_text(content, encoding="utf-8")
+    file_b.write_text(content, encoding="utf-8")
+    file_c.write_text(content + "\n补充说明: 已通过最新一次安全认证。\n", encoding="utf-8")
+
+    hash_a = compute_file_hash(file_a)
+    hash_b = compute_file_hash(file_b)
+    hash_c = compute_file_hash(file_c)
+
+    print(f"file_a的哈希值: {hash_a}")
+    print(f"file_b的哈希值: {hash_b}")
+    print(f"file_c的哈希值: {hash_c}")
+
+    assert hash_a == hash_b, "内容完全相同的两份文件(即使文件名不同), 哈希值应该完全一致"
+    assert hash_a != hash_c, "内容有差异的文件, 哈希值应该不同(即使只是多了一行文字)"
+    print("验证通过: 哈希值只与文件内容有关, 与文件名无关, 这正是判断'两份文件是否内容相同'的可靠依据。")
+
+    # 不同的哈希算法, 对同一份内容计算出的结果长度不同, 这里顺手对比一下md5和sha256
+    md5_hash = compute_file_hash(file_a, algorithm="md5")
+    sha256_hash = compute_file_hash(file_a, algorithm="sha256")
+    print(f"同一份文件, md5哈希长度: {len(md5_hash)}位, sha256哈希长度: {len(sha256_hash)}位")
+    assert len(md5_hash) == 32 and len(sha256_hash) == 64, \
+        "md5的十六进制哈希值理应是32位字符, sha256理应是64位字符"
+
+
+def demo_document_deduplication(work_dir: Path) -> None:
+    """
+    综合演示: 结合hashlib, 实现一个简化版的"文档去重"辅助函数——
+    扫描一个目录下的所有文件, 按内容哈希分组, 找出内容完全相同、
+    但文件名不同的重复文档, 这是doc_toolkit工具未来很可能会用到的一个
+    实用能力(避免同一份文档被误统计两次, 拉高关键词出现次数)。
+    """
+    print_section("演示六: 综合应用 —— 基于内容哈希的文档去重")
+
+    dedup_dir = work_dir / "dedup_playground"
+    dedup_dir.mkdir(exist_ok=True)
+
+    (dedup_dir / "report_final.txt").write_text("本季度设备巡检结果: 一切正常。\n", encoding="utf-8")
+    (dedup_dir / "report_final_副本.txt").write_text("本季度设备巡检结果: 一切正常。\n", encoding="utf-8")
+    (dedup_dir / "report_final_backup_2024.txt").write_text("本季度设备巡检结果: 一切正常。\n", encoding="utf-8")
+    (dedup_dir / "report_draft.txt").write_text("本季度设备巡检结果: 草稿, 尚未审核。\n", encoding="utf-8")
+
+    def find_duplicate_groups(directory: Path) -> list[list[Path]]:
+        """扫描目录下全部文件, 按内容哈希分组, 只返回"组内文件数大于1"的重复分组。"""
+        hash_to_paths: dict[str, list[Path]] = {}
+        for file_path in sorted(directory.iterdir()):
+            if not file_path.is_file():
+                continue
+            file_hash = compute_file_hash(file_path)
+            hash_to_paths.setdefault(file_hash, []).append(file_path)
+        return [paths for paths in hash_to_paths.values() if len(paths) > 1]
+
+    duplicate_groups = find_duplicate_groups(dedup_dir)
+    print(f"发现{len(duplicate_groups)}组内容重复的文档:")
+    for group in duplicate_groups:
+        print(f"  重复组: {[p.name for p in group]}")
+
+    assert len(duplicate_groups) == 1, "本次演示数据里应该恰好有一组重复文档(3份内容相同的报告)"
+    assert len(duplicate_groups[0]) == 3, "这一组重复文档应该包含3个文件"
+
+    report_draft_hash = compute_file_hash(dedup_dir / "report_draft.txt")
+    duplicate_hashes = {compute_file_hash(p) for p in duplicate_groups[0]}
+    assert report_draft_hash not in duplicate_hashes, "内容不同的草稿文件, 不应该被误判进重复分组里"
+    print("验证通过: 基于内容哈希的去重逻辑, 正确识别出了3份文件名不同但内容完全相同的重复文档,")
+    print("同时没有误伤内容不同的草稿文件——这正是'不能只靠文件名判断是否重复'这条设计原则的具体体现。")
+
+
+def run_all_demos() -> None:
+    """依次运行本文件中的全部演示, 使用临时目录避免污染当前工作目录。"""
+    work_dir = Path(tempfile.mkdtemp(prefix="subprocess_hashlib_demo_"))
+    try:
+        demo_subprocess_basic()
+        demo_subprocess_check_true()
+        demo_subprocess_timeout()
+        demo_subprocess_input_and_pipe()
+        demo_hashlib_basic(work_dir)
+        demo_document_deduplication(work_dir)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        print(f"\n已清理演示临时目录: {work_dir}")
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+### 文件十三:`configparser_argparse_demo.py`(configparser与argparse进阶——配置文件与命令行子命令)
+
+苏梦整理笔记时想到: 如果doc_toolkit的输入输出目录、关注关键词清单这些参数以后固定下来,每次都要在命令行里重新敲一遍会很麻烦,有没有办法写在配置文件里,命令行只在需要临时覆盖时才传参数? 老王给出的答案是标准库自带的configparser模块。苏梦顺手还练习了argparse的子命令(subparsers)与互斥参数组,模拟了doc_toolkit未来可能演进出的scan/dedup两个子命令。
+
+```python
+"""
+文件名: configparser_argparse_demo.py
+作者: 苏梦
+说明:
+    doc_toolkit/main.py里, 关注关键词清单、输入输出目录这些参数, 目前
+    都是通过argparse在每次运行时手动传入的。苏梦在整理今天的笔记时
+    想到一个问题: "如果这些参数以后固定下来, 每次都要在命令行里敲一遍
+    --input sample_docs --output reports, 有没有更省事的办法, 比如
+    写在一个配置文件里, 命令行只在需要临时覆盖某个参数的时候才传?"
+    老王给出的答案是标准库自带的configparser模块——它专门用于读写
+    ini风格的配置文件, 是很多传统命令行工具(包括Python自己的
+    setup.cfg、部分数据库客户端的配置)常用的配置文件格式。
+
+    本文件覆盖:
+    1. configparser的基础读写: 读取ini文件、按section和key取值、
+       类型转换(getint/getboolean等);
+    2. 配置文件与命令行参数的"合并优先级"设计——命令行传入的参数应该
+       覆盖配置文件里的默认值, 而不是反过来;
+    3. argparse的子命令(subparsers)用法, 模拟doc_toolkit未来可能
+       扩展出的"scan"(扫描)和"dedup"(去重)两个子命令;
+    4. argparse的mutually_exclusive_group, 演示"两个参数不能同时使用"
+       这种校验规则怎么用argparse原生能力表达, 而不需要手写if/else校验。
+"""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import shutil
+import tempfile
+from pathlib import Path
+
+
+def print_section(title: str) -> None:
+    print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
+
+
+# ---------------------------------------------------------------------------
+# 第一部分: configparser基础读写
+# ---------------------------------------------------------------------------
+
+
+SAMPLE_CONFIG_CONTENT = """
+[general]
+input_dir = sample_docs
+output_dir = reports
+top_n = 20
+
+[encoding]
+candidates = utf-8, gbk, gb18030
+strict_mode = false
+
+[keywords]
+focus_list = 故障, 异常, 维护, 检修, 更换, 巡检, 正常, 报警
+"""
+
+
+def demo_configparser_basic(work_dir: Path) -> None:
+    """演示configparser读取ini配置文件, 并按section/key取值, 包含类型转换。"""
+    print_section("演示一: configparser —— 读取ini风格配置文件")
+
+    config_path = work_dir / "doc_toolkit.ini"
+    config_path.write_text(SAMPLE_CONFIG_CONTENT, encoding="utf-8")
+
+    config = configparser.ConfigParser()
+    config.read(config_path, encoding="utf-8")
+
+    print(f"配置文件包含的section: {config.sections()}")
+    assert config.sections() == ["general", "encoding", "keywords"]
+
+    input_dir = config.get("general", "input_dir")
+    top_n = config.getint("general", "top_n")
+    strict_mode = config.getboolean("encoding", "strict_mode")
+
+    print(f"[general] input_dir = {input_dir!r}")
+    print(f"[general] top_n(整数类型) = {top_n!r}, 类型: {type(top_n).__name__}")
+    print(f"[encoding] strict_mode(布尔类型) = {strict_mode!r}, 类型: {type(strict_mode).__name__}")
+
+    assert input_dir == "sample_docs"
+    assert top_n == 20 and isinstance(top_n, int)
+    assert strict_mode is False and isinstance(strict_mode, bool)
+    print("验证通过: configparser的get/getint/getboolean, 分别正确完成了字符串到int/bool的类型转换。")
+
+    # ini格式本身没有"列表"这种数据类型, 团队约定用逗号分隔的字符串来表示列表,
+    # 读取后需要自己拆分并去除多余空格, 这是使用configparser时一个常见的实践模式
+    candidates_raw = config.get("encoding", "candidates")
+    candidates_list = [item.strip() for item in candidates_raw.split(",")]
+    print(f"[encoding] candidates原始字符串: {candidates_raw!r}")
+    print(f"手动拆分后的列表: {candidates_list}")
+    assert candidates_list == ["utf-8", "gbk", "gb18030"]
+
+
+def demo_configparser_fallback_and_defaults(work_dir: Path) -> None:
+    """
+    演示configparser对"配置项缺失"的处理方式: 可以指定fallback默认值,
+    避免因为某个配置文件里漏写了一项, 就直接抛出NoOptionError导致程序崩溃。
+    """
+    print_section("演示二: configparser —— 缺失配置项的fallback默认值")
+
+    minimal_config_content = "[general]\ninput_dir = sample_docs\n"
+    config_path = work_dir / "minimal.ini"
+    config_path.write_text(minimal_config_content, encoding="utf-8")
+
+    config = configparser.ConfigParser()
+    config.read(config_path, encoding="utf-8")
+
+    try:
+        config.get("general", "output_dir")
+        assert False, "配置文件里没有写output_dir, 不加fallback理应抛出异常, 这一行不该被执行到"
+    except configparser.NoOptionError as error:
+        print(f"直接get()一个不存在的配置项, 正确抛出了异常: {error}")
+
+    output_dir_with_fallback = config.get("general", "output_dir", fallback="reports")
+    top_n_with_fallback = config.getint("general", "top_n", fallback=20)
+
+    print(f"用fallback参数取值: output_dir={output_dir_with_fallback!r}, top_n={top_n_with_fallback!r}")
+    assert output_dir_with_fallback == "reports"
+    assert top_n_with_fallback == 20
+    print("验证通过: fallback参数能让配置文件里'可选、允许缺省'的配置项, 优雅地拿到一个合理的默认值。")
+
+
+def demo_config_and_cli_priority_merge(work_dir: Path) -> None:
+    """
+    演示"配置文件默认值 + 命令行参数覆盖"这一常见的参数合并优先级设计:
+    命令行没有显式传入某个参数时, 使用配置文件里的值; 一旦命令行显式
+    传入了, 应该以命令行的值为准, 这是绝大多数成熟命令行工具的标准行为。
+    """
+    print_section("演示三: 配置文件默认值与命令行参数的合并优先级")
+
+    config_path = work_dir / "doc_toolkit.ini"
+    config_path.write_text(SAMPLE_CONFIG_CONTENT, encoding="utf-8")
+    config = configparser.ConfigParser()
+    config.read(config_path, encoding="utf-8")
+
+    def resolve_effective_top_n(cli_value: int | None) -> int:
+        """如果命令行显式传入了--top-n, 优先使用命令行的值; 否则回退到配置文件里的值。"""
+        if cli_value is not None:
+            return cli_value
+        return config.getint("general", "top_n", fallback=20)
+
+    effective_when_not_specified = resolve_effective_top_n(None)
+    effective_when_specified = resolve_effective_top_n(50)
+
+    print(f"命令行未指定--top-n时, 生效值: {effective_when_not_specified}(来自配置文件)")
+    print(f"命令行指定--top-n=50时, 生效值: {effective_when_specified}(来自命令行, 覆盖了配置文件)")
+
+    assert effective_when_not_specified == 20
+    assert effective_when_specified == 50
+    print("验证通过: 命令行参数优先级高于配置文件默认值, 且不传参数时能正确回退到配置文件里的设定。")
+
+
+# ---------------------------------------------------------------------------
+# 第二部分: argparse子命令(subparsers)与互斥参数组
+# ---------------------------------------------------------------------------
+
+
+def build_cli_parser_with_subcommands() -> argparse.ArgumentParser:
+    """
+    构建一个带子命令的命令行解析器, 模拟doc_toolkit未来可能演进出的形态:
+        python -m doc_toolkit scan --input sample_docs --output reports
+        python -m doc_toolkit dedup --input sample_docs --strategy keep-first
+
+    子命令(subparsers)的价值在于: 不同子命令可以拥有各自独立的参数集合,
+    而不需要把所有参数堆到一个平铺的列表里, 再靠程序内部的if/else去判断
+    "用户到底想做哪件事", 这在命令行工具的功能逐渐变多之后, 可维护性
+    差异会非常明显。
+    """
+    parser = argparse.ArgumentParser(prog="doc_toolkit", description="批量文档处理工具集")
+    subparsers = parser.add_subparsers(dest="command", required=True, help="要执行的子命令")
+
+    scan_parser = subparsers.add_parser("scan", help="扫描目录并统计关键词")
+    scan_parser.add_argument("--input", type=str, default="sample_docs")
+    scan_parser.add_argument("--output", type=str, default="reports")
+    scan_parser.add_argument("--top-n", type=int, default=20)
+
+    dedup_parser = subparsers.add_parser("dedup", help="扫描目录并检测重复文档")
+    dedup_parser.add_argument("--input", type=str, default="sample_docs")
+
+    # 互斥参数组: --keep-first和--keep-last不能同时指定, argparse会在解析阶段
+    # 自动校验并报错, 不需要在业务代码里手写"如果两个都传了就raise"这样的判断逻辑
+    strategy_group = dedup_parser.add_mutually_exclusive_group()
+    strategy_group.add_argument("--keep-first", action="store_true", help="重复文档中保留最先扫描到的一份(默认行为)")
+    strategy_group.add_argument("--keep-last", action="store_true", help="重复文档中保留最后扫描到的一份")
+
+    return parser
+
+
+def demo_argparse_subcommands() -> None:
+    """演示子命令解析: 相同的parser对象, 根据不同的子命令, 解析出结构不同的参数集合。"""
+    print_section("演示四: argparse子命令(subparsers)")
+
+    parser = build_cli_parser_with_subcommands()
+
+    scan_args = parser.parse_args(["scan", "--input", "my_docs", "--top-n", "30"])
+    print(f"scan子命令解析结果: command={scan_args.command}, input={scan_args.input}, top_n={scan_args.top_n}")
+    assert scan_args.command == "scan"
+    assert scan_args.input == "my_docs"
+    assert scan_args.top_n == 30
+    assert not hasattr(scan_args, "keep_first"), "scan子命令不应该识别dedup子命令独有的参数"
+
+    dedup_args = parser.parse_args(["dedup", "--input", "my_docs", "--keep-last"])
+    print(f"dedup子命令解析结果: command={dedup_args.command}, input={dedup_args.input}, keep_last={dedup_args.keep_last}")
+    assert dedup_args.command == "dedup"
+    assert dedup_args.keep_last is True
+    assert dedup_args.keep_first is False
+    print("验证通过: 同一个顶层parser, 根据子命令名称正确路由到了各自独立的参数定义。")
+
+
+def demo_argparse_mutually_exclusive_validation() -> None:
+    """演示互斥参数组: 同时传入两个互斥参数时, argparse会主动报错并退出, 而不需要业务代码自己校验。"""
+    print_section("演示五: argparse互斥参数组校验")
+
+    parser = build_cli_parser_with_subcommands()
+
+    try:
+        parser.parse_args(["dedup", "--input", "my_docs", "--keep-first", "--keep-last"])
+        assert False, "同时传入互斥的两个参数, argparse理应报错并退出, 这一行不该被执行到"
+    except SystemExit as exit_signal:
+        # argparse在参数校验失败时, 内部调用的是parser.error(), 它会打印错误信息到标准错误流,
+        # 然后调用sys.exit(2), 表现为抛出SystemExit异常, 这是argparse的标准错误处理约定
+        print(f"同时传入--keep-first和--keep-last, argparse正确触发了退出信号, 退出码: {exit_signal.code}")
+        assert exit_signal.code == 2, "argparse参数校验失败时, 约定的退出码是2"
+
+    print("验证通过: 互斥参数组能让'两个参数不能同时使用'这类校验规则, 完全交给argparse原生处理,")
+    print("不需要在业务代码里手写额外的if语句去做同样的事情。")
+
+
+def run_all_demos() -> None:
+    """依次运行本文件中的全部演示, 使用临时目录存放过程中生成的配置文件。"""
+    work_dir = Path(tempfile.mkdtemp(prefix="configparser_argparse_demo_"))
+    try:
+        demo_configparser_basic(work_dir)
+        demo_configparser_fallback_and_defaults(work_dir)
+        demo_config_and_cli_priority_merge(work_dir)
+        demo_argparse_subcommands()
+        demo_argparse_mutually_exclusive_validation()
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        print(f"\n已清理演示临时目录: {work_dir}")
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+### 综合实战补充:doc_toolkit包扩展——基于内容哈希的文档去重模块
+
+综合实战交付之后,老王在群里留了一个"选做"的补充需求: doc_toolkit工具目前对batch_result.succeeded里的每一条记录都直接参与关键词统计,如果同一份文档被不同的人从不同渠道各存了一份(文件名不同,内容完全相同),关键词会被重复计算两次,悄悄拉高它在报告里的权重。陈铭把上午学的hashlib用到了doc_toolkit包里,补上了第五个功能模块——dedup.py,基于内容哈希识别并剔除重复文档,同时补上了一份不依赖真实文件系统、可以被CI快速执行的单元测试。
+
+#### `doc_toolkit/dedup.py`
+
+```python
+"""
+模块名: doc_toolkit.dedup
+说明:
+    doc_toolkit包的第五个功能模块——文档去重。
+
+    背景: 老王在晚自习巡场时提了一个补充需求(对应课后作业里"选做"
+    的部分): "如果同一份文档被不同的人从不同渠道各存了一份, 文件名
+    可能完全不一样(比如'巡检记录.csv'和'巡检记录_张凡备份版.csv'),
+    但内容其实是一模一样的, 咱们现在的关键词统计, 会不会把这份文档的
+    关键词重复计算两次, 拉高了它在报告里的权重?" 答案是: 会的——
+    keyword_stats模块目前是对batch_result.succeeded里的每一条记录
+    都参与统计, 并不会做任何去重处理。
+
+    本模块基于文件内容的哈希指纹(而不是文件名或文件路径), 识别出
+    BatchReadResult.succeeded列表里"内容完全相同"的重复文档, 并提供
+    一个去重函数, 在统计之前先把重复文档过滤掉, 只保留每组重复文档
+    中的第一份, 避免同一份内容被多次计入关键词频率统计。
+"""
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass, field
+
+from .file_readers import BatchReadResult, DocumentRecord
+
+
+@dataclass
+class DuplicateGroup:
+    """
+    一组内容完全相同的重复文档。
+
+    :ivar content_hash: 这组文档内容对应的哈希指纹
+    :ivar records: 属于这一组的全部文档记录(按扫描到的先后顺序排列)
+    """
+
+    content_hash: str
+    records: list[DocumentRecord] = field(default_factory=list)
+
+    @property
+    def kept_record(self) -> DocumentRecord:
+        """按约定, 一组重复文档里, 保留最先被扫描到的那一份作为"代表记录"。"""
+        return self.records[0]
+
+    @property
+    def discarded_records(self) -> list[DocumentRecord]:
+        """这一组里除了"代表记录"之外, 其余应该被去重掉的记录。"""
+        return self.records[1:]
+
+
+def compute_content_hash(record: DocumentRecord, algorithm: str = "sha256") -> str:
+    """
+    计算一条文档记录的内容哈希指纹。
+
+    这里选择基于`record.raw_text`(而不是原始文件的字节内容)来计算哈希,
+    是一个经过讨论后的设计取舍: raw_text是file_readers模块已经完成
+    编码探测与解码之后的"标准化文本", 即使两份原始文件使用了不同的
+    编码保存(比如一份是UTF-8, 另一份是GBK), 只要解码后的文字内容
+    完全相同, 就应该被判定为重复文档——这比直接对原始字节做哈希更贴近
+    "内容层面是否重复"这个业务语义, 而不是"字节层面是否重复"。
+
+    :param record: 待计算哈希的文档记录
+    :param algorithm: 哈希算法名称, 默认sha256
+    :return: 十六进制哈希字符串
+    """
+    hasher = hashlib.new(algorithm)
+    hasher.update(record.raw_text.encode("utf-8"))
+    return hasher.hexdigest()
+
+
+def find_duplicate_groups(records: list[DocumentRecord]) -> list[DuplicateGroup]:
+    """
+    在一批文档记录中, 找出内容完全相同的重复分组。
+
+    :param records: 待检测的文档记录列表, 通常是BatchReadResult.succeeded
+    :return: 重复分组列表, 只包含"组内记录数大于1"的分组, 且分组内部保持
+        原始扫描顺序; 如果没有任何重复, 返回空列表
+    """
+    hash_to_group: dict[str, DuplicateGroup] = {}
+    for record in records:
+        content_hash = compute_content_hash(record)
+        if content_hash not in hash_to_group:
+            hash_to_group[content_hash] = DuplicateGroup(content_hash=content_hash)
+        hash_to_group[content_hash].records.append(record)
+
+    return [group for group in hash_to_group.values() if len(group.records) > 1]
+
+
+def deduplicate_records(records: list[DocumentRecord]) -> tuple[list[DocumentRecord], list[DuplicateGroup]]:
+    """
+    对一批文档记录做去重: 每一组重复文档只保留第一份, 其余标记为被丢弃。
+
+    :param records: 待去重的文档记录列表
+    :return: 二元组(去重后的记录列表, 全部重复分组信息), 去重后的记录列表
+        保持原始扫描顺序不变, 只是从中剔除了每组重复文档中多余的部分
+    """
+    duplicate_groups = find_duplicate_groups(records)
+
+    # 用id()而不是相等性比较, 是因为DocumentRecord是dataclass但没有定义__eq__的特殊逻辑,
+    # 默认的dataclass相等性比较是"逐字段比较值", 两条file_path不同但raw_text相同的记录,
+    # 用==比较会得到False(因为file_path不同), 但我们这里明确需要的是"对象身份"层面的排除,
+    # 即"这个具体的DocumentRecord对象, 是不是应该从最终结果里剔除掉"
+    discarded_ids = {
+        id(discarded_record)
+        for group in duplicate_groups
+        for discarded_record in group.discarded_records
+    }
+
+    deduplicated = [record for record in records if id(record) not in discarded_ids]
+    return deduplicated, duplicate_groups
+
+
+def deduplicate_batch_result(batch_result: BatchReadResult) -> tuple[BatchReadResult, list[DuplicateGroup]]:
+    """
+    对一次完整的批量读取结果做去重, 只处理succeeded部分
+    (failed部分本身就是读取失败的记录, 不存在"内容重复"的问题)。
+
+    :param batch_result: file_readers.read_documents_from_dir()的返回结果
+    :return: 二元组(去重后的新BatchReadResult, 全部重复分组信息)
+    """
+    deduplicated_succeeded, duplicate_groups = deduplicate_records(batch_result.succeeded)
+    new_batch_result = BatchReadResult(succeeded=deduplicated_succeeded, failed=list(batch_result.failed))
+    return new_batch_result, duplicate_groups
+
+
+def format_duplicate_report(duplicate_groups: list[DuplicateGroup]) -> str:
+    """
+    把重复分组信息, 整理成一份适合打印到终端或者写入报告文件的文字描述。
+
+    :param duplicate_groups: find_duplicate_groups()或deduplicate_records()
+        返回的重复分组列表
+    :return: 多行文字描述, 如果没有任何重复, 返回一句说明性文字
+    """
+    if not duplicate_groups:
+        return "本次扫描未发现内容重复的文档。"
+
+    lines = [f"本次扫描发现{len(duplicate_groups)}组内容重复的文档:"]
+    for index, group in enumerate(duplicate_groups, start=1):
+        kept_name = group.kept_record.file_path.name
+        discarded_names = [record.file_path.name for record in group.discarded_records]
+        lines.append(
+            f"  第{index}组(哈希前8位: {group.content_hash[:8]}): "
+            f"保留《{kept_name}》, 剔除{discarded_names}"
+        )
+    return "\n".join(lines)
+```
+
+#### `test_doc_toolkit_dedup.py`(dedup模块单元测试)
+
+陈铭把这份测试放在项目根目录下(与doc_toolkit包同级),全程用内存中构造的DocumentRecord对象,不创建任何真实文件,跑完全部用例只需要几毫秒。
+
+```python
+"""
+文件名: test_doc_toolkit_dedup.py
+作者: 陈铭
+说明:
+    针对doc_toolkit.dedup模块(文档去重)编写的单元测试, 覆盖以下场景:
+    1. 完全没有重复文档时, find_duplicate_groups应该返回空列表;
+    2. 存在一组重复文档时, 能正确识别出重复分组, 且保留顺序符合约定
+       (保留最先扫描到的那一份);
+    3. deduplicate_records去重后的记录列表, 长度与内容都符合预期;
+    4. deduplicate_batch_result对failed列表应该原样保留, 不受succeeded
+       部分去重逻辑的影响;
+    5. format_duplicate_report在"有重复"和"无重复"两种场景下, 都能生成
+       合理的文字描述。
+
+    苍穹平台的测试规范要求: 单元测试不依赖真实文件系统读写(除非测试的
+    目标本身就是"文件系统交互逻辑"), 本文件全程使用内存中构造的
+    DocumentRecord对象, 不创建任何真实文件, 保证测试运行速度与隔离性。
+
+    运行方式(需要doc_toolkit包在同一个项目目录下):
+        python -m unittest test_doc_toolkit_dedup.py -v
+"""
+
+from __future__ import annotations
+
+import unittest
+from pathlib import Path
+
+from doc_toolkit.dedup import (
+    DuplicateGroup,
+    compute_content_hash,
+    deduplicate_batch_result,
+    deduplicate_records,
+    find_duplicate_groups,
+    format_duplicate_report,
+)
+from doc_toolkit.file_readers import BatchReadResult, DocumentRecord
+
+
+def make_record(name: str, raw_text: str, file_type: str = "txt") -> DocumentRecord:
+    """测试辅助函数: 快速构造一条DocumentRecord, 不涉及任何真实文件系统操作。"""
+    return DocumentRecord(file_path=Path(name), file_type=file_type, raw_text=raw_text, structured_data=None)
+
+
+class ComputeContentHashTests(unittest.TestCase):
+    """针对compute_content_hash函数的行为验证。"""
+
+    def test_same_text_produces_same_hash(self):
+        record_a = make_record("a.txt", "设备巡检结果: 正常")
+        record_b = make_record("b.txt", "设备巡检结果: 正常")
+        self.assertEqual(compute_content_hash(record_a), compute_content_hash(record_b))
+
+    def test_different_text_produces_different_hash(self):
+        record_a = make_record("a.txt", "设备巡检结果: 正常")
+        record_b = make_record("b.txt", "设备巡检结果: 异常")
+        self.assertNotEqual(compute_content_hash(record_a), compute_content_hash(record_b))
+
+    def test_hash_ignores_file_path_and_file_type(self):
+        """哈希值应该只取决于raw_text, 与file_path、file_type无关。"""
+        record_a = make_record("report_a.csv", "相同内容", file_type="csv")
+        record_b = make_record("report_b.json", "相同内容", file_type="json")
+        self.assertEqual(compute_content_hash(record_a), compute_content_hash(record_b))
+
+
+class FindDuplicateGroupsTests(unittest.TestCase):
+    """针对find_duplicate_groups函数的行为验证。"""
+
+    def test_no_duplicates_returns_empty_list(self):
+        records = [
+            make_record("a.txt", "内容A"),
+            make_record("b.txt", "内容B"),
+            make_record("c.txt", "内容C"),
+        ]
+        self.assertEqual(find_duplicate_groups(records), [])
+
+    def test_single_duplicate_group_detected(self):
+        records = [
+            make_record("report_final.txt", "本季度巡检结果正常"),
+            make_record("report_final_副本.txt", "本季度巡检结果正常"),
+            make_record("report_draft.txt", "草稿, 未审核"),
+        ]
+        groups = find_duplicate_groups(records)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0].records), 2)
+
+    def test_multiple_independent_duplicate_groups(self):
+        records = [
+            make_record("a1.txt", "内容甲"),
+            make_record("b1.txt", "内容乙"),
+            make_record("a2.txt", "内容甲"),
+            make_record("b2.txt", "内容乙"),
+            make_record("c1.txt", "内容丙"),
+        ]
+        groups = find_duplicate_groups(records)
+        self.assertEqual(len(groups), 2, "应该识别出'内容甲'和'内容乙'两组独立的重复")
+        group_sizes = sorted(len(g.records) for g in groups)
+        self.assertEqual(group_sizes, [2, 2])
+
+    def test_group_preserves_original_scan_order(self):
+        records = [
+            make_record("first.txt", "重复内容"),
+            make_record("second.txt", "重复内容"),
+            make_record("third.txt", "重复内容"),
+        ]
+        groups = find_duplicate_groups(records)
+        self.assertEqual(len(groups), 1)
+        scanned_names = [r.file_path.name for r in groups[0].records]
+        self.assertEqual(scanned_names, ["first.txt", "second.txt", "third.txt"], "分组内部应该保持原始扫描顺序")
+
+
+class DuplicateGroupPropertiesTests(unittest.TestCase):
+    """针对DuplicateGroup的kept_record/discarded_records属性的行为验证。"""
+
+    def test_kept_record_is_the_first_scanned(self):
+        group = DuplicateGroup(
+            content_hash="fakehash",
+            records=[make_record("first.txt", "x"), make_record("second.txt", "x")],
+        )
+        self.assertEqual(group.kept_record.file_path.name, "first.txt")
+
+    def test_discarded_records_excludes_the_kept_one(self):
+        group = DuplicateGroup(
+            content_hash="fakehash",
+            records=[make_record("first.txt", "x"), make_record("second.txt", "x"), make_record("third.txt", "x")],
+        )
+        discarded_names = [r.file_path.name for r in group.discarded_records]
+        self.assertEqual(discarded_names, ["second.txt", "third.txt"])
+
+
+class DeduplicateRecordsTests(unittest.TestCase):
+    """针对deduplicate_records函数的行为验证。"""
+
+    def test_dedup_removes_extra_copies_but_keeps_first(self):
+        records = [
+            make_record("report_final.txt", "重复内容"),
+            make_record("report_final_backup.txt", "重复内容"),
+            make_record("report_draft.txt", "草稿内容"),
+        ]
+        deduplicated, groups = deduplicate_records(records)
+
+        self.assertEqual(len(deduplicated), 2, "3条记录里有2条重复, 去重后应该剩2条")
+        remaining_names = [r.file_path.name for r in deduplicated]
+        self.assertEqual(remaining_names, ["report_final.txt", "report_draft.txt"], "应该保留最先扫描到的那一份, 且相对顺序不变")
+        self.assertEqual(len(groups), 1)
+
+    def test_dedup_with_no_duplicates_returns_all_records_unchanged(self):
+        records = [make_record("a.txt", "A"), make_record("b.txt", "B")]
+        deduplicated, groups = deduplicate_records(records)
+        self.assertEqual(len(deduplicated), 2)
+        self.assertEqual(groups, [])
+
+    def test_dedup_with_all_records_identical(self):
+        records = [make_record(f"copy_{i}.txt", "完全相同的内容") for i in range(5)]
+        deduplicated, groups = deduplicate_records(records)
+        self.assertEqual(len(deduplicated), 1, "5份完全相同的记录去重后应该只剩1份")
+        self.assertEqual(deduplicated[0].file_path.name, "copy_0.txt")
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0].records), 5)
+
+
+class DeduplicateBatchResultTests(unittest.TestCase):
+    """针对deduplicate_batch_result函数的行为验证, 重点确认failed部分不受影响。"""
+
+    def test_failed_list_is_preserved_untouched(self):
+        batch_result = BatchReadResult(
+            succeeded=[make_record("a.txt", "内容A"), make_record("a_copy.txt", "内容A")],
+            failed=[{"file_path": "broken.txt", "error": "解码失败", "error_type": "DecodeFailedError"}],
+        )
+        new_batch_result, groups = deduplicate_batch_result(batch_result)
+
+        self.assertEqual(len(new_batch_result.succeeded), 1, "succeeded部分应该被去重")
+        self.assertEqual(new_batch_result.failed, batch_result.failed, "failed部分应该原样保留, 不受succeeded去重逻辑影响")
+        self.assertEqual(len(groups), 1)
+
+    def test_original_batch_result_is_not_mutated(self):
+        """验证deduplicate_batch_result不会修改传入的原始batch_result对象, 而是返回一个新对象。"""
+        original_records = [make_record("a.txt", "重复内容"), make_record("b.txt", "重复内容")]
+        batch_result = BatchReadResult(succeeded=original_records, failed=[])
+
+        new_batch_result, _ = deduplicate_batch_result(batch_result)
+
+        self.assertEqual(len(batch_result.succeeded), 2, "原始batch_result.succeeded不应该被就地修改")
+        self.assertEqual(len(new_batch_result.succeeded), 1, "返回的新对象才是去重后的结果")
+
+
+class FormatDuplicateReportTests(unittest.TestCase):
+    """针对format_duplicate_report函数的行为验证。"""
+
+    def test_no_duplicates_message(self):
+        report = format_duplicate_report([])
+        self.assertIn("未发现", report)
+
+    def test_report_mentions_kept_and_discarded_file_names(self):
+        records = [make_record("report_final.txt", "重复内容"), make_record("report_final_副本.txt", "重复内容")]
+        _, groups = deduplicate_records(records)
+        report = format_duplicate_report(groups)
+
+        self.assertIn("report_final.txt", report)
+        self.assertIn("report_final_副本.txt", report)
+        self.assertIn("1组", report)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+```
+
 ---
 
 ## 今日复盘
