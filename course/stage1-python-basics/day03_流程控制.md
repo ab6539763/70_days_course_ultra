@@ -2427,6 +2427,975 @@ print("全部6个检查点均已通过,Day3流程控制知识点掌握情况良�
 print("=" * 50)
 ```
 
+晚自习收尾前,老王照例过了一遍大家提交的代码,他多留了十分钟,布置了几份"加餐"练习,原话是:"你们今天写的东西,骨架都对,但我发现一个共同的现象——大部分人写完能跑的版本,就不再往下想了。真正的企业级代码,'能跑'只是及格线,'覆盖了多少种刁钻情况''换一个业务场景能不能直接套用这套思路',才是我们平时说的'代码质量'。接下来这几份练习,依然只允许用if/while/for/range/break/continue,不许用还没学过的列表、字典、函数,我想看看,只靠这几个最基础的工具,你们能把'覆盖面'做到多细。"
+
+### 文件12:`nested_conditions_business_scenarios.py` —— 嵌套条件业务场景加强练习
+
+```python
+"""
+文件名:nested_conditions_business_scenarios.py
+作者:陈铭
+说明:
+    老王加餐布置的嵌套条件练习,选取了三个更贴近真实业务的场景,
+    刻意比上午课堂上的"登录校验"例子更复杂一层,
+    目的是巩固"先判断大前提,再逐层深入判断细节"的嵌套思路,
+    同时练习"多个独立维度组合判断"时,嵌套写法和平铺写法该怎么取舍。
+    依然严格不使用函数、列表、字典,所有分支都用最朴素的if/elif/else实现。
+"""
+
+print("=" * 60)
+print("嵌套条件业务场景加强练习")
+print("=" * 60)
+
+# ============================================================
+# 场景一:阶梯运费计算器(嵌套条件 + 多档位判断)
+# ============================================================
+print("\n【场景一:阶梯运费计算器】")
+print("规则说明:")
+print("  - 黄金会员:订单满99元包邮,不满99元统一收10元运费")
+print("  - 普通会员:订单满199元包邮,不满199元但满99元收15元运费,不满99元收20元运费")
+
+member_level_1 = input("请输入会员等级(黄金会员/普通会员):")
+order_amount_1 = float(input("请输入订单金额:"))
+
+# 外层if:先按会员等级分成两条大路径,这是"大前提"
+if member_level_1 == "黄金会员":
+    # 内层:黄金会员内部,只需要再判断一次金额门槛
+    if order_amount_1 >= 99:
+        shipping_fee_1 = 0
+        print(f"黄金会员,订单{order_amount_1}元,已满99元包邮门槛,运费:{shipping_fee_1}元")
+    else:
+        shipping_fee_1 = 10
+        print(f"黄金会员,订单{order_amount_1}元,未满99元包邮门槛,运费:{shipping_fee_1}元")
+elif member_level_1 == "普通会员":
+    # 内层:普通会员的门槛更复杂,需要三档判断,天然适合再套一层if/elif/else
+    if order_amount_1 >= 199:
+        shipping_fee_1 = 0
+        print(f"普通会员,订单{order_amount_1}元,已满199元包邮门槛,运费:{shipping_fee_1}元")
+    elif order_amount_1 >= 99:
+        shipping_fee_1 = 15
+        print(f"普通会员,订单{order_amount_1}元,满99元但未满199元,运费:{shipping_fee_1}元")
+    else:
+        shipping_fee_1 = 20
+        print(f"普通会员,订单{order_amount_1}元,未满99元,运费:{shipping_fee_1}元")
+else:
+    # 兜底:会员等级输入不合法,给出明确提示,而不是让程序悄无声息地跑出一个错误结果
+    print(f"未识别的会员等级'{member_level_1}',请输入'黄金会员'或'普通会员'。")
+
+# ============================================================
+# 场景二:客服工单优先级分级(多维度嵌套判断)
+# ============================================================
+print("\n" + "-" * 60)
+print("【场景二:客服工单优先级分级】")
+print("规则说明:")
+print("  - 先看客户等级(VIP客户/普通客户),再看问题类型(系统故障/咨询类)")
+print("  - VIP客户的系统故障 -> P0(最高优先级,需要在15分钟内响应)")
+print("  - VIP客户的咨询类   -> P1(1小时内响应)")
+print("  - 普通客户的系统故障 -> P1(1小时内响应)")
+print("  - 普通客户的咨询类   -> P2(4小时内响应)")
+
+customer_level_2 = input("请输入客户等级(VIP客户/普通客户):")
+issue_type_2 = input("请输入问题类型(系统故障/咨询类):")
+
+if customer_level_2 == "VIP客户":
+    if issue_type_2 == "系统故障":
+        priority_2 = "P0"
+        response_time_2 = "15分钟内"
+    elif issue_type_2 == "咨询类":
+        priority_2 = "P1"
+        response_time_2 = "1小时内"
+    else:
+        priority_2 = "未知(问题类型输入有误)"
+        response_time_2 = "无法判定"
+elif customer_level_2 == "普通客户":
+    if issue_type_2 == "系统故障":
+        priority_2 = "P1"
+        response_time_2 = "1小时内"
+    elif issue_type_2 == "咨询类":
+        priority_2 = "P2"
+        response_time_2 = "4小时内"
+    else:
+        priority_2 = "未知(问题类型输入有误)"
+        response_time_2 = "无法判定"
+else:
+    priority_2 = "未知(客户等级输入有误)"
+    response_time_2 = "无法判定"
+
+print(f"判定结果:优先级 {priority_2},要求响应时限 {response_time_2}")
+
+# ============================================================
+# 场景三:季节性折扣叠加计算(嵌套条件 + and/or组合)
+# ============================================================
+print("\n" + "-" * 60)
+print("【场景三:季节性折扣叠加计算】")
+print("规则说明:")
+print("  - 如果是大促季节(输入'是'),且订单金额满500元,享受8折")
+print("  - 如果是大促季节但订单金额不满500元,享受9折")
+print("  - 如果不是大促季节,但是黄金会员且订单满300元,享受9折")
+print("  - 其余情况不打折(原价)")
+
+is_promotion_season_3 = input("当前是否是大促季节?(是/否):")
+order_amount_3 = float(input("请输入订单金额:"))
+member_level_3 = input("请输入会员等级(黄金会员/普通会员):")
+
+if is_promotion_season_3 == "是":
+    # 大促季节内部,只需要再看金额门槛
+    if order_amount_3 >= 500:
+        discount_3 = 0.8
+        print(f"大促季节,订单{order_amount_3}元,满500元,享受8折,折后价:{order_amount_3 * discount_3:.2f}元")
+    else:
+        discount_3 = 0.9
+        print(f"大促季节,订单{order_amount_3}元,未满500元,享受9折,折后价:{order_amount_3 * discount_3:.2f}元")
+else:
+    # 非大促季节,需要同时看会员等级和金额(and组合),这里用嵌套而不是长串and,可读性更好
+    if member_level_3 == "黄金会员":
+        if order_amount_3 >= 300:
+            discount_3 = 0.9
+            print(f"非大促季节,黄金会员,订单{order_amount_3}元,满300元,享受9折,折后价:{order_amount_3 * discount_3:.2f}元")
+        else:
+            discount_3 = 1.0
+            print(f"非大促季节,黄金会员,订单{order_amount_3}元,未满300元,原价:{order_amount_3 * discount_3:.2f}元")
+    else:
+        discount_3 = 1.0
+        print(f"非大促季节,非黄金会员,原价:{order_amount_3 * discount_3:.2f}元")
+
+print("\n" + "=" * 60)
+print("嵌套条件业务场景加强练习执行完毕。")
+print("=" * 60)
+```
+
+### 文件13:`loop_patterns_playground.py` —— 循环模式与经典数学问题练习场
+
+```python
+"""
+文件名:loop_patterns_playground.py
+作者:陈铭
+说明:
+    老王加餐布置的循环模式练习,覆盖以下经典问题(全部只用while/for/range实现,
+    不使用函数、列表、字典):
+    1. 拆解一个整数每一位数字之和(while + %/ //)
+    2. 统计一个整数有多少位(while)
+    3. 判断一个数是否是"水仙花数"(Armstrong Number,三位数版本)
+    4. 用欧几里得算法求两个数的最大公约数(GCD)与最小公倍数(LCM)
+    5. 打印菱形图案(嵌套for循环,巩固"内层循环范围依赖外层变量"的思路)
+    6. 用while实现斐波那契数列的前N项
+    7. 判断一个数是否是完全数(Perfect Number)
+"""
+
+print("=" * 60)
+print("循环模式与经典数学问题练习场")
+print("=" * 60)
+
+# ============================================================
+# 第一部分:计算一个整数各位数字之和
+# ============================================================
+print("\n【第一部分:计算各位数字之和】")
+
+digit_sum_source = 8749
+temp_for_digit_sum = digit_sum_source
+digit_sum_result = 0
+
+# 边界情况处理:如果输入是负数,先转成正数再处理,负号本身不参与数字求和
+if temp_for_digit_sum < 0:
+    temp_for_digit_sum = -temp_for_digit_sum
+
+while temp_for_digit_sum > 0:
+    current_digit = temp_for_digit_sum % 10   # 取最后一位数字
+    digit_sum_result = digit_sum_result + current_digit
+    temp_for_digit_sum = temp_for_digit_sum // 10   # 去掉最后一位,准备处理下一位
+
+print(f"数字{digit_sum_source},各位数字之和为:{digit_sum_result}")
+
+# 边界情况:数字本身是0
+zero_digit_sum_source = 0
+temp_zero = zero_digit_sum_source
+zero_digit_sum_result = 0
+while temp_zero > 0:
+    zero_digit_sum_result = zero_digit_sum_result + temp_zero % 10
+    temp_zero = temp_zero // 10
+print(f"边界情况:数字{zero_digit_sum_source},各位数字之和为:{zero_digit_sum_result}(0本身没有进入循环体,结果直接是初始值0)")
+
+# ============================================================
+# 第二部分:统计一个整数有多少位
+# ============================================================
+print("\n" + "-" * 60)
+print("【第二部分:统计整数位数】")
+
+digit_count_source = 20240520
+temp_for_count = digit_count_source
+if temp_for_count < 0:
+    temp_for_count = -temp_for_count
+
+digit_count_result = 0
+if temp_for_count == 0:
+    # 特殊边界:数字本身是0,应该算作1位,而不是0位(因为下面的while循环对0根本不会执行)
+    digit_count_result = 1
+else:
+    while temp_for_count > 0:
+        digit_count_result = digit_count_result + 1
+        temp_for_count = temp_for_count // 10
+
+print(f"数字{digit_count_source}共有{digit_count_result}位")
+
+digit_count_source_2 = 0
+print(f"边界情况:数字{digit_count_source_2}的位数按规则应判定为1位(因为0本身也算一位有效数字)")
+
+# ============================================================
+# 第三部分:判断水仙花数(Armstrong Number,三位数版本)
+# 定义:一个三位数,其每一位数字的三次方之和等于这个数本身,比如153 = 1^3+5^3+3^3
+# ============================================================
+print("\n" + "-" * 60)
+print("【第三部分:寻找100-999之间所有的水仙花数】")
+
+armstrong_found_count = 0
+for candidate in range(100, 1000):
+    hundreds_digit = candidate // 100          # 百位
+    tens_digit = (candidate // 10) % 10        # 十位
+    units_digit = candidate % 10               # 个位
+
+    digit_cube_sum = hundreds_digit ** 3 + tens_digit ** 3 + units_digit ** 3
+
+    if digit_cube_sum == candidate:
+        print(f"  找到水仙花数:{candidate}  ({hundreds_digit}^3 + {tens_digit}^3 + {units_digit}^3 = {digit_cube_sum})")
+        armstrong_found_count = armstrong_found_count + 1
+
+print(f"100-999之间共找到{armstrong_found_count}个水仙花数(标准答案应该是4个:153、370、371、407)")
+assert armstrong_found_count == 4, "水仙花数的数量应该是4个,请检查判断逻辑"
+
+# ============================================================
+# 第四部分:欧几里得算法求最大公约数(GCD)与最小公倍数(LCM)
+# ============================================================
+print("\n" + "-" * 60)
+print("【第四部分:最大公约数与最小公倍数】")
+
+gcd_num_a = 48
+gcd_num_b = 18
+original_a = gcd_num_a
+original_b = gcd_num_b
+
+# 欧几里得算法:反复用较大数对较小数取余,直到余数为0,此时较小数就是最大公约数
+temp_a = gcd_num_a
+temp_b = gcd_num_b
+while temp_b != 0:
+    remainder = temp_a % temp_b
+    temp_a = temp_b
+    temp_b = remainder
+
+gcd_result = temp_a
+# 最小公倍数 = 两数之积 除以 最大公约数(数学性质,不需要额外再写一套算法)
+lcm_result = (original_a * original_b) // gcd_result
+
+print(f"{original_a}和{original_b}的最大公约数是:{gcd_result}")
+print(f"{original_a}和{original_b}的最小公倍数是:{lcm_result}")
+assert gcd_result == 6, "48和18的最大公约数应该是6"
+assert lcm_result == 144, "48和18的最小公倍数应该是144"
+
+# ============================================================
+# 第五部分:打印菱形图案(嵌套for循环)
+# ============================================================
+print("\n" + "-" * 60)
+print("【第五部分:打印菱形图案(边长为5)】")
+
+diamond_size = 5
+
+# 上半部分(包含中线):从1个星号逐渐增加到9个星号(2*size-1)
+for i in range(1, diamond_size + 1):
+    space_count = diamond_size - i         # 左侧空格数量,随着行数增加逐渐减少
+    star_count = 2 * i - 1                 # 星号数量,按奇数规律递增:1,3,5,7,9
+
+    line_content = " " * space_count + "*" * star_count
+    print(line_content)
+
+# 下半部分(不包含中线,从倒数第二行开始往上收窄)
+for i in range(diamond_size - 1, 0, -1):
+    space_count = diamond_size - i
+    star_count = 2 * i - 1
+    line_content = " " * space_count + "*" * star_count
+    print(line_content)
+
+# ============================================================
+# 第六部分:用while实现斐波那契数列前N项
+# ============================================================
+print("\n" + "-" * 60)
+print("【第六部分:斐波那契数列前12项】")
+
+fib_count_target = 12
+fib_prev = 0
+fib_curr = 1
+fib_index = 0
+
+fib_sequence_text = ""   # 因为不能用列表,这里用字符串拼接的方式把结果"攒起来"展示
+while fib_index < fib_count_target:
+    fib_sequence_text = fib_sequence_text + str(fib_prev) + " "
+    fib_next = fib_prev + fib_curr
+    fib_prev = fib_curr
+    fib_curr = fib_next
+    fib_index = fib_index + 1
+
+print(f"斐波那契数列前{fib_count_target}项: {fib_sequence_text.strip()}")
+
+# ============================================================
+# 第七部分:判断完全数(Perfect Number)
+# 定义:一个正整数,如果它所有小于自身的正因数之和等于它本身,就是完全数,比如6 = 1+2+3
+# ============================================================
+print("\n" + "-" * 60)
+print("【第七部分:寻找1-10000之间的完全数】")
+
+perfect_number_found_count = 0
+for candidate in range(2, 10001):
+    factor_sum = 0
+    for possible_factor in range(1, candidate):
+        if candidate % possible_factor == 0:
+            factor_sum = factor_sum + possible_factor
+        # 小优化:一旦factor_sum已经超过candidate,继续往下找也不可能再等于candidate了,
+        # 可以直接break提前退出内层循环,避免无意义的重复计算(对大数字尤其有性能意义)
+        if factor_sum > candidate:
+            break
+
+    if factor_sum == candidate:
+        print(f"  找到完全数:{candidate}")
+        perfect_number_found_count = perfect_number_found_count + 1
+
+print(f"1-10000之间共找到{perfect_number_found_count}个完全数(标准答案应该是4个:6、28、496、8128)")
+assert perfect_number_found_count == 4, "1-10000之间的完全数应该是4个(6、28、496、8128)"
+
+print("\n" + "=" * 60)
+print("循环模式与经典数学问题练习场执行完毕。")
+print("=" * 60)
+```
+
+### 文件14:`guess_number_game_v4_extended_stats.py` —— 猜数字游戏(v4:扩展统计版)
+
+```python
+"""
+文件名:guess_number_game_v4_extended_stats.py
+作者:陈铭
+版本:v4(在v3企业风格进阶版基础上,进一步扩展统计维度)
+说明:
+    老王提出一个新的加餐要求:"如果我是产品经理,我还想知道用户猜测的
+    '效率'怎么样——猜的数字有没有越来越接近答案,还是完全在瞎猜?"
+    这一版新增以下统计维度,依然只用变量记录,不使用列表:
+    1. 记录本局猜过的"最接近答案的一次距离"(绝对差值最小的一次)。
+    2. 记录本局第一次猜测的数字与答案的距离,和最后一次猜测的距离对比,
+       粗略判断"用户是不是越猜越接近"。
+    3. 增加一个简化版的"折半猜测法"效率评分——如果用户的平均猜测距离
+       下降趋势明显,给出"猜测策略高效"的评价,否则给出改进建议。
+"""
+
+import random
+
+print("=" * 50)
+print("欢迎来到猜数字游戏(v4:扩展统计版)")
+print("=" * 50)
+
+answer = random.randint(1, 100)
+max_attempts = 8
+attempts = 0
+
+# ------------------------------------------------------------------
+# 统计相关的状态变量,全部在循环开始前初始化
+# ------------------------------------------------------------------
+is_win = False
+closest_distance = 101          # 初始值设为一个不可能出现的大数(比101大的距离不存在,因为范围是1-100)
+first_guess_distance = -1       # -1表示"还没有记录过第一次的距离",用一个不会自然出现的值当作"哨兵"
+last_guess_distance = -1
+total_distance_sum = 0          # 用于后续计算平均距离
+
+print(f"我已经想好了一个1到100之间的整数,你有{max_attempts}次机会!")
+
+while attempts < max_attempts:
+    remaining = max_attempts - attempts
+    guess = int(input(f"（剩余{remaining}次机会)请输入你猜的数字:"))
+    attempts = attempts + 1
+
+    # 计算本次猜测与答案的绝对距离,abs()是内置函数,用来取绝对值,今天第一次正式使用它
+    current_distance = abs(guess - answer)
+    total_distance_sum = total_distance_sum + current_distance
+
+    # 记录第一次猜测的距离(只在attempts等于1的时候记录一次)
+    if attempts == 1:
+        first_guess_distance = current_distance
+
+    # 持续更新"最接近答案的一次距离"
+    if current_distance < closest_distance:
+        closest_distance = current_distance
+
+    # 每一次猜测都更新"最后一次的距离",循环结束后,它自然就是最后一次的值
+    last_guess_distance = current_distance
+
+    if guess == answer:
+        is_win = True
+        print(f"恭喜你,猜中了!一共用了{attempts}次机会。")
+        break
+    elif guess > answer:
+        print(f"猜大了,再试试(本次距离答案还差{current_distance})")
+    else:
+        print(f"猜小了,再试试(本次距离答案还差{current_distance})")
+else:
+    print(f"很遗憾,{max_attempts}次机会都已用完,正确答案是{answer}。")
+
+# ------------------------------------------------------------------
+# 打印扩展统计报告
+# ------------------------------------------------------------------
+print("\n----- 本局扩展统计报告 -----")
+print("是否猜中:", is_win)
+print("实际使用次数:", attempts)
+print("最接近答案的一次距离:", closest_distance)
+print("第一次猜测的距离:", first_guess_distance)
+print("最后一次(或猜中那一次)猜测的距离:", last_guess_distance)
+
+# 平均距离计算:这里用attempts作为除数,因为attempts在循环结束后,
+# 记录的正是"实际发生过的猜测次数",不会是0(至少会猜一次),所以不需要额外防0处理
+average_distance = total_distance_sum / attempts
+print(f"平均每次猜测与答案的距离:{average_distance:.2f}")
+
+# 效率评价:比较第一次距离和最后一次距离,粗略判断用户是不是"越猜越准"
+print("\n----- 猜测策略评价 -----")
+if is_win and attempts == 1:
+    print("你第一次就直接猜中了,运气非常好,暂时无法评价'策略',因为只有一个数据点。")
+elif first_guess_distance > last_guess_distance:
+    print("整体趋势:你的猜测距离在逐渐缩小,说明你的判断和调整策略是有效的。")
+    if average_distance <= 15:
+        print("评价:猜测策略效率较高,继续保持。")
+    else:
+        print("评价:整体方向是对的,但平均距离仍然偏大,建议尝试'折半猜测法'——")
+        print("      每次猜当前可能范围的中间值,能更快收窄范围。")
+elif first_guess_distance == last_guess_distance:
+    print("整体趋势:距离没有明显变化,可能第一次就已经很接近,或者猜测比较随意。")
+else:
+    print("整体趋势:最后一次的距离反而比第一次更远,建议猜测时更多参考'猜大了/猜小了'的提示,")
+    print("          而不是每次都天马行空地猜一个新的数字。")
+
+print("\n" + "=" * 50)
+print("游戏结束,感谢参与。")
+print("=" * 50)
+```
+
+### 文件15:`common_errors_control_flow_extended.py` —— 流程控制常见报错案例集(加强版)
+
+```python
+"""
+文件名:common_errors_control_flow_extended.py
+作者:陈铭
+说明:
+    在文件8`common_errors_control_flow.py`基础上,补充老王加餐时特别强调的
+    几类更隐蔽的报错和逻辑陷阱,依然遵循"错误示范用注释保留,修复后的代码
+    真实执行"的整理规范。这一批案例更偏向"嵌套循环里的break/continue作用范围"
+    和"for...else / while...else的误用"这两个新手进阶后容易犯的错误。
+"""
+
+print("=" * 60)
+print("流程控制常见报错案例集(加强版) —— Day3补充整理")
+print("=" * 60)
+
+# --------------------------------------------------------------------------
+# 案例8:嵌套循环里,break只能跳出它所在的那一层,常被误以为能跳出所有层
+# --------------------------------------------------------------------------
+print("\n【案例8:嵌套循环中break的作用范围被误解】")
+
+# 错误的心理预期示范:很多新手以为下面这段代码,一旦内层break触发,
+# 外层循环也会立刻停止,但实际上外层循环会继续往下走
+print("错误的心理预期(误以为找到target后,整个嵌套循环都会停止):")
+target_case8 = 6
+found_case8_wrong_expectation = False
+for outer_i in range(1, 4):
+    for inner_j in range(1, 4):
+        if outer_i * inner_j == target_case8:
+            print(f"  在outer_i={outer_i}, inner_j={inner_j}时找到了target={target_case8}")
+            found_case8_wrong_expectation = True
+            break   # 这个break只会跳出内层for循环,外层for循环会继续执行下一个outer_i
+    # 注意:这一行是在外层循环体内,但在内层循环外面,证明外层循环确实还在继续
+    print(f"  (外层循环继续执行,当前outer_i={outer_i}已处理完毕)")
+
+print("说明:可以看到,即使已经找到了target,外层循环依然完整地跑完了所有的outer_i,")
+print("     这就是'break只作用于它所在的那一层'的真实效果。")
+
+# 正确的做法:如果确实需要"找到就完全停止所有层的循环",
+# 需要引入一个"哨兵变量",在外层循环的continue条件里也检查这个变量
+print("\n正确的做法(用一个哨兵变量控制外层循环提前退出):")
+found_case8_correct = False
+for outer_i in range(1, 4):
+    if found_case8_correct:
+        break   # 外层循环开头就检查哨兵变量,已经找到就直接跳出外层循环
+    for inner_j in range(1, 4):
+        if outer_i * inner_j == target_case8:
+            print(f"  在outer_i={outer_i}, inner_j={inner_j}时找到了target={target_case8},设置哨兵变量并跳出内层")
+            found_case8_correct = True
+            break
+
+print(f"哨兵变量最终状态: found_case8_correct = {found_case8_correct}")
+
+# --------------------------------------------------------------------------
+# 案例9:for...else被误以为"else会在每次循环后都执行一次"
+# --------------------------------------------------------------------------
+print("\n" + "-" * 60)
+print("【案例9:for...else的else执行时机被误解】")
+
+# 错误的心理预期:有些新手以为for循环的else,会在每一轮循环后都执行一次,
+# 类似于"每次循环完都做点什么",但实际上else只会在整个for循环"正常跑完、没有被break打断"时,
+# 执行一次,而不是每轮都执行
+print("验证:for...else的else只会在循环完全正常结束后执行一次,不是每轮都执行")
+
+execution_count_case9 = 0
+for i in range(1, 6):
+    print(f"  第{i}轮循环体执行")
+else:
+    execution_count_case9 = execution_count_case9 + 1
+    print("  else块被执行了(整个for循环没有被break打断)")
+
+print(f"else块总共被执行了{execution_count_case9}次(应该是1次,不是5次)")
+assert execution_count_case9 == 1, "for...else的else应该只在循环结束后执行一次"
+
+# 对比:如果循环中途被break打断,else不会被执行
+print("\n对比:如果循环中途被break打断,else不会执行")
+else_triggered_case9 = False
+for i in range(1, 6):
+    if i == 3:
+        print(f"  第{i}轮循环体执行,触发break")
+        break
+    print(f"  第{i}轮循环体执行")
+else:
+    else_triggered_case9 = True
+    print("  else块被执行了")
+
+print(f"else是否被触发: {else_triggered_case9}(应该是False,因为循环是被break打断的)")
+assert else_triggered_case9 is False, "被break打断的for循环,else不应该被执行"
+
+# --------------------------------------------------------------------------
+# 案例10:range()第三个参数(步长)为负数时,起始值必须大于终止值,否则得到空序列
+# --------------------------------------------------------------------------
+print("\n" + "-" * 60)
+print("【案例10:range()递减步长的方向搞反,导致得到空序列】")
+
+# 错误示范:想要从1递减到10(方向搞反了,起始值反而比终止值小)
+# 以下代码保留为注释,实际执行不会报错,但循环体一次都不会执行,是一个"安静的空转"
+# for i in range(1, 10, -1):
+#     print(i)
+# 现象:什么都不会打印,因为range(1, 10, -1)会产生一个空序列
+# 原因:步长是负数(递减),但起始值(1)却比终止值(10)还小,方向和步长矛盾,Python判定这是空区间
+
+loop_execution_count_case10 = 0
+for i in range(1, 10, -1):
+    loop_execution_count_case10 = loop_execution_count_case10 + 1
+
+print(f"range(1, 10, -1) 循环体实际执行次数: {loop_execution_count_case10}(应该是0,循环体完全没有执行)")
+assert loop_execution_count_case10 == 0, "方向和步长矛盾的range应该产生空序列"
+
+# 正确写法:想要从10递减到1,起始值要比终止值大,步长为负数
+print("正确写法:range(10, 0, -1),从10递减到1")
+correct_descending_text_case10 = ""
+for i in range(10, 0, -1):
+    correct_descending_text_case10 = correct_descending_text_case10 + str(i) + " "
+print(f"结果: {correct_descending_text_case10.strip()}")
+
+# --------------------------------------------------------------------------
+# 案例11:字符串比较代替数字比较,导致菜单排序或范围判断出现意料之外的结果
+# --------------------------------------------------------------------------
+print("\n" + "-" * 60)
+print("【案例11:忘记类型转换,用字符串比较代替数字比较】")
+
+# 错误示范:菜单编号本应该按数字大小比较,但如果忘记int()转换,会变成字符串比较
+menu_choice_str_case11 = "10"
+comparison_threshold_case11 = "9"
+
+wrong_comparison_case11 = menu_choice_str_case11 < comparison_threshold_case11
+print(f"字符串比较: '{menu_choice_str_case11}' < '{comparison_threshold_case11}' -> {wrong_comparison_case11}")
+print("(这个结果为True,是因为字符串按字符编码逐位比较,'1'的编码比'9'小,")
+print(" 但如果业务本意是比较'数字10'和'数字9'谁更大,这个结果明显是错的)")
+
+correct_comparison_case11 = int(menu_choice_str_case11) < int(comparison_threshold_case11)
+print(f"转换为数字后比较: {int(menu_choice_str_case11)} < {int(comparison_threshold_case11)} -> {correct_comparison_case11}")
+assert wrong_comparison_case11 is True, "字符串比较的结果应为True(用于演示对比,不代表业务正确)"
+assert correct_comparison_case11 is False, "数字比较后10不小于9,结果应为False"
+
+print("\n" + "=" * 60)
+print("以上4个加强版案例(案例8-11)覆盖了嵌套循环break作用范围、")
+print("for...else执行时机、range递减方向陷阱、字符串数字比较混淆四类进阶易错点。")
+print("=" * 60)
+```
+
+### 文件16:`leetcode_extra_practice_day3.py` —— LeetCode加餐练习(回文数变体、反转整数、完全数判断)
+
+```python
+"""
+文件名:leetcode_extra_practice_day3.py
+作者:陈铭
+说明:
+    老王额外布置的LeetCode加餐练习,选取了三道同样只需要if/while/for就能
+    完成的Easy/Medium难度题目,继续用"脚本+assert自测"的方式实现:
+    1. LeetCode 7 —— 整数反转(Reverse Integer),重点是"反转后可能超出
+       32位有符号整数范围"这个边界情况的处理。
+    2. 变式题:判断一个数是否是"完美数字"的简化版——判断一个数所有数位
+       是否严格递增(比如1234符合,1243不符合),用于巩固数位拆解的思路。
+    3. 变式题:统计一个正整数的二进制表示中,1的个数(不使用bin()字符串转换,
+       纯用位运算和循环实现,呼应Day2补充过的位运算知识)。
+"""
+
+print("=" * 60)
+print("LeetCode加餐练习 —— 整数反转、数位递增判断、二进制1的个数统计")
+print("=" * 60)
+
+# ============================================================
+# 第一题:LeetCode 7 —— 整数反转(Reverse Integer)
+# 题目描述:给一个32位有符号整数x,反转它的每一位数字,如果反转后的整数
+# 超出32位有符号整数的表示范围[-2^31, 2^31 - 1],则返回0。
+# ============================================================
+print("\n【第一题:整数反转】")
+
+INT_MAX_32BIT = 2 ** 31 - 1     # 2147483647
+INT_MIN_32BIT = -(2 ** 31)      # -2147483648
+
+# 测试用例1:普通正数反转
+x1 = 123
+is_negative_1 = (x1 < 0)
+abs_x1 = -x1 if is_negative_1 else x1   # 这里用了三元表达式,老王在Day2曾提前透露过这个语法糖用法
+
+reversed_value_1 = 0
+temp_1 = abs_x1
+while temp_1 > 0:
+    reversed_value_1 = reversed_value_1 * 10 + temp_1 % 10
+    temp_1 = temp_1 // 10
+
+if is_negative_1:
+    reversed_value_1 = -reversed_value_1
+
+if reversed_value_1 > INT_MAX_32BIT or reversed_value_1 < INT_MIN_32BIT:
+    reversed_value_1 = 0
+
+print(f"x = {x1}, 反转结果 = {reversed_value_1}(预期: 321)")
+assert reversed_value_1 == 321, "123反转应该是321"
+
+# 测试用例2:负数反转
+x2 = -456
+is_negative_2 = (x2 < 0)
+abs_x2 = -x2 if is_negative_2 else x2
+
+reversed_value_2 = 0
+temp_2 = abs_x2
+while temp_2 > 0:
+    reversed_value_2 = reversed_value_2 * 10 + temp_2 % 10
+    temp_2 = temp_2 // 10
+
+if is_negative_2:
+    reversed_value_2 = -reversed_value_2
+
+if reversed_value_2 > INT_MAX_32BIT or reversed_value_2 < INT_MIN_32BIT:
+    reversed_value_2 = 0
+
+print(f"x = {x2}, 反转结果 = {reversed_value_2}(预期: -654)")
+assert reversed_value_2 == -654, "-456反转应该是-654"
+
+# 测试用例3:末位为0,反转后位数变少
+x3 = 120
+is_negative_3 = (x3 < 0)
+abs_x3 = -x3 if is_negative_3 else x3
+
+reversed_value_3 = 0
+temp_3 = abs_x3
+while temp_3 > 0:
+    reversed_value_3 = reversed_value_3 * 10 + temp_3 % 10
+    temp_3 = temp_3 // 10
+
+if is_negative_3:
+    reversed_value_3 = -reversed_value_3
+
+print(f"x = {x3}, 反转结果 = {reversed_value_3}(预期: 21,前导0在反转后自然消失)")
+assert reversed_value_3 == 21, "120反转应该是21(前导0消失)"
+
+# 测试用例4:边界情况——反转后会超出32位整数范围,应该返回0
+x4 = 1534236469
+is_negative_4 = (x4 < 0)
+abs_x4 = -x4 if is_negative_4 else x4
+
+reversed_value_4 = 0
+temp_4 = abs_x4
+while temp_4 > 0:
+    reversed_value_4 = reversed_value_4 * 10 + temp_4 % 10
+    temp_4 = temp_4 // 10
+
+if is_negative_4:
+    reversed_value_4 = -reversed_value_4
+
+if reversed_value_4 > INT_MAX_32BIT or reversed_value_4 < INT_MIN_32BIT:
+    print(f"x = {x4}, 反转后数值为{reversed_value_4},超出32位整数范围,按题目要求返回0")
+    reversed_value_4 = 0
+else:
+    print(f"x = {x4}, 反转结果 = {reversed_value_4}")
+
+assert reversed_value_4 == 0, "1534236469反转后应超出32位范围,结果应为0"
+
+# 测试用例5:x本身是0
+x5 = 0
+reversed_value_5 = 0   # 0反转还是0,循环体一次都不会执行,初始值就是正确答案
+print(f"x = {x5}, 反转结果 = {reversed_value_5}(预期: 0)")
+assert reversed_value_5 == 0, "0反转应该还是0"
+
+print("\n整数反转全部测试用例通过。")
+
+# ============================================================
+# 第二题变式:判断一个正整数的所有数位是否严格递增
+# 比如1234(1<2<3<4)符合,1243(4>3,不满足严格递增)不符合
+# ============================================================
+print("\n" + "-" * 60)
+print("【第二题:判断数位是否严格递增】")
+
+test_number_a = 1234
+temp_a = test_number_a
+is_strictly_increasing_a = True
+previous_digit_a = 10   # 用一个比任何单个数字都大的初始值,确保第一位数字一定"小于"这个初始值
+
+# 因为要"从高位到低位"检查递增关系,而while取余是"从低位到高位"取出来的,
+# 这里先把数字反过来处理,相当于从个位往最高位方向扫描,
+# 检查"从个位往前走,数字是否严格递减"(等价于"从高位往后走,数字严格递增")
+digit_sequence_text_a = ""
+while temp_a > 0:
+    digit_sequence_text_a = str(temp_a % 10) + digit_sequence_text_a   # 每次把新取的数位拼在字符串最前面,还原原始顺序
+    temp_a = temp_a // 10
+
+# digit_sequence_text_a现在是"1234"这样的字符串,按原始高位到低位的顺序排列,
+# 用for循环遍历字符串里的每一个字符,逐一转换成数字比较
+previous_digit_a = -1   # 用-1做初始"哨兵",因为数字的个位数不可能是负数,-1保证第一位一定"大于"它
+for char_digit in digit_sequence_text_a:
+    current_digit_value = int(char_digit)
+    if current_digit_value <= previous_digit_a:
+        is_strictly_increasing_a = False
+        break
+    previous_digit_a = current_digit_value
+
+print(f"数字{test_number_a}的数位是否严格递增: {is_strictly_increasing_a}(预期: True)")
+assert is_strictly_increasing_a is True, "1234应该是严格递增的"
+
+test_number_b = 1243
+digit_sequence_text_b = ""
+temp_b = test_number_b
+while temp_b > 0:
+    digit_sequence_text_b = str(temp_b % 10) + digit_sequence_text_b
+    temp_b = temp_b // 10
+
+is_strictly_increasing_b = True
+previous_digit_b = -1
+for char_digit in digit_sequence_text_b:
+    current_digit_value = int(char_digit)
+    if current_digit_value <= previous_digit_b:
+        is_strictly_increasing_b = False
+        break
+    previous_digit_b = current_digit_value
+
+print(f"数字{test_number_b}的数位是否严格递增: {is_strictly_increasing_b}(预期: False,因为4之后是3,3<4不满足递增)")
+assert is_strictly_increasing_b is False, "1243不应该是严格递增的(4后面是3)"
+
+# 边界情况:单个数字,天然满足"严格递增"(因为没有相邻数位可以比较,视为默认满足)
+test_number_c = 7
+digit_sequence_text_c = str(test_number_c)
+is_strictly_increasing_c = True
+previous_digit_c = -1
+for char_digit in digit_sequence_text_c:
+    current_digit_value = int(char_digit)
+    if current_digit_value <= previous_digit_c:
+        is_strictly_increasing_c = False
+        break
+    previous_digit_c = current_digit_value
+
+print(f"边界情况:单个数字{test_number_c}的数位是否严格递增: {is_strictly_increasing_c}(预期: True)")
+assert is_strictly_increasing_c is True, "单个数字应视为严格递增"
+
+# ============================================================
+# 第三题变式:统计一个正整数二进制表示中1的个数(不使用bin()字符串转换)
+# ============================================================
+print("\n" + "-" * 60)
+print("【第三题:统计二进制表示中1的个数(纯位运算实现)】")
+
+number_for_bits_a = 11   # 二进制是1011,应该有3个1
+temp_bits_a = number_for_bits_a
+ones_count_a = 0
+while temp_bits_a > 0:
+    # temp_bits_a & 1:按位与运算,只保留最低位,如果最低位是1,结果是1,否则是0
+    ones_count_a = ones_count_a + (temp_bits_a & 1)
+    temp_bits_a = temp_bits_a >> 1   # 右移一位,相当于把已经检查过的最低位"丢弃",继续检查下一位
+
+print(f"数字{number_for_bits_a}的二进制表示(用bin()验证): {bin(number_for_bits_a)}, 1的个数(纯位运算统计): {ones_count_a}")
+assert ones_count_a == 3, "11(二进制1011)应该有3个1"
+
+number_for_bits_b = 255   # 二进制是11111111,应该有8个1
+temp_bits_b = number_for_bits_b
+ones_count_b = 0
+while temp_bits_b > 0:
+    ones_count_b = ones_count_b + (temp_bits_b & 1)
+    temp_bits_b = temp_bits_b >> 1
+
+print(f"数字{number_for_bits_b}的二进制表示(用bin()验证): {bin(number_for_bits_b)}, 1的个数(纯位运算统计): {ones_count_b}")
+assert ones_count_b == 8, "255(二进制11111111)应该有8个1"
+
+# 边界情况:数字是0,二进制表示里没有任何1
+number_for_bits_c = 0
+temp_bits_c = number_for_bits_c
+ones_count_c = 0
+while temp_bits_c > 0:
+    ones_count_c = ones_count_c + (temp_bits_c & 1)
+    temp_bits_c = temp_bits_c >> 1
+
+print(f"边界情况:数字{number_for_bits_c}的1的个数: {ones_count_c}(预期: 0,循环体一次都没有执行)")
+assert ones_count_c == 0, "0的二进制表示中不应该有1"
+
+print("\n" + "=" * 60)
+print("LeetCode加餐练习全部完成,三道题的所有测试用例均验证通过。")
+print("=" * 60)
+```
+
+### 文件17:`self_check_tests_day3_extended.py` —— Day3扩展自检脚本
+
+```python
+"""
+文件名:self_check_tests_day3_extended.py
+作者:陈铭
+说明:
+    在文件11`self_check_tests_day3.py`基础上,补充针对本次加餐内容
+    (嵌套条件业务场景、循环模式经典问题、猜数字游戏扩展统计、
+    LeetCode加餐练习)的自检验证。依然使用assert语句,不引入任何
+    还没学过的知识点(函数、列表、字典)。
+"""
+
+print("开始执行Day3扩展自检脚本...\n")
+
+# --------------------------------------------------------------------------
+# 检查点7:阶梯运费计算逻辑(用固定测试值代替input,方便自动化验证)
+# --------------------------------------------------------------------------
+member_level_check = "黄金会员"
+order_amount_check = 50.0
+
+if member_level_check == "黄金会员":
+    if order_amount_check >= 99:
+        shipping_fee_check = 0
+    else:
+        shipping_fee_check = 10
+elif member_level_check == "普通会员":
+    if order_amount_check >= 199:
+        shipping_fee_check = 0
+    elif order_amount_check >= 99:
+        shipping_fee_check = 15
+    else:
+        shipping_fee_check = 20
+else:
+    shipping_fee_check = -1   # -1表示未识别的会员等级,用于测试兜底分支
+
+assert shipping_fee_check == 10, "黄金会员订单50元,未满99元,运费应该是10元"
+print("检查点7通过:阶梯运费计算逻辑在黄金会员未满99元场景下结果正确。")
+
+# --------------------------------------------------------------------------
+# 检查点8:数字各位之和与位数统计
+# --------------------------------------------------------------------------
+digit_sum_check_source = 999
+temp_check = digit_sum_check_source
+digit_sum_check_result = 0
+digit_count_check_result = 0
+while temp_check > 0:
+    digit_sum_check_result = digit_sum_check_result + temp_check % 10
+    digit_count_check_result = digit_count_check_result + 1
+    temp_check = temp_check // 10
+
+assert digit_sum_check_result == 27, "999的各位数字之和应该是27(9+9+9)"
+assert digit_count_check_result == 3, "999应该是3位数"
+print("检查点8通过:999的数字之和为27,位数为3,均符合预期。")
+
+# --------------------------------------------------------------------------
+# 检查点9:水仙花数判断(用153单独验证一次)
+# --------------------------------------------------------------------------
+armstrong_check_candidate = 153
+hundreds_check = armstrong_check_candidate // 100
+tens_check = (armstrong_check_candidate // 10) % 10
+units_check = armstrong_check_candidate % 10
+armstrong_check_result = (hundreds_check ** 3 + tens_check ** 3 + units_check ** 3 == armstrong_check_candidate)
+
+assert armstrong_check_result is True, "153应该是水仙花数(1^3+5^3+3^3=153)"
+print("检查点9通过:153被正确判定为水仙花数。")
+
+# --------------------------------------------------------------------------
+# 检查点10:欧几里得算法求最大公约数
+# --------------------------------------------------------------------------
+gcd_check_a = 24
+gcd_check_b = 36
+temp_gcd_a = gcd_check_a
+temp_gcd_b = gcd_check_b
+while temp_gcd_b != 0:
+    remainder_check = temp_gcd_a % temp_gcd_b
+    temp_gcd_a = temp_gcd_b
+    temp_gcd_b = remainder_check
+
+assert temp_gcd_a == 12, "24和36的最大公约数应该是12"
+print("检查点10通过:24和36的最大公约数正确计算为12。")
+
+# --------------------------------------------------------------------------
+# 检查点11:嵌套循环中break只作用于当前层(用简化场景复现文件15的案例8)
+# --------------------------------------------------------------------------
+outer_loop_execution_count_check = 0
+for outer_val in range(1, 4):
+    outer_loop_execution_count_check = outer_loop_execution_count_check + 1
+    for inner_val in range(1, 4):
+        if inner_val == 2:
+            break   # 只会跳出内层循环
+
+assert outer_loop_execution_count_check == 3, "外层循环应该完整执行3次,不受内层break影响"
+print("检查点11通过:内层break不影响外层循环的完整执行次数。")
+
+# --------------------------------------------------------------------------
+# 检查点12:range()方向与步长矛盾时,应产生空序列
+# --------------------------------------------------------------------------
+mismatched_range_execution_count_check = 0
+for i in range(5, 10, -1):
+    mismatched_range_execution_count_check = mismatched_range_execution_count_check + 1
+
+assert mismatched_range_execution_count_check == 0, "方向与步长矛盾的range应该是空序列,循环体不应执行"
+print("检查点12通过:range(5, 10, -1)正确地产生了空序列。")
+
+# --------------------------------------------------------------------------
+# 检查点13:整数反转的边界情况(超出32位整数范围应返回0)
+# --------------------------------------------------------------------------
+INT_MAX_32BIT_CHECK = 2 ** 31 - 1
+INT_MIN_32BIT_CHECK = -(2 ** 31)
+
+x_check = 1563847412
+is_negative_check = (x_check < 0)
+abs_x_check = -x_check if is_negative_check else x_check
+
+reversed_value_check = 0
+temp_reverse_check = abs_x_check
+while temp_reverse_check > 0:
+    reversed_value_check = reversed_value_check * 10 + temp_reverse_check % 10
+    temp_reverse_check = temp_reverse_check // 10
+
+if is_negative_check:
+    reversed_value_check = -reversed_value_check
+
+if reversed_value_check > INT_MAX_32BIT_CHECK or reversed_value_check < INT_MIN_32BIT_CHECK:
+    reversed_value_check = 0
+
+assert reversed_value_check == 0, "1563847412反转后应超出32位整数范围,结果应为0"
+print("检查点13通过:整数反转正确处理了超出32位范围的边界情况。")
+
+# --------------------------------------------------------------------------
+# 检查点14:二进制1的个数统计(纯位运算实现)
+# --------------------------------------------------------------------------
+number_check_bits = 1023   # 二进制是1111111111(10个1)
+temp_bits_check = number_check_bits
+ones_count_check = 0
+while temp_bits_check > 0:
+    ones_count_check = ones_count_check + (temp_bits_check & 1)
+    temp_bits_check = temp_bits_check >> 1
+
+assert ones_count_check == 10, "1023(二进制1111111111)应该有10个1"
+print("检查点14通过:1023的二进制表示中1的个数正确统计为10。")
+
+# --------------------------------------------------------------------------
+# 汇总
+# --------------------------------------------------------------------------
+print("\n" + "=" * 50)
+print("全部8个扩展检查点(检查点7-14)均已通过,")
+print("Day3加餐内容(嵌套条件业务场景、循环模式、扩展统计、LeetCode加餐)验证完成。")
+print("=" * 50)
+```
+
+老王把这五个加餐文件在群里过了一遍,评价道:"你们注意文件16里判断'数位是否严格递增'那道题,我特意让陈铭绕了个弯——用字符串拼接把数字从'取余取出来的低位到高位顺序'重新还原成'高位到低位'的正常顺序,再用for去遍历比较。这个绕弯的过程,本质上是在'没有列表'的约束下,硬生生地模拟出了'把数据倒过来存一遍再正向处理'这个很朴素但很常见的编程技巧。明天你们学了列表,这道题可以直接用切片反转外加一次遍历搞定,代码量至少减半。我故意让你们先用最笨的办法走一遍,是想让你们对'有列表'和'没列表'的差距,有一个更具体的、亲手写代码的体感,而不是我口头说说而已。"
+
 ---
 
 ## 今日复盘
