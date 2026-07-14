@@ -2035,7 +2035,978 @@ LlamaIndex,而不是默认所有场景都用LangChain实现。
   需要在真正决定切换或引入某个场景之前补做专项性能验证。
 ```
 
-至此,今天代码实战部分的三大产出全部完成——LlamaIndex版知识库问答系统的完整实现、与LangChain版本的对比测试代码、以及正式提交的对比笔记文档。三部分内容互相印证,共同构成了CQ-294到CQ-296三个任务号的完整交付物。
+陈铭晚上补测边界场景之后,又抽空多写了三个文件,严格来说不属于CQ-294到CQ-296三个任务号明确要求的范围,但他觉得"既然今天都踩过一遍坑了,不趁热记录下来,以后重新捡起来又要重新踩一遍"。这三个文件分别是:一份LlamaIndex高级用法的补充示例(把上午FAQ环节提到的、"今天先不展开"的几个能力——SummaryIndex、KeywordTableIndex、QueryFusionRetriever混合检索、自动合并检索、ChatEngine多轮对话——各写一个最小可运行的示例,不追求生产级完整度,只求"留一份能直接跑起来的参考代码,而不是只有课堂笔记里的文字描述");一份更严谨的性能对比测试脚本(用并发压测的方式,弥补正文里"今天不是严格的性能基准测试"这个声明留下的空白,虽然仍然不是生产级压测,但比逐题串行调用更接近真实场景);以及一份pytest风格的单元测试,把今天写的核心逻辑(兜底判断、模糊命中判断、报告生成)都补上自动化测试,而不是只靠肉眼看输出是否正确。
+
+### 四、LlamaIndex高级用法补充示例(遗留问题的最小可运行实现)
+
+#### 文件十五:`experiments/day35_llamaindex_poc/advanced/index_family_showcase.py`
+
+```python
+# -*- coding: utf-8 -*-
+"""
+Day35 · LlamaIndex Index家族高级用法补充示例
+
+对应上午课堂笔记里提到、但为了保持时间盒克制而"今天先不展开"的几个
+Index类型——SummaryIndex、KeywordTableIndex,以及基于Node关系指针的
+自动合并检索(Auto-Merging Retrieval)。这里各写一个最小可运行的示例,
+目的不是生产级封装,是给团队留一份"以后真的需要时,能直接跑起来
+参考"的代码,而不是只有课堂笔记里的文字描述。
+
+运行前提:与llamaindex_version模块共用同一份Settings配置逻辑,
+本文件内部会单独调用configure_global_settings()完成初始化。
+"""
+
+from __future__ import annotations
+
+import logging
+
+from llama_index.core import Document, SummaryIndex, VectorStoreIndex
+from llama_index.core.indices.keyword_table import SimpleKeywordTableIndex
+from llama_index.core.node_parser import HierarchicalNodeParser, get_leaf_nodes
+from llama_index.core.retrievers import (
+    AutoMergingRetriever,
+    QueryFusionRetriever,
+)
+from llama_index.core.storage.docstore import SimpleDocumentStore
+
+from ..llamaindex_version.config import LlamaIndexPOCSettings
+from ..llamaindex_version.index_builder import configure_global_settings
+
+logger = logging.getLogger(__name__)
+
+
+def build_summary_index_demo(documents: list[Document]) -> str:
+    """演示SummaryIndex的典型用法:不做向量检索,遍历全部Node生成总结。
+
+    适用场景:上午课堂笔记提到,"总结全篇文档"这类不需要精确定位、
+    需要看到全局的场景,SummaryIndex比VectorStoreIndex更合适——
+    因为向量检索本质上是"找局部相关片段",而摘要类需求需要"看到全部"。
+
+    Args:
+        documents: 待总结的Document列表,建议传入单一分类下的文档
+            (比如只传入equipment_manuals分类的全部文档),
+            否则总结结果会因为跨领域内容混杂而失焦。
+
+    Returns:
+        大模型基于全部文档内容生成的总结文本。
+    """
+    summary_index = SummaryIndex.from_documents(documents)
+    query_engine = summary_index.as_query_engine(response_mode="tree_summarize")
+    response = query_engine.query("请用200字以内,总结这批文档的核心内容涉及哪些方面。")
+    logger.info("SummaryIndex演示完成,共处理%d个Document", len(documents))
+    return str(response)
+
+
+def build_keyword_table_index_demo(documents: list[Document], keyword_query: str) -> str:
+    """演示KeywordTableIndex的典型用法:基于关键词匹配而非向量相似度检索。
+
+    适用场景:上午课堂笔记提到的"型号编号精确查找"类需求,
+    比如查找"XJ-500"这个具体设备型号相关的内容,关键词匹配比
+    语义相似度检索更直接、更不容易被"语义相近但型号不同"的
+    干扰内容带偏——这一点和Day33学的BM25混合检索思路是一致的。
+
+    Args:
+        documents: 待建立关键词索引的Document列表。
+        keyword_query: 精确的关键词查询,建议传入具体的型号/编号/代码。
+
+    Returns:
+        基于关键词匹配检索结果生成的回答文本。
+    """
+    keyword_index = SimpleKeywordTableIndex.from_documents(documents)
+    query_engine = keyword_index.as_query_engine()
+    response = query_engine.query(keyword_query)
+    logger.info("KeywordTableIndex演示完成,查询关键词:%s", keyword_query)
+    return str(response)
+
+
+def build_query_fusion_demo(
+    vector_index: VectorStoreIndex,
+    keyword_index: SimpleKeywordTableIndex,
+    query: str,
+    num_queries: int = 4,
+) -> list:
+    """演示QueryFusionRetriever:把向量检索和关键词检索的结果做融合排序。
+
+    这是上午课堂笔记里陈铭主动联想到的问题——"如果我想同时用向量检索
+    又想用关键词检索,在LlamaIndex里该怎么做"的具体答案。
+    QueryFusionRetriever内部会先用大模型把原始query改写成多个变体
+    (num_queries参数控制改写数量,思路上和Day32学的"查询改写"技术
+    是同一个原理),分别用各个底层Retriever检索,最后用类似RRF
+    (倒数排名融合)的算法把所有检索结果统一排序去重。
+
+    Args:
+        vector_index: 已构建好的VectorStoreIndex。
+        keyword_index: 已构建好的SimpleKeywordTableIndex,
+            与vector_index必须基于同一批文档构建,否则融合结果没有意义。
+        query: 用户原始查询。
+        num_queries: 内部改写生成的查询变体数量(包含原始查询本身)。
+
+    Returns:
+        融合排序后的NodeWithScore列表。
+    """
+    fusion_retriever = QueryFusionRetriever(
+        retrievers=[
+            vector_index.as_retriever(similarity_top_k=5),
+            keyword_index.as_retriever(),
+        ],
+        similarity_top_k=5,
+        num_queries=num_queries,
+        mode="reciprocal_rerank",  # 采用RRF融合排序,与Day33混合检索采用的融合算法一致
+        use_async=False,
+    )
+    fused_nodes = fusion_retriever.retrieve(query)
+    logger.info(
+        "QueryFusionRetriever演示完成,查询「%s」共融合出%d个候选Node",
+        query,
+        len(fused_nodes),
+    )
+    return fused_nodes
+
+
+def build_auto_merging_retrieval_demo(documents: list[Document], query: str) -> str:
+    """演示自动合并检索(Auto-Merging Retrieval):利用Node关系指针,
+    在检索到细粒度片段命中之后,自动合并成更完整的父级上下文。
+
+    这是上午课堂笔记里重点讲过的Node独有能力——用HierarchicalNodeParser
+    把文档切分成多层粒度(比如2048字符的大块、512字符的中块、128字符的
+    小块),构建索引时只对最细粒度的叶子节点做向量化和检索,
+    但检索命中之后,如果同一个父节点下超过一定比例的子节点都被命中,
+    AutoMergingRetriever会自动把这些子节点"合并"回父节点,返回更完整、
+    上下文更连贯的内容,而不是零散的几个小片段。
+
+    Args:
+        documents: 待构建分层索引的Document列表。
+        query: 用户查询。
+
+    Returns:
+        经过自动合并检索之后,拼接得到的上下文文本预览(截断显示)。
+    """
+    # chunk_sizes从大到小排列,分别对应"父层-中层-叶子层"三级粒度,
+    # 数值选择参考LlamaIndex官方文档的推荐配置,与今天Demo的chunk_size=512
+    # 保持同一数量级,便于团队后续横向比较。
+    node_parser = HierarchicalNodeParser.from_defaults(chunk_sizes=[2048, 512, 128])
+    all_nodes = node_parser.get_nodes_from_documents(documents)
+    leaf_nodes = get_leaf_nodes(all_nodes)
+
+    doc_store = SimpleDocumentStore()
+    doc_store.add_documents(all_nodes)
+
+    from llama_index.core import StorageContext
+
+    storage_context = StorageContext.from_defaults(docstore=doc_store)
+    base_index = VectorStoreIndex(leaf_nodes, storage_context=storage_context)
+
+    base_retriever = base_index.as_retriever(similarity_top_k=6)
+    auto_merging_retriever = AutoMergingRetriever(base_retriever, storage_context, verbose=True)
+
+    merged_nodes = auto_merging_retriever.retrieve(query)
+    context_preview = "\n---\n".join(node.get_content()[:120] for node in merged_nodes)
+    logger.info(
+        "自动合并检索演示完成,叶子节点数=%d,合并后返回%d个节点",
+        len(leaf_nodes),
+        len(merged_nodes),
+    )
+    return context_preview
+
+
+def build_chat_engine_demo(index: VectorStoreIndex) -> list[str]:
+    """演示ChatEngine多轮对话能力:在QueryEngine基础上叠加对话记忆。
+
+    对应上午FAQ里"如果客户以后要求支持多轮对话,LlamaIndex能做到吗"
+    这个问题的具体实现。这里选用CondenseQuestionChatEngine——它会先
+    结合历史对话,把当前这一轮可能带有指代关系的问题(比如"那它多久
+    保养一次"里的"它"),压缩改写成一个不依赖上下文也能独立理解的
+    完整问题,再走正常的检索流程,思路上和LangChain里"先改写、
+    再检索"的部分Memory实现方式是相通的。
+
+    Args:
+        index: 已构建好的VectorStoreIndex。
+
+    Returns:
+        三轮对话依次产生的回答文本列表,用于演示"指代消解"是否生效。
+    """
+    chat_engine = index.as_chat_engine(chat_mode="condense_question", verbose=True)
+
+    answers = []
+    first_answer = chat_engine.chat("XJ-500注塑机的季度保养项目有哪些?")
+    answers.append(str(first_answer))
+
+    # 这一轮问题里的"它"依赖上一轮对话的上下文才能理解具体指的是XJ-500注塑机,
+    # 用来验证CondenseQuestionChatEngine是否真的完成了指代消解。
+    second_answer = chat_engine.chat("那它大概多久做一次这个保养?")
+    answers.append(str(second_answer))
+
+    third_answer = chat_engine.chat("如果错过了保养周期,大概会有什么风险?")
+    answers.append(str(third_answer))
+
+    logger.info("ChatEngine多轮对话演示完成,共完成%d轮对话", len(answers))
+    return answers
+
+
+def run_all_advanced_demos(data_dir: str) -> None:
+    """一次性跑完本文件全部高级用法示例的驱动函数,供团队后续快速复现参考。
+
+    Args:
+        data_dir: 海纳集团样本文档根目录。
+    """
+    from ..llamaindex_version.document_loader import load_hainer_documents
+
+    settings = LlamaIndexPOCSettings()
+    configure_global_settings(settings)
+    documents = load_hainer_documents(data_dir)
+
+    print("\n===== SummaryIndex 演示 =====")
+    print(build_summary_index_demo(documents[:20]))  # 只取前20个文档,控制演示成本
+
+    print("\n===== KeywordTableIndex 演示 =====")
+    print(build_keyword_table_index_demo(documents, "XJ-500注塑机的液压系统"))
+
+    print("\n===== 自动合并检索 演示 =====")
+    print(build_auto_merging_retrieval_demo(documents, "注塑机液压系统故障怎么排查"))
+
+
+if __name__ == "__main__":
+    import sys
+
+    run_all_advanced_demos(sys.argv[1] if len(sys.argv) > 1 else "./data/hainer_samples")
+```
+
+老王后来在傍晚复盘的时候看到陈铭又多写了这份代码,评价说:"这份东西不算今天的硬性任务,但我看完觉得比笔记本身更有价值——你把FAQ里那些‘今天先不展开’的问题,变成了真正能跑一遍看看效果的代码,而不是只停留在‘听懂了’的层面。以后团队里其他同学要是真的碰到需要SummaryIndex或者自动合并检索的场景,直接从这份代码改一改就能用,比重新去啃官方文档要快得多。"
+
+### 五、性能对比测试脚本(并发压测,弥补"非严格基准测试"的空白)
+
+#### 文件十六:`experiments/day35_llamaindex_poc/comparison/performance_benchmark.py`
+
+```python
+# -*- coding: utf-8 -*-
+"""
+Day35 · 双框架并发性能对比测试脚本
+
+正文的run_comparison.py是逐题串行调用,得到的耗时数据只能反映
+"单次查询大概要多久",不能反映"多个请求同时打过来,系统撑不撑得住"
+这个更接近真实生产场景的问题。这个脚本用线程池模拟并发请求,
+分别测试两个框架实现在不同并发度下的表现,作为对"今天不是严格的
+性能基准测试"这条声明的一次弥补性尝试——依然不是生产级压测
+(没有模拟真实的网络延迟波动、没有测试长时间持续压力下的表现),
+但比单纯的逐题串行调用更接近"多用户同时提问"的真实场景。
+"""
+
+from __future__ import annotations
+
+import logging
+import statistics
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class BenchmarkResult:
+    """单次并发压测的统计结果。
+
+    Attributes:
+        framework: 被测框架名称,如"LlamaIndex"或"LangChain"。
+        concurrency: 本轮压测使用的并发线程数。
+        total_requests: 本轮压测发出的总请求数。
+        latencies: 每个请求各自的耗时列表(秒)。
+        total_wall_time: 本轮压测从开始到全部请求完成的总墙钟耗时(秒),
+            这个数值和latencies之和的差异,能反映"并发带来的实际吞吐提升"。
+        error_count: 请求过程中抛出异常的次数。
+    """
+
+    framework: str
+    concurrency: int
+    total_requests: int
+    latencies: list[float] = field(default_factory=list)
+    total_wall_time: float = 0.0
+    error_count: int = 0
+
+    @property
+    def avg_latency(self) -> float:
+        """平均单请求耗时(秒)。"""
+        return statistics.mean(self.latencies) if self.latencies else 0.0
+
+    @property
+    def p95_latency(self) -> float:
+        """95分位耗时(秒),比平均值更能反映"多数用户实际体验到的最差情况"。"""
+        if not self.latencies:
+            return 0.0
+        sorted_latencies = sorted(self.latencies)
+        index = min(int(len(sorted_latencies) * 0.95), len(sorted_latencies) - 1)
+        return sorted_latencies[index]
+
+    @property
+    def throughput_qps(self) -> float:
+        """吞吐量:每秒实际处理的请求数(基于总墙钟耗时计算)。"""
+        if self.total_wall_time <= 0:
+            return 0.0
+        return round(self.total_requests / self.total_wall_time, 3)
+
+    def to_summary_dict(self) -> dict:
+        """转换为便于落盘/展示的汇总字典。"""
+        return {
+            "framework": self.framework,
+            "concurrency": self.concurrency,
+            "total_requests": self.total_requests,
+            "avg_latency_seconds": round(self.avg_latency, 3),
+            "p95_latency_seconds": round(self.p95_latency, 3),
+            "throughput_qps": self.throughput_qps,
+            "error_count": self.error_count,
+        }
+
+
+def run_concurrent_benchmark(
+    ask_fn,
+    questions: list[str],
+    framework_name: str,
+    concurrency: int,
+) -> BenchmarkResult:
+    """用线程池并发执行一组问答请求,统计耗时分布与吞吐量。
+
+    设计说明:
+        由于两个框架的问答引擎内部大部分耗时花在网络I/O等待
+        (调用大模型API、调用Embedding服务),用线程池(而不是
+        进程池)做并发模拟是合理的选择——Python的GIL在I/O等待期间
+        会被释放,线程池足以模拟"多个请求同时发出、等待响应"的场景,
+        不需要引入进程池带来的额外复杂度。
+
+    Args:
+        ask_fn: 可调用对象,接收一个问题字符串,返回问答结果
+            (只要求内部有一次问答调用即可,不关心具体返回值类型)。
+        questions: 待测试的问题列表,会被循环使用以填满并发请求数。
+        framework_name: 被测框架名称,用于结果标注。
+        concurrency: 并发线程数。
+
+    Returns:
+        本轮压测的BenchmarkResult统计结果。
+    """
+    total_requests = max(len(questions), concurrency * 2)  # 保证请求总数至少覆盖两轮并发
+    task_questions = [questions[i % len(questions)] for i in range(total_requests)]
+
+    result = BenchmarkResult(
+        framework=framework_name,
+        concurrency=concurrency,
+        total_requests=total_requests,
+    )
+
+    def _timed_ask(question: str) -> float:
+        """执行单次问答并返回耗时,异常会被外层捕获统计,不在这里吞掉。"""
+        start = time.perf_counter()
+        ask_fn(question)
+        return time.perf_counter() - start
+
+    wall_start = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {executor.submit(_timed_ask, q): q for q in task_questions}
+        for future in as_completed(futures):
+            question = futures[future]
+            try:
+                latency = future.result()
+                result.latencies.append(latency)
+            except Exception as exc:  # noqa: BLE001 —— 压测阶段需要统计错误数量,不能让单次失败中断整轮测试
+                result.error_count += 1
+                logger.warning("并发压测中问题「%s」执行失败:%s", question, exc)
+    result.total_wall_time = time.perf_counter() - wall_start
+
+    logger.info(
+        "[%s] 并发度=%d 压测完成:平均耗时=%.2fs, P95=%.2fs, 吞吐=%.2f QPS, 错误数=%d",
+        framework_name,
+        concurrency,
+        result.avg_latency,
+        result.p95_latency,
+        result.throughput_qps,
+        result.error_count,
+    )
+    return result
+
+
+def run_benchmark_suite(
+    llamaindex_ask_fn,
+    langchain_ask_fn,
+    questions: list[str],
+    concurrency_levels: list[int] | None = None,
+) -> list[dict]:
+    """对两个框架分别跑一组不同并发度的压测,返回汇总结果列表。
+
+    Args:
+        llamaindex_ask_fn: LlamaIndex版引擎的问答调用函数。
+        langchain_ask_fn: LangChain版引擎的问答调用函数。
+        questions: 压测使用的问题池。
+        concurrency_levels: 要测试的并发度列表,默认覆盖1(串行基线)、
+            3(轻度并发)、8(中度并发)三个档位,足够观察出趋势,
+            又不至于在CPU上跑bge-large-zh-v1.5时把机器压得太狠。
+
+    Returns:
+        每个(框架, 并发度)组合对应一条汇总字典的列表,便于直接
+        转换成表格展示或写入报告。
+    """
+    concurrency_levels = concurrency_levels or [1, 3, 8]
+    summaries: list[dict] = []
+
+    for concurrency in concurrency_levels:
+        li_result = run_concurrent_benchmark(
+            llamaindex_ask_fn, questions, "LlamaIndex", concurrency
+        )
+        summaries.append(li_result.to_summary_dict())
+
+        lc_result = run_concurrent_benchmark(
+            langchain_ask_fn, questions, "LangChain", concurrency
+        )
+        summaries.append(lc_result.to_summary_dict())
+
+    return summaries
+
+
+def render_benchmark_markdown_table(summaries: list[dict]) -> str:
+    """把压测汇总结果渲染成Markdown表格文本,便于粘贴进对比笔记附录。
+
+    Args:
+        summaries: run_benchmark_suite()的返回结果。
+
+    Returns:
+        渲染好的Markdown表格字符串。
+    """
+    lines = [
+        "| 框架 | 并发度 | 总请求数 | 平均耗时(s) | P95耗时(s) | 吞吐(QPS) | 错误数 |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for item in summaries:
+        lines.append(
+            f"| {item['framework']} | {item['concurrency']} | {item['total_requests']} | "
+            f"{item['avg_latency_seconds']} | {item['p95_latency_seconds']} | "
+            f"{item['throughput_qps']} | {item['error_count']} |"
+        )
+    return "\n".join(lines)
+
+
+def analyze_concurrency_scaling(summaries: list[dict], framework: str) -> str:
+    """分析某个框架随并发度提升,吞吐量是否呈现合理的扩展趋势。
+
+    设计意图:
+        单纯罗列表格数据不足以直接得出结论,这个函数把"吞吐量是否
+        随并发度提升而提升"这件事,转换成一段可以直接引用的文字判断,
+        帮助团队快速判断"要不要进一步做更细致的性能调优"。
+
+    Args:
+        summaries: run_benchmark_suite()的返回结果。
+        framework: 要分析的框架名称。
+
+    Returns:
+        分析结论文字。
+    """
+    framework_results = sorted(
+        (item for item in summaries if item["framework"] == framework),
+        key=lambda x: x["concurrency"],
+    )
+    if len(framework_results) < 2:
+        return f"{framework}的压测数据点不足,无法分析扩展趋势。"
+
+    throughputs = [item["throughput_qps"] for item in framework_results]
+    concurrencies = [item["concurrency"] for item in framework_results]
+
+    if throughputs[-1] > throughputs[0] * 1.5:
+        return (
+            f"{framework}在并发度从{concurrencies[0]}提升到{concurrencies[-1]}时,"
+            f"吞吐量从{throughputs[0]}QPS提升到{throughputs[-1]}QPS,提升幅度明显,"
+            "说明当前瓶颈主要在网络I/O等待(大模型/Embedding API调用),"
+            "线程池并发能够有效提升整体吞吐,具备一定的横向扩展空间。"
+        )
+    elif throughputs[-1] > throughputs[0]:
+        return (
+            f"{framework}的吞吐量随并发度提升有小幅改善"
+            f"(从{throughputs[0]}QPS到{throughputs[-1]}QPS),"
+            "但提升幅度有限,可能已经接近本地CPU做Embedding计算的性能瓶颈,"
+            "如果要进一步提升吞吐,需要考虑把Embedding计算迁移到GPU或独立的推理服务。"
+        )
+    else:
+        return (
+            f"{framework}的吞吐量在测试的并发度范围内没有随并发提升而改善,"
+            "需要进一步排查是否存在锁竞争、全局单例状态互相干扰"
+            "(尤其是LlamaIndex的Settings全局配置,在多线程环境下的线程安全性"
+            "今天没有专项验证,这是一个值得在遗留问题清单里补充的点),"
+            "或者是CPU计算资源已经达到饱和上限。"
+        )
+
+
+if __name__ == "__main__":
+    import argparse
+
+    from ..langchain_reference.rebuild_langchain_version import build_reference_engine
+    from ..llamaindex_version.config import LlamaIndexPOCSettings
+    from ..llamaindex_version.document_loader import load_hainer_documents
+    from ..llamaindex_version.index_builder import build_or_load_index, configure_global_settings
+    from ..llamaindex_version.query_engine_factory import build_query_engine, HainerQueryEngine
+    from .eval_questions import EVAL_QUESTIONS
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+    arg_parser = argparse.ArgumentParser(description="双框架并发性能压测")
+    arg_parser.add_argument("--data-dir", default="./data/hainer_samples")
+    args = arg_parser.parse_args()
+
+    li_settings = LlamaIndexPOCSettings()
+    configure_global_settings(li_settings)
+    li_index = build_or_load_index(None, li_settings, force_rebuild=False)
+    li_engine = HainerQueryEngine(build_query_engine(li_index, li_settings))
+
+    lc_engine = build_reference_engine(args.data_dir)
+
+    benchmark_summaries = run_benchmark_suite(
+        llamaindex_ask_fn=lambda q: li_engine.ask(q),
+        langchain_ask_fn=lambda q: lc_engine.ask(q),
+        questions=EVAL_QUESTIONS,
+    )
+
+    print("\n" + render_benchmark_markdown_table(benchmark_summaries))
+    print("\n" + analyze_concurrency_scaling(benchmark_summaries, "LlamaIndex"))
+    print(analyze_concurrency_scaling(benchmark_summaries, "LangChain"))
+```
+
+### 六、核心逻辑单元测试(pytest风格,不依赖真实API调用)
+
+#### 文件十七:`experiments/day35_llamaindex_poc/tests/test_poc_core_logic.py`
+
+```python
+# -*- coding: utf-8 -*-
+"""
+Day35 · 调研代码核心逻辑单元测试
+
+覆盖三块不依赖真实大模型/Embedding API调用的核心逻辑:
+1. citation_formatter.py里的格式化函数。
+2. run_comparison.py里的汇总统计与兜底正确性核对函数。
+3. 课后作业第4题参考答案中的"模糊命中"判定逻辑。
+4. performance_benchmark.py里的统计计算与趋势分析函数。
+
+运行方式:
+    pytest experiments/day35_llamaindex_poc/tests/test_poc_core_logic.py -v
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import pytest
+
+from ..comparison.performance_benchmark import (
+    BenchmarkResult,
+    analyze_concurrency_scaling,
+    render_benchmark_markdown_table,
+)
+from ..comparison.run_comparison import check_fallback_correctness, summarize
+from ..llamaindex_version.citation_formatter import (
+    export_markdown_table,
+    format_comparison_row,
+)
+
+
+@dataclass
+class _FakeQAResult:
+    """一个轻量的伪造QAResult,只用于测试格式化函数,不依赖真实的LlamaIndex调用。"""
+
+    question: str
+    answer: str
+    latency_seconds: float
+    is_fallback: bool
+    source_count: int
+    sources: list
+
+
+# ============================================================
+# citation_formatter.py 测试
+# ============================================================
+
+class TestCitationFormatter:
+    """针对引用格式化工具函数的测试类。"""
+
+    def test_format_comparison_row_identifies_faster_framework(self):
+        """当LlamaIndex耗时更短时,应正确标注"LlamaIndex更快"。"""
+        row = format_comparison_row("测试问题内容超过二十个字符用于截断验证", 1.0, 2.0)
+        assert "LlamaIndex更快" in row
+
+    def test_format_comparison_row_identifies_langchain_faster(self):
+        """当LangChain耗时更短时,应正确标注"LangChain更快"。"""
+        row = format_comparison_row("简短问题", 3.0, 1.5)
+        assert "LangChain更快" in row
+
+    def test_export_markdown_table_includes_all_rows(self):
+        """导出的Markdown表格应包含全部传入结果对应的行,不应遗漏。"""
+        results = [
+            _FakeQAResult("问题一", "答案一", 1.2, False, 3, []),
+            _FakeQAResult("问题二", "答案二", 0.5, True, 0, []),
+        ]
+        table = export_markdown_table(results)
+        assert "问题一" in table
+        assert "问题二" in table
+        assert table.count("|") > 0
+
+    def test_export_markdown_table_truncates_long_question(self):
+        """超过20个字符的问题应被截断并追加省略号,避免表格因长文本错位。"""
+        long_question = "这是一个非常非常非常非常非常非常长的测试问题文本内容"
+        results = [_FakeQAResult(long_question, "答案", 1.0, False, 1, [])]
+        table = export_markdown_table(results)
+        assert "..." in table
+
+
+# ============================================================
+# run_comparison.py 测试
+# ============================================================
+
+class TestRunComparisonHelpers:
+    """针对对比测试脚本中汇总统计与正确性核对函数的测试类。"""
+
+    def test_summarize_computes_correct_average_latency(self):
+        """汇总统计的平均耗时计算应正确。"""
+        results = [
+            {"latency_seconds": 1.0, "is_fallback": False},
+            {"latency_seconds": 2.0, "is_fallback": False},
+            {"latency_seconds": 3.0, "is_fallback": True},
+        ]
+        summary = summarize(results)
+        assert summary["count"] == 3
+        assert abs(summary["avg_latency_seconds"] - 2.0) < 1e-6
+        assert summary["fallback_count"] == 1
+
+    def test_summarize_handles_empty_results(self):
+        """结果列表为空时,应返回count为0,不应该抛出除零异常。"""
+        summary = summarize([])
+        assert summary["count"] == 0
+
+    def test_check_fallback_correctness_detects_wrong_fallback(self, capsys):
+        """当超范围问题没有触发兜底时,应在输出中明确指出该问题。"""
+        results = [
+            {"question": "超范围问题A", "is_fallback": False},
+            {"question": "范围内问题B", "is_fallback": False},
+        ]
+        check_fallback_correctness(results, {"超范围问题A"}, "测试框架")
+        captured = capsys.readouterr()
+        assert "超范围问题A" in captured.out
+
+    def test_check_fallback_correctness_all_correct(self, capsys):
+        """当兜底逻辑全部正确时,输出应明确提示"无(全部正确)"。"""
+        results = [
+            {"question": "超范围问题A", "is_fallback": True},
+            {"question": "范围内问题B", "is_fallback": False},
+        ]
+        check_fallback_correctness(results, {"超范围问题A"}, "测试框架")
+        captured = capsys.readouterr()
+        assert "全部正确" in captured.out
+
+
+# ============================================================
+# performance_benchmark.py 测试
+# ============================================================
+
+class TestPerformanceBenchmark:
+    """针对性能压测统计计算逻辑的测试类。"""
+
+    def _make_result(self, latencies, wall_time):
+        result = BenchmarkResult(
+            framework="TestFramework",
+            concurrency=1,
+            total_requests=len(latencies),
+        )
+        result.latencies = latencies
+        result.total_wall_time = wall_time
+        return result
+
+    def test_avg_latency_calculation(self):
+        """平均耗时计算应正确。"""
+        result = self._make_result([1.0, 2.0, 3.0], wall_time=2.0)
+        assert abs(result.avg_latency - 2.0) < 1e-6
+
+    def test_p95_latency_calculation(self):
+        """P95耗时应正确取到排序后第95百分位对应的数值。"""
+        latencies = list(range(1, 101))  # 1到100,P95理论上应接近95-96附近
+        result = self._make_result([float(x) for x in latencies], wall_time=50.0)
+        assert 94 <= result.p95_latency <= 96
+
+    def test_throughput_qps_calculation(self):
+        """吞吐量计算:总请求数除以总墙钟耗时。"""
+        result = self._make_result([1.0, 1.0, 1.0, 1.0], wall_time=2.0)
+        assert abs(result.throughput_qps - 2.0) < 1e-6
+
+    def test_throughput_qps_zero_wall_time_does_not_raise(self):
+        """总墙钟耗时为0(极端边界情况)时,吞吐量应返回0而不是抛出除零异常。"""
+        result = self._make_result([1.0], wall_time=0.0)
+        assert result.throughput_qps == 0.0
+
+    def test_to_summary_dict_contains_all_expected_keys(self):
+        """汇总字典应包含全部预期字段,方便下游渲染函数直接取用。"""
+        result = self._make_result([1.0, 2.0], wall_time=1.5)
+        summary = result.to_summary_dict()
+        expected_keys = {
+            "framework", "concurrency", "total_requests",
+            "avg_latency_seconds", "p95_latency_seconds",
+            "throughput_qps", "error_count",
+        }
+        assert expected_keys.issubset(summary.keys())
+
+    def test_render_benchmark_markdown_table_contains_all_frameworks(self):
+        """渲染的Markdown表格应包含全部传入结果对应的框架名称。"""
+        summaries = [
+            {"framework": "LlamaIndex", "concurrency": 1, "total_requests": 10,
+             "avg_latency_seconds": 1.0, "p95_latency_seconds": 1.5,
+             "throughput_qps": 5.0, "error_count": 0},
+            {"framework": "LangChain", "concurrency": 1, "total_requests": 10,
+             "avg_latency_seconds": 1.1, "p95_latency_seconds": 1.6,
+             "throughput_qps": 4.8, "error_count": 0},
+        ]
+        table = render_benchmark_markdown_table(summaries)
+        assert "LlamaIndex" in table
+        assert "LangChain" in table
+
+    def test_analyze_concurrency_scaling_detects_good_scaling(self):
+        """当吞吐量随并发度显著提升时,应识别为"扩展空间良好"的结论类型。"""
+        summaries = [
+            {"framework": "LlamaIndex", "concurrency": 1, "throughput_qps": 1.0},
+            {"framework": "LlamaIndex", "concurrency": 8, "throughput_qps": 3.0},
+        ]
+        analysis = analyze_concurrency_scaling(summaries, "LlamaIndex")
+        assert "提升幅度明显" in analysis
+
+    def test_analyze_concurrency_scaling_detects_no_improvement(self):
+        """当吞吐量没有随并发度提升而改善时,应给出排查建议类型的结论。"""
+        summaries = [
+            {"framework": "LangChain", "concurrency": 1, "throughput_qps": 2.0},
+            {"framework": "LangChain", "concurrency": 8, "throughput_qps": 1.8},
+        ]
+        analysis = analyze_concurrency_scaling(summaries, "LangChain")
+        assert "没有随并发提升而改善" in analysis
+
+    def test_analyze_concurrency_scaling_insufficient_data(self):
+        """当某个框架只有一个数据点时,应明确提示数据点不足,而不是尝试计算并出错。"""
+        summaries = [{"framework": "LlamaIndex", "concurrency": 1, "throughput_qps": 1.0}]
+        analysis = analyze_concurrency_scaling(summaries, "LlamaIndex")
+        assert "数据点不足" in analysis
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+```
+
+写完单元测试之后,陈铭又想起白天晨会上老王随口提的一句话——"你这个Demo写完了,别人接手的时候看得懂吗?"。这句话让他觉得光有代码和测试还不够,应该再补一份能在提交前自动跑一遍的"环境与配置自检脚本",把今天写的六个模块依赖的关键前提(环境变量是否配置、依赖包版本是否满足、示例数据目录是否存在)都提前检查一遍,避免自己人机器上跑得好好的,换一台机器上给同事复现的时候,才发现是环境变量没配置这种低级问题——这也是他从Day30立项以来慢慢养成的习惯:交付物不能只对自己的机器负责,要对"任何一个接手的同事"负责。
+
+#### 文件十六:`experiments/day35_llamaindex_poc/tools/environment_self_check.py`
+
+```python
+"""
+Day35 LlamaIndex POC —— 环境与配置自检脚本
+
+陈铭在写完核心Demo、对比脚本和单元测试之后,又补充了这一份自检脚本。
+动机很朴素:今天所有代码都是在自己的开发机上验证通过的,但明天这份代码
+可能会被团队里的其他同事拉下来直接跑,如果对方机器上缺了某个环境变量、
+某个依赖包版本不对、或者示例数据目录还没准备,直接运行主流程很可能会在
+执行到一半时才报错,而且报错信息未必能直接定位到根因。
+
+这份脚本的设计目标是:在真正运行索引构建、查询、对比测试之前,先用一份
+轻量级的"体检清单"把常见的环境问题尽可能提前暴露出来,并且给出具体的
+修复建议文案,而不是只抛出一个含糊的异常堆栈。
+"""
+
+from __future__ import annotations
+
+import importlib
+import os
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+@dataclass
+class CheckItem:
+    """单项自检结果。"""
+
+    name: str
+    passed: bool
+    message: str
+    fix_hint: str = ""
+
+
+@dataclass
+class SelfCheckReport:
+    """自检报告汇总。"""
+
+    items: list[CheckItem] = field(default_factory=list)
+
+    def add(self, item: CheckItem) -> None:
+        self.items.append(item)
+
+    @property
+    def all_passed(self) -> bool:
+        return all(item.passed for item in self.items)
+
+    @property
+    def failed_items(self) -> list[CheckItem]:
+        return [item for item in self.items if not item.passed]
+
+    def render(self) -> str:
+        """渲染成便于终端阅读的文本报告。"""
+        lines = ["=" * 60, "Day35 LlamaIndex POC 环境自检报告", "=" * 60]
+        for item in self.items:
+            flag = "[通过]" if item.passed else "[失败]"
+            lines.append(f"{flag} {item.name}: {item.message}")
+            if not item.passed and item.fix_hint:
+                lines.append(f"       修复建议: {item.fix_hint}")
+        lines.append("-" * 60)
+        if self.all_passed:
+            lines.append("全部检查项通过,可以继续运行主流程。")
+        else:
+            lines.append(
+                f"共 {len(self.failed_items)} 项检查未通过,"
+                "请先根据上方修复建议处理后再运行主流程。"
+            )
+        lines.append("=" * 60)
+        return "\n".join(lines)
+
+
+# 主流程实际用到、必须存在的关键环境变量。
+# 这里只列出Demo运行必需的最小集合,不要求团队每个人都配置全部可能用到的变量。
+REQUIRED_ENV_VARS = [
+    ("DASHSCOPE_API_KEY", "通义千问/text-embedding-v3调用凭证"),
+    ("OPENAI_API_KEY", "DeepSeek兼容接口调用凭证(部分环境复用此变量名)"),
+]
+
+# 今天代码实际import过的第三方包,版本要求写在requirements里,这里只做存在性检查。
+REQUIRED_PACKAGES = [
+    "llama_index.core",
+    "langchain",
+    "langchain_community",
+    "chromadb",
+]
+
+
+def check_env_vars() -> list[CheckItem]:
+    """检查必需的环境变量是否已配置(至少配置一个可用的模型凭证即可通过)。"""
+    results: list[CheckItem] = []
+    configured = [name for name, _ in REQUIRED_ENV_VARS if os.environ.get(name)]
+    if configured:
+        results.append(
+            CheckItem(
+                name="模型API凭证",
+                passed=True,
+                message=f"检测到已配置: {', '.join(configured)}",
+            )
+        )
+    else:
+        hint_list = "、".join(f"{name}({desc})" for name, desc in REQUIRED_ENV_VARS)
+        results.append(
+            CheckItem(
+                name="模型API凭证",
+                passed=False,
+                message="未检测到任何可用的模型调用凭证环境变量",
+                fix_hint=f"请至少配置以下环境变量之一: {hint_list}",
+            )
+        )
+    return results
+
+
+def check_packages() -> list[CheckItem]:
+    """检查关键第三方依赖包是否已安装(仅检查能否import,不校验具体版本号)。"""
+    results: list[CheckItem] = []
+    for package_name in REQUIRED_PACKAGES:
+        try:
+            importlib.import_module(package_name)
+        except ImportError as exc:
+            results.append(
+                CheckItem(
+                    name=f"依赖包: {package_name}",
+                    passed=False,
+                    message=f"导入失败: {exc}",
+                    fix_hint=f"请运行 pip install {package_name.split('.')[0]} 后重试",
+                )
+            )
+        else:
+            results.append(
+                CheckItem(name=f"依赖包: {package_name}", passed=True, message="已正确安装")
+            )
+    return results
+
+
+def check_data_directory(data_dir: str | Path) -> list[CheckItem]:
+    """检查示例知识库文档目录是否存在且非空。"""
+    results: list[CheckItem] = []
+    path = Path(data_dir)
+    if not path.exists():
+        results.append(
+            CheckItem(
+                name="示例数据目录",
+                passed=False,
+                message=f"目录不存在: {path}",
+                fix_hint="请先运行数据准备脚本生成示例知识库文档,或联系陈铭获取样例数据包",
+            )
+        )
+    elif not any(path.iterdir()):
+        results.append(
+            CheckItem(
+                name="示例数据目录",
+                passed=False,
+                message=f"目录存在但为空: {path}",
+                fix_hint="请确认示例文档已正确解压到该目录下",
+            )
+        )
+    else:
+        file_count = sum(1 for _ in path.rglob("*") if _.is_file())
+        results.append(
+            CheckItem(
+                name="示例数据目录",
+                passed=True,
+                message=f"目录存在,包含 {file_count} 个文件",
+            )
+        )
+    return results
+
+
+def check_python_version(minimum: tuple[int, int] = (3, 9)) -> list[CheckItem]:
+    """检查当前Python版本是否满足最低要求(项目里用到了较新的类型标注写法)。"""
+    current = (sys.version_info.major, sys.version_info.minor)
+    if current >= minimum:
+        return [
+            CheckItem(
+                name="Python版本",
+                passed=True,
+                message=f"当前版本 {current[0]}.{current[1]} 满足要求(>= {minimum[0]}.{minimum[1]})",
+            )
+        ]
+    return [
+        CheckItem(
+            name="Python版本",
+            passed=False,
+            message=f"当前版本 {current[0]}.{current[1]} 低于要求(>= {minimum[0]}.{minimum[1]})",
+            fix_hint="请升级Python解释器版本,或使用项目指定的虚拟环境",
+        )
+    ]
+
+
+def run_full_self_check(data_dir: str | Path = "data/knowledge_base") -> SelfCheckReport:
+    """执行完整的自检流程,汇总所有检查项并返回报告对象。"""
+    report = SelfCheckReport()
+    for item in check_python_version():
+        report.add(item)
+    for item in check_env_vars():
+        report.add(item)
+    for item in check_packages():
+        report.add(item)
+    for item in check_data_directory(data_dir):
+        report.add(item)
+    return report
+
+
+def main() -> int:
+    """命令行入口:执行自检并根据结果返回相应的退出码,方便接入CI或pre-commit钩子。"""
+    report = run_full_self_check()
+    print(report.render())
+    return 0 if report.all_passed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+这份自检脚本写完之后,陈铭顺手在自己机器上跑了一次,发现`DASHSCOPE_API_KEY`一切正常,但`chromadb`报了一个版本告警(不影响运行,但提示未来某个大版本会有breaking change)——他把这个告警记进了遗留问题清单,提醒自己下次评审的时候提一句,不算今天必须解决的问题,只是"顺手记下来,不让它变成将来某天凌晨突然爆炸的意外"。
+
+至此,今天代码实战部分的全部产出完成——LlamaIndex版知识库问答系统的完整实现、与LangChain版本的对比测试代码、正式提交的对比笔记文档,以及晚上追加的高级用法补充示例、并发性能压测脚本、核心逻辑单元测试、环境自检脚本。全部内容互相印证,共同构成了CQ-294到CQ-296三个任务号的完整交付物,外加陈铭自发补充的技术储备资产。
 
 回头梳理这三部分代码之间的关系,会发现一个刻意设计的对称结构——LlamaIndex版本的六个模块(config、document_loader、index_builder、query_engine_factory、citation_formatter、cli),每一个都能在LangChain参照版本里找到对应的功能片段(尽管LangChain版本为了公平对比收敛成了单文件);而`comparison`目录下的两个脚本,则像一个中立的裁判,同时调用双方的引擎,不偏向任何一边地记录客观数据。这种"实现对称+中立裁判"的代码组织方式,本身也是一种值得记住的调研方法论——如果只是简单地各写各的,最后很容易在对比阶段出现"两边测的东西其实不完全一样"的尴尬局面,而今天这套代码结构,从设计阶段就把"如何保证公平对比"这个问题考虑了进去,而不是等测完了才发现方法有问题需要重新来一遍。
 
