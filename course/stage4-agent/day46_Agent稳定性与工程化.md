@@ -2097,6 +2097,1119 @@ if __name__ == "__main__":
 
 小唐后来又补充测试了几个边缘场景,进一步验证了这套机制的健壮性。第一个边缘场景是"合法的多轮工具调用不应该被误判为死循环"——她构造了一个正常的多楼栋查询任务,Agent需要依次查询A栋、B栋、C栋三栋楼的工单数据,虽然调用的都是`search_work_orders`这个工具,但每次传入的`building_code`参数是不同的(A栋、B栋、C栋),重复调用检测器在归一化参数指纹之后,准确识别出这是三次语义不同的调用,没有误报为死循环,整个任务在第3次工具调用后顺利产出结果,验证了检测算法在"同工具不同语义"场景下的区分能力没有问题。第二个边缘场景是"护栏拦截后系统能否继续沿着降级路径优雅收尾"——她故意让某个测试Agent尝试调用一个不存在于白名单里的工具,验证系统是否会在拦截之后陷入另一种形式的死循环(比如反复尝试调用同一个被拒绝的工具),测试结果显示,由于`run_with_guard`函数里对`GuardrailViolation`异常有专门的捕获与重试次数限制,Agent在被拒绝后最多重试两次就会转向别的决策路径或直接终止,不会无限重试同一个越权请求,这个测试补上了此前需求文档里没有明确提到、但实际很容易被忽略的一个隐患点。小唐把这两个边缘场景也补充进了当天的回归测试文档,老王评价说这种"验证正确的行为不会被误伤"的补充测试,往往比只测"错误行为能否被拦截"的测试更能反映一个团队的测试思维是否成熟。
 
+晚上七点多,陈铭正准备收工,阿俊拎着外卖袋子路过工位,随口提了一句:"晨会上老王说的那个'为什么同一个用户可以无限制并发提交同类型任务'的漏洞,还记着记着,是不是就打算先记下来,这个Sprint都不管了?"这句话把陈铭问住了——一整天忙着处理死循环检测、护栏、成本监控,这个晨会上被明确标记为"工程化漏洞"的问题,确实还没有真正动手解决。他把老王叫了回来,老王看了一眼时间,说:"你说得对,这个问题今天必须补上,不然写的东西不完整。而且我还想到一层——小唐那个'审批被刷屏近200条'的事故,咱们靠死循环检测和幂等去重管住了发送行为本身,但如果将来咱们真的把告警也接上企业微信机器人,万一告警本身触发得又快又频繁,那这个告警机器人不就变成了新的刷屏源?这是个很讽刺但很真实的风险,今天也得一并考虑进去。"于是团队又多留了一个多小时,补上了四个模块和一份覆盖它们的单元测试,分别是:同用户并发会话控制、外部依赖熔断器、带自我限流能力的企业微信告警通知器,以及把课后作业里"高成本用户分级响应"设计思路真正落成可运行代码的`UserCostAggregator`。
+
+### 7.8 并发会话控制:同用户并发限制与重复请求去重
+
+这段代码直接回应晨会上老王点出的那个漏洞——小唐在测试时开了两个窗口重复提交同一个请求,系统对此毫无感知,两个会话各自占用资源、各自往前跑,这本身就是对系统资源的一种无声浪费,即便这两个会话最终都不会陷入死循环,单纯的"同一用户同类型任务重复提交"也应该在入口层就被拦下来,而不是放任它们进入系统内部再去竞争资源。
+
+```python
+"""
+concurrency_guard.py
+
+同用户并发会话控制模块。
+
+背景:晨会复盘中老王指出的工程化漏洞——"为什么同一个用户可以
+无限制地并发提交同类型任务",本模块补上这个缺口,提供:
+1. 基于(user_id, task_type)维度的并发会话数限制(默认同类型任务
+   同一用户最多允许1个在途会话,其余请求直接拒绝并给出清晰提示,
+   而不是让它们和已有会话一起抢资源、一起陷入未知状态)。
+2. 基于请求指纹(用户+任务类型+归一化参数)的短时任务去重,
+   防止用户因为页面卡顿而不小心开了第二个窗口重复提交一模一样的请求
+   (这正是周六测试事故里小唐踩到的真实场景)。
+3. 提供上下文管理器与装饰器两种使用方式,方便嵌入到现有FastAPI
+   路由或Agent执行入口。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Optional
+
+logger = logging.getLogger("cangqiong.concurrency_guard")
+
+
+class ConcurrentSessionRejectedError(Exception):
+    """当同一用户同类型任务的并发数超过限制时抛出。"""
+
+    def __init__(self, user_id: str, task_type: str, current_count: int, limit: int):
+        self.user_id = user_id
+        self.task_type = task_type
+        self.current_count = current_count
+        self.limit = limit
+        super().__init__(
+            f"用户({user_id})的任务类型({task_type})当前已有{current_count}个在途会话,"
+            f"超过并发上限({limit}),本次请求被拒绝。"
+        )
+
+    def to_user_message(self) -> str:
+        """生成面向终端用户的友好提示,不能把内部异常信息直接甩给用户。"""
+        return "您有一个相同类型的任务正在处理中,请等待其完成后再提交,避免重复请求造成资源浪费。"
+
+
+class DuplicateRequestRejectedError(Exception):
+    """当检测到短时间内的重复请求指纹时抛出。"""
+
+    def __init__(self, fingerprint: str, window_seconds: float):
+        self.fingerprint = fingerprint
+        self.window_seconds = window_seconds
+        super().__init__(
+            f"检测到重复请求(指纹={fingerprint}),在{window_seconds}秒去重窗口内已存在相同请求。"
+        )
+
+    def to_user_message(self) -> str:
+        return "检测到您刚刚提交了相同的请求,系统已自动合并处理,请勿重复点击提交。"
+
+
+def _build_fingerprint(user_id: str, task_type: str, params: dict) -> str:
+    """
+    根据用户ID、任务类型与归一化后的参数,生成一个稳定的请求指纹。
+
+    对参数做json.dumps(sort_keys=True)归一化,是为了让"参数字典的key
+    顺序不同但内容相同"的两次请求,能够被识别成同一个指纹,这跟
+    今天7.1节死循环检测器里对参数做相似度归一化是同一类思路的延伸。
+    """
+    normalized_params = json.dumps(params, sort_keys=True, ensure_ascii=False, default=str)
+    raw = f"{user_id}:{task_type}:{normalized_params}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+@dataclass
+class ConcurrencyGuardConfig:
+    """并发控制的可配置参数。"""
+
+    max_concurrent_per_user_task: int = 1
+    dedup_window_seconds: float = 10.0
+
+
+@dataclass
+class _ActiveSessionBucket:
+    """某个(user_id, task_type)维度当前的活跃会话计数与最近的请求指纹缓存。"""
+
+    active_count: int = 0
+    recent_fingerprints: Dict[str, float] = field(default_factory=dict)
+
+
+class ConcurrencyGuard:
+    """
+    面向Agent任务入口的并发与重复请求防护器。
+
+    典型用法(上下文管理器方式):
+        guard = ConcurrencyGuard()
+        with guard.acquire(user_id="u_001", task_type="work_order_query", params={...}):
+            result = run_agent_task(...)
+
+    典型用法(装饰器方式):
+        @guard.guarded(task_type="work_order_query")
+        def handle_query(user_id: str, params: dict):
+            ...
+    """
+
+    def __init__(self, config: Optional[ConcurrencyGuardConfig] = None):
+        self._config = config or ConcurrencyGuardConfig()
+        self._lock = threading.Lock()
+        self._buckets: Dict[str, _ActiveSessionBucket] = {}
+
+    def _bucket_key(self, user_id: str, task_type: str) -> str:
+        return f"{user_id}::{task_type}"
+
+    def _get_bucket(self, key: str) -> _ActiveSessionBucket:
+        if key not in self._buckets:
+            self._buckets[key] = _ActiveSessionBucket()
+        return self._buckets[key]
+
+    def _cleanup_expired_fingerprints(self, bucket: _ActiveSessionBucket) -> None:
+        now = time.time()
+        expired = [
+            fp for fp, ts in bucket.recent_fingerprints.items()
+            if now - ts > self._config.dedup_window_seconds
+        ]
+        for fp in expired:
+            bucket.recent_fingerprints.pop(fp, None)
+
+    @contextmanager
+    def acquire(self, user_id: str, task_type: str, params: Optional[dict] = None):
+        """
+        申请一次任务执行许可,离开上下文时自动释放并发计数。
+
+        参数:
+            user_id: 发起请求的用户ID。
+            task_type: 任务类型标识,例如"work_order_query"。
+            params: 任务参数,用于生成去重指纹,可为空(为空时只做并发数限制,
+                不做去重判断)。
+
+        异常:
+            ConcurrentSessionRejectedError: 并发数超限。
+            DuplicateRequestRejectedError: 短时间内检测到完全相同的重复请求。
+        """
+        key = self._bucket_key(user_id, task_type)
+        fingerprint = _build_fingerprint(user_id, task_type, params or {})
+
+        with self._lock:
+            bucket = self._get_bucket(key)
+            self._cleanup_expired_fingerprints(bucket)
+
+            if fingerprint in bucket.recent_fingerprints:
+                raise DuplicateRequestRejectedError(fingerprint, self._config.dedup_window_seconds)
+
+            if bucket.active_count >= self._config.max_concurrent_per_user_task:
+                raise ConcurrentSessionRejectedError(
+                    user_id, task_type, bucket.active_count, self._config.max_concurrent_per_user_task,
+                )
+
+            bucket.active_count += 1
+            bucket.recent_fingerprints[fingerprint] = time.time()
+            logger.info(
+                "任务许可已授予: user_id=%s task_type=%s 当前并发数=%d",
+                user_id, task_type, bucket.active_count,
+            )
+
+        try:
+            yield
+        finally:
+            with self._lock:
+                bucket = self._get_bucket(key)
+                bucket.active_count = max(0, bucket.active_count - 1)
+                logger.info(
+                    "任务许可已释放: user_id=%s task_type=%s 当前并发数=%d",
+                    user_id, task_type, bucket.active_count,
+                )
+
+    def guarded(self, task_type: str):
+        """
+        装饰器形式的并发防护,要求调用方以关键字参数传入user_id,
+        以及可选的params用于去重判断。
+        """
+
+        def decorator(func: Callable) -> Callable:
+            def wrapper(*args: Any, user_id: str, params: Optional[dict] = None, **kwargs: Any) -> Any:
+                with self.acquire(user_id=user_id, task_type=task_type, params=params):
+                    return func(*args, user_id=user_id, params=params, **kwargs)
+
+            return wrapper
+
+        return decorator
+
+    def get_active_count(self, user_id: str, task_type: str) -> int:
+        """查询指定用户+任务类型当前的活跃会话数,便于监控面板展示。"""
+        with self._lock:
+            return self._get_bucket(self._bucket_key(user_id, task_type)).active_count
+```
+
+陈铭把这个模块接到数据查询Agent的入口之后,又用小唐当天的测试脚本还原了一遍"开两个窗口提交同一个请求"的场景——第二个窗口的请求立刻被`DuplicateRequestRejectedError`拦下,页面提示"检测到您刚刚提交了相同的请求",而不再是转圈两分钟之后一个冷冰冰的超时提示。老王看完评价说:"这才是把晨会上那句'先记下来'真正兑现了,一个问题被记下来但没有代码落地,本质上和没发现是一样的。"
+
+### 7.9 熔断器:防止外部依赖响应缓慢拖垮整体会话
+
+课后作业第6题里,老王给出的参考答案提到过一个新场景——数据分析Agent调用祺瑞集团内部老旧ERP系统接口获取历史财务数据,如果这个接口本身响应很慢,即便Agent的推理逻辑完全正常、只调用了一次,也会导致整个会话被拖得很长,这种情况下最大迭代次数限制完全起不到作用,必须靠总执行时长上限与熔断降级来兜底。今天晚上补的这段代码,就是把这个思路落成一个可以直接嵌到任意外部依赖调用上的通用熔断器。
+
+```python
+"""
+circuit_breaker.py
+
+面向外部依赖调用(祺瑞集团ERP系统接口、第三方API等)的熔断器与
+超时控制模块。
+
+对应课后作业里"超时控制防御"覆盖的风险场景——某个环节依赖的外部
+资源响应缓慢甚至彻底卡死,这种情况迭代次数限制起不到任何作用,
+必须靠"总执行时长上限"与"熔断降级"来兜底。
+
+熔断器实现经典的三态状态机:
+    CLOSED(闭合,正常放行请求) --连续失败次数超阈值--> OPEN(打开,直接拒绝)
+    OPEN --冷却时间到--> HALF_OPEN(半开,允许少量试探请求)
+    HALF_OPEN --试探请求成功--> CLOSED
+    HALF_OPEN --试探请求失败--> OPEN(重新计时冷却)
+"""
+
+from __future__ import annotations
+
+import functools
+import logging
+import threading
+import time
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Callable, Optional
+
+logger = logging.getLogger("cangqiong.circuit_breaker")
+
+
+class CircuitState(str, Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
+class CircuitOpenError(Exception):
+    """熔断器处于打开状态,拒绝本次调用时抛出。"""
+
+    def __init__(self, name: str, retry_after_seconds: float):
+        self.name = name
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__(
+            f"依赖({name})当前处于熔断保护状态,请{retry_after_seconds:.0f}秒后重试。"
+        )
+
+
+class CallTimeoutError(Exception):
+    """单次调用超过超时上限时抛出。"""
+
+
+@dataclass
+class CircuitBreakerConfig:
+    """熔断器可配置参数。"""
+
+    failure_threshold: int = 5              # 连续失败多少次后打开熔断
+    recovery_timeout_seconds: float = 30.0  # 打开状态下,多久后允许进入半开状态试探
+    half_open_max_trials: int = 1           # 半开状态下允许放行的试探请求数
+    call_timeout_seconds: float = 20.0      # 单次调用的超时上限
+
+
+class CircuitBreaker:
+    """
+    单个外部依赖的熔断器实例,通常按依赖名称(例如"qirui_erp_api")
+    独立创建,不同依赖的熔断状态互不影响,这一点很关键——不能用一个
+    全局熔断器管所有外部依赖,否则某个不重要的接口抖动一下,会连带
+    把其他健康的依赖也一起熔断掉。
+
+    典型用法:
+        breaker = CircuitBreaker(name="qirui_erp_api")
+
+        @breaker.protect
+        def call_erp_api(...):
+            ...
+    """
+
+    def __init__(self, name: str, config: Optional[CircuitBreakerConfig] = None):
+        self.name = name
+        self._config = config or CircuitBreakerConfig()
+        self._lock = threading.Lock()
+        self._state = CircuitState.CLOSED
+        self._consecutive_failures = 0
+        self._opened_at: float = 0.0
+        self._half_open_trials_used = 0
+
+    @property
+    def state(self) -> CircuitState:
+        with self._lock:
+            self._maybe_transition_to_half_open()
+            return self._state
+
+    def _maybe_transition_to_half_open(self) -> None:
+        """如果处于打开状态且冷却时间已到,自动转入半开状态,允许试探。"""
+        if self._state == CircuitState.OPEN:
+            elapsed = time.time() - self._opened_at
+            if elapsed >= self._config.recovery_timeout_seconds:
+                self._state = CircuitState.HALF_OPEN
+                self._half_open_trials_used = 0
+                logger.warning("依赖(%s)熔断器进入半开状态,允许试探性请求", self.name)
+
+    def _on_success(self) -> None:
+        with self._lock:
+            if self._state == CircuitState.HALF_OPEN:
+                logger.info("依赖(%s)半开状态下的试探请求成功,熔断器恢复闭合", self.name)
+            self._state = CircuitState.CLOSED
+            self._consecutive_failures = 0
+
+    def _on_failure(self) -> None:
+        with self._lock:
+            self._consecutive_failures += 1
+            if self._state == CircuitState.HALF_OPEN:
+                logger.error("依赖(%s)半开状态下的试探请求仍然失败,重新回到打开状态", self.name)
+                self._state = CircuitState.OPEN
+                self._opened_at = time.time()
+                return
+            if self._consecutive_failures >= self._config.failure_threshold:
+                logger.error(
+                    "依赖(%s)连续失败%d次,达到熔断阈值,熔断器打开,%.0f秒内将直接拒绝请求",
+                    self.name, self._consecutive_failures, self._config.recovery_timeout_seconds,
+                )
+                self._state = CircuitState.OPEN
+                self._opened_at = time.time()
+
+    def _acquire_call_permit(self) -> None:
+        """在真正发起调用之前,检查当前状态是否允许放行。"""
+        with self._lock:
+            self._maybe_transition_to_half_open()
+            if self._state == CircuitState.OPEN:
+                remaining = self._config.recovery_timeout_seconds - (time.time() - self._opened_at)
+                raise CircuitOpenError(self.name, max(remaining, 0.0))
+            if self._state == CircuitState.HALF_OPEN:
+                if self._half_open_trials_used >= self._config.half_open_max_trials:
+                    raise CircuitOpenError(self.name, self._config.recovery_timeout_seconds)
+                self._half_open_trials_used += 1
+
+    def call(self, func: Callable, *args: Any, **kwargs: Any) -> Any:
+        """
+        在熔断保护与超时控制下,执行一次对外部依赖的调用。
+
+        参数:
+            func: 实际执行外部调用的函数(同步函数)。
+
+        异常:
+            CircuitOpenError: 熔断器处于打开状态,直接拒绝。
+            CallTimeoutError: 调用耗时超过配置的超时上限。
+        """
+        self._acquire_call_permit()
+
+        result_container: dict = {}
+        error_container: dict = {}
+
+        def _target() -> None:
+            try:
+                result_container["value"] = func(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                error_container["error"] = exc
+
+        worker = threading.Thread(target=_target, daemon=True)
+        started_at = time.time()
+        worker.start()
+        worker.join(timeout=self._config.call_timeout_seconds)
+
+        if worker.is_alive():
+            # 超时:线程仍在运行,Python没有安全的线程强杀机制,我们无法真正
+            # 中断它,但可以让调用方及时拿到超时结果、判定这次熔断失败,
+            # 不再傻等——真实生产环境中,应当结合底层调用库自身的超时参数
+            # (如requests的timeout)双重保护,这里的join超时是最后一道兜底线。
+            self._on_failure()
+            elapsed = time.time() - started_at
+            logger.error(
+                "依赖(%s)调用超时: 已等待%.1f秒,超过上限%.1f秒", self.name, elapsed,
+                self._config.call_timeout_seconds,
+            )
+            raise CallTimeoutError(f"依赖({self.name})调用超时,已等待{elapsed:.1f}秒")
+
+        if "error" in error_container:
+            self._on_failure()
+            raise error_container["error"]
+
+        self._on_success()
+        return result_container.get("value")
+
+    def protect(self, func: Callable) -> Callable:
+        """装饰器形式,等价于对被装饰函数的每次调用套上 self.call。"""
+
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            return self.call(func, *args, **kwargs)
+
+        return wrapper
+
+
+class CircuitBreakerRegistry:
+    """
+    多个外部依赖各自独立熔断器的统一注册中心,避免每个业务模块
+    各自维护熔断器实例、命名混乱、状态互相覆盖。
+    """
+
+    def __init__(self) -> None:
+        self._breakers: Dict[str, CircuitBreaker] = {}
+        self._lock = threading.Lock()
+
+    def get_or_create(self, name: str, config: Optional[CircuitBreakerConfig] = None) -> CircuitBreaker:
+        with self._lock:
+            if name not in self._breakers:
+                self._breakers[name] = CircuitBreaker(name=name, config=config)
+            return self._breakers[name]
+
+    def snapshot(self) -> dict:
+        """返回所有已注册熔断器当前状态的快照,便于监控面板展示。"""
+        with self._lock:
+            return {name: breaker.state.value for name, breaker in self._breakers.items()}
+
+
+global_circuit_breaker_registry = CircuitBreakerRegistry()
+```
+
+补充这段代码时,阿俊提了一个很实际的问题:"Python线程没法被强制杀死,那如果调用真的卡死了,那个worker线程不会一直占着资源、越攒越多吗?"陈铭想了想,承认这确实是个局限,并把这一点原样写进了模块的注释里,同时在预研待办里补了一条——"生产环境应结合底层HTTP客户端自身的超时参数做双重保护,不能只依赖join超时",这也是老王常说的"工程代码要老实承认自己的局限,不要用注释掩盖问题,而是要用注释指出问题、留下改进的线索"的一个具体体现。
+
+### 7.10 企业微信告警通知器:分级推送与自我限流
+
+前面提到的那个"讽刺但真实的风险"——告警系统本身变成新的刷屏源——在这段代码里被认真对待。它不是简单地把异常信息转发到企业微信机器人,而是自带了指纹去重与频率限流,确保"同一个问题在短时间内反复触发"这种情况,不会变成对运维同事的骚扰式轰炸。
+
+```python
+"""
+wecom_alert_notifier.py
+
+企业微信机器人告警推送模块。
+
+背景与教训:晨会复盘的另一半事故——费用审批Agent因为没收到人工反馈,
+反复发起审批请求,把审批人企业微信刷屏近200条通知。今天补上死循环
+检测和幂等去重之后,审批场景本身不会再刷屏了;但引申出一个新问题——
+如果把系统里各种异常都接上企业微信告警推送,万一告警本身触发得
+过于频繁(比如同一个错误在几分钟内反复出现),告警机器人自己也会
+变成一个新的刷屏源。所以本模块在实现告警推送能力的同时,
+必须自带"告警去重与限流"能力,这是一种防御性设计的自我指涉。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import threading
+import time
+import urllib.request
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, Optional, Union
+
+logger = logging.getLogger("cangqiong.wecom_alert")
+
+
+class AlertLevel(str, Enum):
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    CRITICAL = "critical"
+
+
+_LEVEL_EMOJI = {
+    AlertLevel.INFO: "ℹ️",
+    AlertLevel.WARNING: "⚠️",
+    AlertLevel.ERROR: "🔴",
+    AlertLevel.CRITICAL: "🚨",
+}
+
+_LEVEL_LOG_FUNC_NAME = {
+    AlertLevel.INFO: "info",
+    AlertLevel.WARNING: "warning",
+    AlertLevel.ERROR: "error",
+    AlertLevel.CRITICAL: "critical",
+}
+
+
+@dataclass
+class AlertThrottleConfig:
+    """告警自身的去重/限流配置,避免告警推送变成新的刷屏源。"""
+
+    dedup_window_seconds: float = 300.0     # 同一告警指纹5分钟内只推送一次
+    max_alerts_per_minute: int = 10         # 每分钟最多推送多少条告警,超过则降级为仅记录本地日志
+
+
+@dataclass
+class _AlertRecord:
+    fingerprint: str
+    last_sent_at: float
+    suppressed_count: int = 0
+
+
+class WeComAlertNotifier:
+    """
+    企业微信机器人Webhook告警推送器。
+
+    典型用法:
+        notifier = WeComAlertNotifier(webhook_url=os.environ["WECOM_WEBHOOK_URL"])
+        notifier.send(
+            level=AlertLevel.ERROR,
+            title="Agent会话疑似死循环",
+            detail="session_id=xxx, 已达到最大迭代次数",
+        )
+    """
+
+    def __init__(self, webhook_url: Optional[str] = None,
+                 throttle_config: Optional[AlertThrottleConfig] = None):
+        self._webhook_url = webhook_url or os.environ.get("WECOM_WEBHOOK_URL", "")
+        self._throttle_config = throttle_config or AlertThrottleConfig()
+        self._lock = threading.Lock()
+        self._recent_alerts: Dict[str, _AlertRecord] = {}
+        self._sent_timestamps_window: list[float] = []
+
+    @staticmethod
+    def _coerce_level(level: Union["AlertLevel", str]) -> "AlertLevel":
+        """允许调用方传入AlertLevel实例或纯字符串,统一转换为AlertLevel。"""
+        if isinstance(level, AlertLevel):
+            return level
+        return AlertLevel(level)
+
+    def _fingerprint(self, title: str, detail: str) -> str:
+        raw = f"{title}::{detail[:200]}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+    def _is_within_dedup_window(self, fingerprint: str) -> bool:
+        record = self._recent_alerts.get(fingerprint)
+        if record is None:
+            return False
+        return time.time() - record.last_sent_at < self._throttle_config.dedup_window_seconds
+
+    def _is_rate_limited(self) -> bool:
+        now = time.time()
+        one_minute_ago = now - 60.0
+        self._sent_timestamps_window = [t for t in self._sent_timestamps_window if t > one_minute_ago]
+        return len(self._sent_timestamps_window) >= self._throttle_config.max_alerts_per_minute
+
+    def send(self, level: Union[AlertLevel, str], title: str, detail: str,
+              extra_fields: Optional[dict] = None) -> bool:
+        """
+        发送一条告警通知,内部会自动执行去重与限流判断。
+
+        参数:
+            level: 告警级别,可传入AlertLevel实例或对应的字符串。
+            title: 告警标题,应简洁明确,例如"Agent会话疑似死循环"。
+            detail: 告警详情,例如session_id、错误堆栈摘要等。
+            extra_fields: 可选的额外结构化字段,会附加到推送内容末尾。
+
+        返回:
+            True表示本次告警已实际推送(或至少完成了本地日志记录);
+            False表示被去重/限流抑制,只做了计数,不会真正发出网络请求。
+        """
+        level = self._coerce_level(level)
+        fingerprint = self._fingerprint(title, detail)
+
+        with self._lock:
+            if self._is_within_dedup_window(fingerprint):
+                record = self._recent_alerts[fingerprint]
+                record.suppressed_count += 1
+                logger.info(
+                    "告警被去重抑制: title=%s fingerprint=%s 累计抑制次数=%d",
+                    title, fingerprint, record.suppressed_count,
+                )
+                return False
+
+            if self._is_rate_limited():
+                logger.warning(
+                    "告警推送触发限流(每分钟上限%d条),本条降级为仅记录本地日志: title=%s",
+                    self._throttle_config.max_alerts_per_minute, title,
+                )
+                self._log_locally(level, title, detail, extra_fields)
+                return False
+
+            self._recent_alerts[fingerprint] = _AlertRecord(fingerprint=fingerprint, last_sent_at=time.time())
+            self._sent_timestamps_window.append(time.time())
+
+        self._log_locally(level, title, detail, extra_fields)
+        return self._push_to_wecom(level, title, detail, extra_fields)
+
+    def _log_locally(self, level: AlertLevel, title: str, detail: str,
+                       extra_fields: Optional[dict]) -> None:
+        payload = {"title": title, "detail": detail, "extra": extra_fields or {}}
+        log_func = getattr(logger, _LEVEL_LOG_FUNC_NAME[level])
+        log_func("[%s] %s", level.value.upper(), json.dumps(payload, ensure_ascii=False))
+
+    def _push_to_wecom(self, level: AlertLevel, title: str, detail: str,
+                         extra_fields: Optional[dict]) -> bool:
+        """
+        真正向企业微信机器人Webhook发起推送。
+
+        没有配置webhook_url时(例如本地开发或单元测试环境),直接跳过
+        网络请求,只依赖前面已经完成的本地日志记录,这个"优雅降级"
+        设计避免了单元测试因为缺少真实凭证而失败或产生真实的网络调用。
+        """
+        if not self._webhook_url:
+            logger.debug("未配置WECOM_WEBHOOK_URL,跳过实际网络推送")
+            return True
+
+        markdown_content = (
+            f"{_LEVEL_EMOJI[level]} **{title}**\n"
+            f"> 级别:{level.value}\n"
+            f"> 详情:{detail}\n"
+        )
+        if extra_fields:
+            for key, value in extra_fields.items():
+                markdown_content += f"> {key}:{value}\n"
+
+        body = json.dumps({
+            "msgtype": "markdown",
+            "markdown": {"content": markdown_content},
+        }).encode("utf-8")
+
+        try:
+            request = urllib.request.Request(
+                self._webhook_url, data=body,
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                success = response.status == 200
+                if not success:
+                    logger.error("企业微信告警推送返回非200状态码: %s", response.status)
+                return success
+        except Exception:  # noqa: BLE001
+            logger.exception("企业微信告警推送失败,请检查Webhook地址与网络连通性")
+            return False
+
+    def get_suppression_report(self) -> list[dict]:
+        """返回当前被去重抑制的告警统计,便于事后回顾"哪些问题在短时间内反复发生"。"""
+        with self._lock:
+            return [
+                {"fingerprint": fp, "suppressed_count": record.suppressed_count,
+                 "last_sent_at": record.last_sent_at}
+                for fp, record in self._recent_alerts.items() if record.suppressed_count > 0
+            ]
+
+
+global_wecom_notifier = WeComAlertNotifier()
+```
+
+### 7.11 高成本用户分级响应:UserCostAggregator完整实现
+
+课后作业第2题里,老王要求团队"设计思路与关键代码结构,不要求完整可运行",这原本是留给学员自己课后消化的开放题。但当晚复盘时,老王改了主意:"设计思路和能跑起来的代码之间永远有一道鸿沟,不亲手实现一遍,很多边界条件根本想不到——比如'连续几天限流'这个'连续'到底怎么算,是自然日,还是滑动24小时?这个问题光靠嘴说是说不清楚的。"于是这段代码把参考答案里的设计,真正落成了一份可以运行、可以写单元测试的完整实现。
+
+```python
+"""
+user_cost_aggregator.py
+
+跨会话、跨天的用户级成本聚合与分级响应模块。
+
+本模块是课后作业第2题"设计UserCostAggregator"的完整可运行实现——
+课堂讨论阶段只给出了设计思路,这里把设计落成真正可以跑起来、
+可以写单元测试验证的代码,也是老王反复强调的"设计思路和能跑的代码
+之间永远有一道鸿沟,不亲手实现一遍,很多边界条件想不到"的具体体现。
+
+分级响应策略(与作业参考答案保持一致):
+    第一级(达到阈值50%): 仅记录日志,供人工日常巡检。
+    第二级(达到阈值100%): 自动限流,将该用户的并发上限降低。
+    第三级(连续多天触发限流): 转人工review。
+
+关于"连续天数"的口径说明:本实现按自然日(本地时区)分桶统计,
+"连续"指的是"每个自然日的累计成本都达到过限流阈值",只要中间
+有一个自然日没有达到阈值,连续计数就会被重置为0,这个口径在
+实现前必须先明确下来,否则不同人写出来的代码,统计结果会完全不同。
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, List, Optional
+
+logger = logging.getLogger("cangqiong.user_cost_aggregator")
+
+
+class UserRiskLevel(str, Enum):
+    NORMAL = "normal"
+    WATCHLIST = "watchlist"        # 达到50%阈值,进入观察名单
+    RATE_LIMITED = "rate_limited"  # 达到100%阈值,自动限流
+    HUMAN_REVIEW = "human_review"  # 连续多天限流,转人工review
+
+
+@dataclass
+class DailyCostRecord:
+    """某个用户某一天的累计成本记录。"""
+
+    date_key: str  # 格式 YYYY-MM-DD,按自然日分桶
+    total_cost_cny: float = 0.0
+    call_count: int = 0
+
+
+@dataclass
+class UserCostProfile:
+    """单个用户的成本画像与风险状态。"""
+
+    user_id: str
+    daily_records: Dict[str, DailyCostRecord] = field(default_factory=dict)
+    risk_level: UserRiskLevel = UserRiskLevel.NORMAL
+    consecutive_rate_limited_days: int = 0
+    last_evaluated_date: str = ""
+
+
+@dataclass
+class UserCostAggregatorConfig:
+    """分级响应的阈值配置。"""
+
+    daily_cost_threshold_cny: float = 50.0
+    watchlist_ratio: float = 0.5            # 达到阈值的50%进入观察名单
+    rate_limited_ratio: float = 1.0         # 达到阈值的100%触发限流
+    human_review_consecutive_days: int = 3  # 连续几天限流后转人工review
+    rate_limited_concurrency: int = 1       # 限流后允许的并发会话数
+
+
+def _today_key() -> str:
+    """获取当前自然日的日期字符串,按本地时间分桶。"""
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+
+class UserCostAggregator:
+    """
+    维护"用户ID -> 按天累计成本"的映射,并根据阈值触发分级响应。
+
+    典型用法:
+        aggregator = UserCostAggregator()
+        aggregator.record_cost(user_id="u_001", cost_cny=12.5)
+        level = aggregator.get_risk_level("u_001")
+        if level == UserRiskLevel.RATE_LIMITED:
+            allowed_concurrency = aggregator.get_allowed_concurrency("u_001")
+    """
+
+    def __init__(self, config: Optional[UserCostAggregatorConfig] = None,
+                 alert_notifier=None):
+        self._config = config or UserCostAggregatorConfig()
+        self._alert_notifier = alert_notifier
+        self._lock = threading.Lock()
+        self._profiles: Dict[str, UserCostProfile] = {}
+
+    def _get_profile(self, user_id: str) -> UserCostProfile:
+        if user_id not in self._profiles:
+            self._profiles[user_id] = UserCostProfile(user_id=user_id)
+        return self._profiles[user_id]
+
+    def record_cost(self, user_id: str, cost_cny: float) -> UserRiskLevel:
+        """
+        记录一次调用产生的成本,并立即重新评估该用户的风险等级。
+
+        参数:
+            user_id: 用户ID。
+            cost_cny: 本次调用产生的费用(元)。
+
+        返回:
+            记录之后,该用户当前的风险等级。
+        """
+        today = _today_key()
+        with self._lock:
+            profile = self._get_profile(user_id)
+            record = profile.daily_records.setdefault(today, DailyCostRecord(date_key=today))
+            record.total_cost_cny += cost_cny
+            record.call_count += 1
+
+            self._evaluate_risk_level(profile, today, record)
+            return profile.risk_level
+
+    def _evaluate_risk_level(self, profile: UserCostProfile, today: str,
+                               record: DailyCostRecord) -> None:
+        """
+        依据当天累计成本,重新评估用户的风险等级,并在等级发生变化时
+        触发对应的分级响应动作(记录日志/限流/人工review)。
+        """
+        threshold = self._config.daily_cost_threshold_cny
+        watchlist_bar = threshold * self._config.watchlist_ratio
+        rate_limit_bar = threshold * self._config.rate_limited_ratio
+
+        is_new_day = profile.last_evaluated_date != today
+        previous_level = profile.risk_level
+
+        if record.total_cost_cny >= rate_limit_bar:
+            new_level = UserRiskLevel.RATE_LIMITED
+        elif record.total_cost_cny >= watchlist_bar:
+            new_level = UserRiskLevel.WATCHLIST
+        else:
+            new_level = UserRiskLevel.NORMAL
+
+        if is_new_day:
+            # "连续限流天数"只在跨入新的一天时才更新一次,避免同一天内
+            # 多次调用record_cost反复累加,那样"连续"这个概念就失真了。
+            if new_level == UserRiskLevel.RATE_LIMITED:
+                profile.consecutive_rate_limited_days += 1
+            else:
+                profile.consecutive_rate_limited_days = 0
+            profile.last_evaluated_date = today
+
+        if profile.consecutive_rate_limited_days >= self._config.human_review_consecutive_days:
+            new_level = UserRiskLevel.HUMAN_REVIEW
+
+        profile.risk_level = new_level
+
+        if new_level != previous_level:
+            self._on_level_changed(profile, previous_level, new_level, record)
+
+    def _on_level_changed(self, profile: UserCostProfile, old_level: UserRiskLevel,
+                            new_level: UserRiskLevel, record: DailyCostRecord) -> None:
+        """风险等级发生变化时,执行对应的分级响应动作。"""
+        logger.info(
+            "用户(%s)风险等级变化: %s -> %s,当日累计成本=%.2f元",
+            profile.user_id, old_level.value, new_level.value, record.total_cost_cny,
+        )
+
+        if new_level == UserRiskLevel.WATCHLIST:
+            logger.warning(
+                "第一级响应: 用户(%s)当日成本%.2f元已达到阈值的%.0f%%,记入观察名单,仅记录日志",
+                profile.user_id, record.total_cost_cny, self._config.watchlist_ratio * 100,
+            )
+        elif new_level == UserRiskLevel.RATE_LIMITED:
+            logger.error(
+                "第二级响应: 用户(%s)当日成本%.2f元已达到阈值%.2f元,自动限流,并发上限降至%d",
+                profile.user_id, record.total_cost_cny, self._config.daily_cost_threshold_cny,
+                self._config.rate_limited_concurrency,
+            )
+            self._maybe_alert(
+                title="用户触发成本限流",
+                detail=f"用户{profile.user_id}当日成本{record.total_cost_cny:.2f}元,已自动限流",
+            )
+        elif new_level == UserRiskLevel.HUMAN_REVIEW:
+            logger.critical(
+                "第三级响应: 用户(%s)连续%d天触发限流,转人工review流程",
+                profile.user_id, profile.consecutive_rate_limited_days,
+            )
+            self._maybe_alert(
+                title="用户转人工review",
+                detail=f"用户{profile.user_id}连续{profile.consecutive_rate_limited_days}天触发成本限流,请介入排查",
+            )
+
+    def _maybe_alert(self, title: str, detail: str) -> None:
+        """如果配置了告警通知器,推送一条告警;通知器本身的去重限流由它自己负责。"""
+        if self._alert_notifier is not None:
+            try:
+                self._alert_notifier.send(level="error", title=title, detail=detail)
+            except Exception:  # noqa: BLE001
+                logger.exception("向告警通知器推送失败,不影响主流程")
+
+    def get_risk_level(self, user_id: str) -> UserRiskLevel:
+        """查询用户当前的风险等级。"""
+        with self._lock:
+            return self._get_profile(user_id).risk_level
+
+    def get_allowed_concurrency(self, user_id: str, default_concurrency: int = 5) -> int:
+        """
+        根据用户当前风险等级,返回应当允许的并发会话数上限。
+
+        这个方法的返回值,应当被用来动态调整7.8节ConcurrencyGuard的
+        max_concurrent_per_user_task参数,两个模块通过这个接口协同工作,
+        而不是各自维护一份互相不知道对方存在的限流状态。
+        """
+        level = self.get_risk_level(user_id)
+        if level in (UserRiskLevel.RATE_LIMITED, UserRiskLevel.HUMAN_REVIEW):
+            return self._config.rate_limited_concurrency
+        return default_concurrency
+
+    def get_daily_report(self, user_id: str, date_key: Optional[str] = None) -> dict:
+        """获取用户某一天(默认今天)的成本报告,供监控面板或客服排查使用。"""
+        date_key = date_key or _today_key()
+        with self._lock:
+            profile = self._get_profile(user_id)
+            record = profile.daily_records.get(date_key, DailyCostRecord(date_key=date_key))
+            return {
+                "user_id": user_id, "date": date_key,
+                "total_cost_cny": round(record.total_cost_cny, 4),
+                "call_count": record.call_count,
+                "risk_level": profile.risk_level.value,
+                "consecutive_rate_limited_days": profile.consecutive_rate_limited_days,
+            }
+
+    def list_watchlist_users(self) -> List[str]:
+        """列出当前处于观察名单及以上风险等级的全部用户,供运营巡检。"""
+        with self._lock:
+            return [
+                uid for uid, profile in self._profiles.items()
+                if profile.risk_level != UserRiskLevel.NORMAL
+            ]
+```
+
+老王review完这份代码,特别认可"连续天数口径说明"这段注释,他说:"这种看似啰嗦的口径说明,恰恰是企业级代码和课堂练习代码最大的区别之一——课堂练习写完能跑就行,企业级代码要考虑'半年后,一个完全没参与过今天讨论的新同事看到这段代码,能不能靠注释就搞清楚这个'连续'到底怎么算',这才是注释真正的价值,不是解释代码在做什么,而是解释代码背后没写出来的业务口径。"
+
+### 7.12 单元测试:覆盖并发控制、熔断、告警与分级响应
+
+```python
+"""
+test_day46_stability_extra_modules.py
+
+针对Day46晚上补充的四个稳定性模块的单元测试:
+    1. ConcurrencyGuard —— 并发限制与重复请求去重
+    2. CircuitBreaker —— 熔断状态机迁移与超时处理
+    3. WeComAlertNotifier —— 告警去重与限流
+    4. UserCostAggregator —— 分级响应升级逻辑
+
+运行方式: pytest test_day46_stability_extra_modules.py -v
+"""
+
+from __future__ import annotations
+
+import time
+
+import pytest
+
+from concurrency_guard import (
+    ConcurrencyGuard,
+    ConcurrencyGuardConfig,
+    ConcurrentSessionRejectedError,
+    DuplicateRequestRejectedError,
+)
+from circuit_breaker import (
+    CallTimeoutError,
+    CircuitBreaker,
+    CircuitBreakerConfig,
+    CircuitOpenError,
+    CircuitState,
+)
+from wecom_alert_notifier import AlertLevel, AlertThrottleConfig, WeComAlertNotifier
+from user_cost_aggregator import UserCostAggregator, UserCostAggregatorConfig, UserRiskLevel
+
+
+class TestConcurrencyGuard:
+    """校验并发会话控制与重复请求去重逻辑。"""
+
+    def test_first_request_is_allowed(self):
+        guard = ConcurrencyGuard()
+        with guard.acquire(user_id="u1", task_type="query", params={"a": 1}):
+            assert guard.get_active_count("u1", "query") == 1
+        assert guard.get_active_count("u1", "query") == 0
+
+    def test_second_concurrent_request_is_rejected(self):
+        guard = ConcurrencyGuard(ConcurrencyGuardConfig(max_concurrent_per_user_task=1))
+        with guard.acquire(user_id="u1", task_type="query", params={"a": 1}):
+            with pytest.raises(ConcurrentSessionRejectedError):
+                with guard.acquire(user_id="u1", task_type="query", params={"a": 2}):
+                    pass
+
+    def test_duplicate_fingerprint_within_window_is_rejected(self):
+        guard = ConcurrencyGuard(
+            ConcurrencyGuardConfig(max_concurrent_per_user_task=5, dedup_window_seconds=5)
+        )
+        with guard.acquire(user_id="u1", task_type="query", params={"a": 1}):
+            pass
+        with pytest.raises(DuplicateRequestRejectedError):
+            with guard.acquire(user_id="u1", task_type="query", params={"a": 1}):
+                pass
+
+    def test_different_params_not_treated_as_duplicate(self):
+        """复现小唐补充的边缘场景:同工具不同参数,不应该被误判为重复请求。"""
+        guard = ConcurrencyGuard(ConcurrencyGuardConfig(max_concurrent_per_user_task=5))
+        with guard.acquire(user_id="u1", task_type="query", params={"building": "A栋"}):
+            pass
+        with guard.acquire(user_id="u1", task_type="query", params={"building": "B栋"}):
+            assert guard.get_active_count("u1", "query") == 1
+
+    def test_released_permit_allows_next_request(self):
+        """会话正常结束释放并发许可后,应当允许发起新的同类型请求。"""
+        guard = ConcurrencyGuard(ConcurrencyGuardConfig(max_concurrent_per_user_task=1, dedup_window_seconds=0.01))
+        with guard.acquire(user_id="u1", task_type="query", params={"a": 1}):
+            pass
+        time.sleep(0.02)
+        with guard.acquire(user_id="u1", task_type="query", params={"a": 3}):
+            assert guard.get_active_count("u1", "query") == 1
+
+
+def _raise_runtime_error() -> None:
+    """测试辅助函数:模拟一次外部依赖调用失败。"""
+    raise RuntimeError("下游依赖异常")
+
+
+def _slow_call() -> str:
+    """测试辅助函数:模拟一次响应缓慢的外部依赖调用。"""
+    time.sleep(1.0)
+    return "太慢了,不应该被正常返回"
+
+
+class TestCircuitBreaker:
+    """校验熔断器的状态机迁移与超时处理逻辑。"""
+
+    def test_successful_calls_keep_circuit_closed(self):
+        breaker = CircuitBreaker("dep_ok", CircuitBreakerConfig(failure_threshold=3))
+        for _ in range(5):
+            result = breaker.call(lambda: "ok")
+            assert result == "ok"
+        assert breaker.state == CircuitState.CLOSED
+
+    def test_circuit_opens_after_consecutive_failures(self):
+        breaker = CircuitBreaker(
+            "dep_fail", CircuitBreakerConfig(failure_threshold=3, recovery_timeout_seconds=60)
+        )
+        for _ in range(3):
+            with pytest.raises(RuntimeError):
+                breaker.call(_raise_runtime_error)
+
+        assert breaker.state == CircuitState.OPEN
+        with pytest.raises(CircuitOpenError):
+            breaker.call(lambda: "should not run")
+
+    def test_timeout_counts_as_failure_and_opens_circuit(self):
+        """复现祺瑞ERP接口响应缓慢的场景:超时应当被计为一次失败。"""
+        breaker = CircuitBreaker(
+            "qirui_erp_api",
+            CircuitBreakerConfig(failure_threshold=1, call_timeout_seconds=0.2, recovery_timeout_seconds=60),
+        )
+        with pytest.raises(CallTimeoutError):
+            breaker.call(_slow_call)
+        assert breaker.state == CircuitState.OPEN
+
+    def test_half_open_recovers_after_cooldown(self):
+        breaker = CircuitBreaker(
+            "dep_recover", CircuitBreakerConfig(failure_threshold=1, recovery_timeout_seconds=0.1)
+        )
+        with pytest.raises(RuntimeError):
+            breaker.call(_raise_runtime_error)
+        assert breaker.state == CircuitState.OPEN
+
+        time.sleep(0.15)
+        result = breaker.call(lambda: "恢复正常")
+        assert result == "恢复正常"
+        assert breaker.state == CircuitState.CLOSED
+
+
+class TestWeComAlertNotifier:
+    """校验告警推送的去重与限流逻辑(告警系统不能变成新的刷屏源)。"""
+
+    def test_first_alert_is_sent(self):
+        notifier = WeComAlertNotifier(webhook_url="")
+        sent = notifier.send(AlertLevel.ERROR, "测试告警", "详情内容")
+        assert sent is True
+
+    def test_duplicate_alert_within_window_is_suppressed(self):
+        notifier = WeComAlertNotifier(
+            webhook_url="", throttle_config=AlertThrottleConfig(dedup_window_seconds=60)
+        )
+        notifier.send(AlertLevel.ERROR, "重复告警", "同样的详情")
+        second = notifier.send(AlertLevel.ERROR, "重复告警", "同样的详情")
+        assert second is False
+
+    def test_rate_limit_kicks_in_after_threshold(self):
+        notifier = WeComAlertNotifier(
+            webhook_url="",
+            throttle_config=AlertThrottleConfig(dedup_window_seconds=0.01, max_alerts_per_minute=2),
+        )
+        results = []
+        for i in range(4):
+            results.append(notifier.send(AlertLevel.WARNING, f"告警{i}", f"详情{i}"))
+            time.sleep(0.02)
+        assert results.count(True) <= 2
+
+    def test_string_level_is_accepted(self):
+        """允许调用方直接传入字符串级别,而不强制要求AlertLevel实例。"""
+        notifier = WeComAlertNotifier(webhook_url="")
+        sent = notifier.send("error", "字符串级别告警", "详情")
+        assert sent is True
+
+
+class TestUserCostAggregator:
+    """校验成本分级响应的升级逻辑。"""
+
+    def test_normal_cost_keeps_normal_level(self):
+        aggregator = UserCostAggregator(UserCostAggregatorConfig(daily_cost_threshold_cny=50.0))
+        level = aggregator.record_cost("u1", 5.0)
+        assert level == UserRiskLevel.NORMAL
+
+    def test_watchlist_triggered_at_half_threshold(self):
+        aggregator = UserCostAggregator(UserCostAggregatorConfig(daily_cost_threshold_cny=50.0))
+        level = aggregator.record_cost("u1", 30.0)
+        assert level == UserRiskLevel.WATCHLIST
+
+    def test_rate_limited_triggered_at_full_threshold(self):
+        aggregator = UserCostAggregator(UserCostAggregatorConfig(daily_cost_threshold_cny=50.0))
+        level = aggregator.record_cost("u1", 60.0)
+        assert level == UserRiskLevel.RATE_LIMITED
+
+    def test_allowed_concurrency_drops_after_rate_limited(self):
+        aggregator = UserCostAggregator(
+            UserCostAggregatorConfig(daily_cost_threshold_cny=50.0, rate_limited_concurrency=1)
+        )
+        aggregator.record_cost("u1", 60.0)
+        assert aggregator.get_allowed_concurrency("u1", default_concurrency=5) == 1
+
+    def test_watchlist_users_listed_correctly(self):
+        aggregator = UserCostAggregator(UserCostAggregatorConfig(daily_cost_threshold_cny=50.0))
+        aggregator.record_cost("u1", 30.0)
+        aggregator.record_cost("u2", 5.0)
+        watchlist = aggregator.list_watchlist_users()
+        assert "u1" in watchlist
+        assert "u2" not in watchlist
+
+    def test_multiple_calls_same_day_do_not_double_count_consecutive_days(self):
+        """同一天内多次record_cost,不应该让'连续限流天数'被重复累加。"""
+        aggregator = UserCostAggregator(UserCostAggregatorConfig(daily_cost_threshold_cny=50.0))
+        for _ in range(5):
+            aggregator.record_cost("u1", 20.0)
+        report = aggregator.get_daily_report("u1")
+        assert report["consecutive_rate_limited_days"] in (0, 1)
+```
+
+九点整,这四个模块加上单元测试全部跑通,陈铭把pytest的输出截图发到群里——20个测试用例全部通过。老王只回了一句:"行,今天这个漏洞总算真正补上了,明天可以睡个安稳觉了。"陈铭后来在自己的笔记里补了一句总结,他说这一天最大的感触是,一份预研或者一次事故复盘,如果只停留在"记下来"这个动作,价值几乎等于零,真正的价值永远发生在"记下来"之后有没有人真的坐下来把它变成可以运行、可以测试的代码——这既是对客户负责,也是对团队自己当天讨论的诚实交代。
+
 ---
 
 ## 八、今日复盘
