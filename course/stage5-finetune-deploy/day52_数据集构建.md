@@ -2129,6 +2129,955 @@ if __name__ == "__main__":
 
 陈铭把整条流水线跑完之后的耗时也记了一下——即便加上大模型 API 调用(教学环境用的是 mock 实现,真实调用会更耗时一些)、几次因为阈值调整而重新跑的清洗和去重步骤,整个流程从原始数据到最终质检报告出炉,单次完整跑通大概只需要几分钟,这还是在他自己的笔记本上跑的,没有用到任何 GPU 资源。这个观察让他对"数据处理"和"模型训练"这两件事在资源消耗上的巨大差异有了更直观的体会——今天一整天的工作量,主要消耗的是人的时间和判断力,而不是机器算力,这和明天要正式压满四张 GPU 卡去跑训练任务,是完全不同的资源画像,也提醒他,数据这一环节的瓶颈从来不是"算得快不快",而是"想得清楚不清楚"。
 
+晚饭前,陈铭又跟王振宇碰了个头,提了三个他觉得今天四个脚本还没完全覆盖到的问题:第一,数据集后续要迭代更新,现在完全没有版本管理的手段,今天这份 v1.0 数据集和以后新增的数据混在一起,时间长了根本说不清哪条数据是哪个版本进来的;第二,今天的 Self-Instruct 只做了单轮问答的变体和扩繁,但业务方已经明确未来要支持"追问"场景,今天完全没有产出任何多轮对话样本,ShareGPT 格式空有多轮的结构能力,实际数据却是单轮凑出来的;第三,质检脚本目前是"全量逐条检测",规模小的时候没问题,但复盘会上老王自己也提到过,规模上去之后不可能全部人工看一遍,应该提前把统计抽样审核这套方法论用代码实现出来,而不是等真遇到大规模数据的时候现场现造。王振宇听完觉得这三点提得都在点上,让陈铭趁热打铁,今天晚上把这三块也一并补上。
+
+### 7.5 数据集版本管理工具
+
+第一个要解决的问题是版本管理。陈铭把课后作业第6题里讨论的版本管理规范,直接落地成了一个可以复用的工具模块——不只是给这次项目用,苍穹中台以后遇到别的客户、别的场景的数据集迭代需求,也能直接套用这套版本管理逻辑。
+
+```python
+# -*- coding: utf-8 -*-
+"""
+dataset_version_manager.py
+苍穹企业级智能体中台 · 通用数据集版本管理工具
+
+设计目标:
+    1. 采用"主版本号.次版本号.修订号"三段式版本命名,对应
+       结构性变更 / 增量数据新增 / 局部修正三种更新类型。
+    2. 每次发布新版本都要留存完整的变更日志、快照文件、
+       质检报告链接,支持任意历史版本的追溯与回滚。
+    3. 增量更新时,自动检测新数据与历史全量数据集之间的
+       近似重复,而不仅仅是新增数据内部去重,避免"新一批
+       数据又把旧数据换个说法重新问了一遍"这种隐性冗余。
+
+本工具与 clean_dataset.py / quality_check.py 是配套关系:
+    版本管理工具负责"存档与追溯",不负责清洗与质检本身的
+    业务逻辑,两者边界清晰,便于独立维护和替换。
+"""
+
+import argparse
+import hashlib
+import json
+import logging
+import re
+import shutil
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("dataset_version_manager")
+
+
+# --------------------------------------------------------------------------
+# 版本号解析与比较
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SemVer:
+    major: int
+    minor: int
+    patch: int
+
+    def __str__(self) -> str:
+        return f"v{self.major}.{self.minor}.{self.patch}"
+
+    def bump(self, level: str) -> "SemVer":
+        if level == "major":
+            return SemVer(self.major + 1, 0, 0)
+        if level == "minor":
+            return SemVer(self.major, self.minor + 1, 0)
+        if level == "patch":
+            return SemVer(self.major, self.minor, self.patch + 1)
+        raise ValueError(f"未知的版本升级级别:{level},只支持 major/minor/patch")
+
+    def as_tuple(self) -> Tuple[int, int, int]:
+        return (self.major, self.minor, self.patch)
+
+
+def parse_semver(version_str: str) -> SemVer:
+    match = re.match(r"^v?(\d+)\.(\d+)\.(\d+)$", version_str.strip())
+    if not match:
+        raise ValueError(f"版本号格式不合法:{version_str},应为 v主版本.次版本.修订号")
+    major, minor, patch = (int(g) for g in match.groups())
+    return SemVer(major, minor, patch)
+
+
+# --------------------------------------------------------------------------
+# 变更日志条目
+# --------------------------------------------------------------------------
+
+@dataclass
+class ChangelogEntry:
+    version: str
+    released_at: str
+    change_type: str          # major / minor / patch
+    description: str
+    added_count: int
+    modified_count: int
+    removed_count: int
+    category_distribution: Dict[str, int]
+    quality_report_ref: str
+    snapshot_path: str
+    content_hash: str
+
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+
+# --------------------------------------------------------------------------
+# 版本仓库
+# --------------------------------------------------------------------------
+
+class DatasetVersionRepository:
+    """
+    数据集版本仓库,以本地目录的形式管理历史版本快照与变更日志。
+
+    目录结构约定:
+        repo_root/
+            changelog.json          -- 全量变更历史(追加写入,不覆盖)
+            snapshots/
+                v1.0.0/dataset.jsonl
+                v1.1.0/dataset.jsonl
+                ...
+    """
+
+    def __init__(self, repo_root: str):
+        self.repo_root = Path(repo_root)
+        self.snapshots_dir = self.repo_root / "snapshots"
+        self.changelog_path = self.repo_root / "changelog.json"
+        self.repo_root.mkdir(parents=True, exist_ok=True)
+        self.snapshots_dir.mkdir(parents=True, exist_ok=True)
+        if not self.changelog_path.exists():
+            self._write_changelog([])
+
+    def _read_changelog(self) -> List[Dict]:
+        with open(self.changelog_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _write_changelog(self, entries: List[Dict]) -> None:
+        with open(self.changelog_path, "w", encoding="utf-8") as f:
+            json.dump(entries, f, ensure_ascii=False, indent=2)
+
+    def get_latest_version(self) -> Optional[SemVer]:
+        entries = self._read_changelog()
+        if not entries:
+            return None
+        versions = [parse_semver(e["version"]) for e in entries]
+        return max(versions, key=lambda v: v.as_tuple())
+
+    def list_versions(self) -> List[ChangelogEntry]:
+        entries = self._read_changelog()
+        return [ChangelogEntry(**e) for e in entries]
+
+    @staticmethod
+    def _compute_dataset_hash(records: List[Dict]) -> str:
+        payload = json.dumps(records, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()[:16]
+
+    @staticmethod
+    def _extract_qa(record: Dict) -> Tuple[str, str]:
+        if "instruction" in record:
+            return record.get("input", ""), record.get("output", "")
+        if "conversations" in record:
+            human = [t["value"] for t in record["conversations"] if t.get("from") == "human"]
+            gpt = [t["value"] for t in record["conversations"] if t.get("from") == "gpt"]
+            return (human[0] if human else ""), (gpt[-1] if gpt else "")
+        return record.get("question", ""), record.get("answer", "")
+
+    @staticmethod
+    def _char_ngrams(text: str, n: int = 2) -> set:
+        text = re.sub(r"\s+", "", text)
+        if len(text) < n:
+            return {text} if text else set()
+        return {text[i:i + n] for i in range(len(text) - n + 1)}
+
+    def _jaccard(self, a: str, b: str) -> float:
+        set_a, set_b = self._char_ngrams(a), self._char_ngrams(b)
+        if not set_a or not set_b:
+            return 0.0
+        return len(set_a & set_b) / len(set_a | set_b)
+
+    def check_cross_version_duplicates(
+        self,
+        new_records: List[Dict],
+        similarity_threshold: float = 0.6,
+    ) -> List[Dict]:
+        """
+        检测新增数据与历史全量数据之间的近似重复,而不仅仅是
+        新增数据内部去重。这是增量更新场景下容易被忽略、但
+        非常关键的一步检查——同一实质内容如果被不同批次的
+        原始数据反复采集,单看每一批内部去重是发现不了的。
+        """
+        latest_version = self.get_latest_version()
+        if latest_version is None:
+            return []  # 首次发布,没有历史数据可比对
+
+        historical_questions: List[str] = []
+        for entry in self.list_versions():
+            snapshot_file = Path(entry.snapshot_path)
+            if not snapshot_file.exists():
+                continue
+            with open(snapshot_file, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            historical = json.loads(content) if content.startswith("[") else [
+                json.loads(line) for line in content.splitlines() if line.strip()
+            ]
+            for rec in historical:
+                q, _ = self._extract_qa(rec)
+                historical_questions.append(q)
+
+        conflicts = []
+        for new_rec in new_records:
+            new_q, _ = self._extract_qa(new_rec)
+            for hist_q in historical_questions:
+                if self._jaccard(new_q, hist_q) >= similarity_threshold:
+                    conflicts.append({
+                        "new_question": new_q,
+                        "conflicting_historical_question": hist_q,
+                        "similarity": round(self._jaccard(new_q, hist_q), 4),
+                    })
+                    break
+        return conflicts
+
+    def publish_new_version(
+        self,
+        records: List[Dict],
+        change_type: str,
+        description: str,
+        added_count: int,
+        modified_count: int,
+        removed_count: int,
+        quality_report_ref: str,
+        allow_cross_version_conflicts: bool = False,
+        conflict_similarity_threshold: float = 0.6,
+    ) -> ChangelogEntry:
+        """
+        发布一个新版本。发布前会先做跨版本近似重复检测,
+        如果检测到冲突且未显式允许,则拒绝发布,强制要求
+        先处理冲突数据。
+        """
+        conflicts = self.check_cross_version_duplicates(records, conflict_similarity_threshold)
+        if conflicts and not allow_cross_version_conflicts:
+            raise ValueError(
+                f"检测到 {len(conflicts)} 条新数据与历史版本存在近似重复,"
+                f"发布已中止。请先处理冲突数据,或在确认无风险后传入 "
+                f"allow_cross_version_conflicts=True 强制发布。"
+                f"冲突示例:{conflicts[:3]}"
+            )
+
+        latest = self.get_latest_version()
+        new_version = SemVer(1, 0, 0) if latest is None else latest.bump(change_type)
+
+        category_distribution: Dict[str, int] = {}
+        for rec in records:
+            _, _ = self._extract_qa(rec)
+            category = rec.get("meta", {}).get("category", rec.get("category", "未分类"))
+            category_distribution[category] = category_distribution.get(category, 0) + 1
+
+        snapshot_dir = self.snapshots_dir / str(new_version)
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_path = snapshot_dir / "dataset.json"
+        with open(snapshot_path, "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False, indent=2)
+
+        entry = ChangelogEntry(
+            version=str(new_version),
+            released_at=datetime.now().isoformat(),
+            change_type=change_type,
+            description=description,
+            added_count=added_count,
+            modified_count=modified_count,
+            removed_count=removed_count,
+            category_distribution=category_distribution,
+            quality_report_ref=quality_report_ref,
+            snapshot_path=str(snapshot_path),
+            content_hash=self._compute_dataset_hash(records),
+        )
+
+        entries = self._read_changelog()
+        entries.append(entry.to_dict())
+        self._write_changelog(entries)
+        logger.info("新版本已发布:%s(%s),包含 %d 条记录", entry.version, change_type, len(records))
+
+        if conflicts:
+            logger.warning(
+                "本次发布是在存在 %d 条跨版本近似重复冲突的情况下被强制放行的,"
+                "建议尽快人工复核这些冲突数据。",
+                len(conflicts),
+            )
+        return entry
+
+    def rollback_to_version(self, target_version: str) -> Path:
+        """
+        回滚:并不删除后续版本的记录(保持变更日志的完整历史),
+        而是返回目标版本对应的快照文件路径,供下游训练流程
+        重新指向这个历史版本使用。真正的"回滚"发生在使用侧
+        切换所引用的数据集路径,而不是破坏性地删除版本仓库里
+        的任何历史记录。
+        """
+        entries = self._read_changelog()
+        for e in entries:
+            if e["version"] == target_version:
+                snapshot_path = Path(e["snapshot_path"])
+                if not snapshot_path.exists():
+                    raise FileNotFoundError(f"版本 {target_version} 对应的快照文件已丢失:{snapshot_path}")
+                logger.info("已定位到版本 %s 的快照:%s,请将下游训练配置指向该文件", target_version, snapshot_path)
+                return snapshot_path
+        raise ValueError(f"未找到版本 {target_version} 的变更记录")
+
+    def diff_versions(self, version_a: str, version_b: str) -> Dict:
+        """比较两个版本之间的数据差异,返回新增、删除、类别分布变化等信息"""
+        path_a = self.rollback_to_version(version_a)
+        path_b = self.rollback_to_version(version_b)
+
+        def load_question_set(path: Path) -> set:
+            with open(path, "r", encoding="utf-8") as f:
+                records = json.load(f)
+            return {self._extract_qa(r)[0] for r in records}
+
+        questions_a = load_question_set(path_a)
+        questions_b = load_question_set(path_b)
+
+        return {
+            "version_a": version_a,
+            "version_b": version_b,
+            "only_in_a": len(questions_a - questions_b),
+            "only_in_b": len(questions_b - questions_a),
+            "common": len(questions_a & questions_b),
+        }
+
+    def print_changelog_summary(self) -> None:
+        entries = self.list_versions()
+        print(f"\n{'=' * 70}")
+        print(" 数据集变更历史")
+        print(f"{'=' * 70}")
+        for e in entries:
+            print(
+                f"  {e.version}  [{e.change_type}]  {e.released_at[:19]}\n"
+                f"      {e.description}\n"
+                f"      新增{e.added_count} 修改{e.modified_count} 删除{e.removed_count}"
+                f"  哈希:{e.content_hash}"
+            )
+        print(f"{'=' * 70}\n")
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="数据集版本管理工具")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    publish_parser = subparsers.add_parser("publish", help="发布新版本")
+    publish_parser.add_argument("--repo", required=True)
+    publish_parser.add_argument("--dataset", required=True, help="本次要发布的完整数据集文件(json)")
+    publish_parser.add_argument("--change-type", choices=["major", "minor", "patch"], required=True)
+    publish_parser.add_argument("--description", required=True)
+    publish_parser.add_argument("--added", type=int, default=0)
+    publish_parser.add_argument("--modified", type=int, default=0)
+    publish_parser.add_argument("--removed", type=int, default=0)
+    publish_parser.add_argument("--quality-report", default="")
+    publish_parser.add_argument("--force", action="store_true", help="强制发布,忽略跨版本重复冲突")
+
+    log_parser = subparsers.add_parser("log", help="查看变更历史")
+    log_parser.add_argument("--repo", required=True)
+
+    diff_parser = subparsers.add_parser("diff", help="比较两个版本")
+    diff_parser.add_argument("--repo", required=True)
+    diff_parser.add_argument("--from", dest="version_a", required=True)
+    diff_parser.add_argument("--to", dest="version_b", required=True)
+
+    return parser
+
+
+def main():
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    repo = DatasetVersionRepository(args.repo)
+
+    if args.command == "publish":
+        with open(args.dataset, "r", encoding="utf-8") as f:
+            records = json.load(f)
+        repo.publish_new_version(
+            records=records,
+            change_type=args.change_type,
+            description=args.description,
+            added_count=args.added,
+            modified_count=args.modified,
+            removed_count=args.removed,
+            quality_report_ref=args.quality_report,
+            allow_cross_version_conflicts=args.force,
+        )
+    elif args.command == "log":
+        repo.print_changelog_summary()
+    elif args.command == "diff":
+        result = repo.diff_versions(args.version_a, args.version_b)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+陈铭用这套工具把今天的 500 条数据集正式发布为 `v1.0.0`,备注写的是"御风金融合规问答场景首个版本,含种子数据清洗结果与 Self-Instruct 扩繁数据"。他还特意模拟了一次"故意引入重复数据"的场景来测试跨版本冲突检测——手动复制了三条已有问题稍作改写,伪装成"下一批新数据"去调用 `publish_new_version`,工具确实识别出了这三条冲突并拒绝了发布,只有加上 `--force` 参数才勉强放行,这个行为符合预期,他把这个测试过程记录进了脚本的使用说明里,作为后续同事上手这套工具时的参考案例。
+
+### 7.6 多轮追问场景 Self-Instruct 扩展
+
+第二个要补的是多轮追问数据。需求文档里早就写明业务方希望未来支持追问,但今天上午写的 Self-Instruct 脚本只生成单轮问答的变体问法。陈铭和王振宇商量后,决定单独写一个扩展模块,专门负责"给一条已有的标准问答对,构造出合理的追问轮次",生成结果直接就是 ShareGPT 多轮格式,不需要再额外转换。
+
+```python
+# -*- coding: utf-8 -*-
+"""
+multi_turn_followup_generator.py
+苍穹企业级智能体中台 · 御风金融合规问答场景
+多轮追问数据生成脚本:基于已有的单轮标准问答对,构造符合业务逻辑的
+"追问"轮次,产出 ShareGPT 格式的多轮对话训练样本。
+
+设计原则:
+    1. 追问必须是"自然的""符合真实用户行为"的追问,而不是随意
+       编造的、与原问题无关的新话题(那样应该算独立的新问答对,
+       不应该包装成"追问"塞进同一段对话里)。
+    2. 每一类业务场景下,常见的追问模式是相对有限且可枚举的
+       (比如"能不能减免""大概多久能解决""还有别的办法吗"),
+       今天先用一套"追问模式库 + 规则匹配"的方式覆盖高频追问,
+       复杂度更高的开放式追问生成留给后续迭代,不追求今天一次到位。
+    3. 追问轮次的答案,同样遵循"金融合规内容不能由模型自由生成"
+       的原则——凡是追问模式库里没有预置对应标准回应模板的,
+       一律标记为待人工补充,不自动编造答案。
+"""
+
+import argparse
+import json
+import logging
+from dataclasses import dataclass, field, asdict
+from typing import List, Dict, Optional
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("multi_turn_followup_generator")
+
+
+# --------------------------------------------------------------------------
+# 追问模式库:按业务类别维护常见的追问触发关键词 + 追问问题模板 + 标准回应模板
+# 这是本场景强领域相关的配置,后续如果换成别的行业场景,主要就是替换这份配置
+# --------------------------------------------------------------------------
+
+@dataclass
+class FollowUpPattern:
+    trigger_keywords: List[str]     # 原问题命中这些关键词时,该追问模式适用
+    followup_question: str          # 追问的具体问法
+    response_template: Optional[str]  # 标准回应模板,None 表示需要人工补充
+    needs_human_review: bool = False
+
+
+FOLLOWUP_PATTERN_LIBRARY: Dict[str, List[FollowUpPattern]] = {
+    "利率费用说明类": [
+        FollowUpPattern(
+            trigger_keywords=["罚息", "利息", "费用"],
+            followup_question="如果我马上把欠款还清,罚息还能不能申请减免一部分?",
+            response_template=(
+                "罚息减免需结合具体逾期情况、还款意愿及历史履约记录,由风控及客服部门综合评估,"
+                "不同情况处理结果可能不同。建议您在结清欠款前,通过官方客服渠道主动说明情况并提出申请,"
+                "由工作人员核实后按内部政策给予相应处理,我们无法在此提前承诺具体的减免比例或结果。"
+            ),
+        ),
+        FollowUpPattern(
+            trigger_keywords=["罚息", "利率", "计算"],
+            followup_question="这个罚息是每天都在增加吗,越晚还是不是越多?",
+            response_template=(
+                "是的,罚息按日计收,从约定还款日次日起,按日累加计算,直至实际还清欠款当日止。"
+                "因此欠款存续时间越长,累计的罚息金额通常会越多,建议尽早处理欠款以减少罚息支出。"
+            ),
+        ),
+    ],
+    "逾期处理流程类": [
+        FollowUpPattern(
+            trigger_keywords=["宽限期", "展期", "结清证明"],
+            followup_question="申请展期大概需要多长时间才能审批下来?",
+            response_template=None,
+            needs_human_review=True,
+        ),
+        FollowUpPattern(
+            trigger_keywords=["逾期", "处理"],
+            followup_question="如果这次是因为特殊原因逾期,是不是可以不算作正式逾期记录?",
+            response_template=(
+                "逾期记录的认定以实际还款时间是否超过约定还款日为准,若确因特殊情况(如银行系统故障、"
+                "不可抗力等)导致的非主观逾期,可通过官方客服渠道提交相关证明材料申请核实处理,"
+                "具体是否可以调整记录以核实结果为准,我们无法在此提前承诺处理结果。"
+            ),
+        ),
+    ],
+    "征信影响类": [
+        FollowUpPattern(
+            trigger_keywords=["征信", "上报"],
+            followup_question="那已经上报的征信记录,以后还能不能消除或者修复?",
+            response_template=(
+                "根据现行征信管理规定,已如实上报的信贷记录不会因为后续还清欠款而被删除,"
+                "但会准确反映后续的还款状态变化(如显示为'已结清')。目前不存在合法途径可以"
+                "'消除'真实发生过的逾期记录,如遇到声称可以'花钱铲单'的服务,请务必提高警惕,"
+                "这类行为本身可能涉嫌违规甚至违法。"
+            ),
+        ),
+        FollowUpPattern(
+            trigger_keywords=["征信", "影响"],
+            followup_question="偶尔一次逾期,对以后申请房贷车贷影响很大吗?",
+            response_template=None,
+            needs_human_review=True,
+        ),
+    ],
+    "投诉处理类": [
+        FollowUpPattern(
+            trigger_keywords=["投诉", "渠道"],
+            followup_question="投诉了之后,催收人员还会不会继续联系我?",
+            response_template=(
+                "投诉提交后,我们会对相关服务过程进行核实,若确认存在服务不当行为,将依据内部管理规定"
+                "对相关人员进行相应处理,并对后续的沟通方式进行规范。但需说明的是,若您名下确实存在"
+                "未结清的逾期欠款,合规范围内的还款提醒与沟通仍会按照正常业务流程进行,投诉本身"
+                "不代表可以免除还款义务。"
+            ),
+        ),
+    ],
+    "个人信息保护类": [
+        FollowUpPattern(
+            trigger_keywords=["第三方", "共享", "提供"],
+            followup_question="如果我不同意信息共享,还能不能正常使用你们的贷款服务?",
+            response_template=None,
+            needs_human_review=True,
+        ),
+    ],
+}
+
+
+@dataclass
+class MultiTurnSample:
+    source_record_id: str
+    category: str
+    turns: List[Dict]              # ShareGPT 风格的轮次列表
+    needs_human_review: bool
+    review_status: str
+
+    def to_sharegpt_dict(self, system_prompt: str) -> Dict:
+        conversations = [{"from": "system", "value": system_prompt}] + self.turns
+        return {
+            "conversations": conversations,
+            "meta": {
+                "record_id": self.source_record_id,
+                "category": self.category,
+                "generation_type": "multi_turn_followup",
+                "needs_human_review": self.needs_human_review,
+                "review_status": self.review_status,
+                "format": "sharegpt",
+            },
+        }
+
+
+def match_applicable_patterns(question: str, category: str) -> List[FollowUpPattern]:
+    patterns = FOLLOWUP_PATTERN_LIBRARY.get(category, [])
+    matched = []
+    for pattern in patterns:
+        if any(keyword in question for keyword in pattern.trigger_keywords):
+            matched.append(pattern)
+    return matched
+
+
+def build_multi_turn_sample(
+    record_id: str,
+    question: str,
+    answer: str,
+    category: str,
+    pattern: FollowUpPattern,
+) -> MultiTurnSample:
+    turns = [
+        {"from": "human", "value": question},
+        {"from": "gpt", "value": answer},
+        {"from": "human", "value": pattern.followup_question},
+    ]
+
+    if pattern.response_template is not None:
+        turns.append({"from": "gpt", "value": pattern.response_template})
+        needs_review = pattern.needs_human_review
+        status = "approved" if not needs_review else "pending"
+    else:
+        # 没有预置回应模板的追问,只生成到用户追问这一轮,答案留空待人工补充,
+        # 不允许脚本自由编造合规相关的回应内容
+        turns.append({"from": "gpt", "value": "[待人工补充:该追问尚无预置标准回应,请合规人员补充审核后的回答内容]"})
+        needs_review = True
+        status = "pending"
+
+    return MultiTurnSample(
+        source_record_id=record_id,
+        category=category,
+        turns=turns,
+        needs_human_review=needs_review,
+        review_status=status,
+    )
+
+
+def generate_multi_turn_dataset(
+    seed_records: List[Dict],
+    max_followups_per_record: int = 1,
+) -> List[MultiTurnSample]:
+    """
+    对每条种子问答记录,尝试匹配适用的追问模式,生成多轮对话样本。
+    max_followups_per_record 控制单条原始问答最多衍生出几条追问对话,
+    避免同一条基础问答被无限制地衍生出过多相似的多轮样本,
+    造成多轮数据在数据集里的占比失衡。
+    """
+    results: List[MultiTurnSample] = []
+    for rec in seed_records:
+        question = rec["question"]
+        answer = rec["answer"]
+        category = rec.get("category", "未分类")
+        record_id = rec["record_id"]
+
+        matched_patterns = match_applicable_patterns(question, category)
+        for pattern in matched_patterns[:max_followups_per_record]:
+            sample = build_multi_turn_sample(record_id, question, answer, category, pattern)
+            results.append(sample)
+
+    return results
+
+
+def run_pipeline(
+    seed_path: str,
+    output_path: str,
+    report_path: str,
+    system_prompt: str = "你是御风金融的智能合规问答助手,回答需符合消费金融行业监管要求,不得编造未经核实的信息。",
+    max_followups_per_record: int = 1,
+) -> None:
+    with open(seed_path, "r", encoding="utf-8") as f:
+        seed_records = [json.loads(line) for line in f if line.strip()]
+
+    logger.info("加载种子数据 %d 条,开始匹配追问模式", len(seed_records))
+    samples = generate_multi_turn_dataset(seed_records, max_followups_per_record)
+    logger.info("生成多轮追问样本 %d 条", len(samples))
+
+    output_records = [s.to_sharegpt_dict(system_prompt) for s in samples]
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(output_records, f, ensure_ascii=False, indent=2)
+
+    pending_count = sum(1 for s in samples if s.review_status == "pending")
+    report = {
+        "total_multi_turn_samples": len(samples),
+        "pending_human_review": pending_count,
+        "auto_approved": len(samples) - pending_count,
+        "category_breakdown": {},
+    }
+    for s in samples:
+        report["category_breakdown"][s.category] = report["category_breakdown"].get(s.category, 0) + 1
+
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    logger.info("多轮追问生成报告:%s", json.dumps(report, ensure_ascii=False))
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="多轮追问场景 Self-Instruct 扩展脚本")
+    parser.add_argument("--seed", required=True, help="清洗后的种子数据 jsonl 路径")
+    parser.add_argument("--output", required=True, help="多轮对话数据输出路径")
+    parser.add_argument("--report", required=True, help="生成报告输出路径")
+    parser.add_argument("--max-followups", type=int, default=1)
+    return parser
+
+
+if __name__ == "__main__":
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    run_pipeline(
+        seed_path=args.seed,
+        output_path=args.output,
+        report_path=args.report,
+        max_followups_per_record=args.max_followups,
+    )
+```
+
+跑完这个脚本,陈铭发现命中追问模式的种子数据大概有四十多条,生成出的多轮样本里,有预置标准回应模板可以直接用的占了大约六成,剩下四成因为触发的追问过于开放(比如"偶尔一次逾期对房贷车贷影响大不大"这种没有绝对标准答案的问题),被标记为待人工补充。他把这份报告发给了周洁,周洁答复说这批"待补充"的问题恰好是她这段时间也在整理的疑难问题清单里的一部分,可以一起处理,不用陈铭单独等她一条条回复。
+
+老王看完这个功能之后提了一点后续建议,没有要求今天就做:"追问模式库现在是硬编码在代码里的一份 Python 字典,数据量小的时候没问题,但以后这份模式库大概率会越滚越大,可能要考虑挪到配置文件或者数据库里维护,让业务人员自己也能不动代码地增补新的追问模式,不然每次新增一条追问规则都要找你改代码、发版本,效率太低。"陈铭把这条记进了后续待办里,今天先把功能跑通,架构上的进一步优化留给下一轮迭代。
+
+### 7.7 统计抽样质量审核工具
+
+第三个要补的,是把复盘会上老王提到的"抽样统计质量控制"方法论,变成真正能跑的代码,而不是只停留在口头讨论。
+
+```python
+# -*- coding: utf-8 -*-
+"""
+sampling_audit.py
+苍穹企业级智能体中台 · 通用数据集抽样审核工具
+
+背景:
+    当数据集规模较小(如今天的500条)时,团队还负担得起"能人工看
+    的尽量都看一眼"的全量人工复核。但随着项目规模扩大到几千、
+    几万条,全量人工复核不再现实,需要引入基于统计抽样的质量
+    控制方法——通过对一个合理规模的随机样本进行人工复核,
+    结合置信区间估算整体数据集的质量水平,而不必逐条过目。
+
+本工具提供:
+    1. 基于目标置信水平与置信区间宽度,计算所需的最小抽样量。
+    2. 分层抽样(按类别分层),确保各业务类别都有足够的样本
+       被抽到,不会因为随机抽样运气不好导致某个类别完全没
+       被覆盖到。
+    3. 抽样结果人工复核后,基于复核结果反推整体数据集质量的
+       置信区间估计。
+"""
+
+import argparse
+import json
+import logging
+import math
+import random
+from dataclasses import dataclass, field, asdict
+from typing import List, Dict, Optional
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("sampling_audit")
+
+
+# --------------------------------------------------------------------------
+# 抽样量计算:基于有限总体的样本量估算公式
+# --------------------------------------------------------------------------
+
+def compute_required_sample_size(
+    population_size: int,
+    confidence_level: float = 0.95,
+    margin_of_error: float = 0.05,
+    estimated_proportion: float = 0.5,
+) -> int:
+    """
+    基于有限总体校正的样本量估算公式(Cochran公式 + 有限总体校正):
+
+        n0 = (z^2 * p * (1-p)) / e^2
+        n  = n0 / (1 + (n0 - 1) / N)
+
+    其中:
+        z: 对应置信水平的标准正态分布临界值(95%置信水平对应约1.96)
+        p: 预估的比例(不确定时用0.5,这是使所需样本量最大、最保守的取值)
+        e: 允许的误差范围(margin_of_error)
+        N: 总体规模(population_size)
+
+    这个公式给出的是"要以给定置信水平和误差范围,估计总体中某个
+    比例指标(比如质量合格率)时,至少需要抽多少个样本"的理论下界。
+    """
+    z_table = {0.90: 1.645, 0.95: 1.96, 0.99: 2.576}
+    z = z_table.get(round(confidence_level, 2), 1.96)
+
+    n0 = (z ** 2 * estimated_proportion * (1 - estimated_proportion)) / (margin_of_error ** 2)
+    n = n0 / (1 + (n0 - 1) / population_size)
+    return math.ceil(n)
+
+
+@dataclass
+class StratumSamplingPlan:
+    category: str
+    population_size: int
+    sample_size: int
+    sample_ratio: float
+
+
+def compute_stratified_sampling_plan(
+    category_population: Dict[str, int],
+    total_sample_size: int,
+    min_sample_per_stratum: int = 5,
+) -> List[StratumSamplingPlan]:
+    """
+    分层抽样方案:按各类别在总体中的占比,比例分配抽样数量,
+    同时设置每层最小抽样量下限,避免占比过小的类别一个样本都没抽到。
+    """
+    total_population = sum(category_population.values())
+    plans = []
+    allocated = 0
+
+    sorted_categories = sorted(category_population.items(), key=lambda x: -x[1])
+    for idx, (category, pop_size) in enumerate(sorted_categories):
+        if idx == len(sorted_categories) - 1:
+            # 最后一层,把剩余的抽样配额全部分配给它,避免因为四舍五入导致总数不对
+            sample_size = max(min_sample_per_stratum, total_sample_size - allocated)
+        else:
+            proportion = pop_size / total_population
+            sample_size = max(min_sample_per_stratum, round(total_sample_size * proportion))
+        sample_size = min(sample_size, pop_size)  # 抽样数不能超过该层实际总量
+        allocated += sample_size
+        plans.append(StratumSamplingPlan(
+            category=category,
+            population_size=pop_size,
+            sample_size=sample_size,
+            sample_ratio=round(sample_size / pop_size, 4) if pop_size else 0.0,
+        ))
+    return plans
+
+
+def draw_stratified_sample(
+    records: List[Dict],
+    plans: List[StratumSamplingPlan],
+    category_field_getter,
+    random_seed: int = 2026,
+) -> List[Dict]:
+    """按分层抽样方案,从records中实际抽取样本记录"""
+    rng = random.Random(random_seed)
+    by_category: Dict[str, List[Dict]] = {}
+    for rec in records:
+        category = category_field_getter(rec)
+        by_category.setdefault(category, []).append(rec)
+
+    sampled = []
+    for plan in plans:
+        candidates = by_category.get(plan.category, [])
+        take_count = min(plan.sample_size, len(candidates))
+        sampled.extend(rng.sample(candidates, take_count))
+    return sampled
+
+
+# --------------------------------------------------------------------------
+# 复核结果统计与置信区间估计
+# --------------------------------------------------------------------------
+
+@dataclass
+class AuditResult:
+    record_id: str
+    passed: bool
+    reviewer: str
+    comment: str = ""
+
+
+def estimate_population_quality(
+    audit_results: List[AuditResult],
+    confidence_level: float = 0.95,
+) -> Dict:
+    """
+    基于抽样复核结果,用 Wilson score interval(比正态近似区间在
+    小样本或极端比例下更稳健的置信区间估计方法)估算整体数据集
+    合格率的置信区间。
+    """
+    n = len(audit_results)
+    if n == 0:
+        return {"sample_size": 0, "observed_pass_rate": None, "confidence_interval": None}
+
+    passed_count = sum(1 for r in audit_results if r.passed)
+    p_hat = passed_count / n
+
+    z_table = {0.90: 1.645, 0.95: 1.96, 0.99: 2.576}
+    z = z_table.get(round(confidence_level, 2), 1.96)
+
+    denominator = 1 + (z ** 2) / n
+    center = (p_hat + (z ** 2) / (2 * n)) / denominator
+    margin = (
+        z * math.sqrt((p_hat * (1 - p_hat) / n) + (z ** 2) / (4 * n ** 2))
+        / denominator
+    )
+    lower_bound = max(0.0, center - margin)
+    upper_bound = min(1.0, center + margin)
+
+    return {
+        "sample_size": n,
+        "observed_pass_rate": round(p_hat, 4),
+        "confidence_level": confidence_level,
+        "confidence_interval": [round(lower_bound, 4), round(upper_bound, 4)],
+        "interpretation": (
+            f"基于本次 {n} 条抽样复核结果,有 {confidence_level * 100:.0f}% 的置信水平认为,"
+            f"整体数据集的真实合格率落在 {lower_bound * 100:.1f}% 至 {upper_bound * 100:.1f}% 之间。"
+        ),
+    }
+
+
+def generate_audit_worksheet(sampled_records: List[Dict], output_path: str) -> None:
+    """生成一份供人工复核使用的工作表(JSON结构,附带待填写的复核结果字段)"""
+    worksheet = []
+    for rec in sampled_records:
+        record_id = rec.get("meta", {}).get("record_id", rec.get("record_id", "unknown"))
+        worksheet.append({
+            "record_id": record_id,
+            "content": rec,
+            "review_result": {
+                "passed": None,       # 待人工填写: true / false
+                "reviewer": "",
+                "comment": "",
+            },
+        })
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(worksheet, f, ensure_ascii=False, indent=2)
+    logger.info("抽样复核工作表已生成:%s,共 %d 条待复核记录", output_path, len(worksheet))
+
+
+def load_completed_worksheet(path: str) -> List[AuditResult]:
+    """加载人工填写完成的复核工作表,提取复核结果"""
+    with open(path, "r", encoding="utf-8") as f:
+        worksheet = json.load(f)
+    results = []
+    for item in worksheet:
+        review = item.get("review_result", {})
+        if review.get("passed") is None:
+            continue  # 尚未填写复核结果的条目跳过
+        results.append(AuditResult(
+            record_id=item["record_id"],
+            passed=bool(review["passed"]),
+            reviewer=review.get("reviewer", ""),
+            comment=review.get("comment", ""),
+        ))
+    return results
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="统计抽样质量审核工具")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    plan_parser = subparsers.add_parser("plan", help="生成分层抽样方案与复核工作表")
+    plan_parser.add_argument("--dataset", required=True)
+    plan_parser.add_argument("--confidence", type=float, default=0.95)
+    plan_parser.add_argument("--margin", type=float, default=0.05)
+    plan_parser.add_argument("--worksheet-output", required=True)
+
+    estimate_parser = subparsers.add_parser("estimate", help="基于复核结果估算整体质量置信区间")
+    estimate_parser.add_argument("--worksheet", required=True)
+    estimate_parser.add_argument("--confidence", type=float, default=0.95)
+
+    return parser
+
+
+def main():
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    if args.command == "plan":
+        with open(args.dataset, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        records = json.loads(content) if content.startswith("[") else [
+            json.loads(line) for line in content.splitlines() if line.strip()
+        ]
+
+        def get_category(rec):
+            return rec.get("meta", {}).get("category", rec.get("category", "未分类"))
+
+        category_population: Dict[str, int] = {}
+        for rec in records:
+            category_population[get_category(rec)] = category_population.get(get_category(rec), 0) + 1
+
+        total_sample_size = compute_required_sample_size(
+            population_size=len(records),
+            confidence_level=args.confidence,
+            margin_of_error=args.margin,
+        )
+        plans = compute_stratified_sampling_plan(category_population, total_sample_size)
+
+        print(f"\n建议总抽样量:{total_sample_size}(总体规模 {len(records)},"
+              f"置信水平 {args.confidence*100:.0f}%,误差范围 ±{args.margin*100:.0f}%)")
+        for plan in plans:
+            print(f"  {plan.category}:总量{plan.population_size},抽样{plan.sample_size},抽样率{plan.sample_ratio*100:.1f}%")
+
+        sampled = draw_stratified_sample(records, plans, get_category)
+        generate_audit_worksheet(sampled, args.worksheet_output)
+
+    elif args.command == "estimate":
+        results = load_completed_worksheet(args.worksheet)
+        estimation = estimate_population_quality(results, confidence_level=args.confidence)
+        print(json.dumps(estimation, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+陈铭拿今天最终的 500 条数据集试算了一下:如果要以 95% 的置信水平、±5% 的误差范围去估计整体合格率,理论上大概需要抽样 217 条左右,分层之后每个类别按占比分配,基本和今天赵学军实际抽检的 15% 比例(约75条)不完全一致——这个对比让陈铭意识到,今天赵学军抽检的比例其实低于严格的统计学建议样本量,只是因为今天数据集本身规模不大、且团队对这批数据的整体质量已经有相当的把握,才用了一个相对宽松的抽检比例。他把这个发现也记进了交给赵学军的说明文档里,建议以后数据规模显著增长之后,抽检比例的确定要参考这套工具算出来的理论建议值,而不是继续沿用"15%"这个在小规模数据下够用、但未必适用于大规模场景的经验比例。
+
+三个新脚本加上今天上午写的四个,一共七个脚本,构成了这套数据处理管道从"一次性构建"到"可持续迭代"的完整能力——版本管理保证了数据集能够安全地增量演进,多轮追问生成补上了业务方明确提出但今天原计划里被暂时搁置的能力缺口,统计抽样审核工具则为未来数据规模扩大后如何科学地做质量把关,提前铺好了路。陈铭把这三个新脚本的产出也一并打包,附在了今天最终交付材料里。
+
 ---
 
 ## 八、今日复盘
