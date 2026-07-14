@@ -1422,6 +1422,1336 @@ if __name__ == "__main__":
 
 陈铭把这段话也记在了自己的笔记里,并补充了一句自己的理解:"技术选型这件事,某种程度上跟咱们Day51以后要学的'微调vs RAG vs Prompt'决策树是同一类问题——都是先把场景特征拆解清楚,再对照一套判断标准去套,而不是凭直觉或者凭'哪个技术听起来更高级'去选。这大概是做工程决策的一个共通方法论,不只适用于Agent这一个领域。"
 
+### 四、补充实战:报销审批场景的完整Dify工作流配置(生产级细化版)
+
+作业四里陈铭已经给出了一份报销审批的配置说明草稿,但那份更多是"结构示意",老王后来在评审时提出,既然团队打算把这份材料留档给未来的同事参考,不如把它写成一份更接近真实生产配置的完整版本——补上超时处理、驳回通知、审批留痕这几个真实项目里必然会被客户问到的细节。陈铭花了一个晚上把这份配置补完整,連同调试用例和发布检查清单一并整理了出来。
+
+```yaml
+# ============================================================
+# 文件:dify_workflow_qiruili_reimbursement_full.yml
+# 说明:祺瑞集团报销审批 —— 生产级细化版工作流配置说明
+# 相比作业四的草稿版本,本版本补充了:
+#   1) 每一级审批的超时兜底策略(超时后如何处理,而不是无限期挂起)
+#   2) 审批被驳回后的通知节点(告知申请人具体驳回原因)
+#   3) 审批全程的留痕字段(审批人、审批时间、审批意见),用于后续审计
+#   4) 金额校验与格式校验的前置节点,避免脏数据流入审批链路
+# ============================================================
+
+app:
+  name: "祺瑞报销审批助手(生产级细化版)"
+  mode: workflow
+  description: >
+    覆盖三级金额分层的报销审批全流程:
+    500元以下自动审批;500-5000元需直属主管审批;
+    5000元以上需直属主管审批通过后,再转交财务总监二次审批。
+    补充超时兜底、驳回通知、审批留痕等生产环境必需的细节能力。
+  icon: "💰"
+  model_provider_default: deepseek
+
+environment_variables:
+  - key: OA_SYSTEM_BASE_URL
+    description: "祺瑞OA系统报销接口的基础地址"
+    value: "https://oa-demo.internal.qiruigroup.example/api/v1"
+  - key: OA_SYSTEM_AUTH_TOKEN
+    description: "调用OA接口的鉴权令牌(演示用固定值,生产环境走动态令牌代理)"
+    value: "{{secrets.OA_SYSTEM_AUTH_TOKEN}}"
+  - key: NOTIFY_WEBHOOK_URL
+    description: "企业内部通知机器人的Webhook地址,用于驳回/超时提醒"
+    value: "{{secrets.NOTIFY_WEBHOOK_URL}}"
+
+graph:
+  nodes:
+    - id: node_start
+      type: start
+      title: "开始"
+      config:
+        input_variables:
+          - name: employee_id
+            type: string
+            required: true
+          - name: amount
+            type: number
+            required: true
+            description: "报销金额,单位:元"
+          - name: reimbursement_reason
+            type: string
+            required: true
+          - name: invoice_attachments
+            type: array[file]
+            required: true
+            description: "发票附件列表,至少一张"
+
+    # -------------------- 前置校验分支 --------------------
+    - id: node_validate_input
+      type: code
+      title: "前置数据校验"
+      config:
+        language: python3
+        code: |
+          def main(amount: float, invoice_attachments: list) -> dict:
+              """
+              在报销单进入分级审批之前,先做一次基础的数据完整性校验,
+              避免金额为负数、附件为空这类脏数据流入后续的审批链路,
+              浪费审批人的时间去驳回一个本来就不该提交的单据。
+              """
+              errors = []
+              if amount is None or amount <= 0:
+                  errors.append("报销金额必须为正数")
+              if not invoice_attachments:
+                  errors.append("必须上传至少一张发票附件")
+              return {
+                  "is_valid": len(errors) == 0,
+                  "validation_errors": "; ".join(errors),
+              }
+        output_variables:
+          - is_valid
+          - validation_errors
+
+    - id: node_if_valid
+      type: if_else
+      title: "校验结果判断"
+      config:
+        conditions:
+          - case_id: case_invalid
+            expression: "{{node_validate_input.is_valid}} == false"
+          # 校验通过走default分支,继续进入金额分级判断
+
+    - id: node_end_invalid
+      type: end
+      branch: case_invalid
+      title: "结束(数据校验未通过)"
+      config:
+        outputs:
+          answer: "报销单未通过基础校验:{{node_validate_input.validation_errors}},请修正后重新提交。"
+          route: "validation_failed"
+
+    # -------------------- 金额分级路由 --------------------
+    - id: node_if_amount_tier
+      type: if_else
+      title: "按金额分级路由"
+      branch: default   # 承接node_if_valid校验通过的分支
+      config:
+        conditions:
+          - case_id: tier_low
+            expression: "{{node_start.amount}} < 500"
+          - case_id: tier_mid
+            expression: "{{node_start.amount}} >= 500 and {{node_start.amount}} <= 5000"
+          # 大于5000元走default分支,即tier_high
+
+    - id: node_auto_approve
+      type: http_request
+      branch: tier_low
+      title: "自动审批通过(低金额)"
+      config:
+        method: POST
+        url: "{{env.OA_SYSTEM_BASE_URL}}/reimbursements/auto-approve"
+        headers:
+          Authorization: "Bearer {{env.OA_SYSTEM_AUTH_TOKEN}}"
+        body:
+          employee_id: "{{node_start.employee_id}}"
+          amount: "{{node_start.amount}}"
+          reason: "{{node_start.reimbursement_reason}}"
+        timeout_seconds: 10
+        output_variable: auto_approve_result
+
+    - id: node_end_low
+      type: end
+      branch: tier_low
+      title: "结束(低金额自动通过)"
+      config:
+        outputs:
+          answer: >
+            报销单已自动审批通过,单号{{node_auto_approve.auto_approve_result.order_id}},
+            金额{{node_start.amount}}元,无需人工审批。
+          route: "auto_approved"
+
+    # -------------------- 中金额:单级人工审批 --------------------
+    - id: node_manager_review
+      type: human_review
+      branch: tier_mid
+      title: "直属主管审批(中金额)"
+      config:
+        assignee_rule: "根据employee_id查询直属主管"
+        notify_channel: "{{env.NOTIFY_WEBHOOK_URL}}"
+        timeout_hours: 48
+        on_timeout_action: "escalate_to_hr"   # 超时未处理,自动升级转交HR跟进催办
+        on_approve_variable: manager_result
+        on_reject_variable: manager_result
+        record_fields:                        # 审批留痕字段,用于后续审计
+          - approver_name
+          - approved_at
+          - approval_comment
+
+    - id: node_if_manager_result_mid
+      type: if_else
+      branch: tier_mid
+      title: "判断中金额主管审批结果"
+      config:
+        conditions:
+          - case_id: mid_rejected
+            expression: "{{node_manager_review.manager_result}} == 'rejected'"
+
+    - id: node_reject_notify_mid
+      type: http_request
+      branch: mid_rejected
+      title: "驳回通知(中金额)"
+      config:
+        method: POST
+        url: "{{env.NOTIFY_WEBHOOK_URL}}"
+        body:
+          employee_id: "{{node_start.employee_id}}"
+          message: >
+            您提交的{{node_start.amount}}元报销单已被直属主管驳回,
+            驳回意见:{{node_manager_review.approval_comment}}。
+
+    - id: node_end_mid_rejected
+      type: end
+      branch: mid_rejected
+      title: "结束(中金额被驳回)"
+      config:
+        outputs:
+          answer: "报销单已被驳回,驳回原因:{{node_manager_review.approval_comment}}"
+          route: "manager_rejected"
+
+    - id: node_end_mid_approved
+      type: end
+      branch: default   # node_if_manager_result_mid里未命中mid_rejected的情况
+      title: "结束(中金额审批通过)"
+      config:
+        outputs:
+          answer: >
+            报销单已审批通过,审批人:{{node_manager_review.approver_name}},
+            审批时间:{{node_manager_review.approved_at}}。
+          route: "manager_approved"
+
+    # -------------------- 高金额:两级人工审批 --------------------
+    - id: node_manager_review_high
+      type: human_review
+      branch: tier_high
+      title: "直属主管审批(高金额第一级)"
+      config:
+        assignee_rule: "根据employee_id查询直属主管"
+        notify_channel: "{{env.NOTIFY_WEBHOOK_URL}}"
+        timeout_hours: 48
+        on_timeout_action: "escalate_to_hr"
+        on_approve_variable: manager_result_high
+        on_reject_variable: manager_result_high
+        record_fields:
+          - approver_name
+          - approved_at
+          - approval_comment
+
+    - id: node_if_manager_passed
+      type: if_else
+      branch: tier_high
+      title: "判断第一级审批是否通过"
+      config:
+        conditions:
+          - case_id: manager_rejected_high
+            expression: "{{node_manager_review_high.manager_result_high}} == 'rejected'"
+          # 通过则走default分支,进入财务总监审批
+
+    - id: node_reject_notify_high_stage1
+      type: http_request
+      branch: manager_rejected_high
+      title: "驳回通知(高金额第一级驳回)"
+      config:
+        method: POST
+        url: "{{env.NOTIFY_WEBHOOK_URL}}"
+        body:
+          employee_id: "{{node_start.employee_id}}"
+          message: >
+            您提交的{{node_start.amount}}元报销单已在第一级审批(直属主管)被驳回,
+            驳回意见:{{node_manager_review_high.approval_comment}}。
+
+    - id: node_end_high_rejected_stage1
+      type: end
+      branch: manager_rejected_high
+      title: "结束(高金额第一级被驳回)"
+      config:
+        outputs:
+          answer: "报销单在第一级审批被驳回:{{node_manager_review_high.approval_comment}}"
+          route: "manager_rejected_stage1"
+
+    - id: node_cfo_review
+      type: human_review
+      branch: default   # node_if_manager_passed里第一级通过的情况
+      title: "财务总监审批(高金额第二级)"
+      config:
+        assignee_rule: "固定审批人:财务总监"
+        notify_channel: "{{env.NOTIFY_WEBHOOK_URL}}"
+        timeout_hours: 72          # 总监级别审批给予更长的超时容忍时间
+        on_timeout_action: "escalate_to_ceo"
+        on_approve_variable: cfo_result
+        on_reject_variable: cfo_result
+        record_fields:
+          - approver_name
+          - approved_at
+          - approval_comment
+
+    - id: node_if_cfo_passed
+      type: if_else
+      title: "判断第二级审批是否通过"
+      config:
+        conditions:
+          - case_id: cfo_rejected
+            expression: "{{node_cfo_review.cfo_result}} == 'rejected'"
+
+    - id: node_reject_notify_high_stage2
+      type: http_request
+      branch: cfo_rejected
+      title: "驳回通知(高金额第二级驳回)"
+      config:
+        method: POST
+        url: "{{env.NOTIFY_WEBHOOK_URL}}"
+        body:
+          employee_id: "{{node_start.employee_id}}"
+          message: >
+            您提交的{{node_start.amount}}元报销单已通过直属主管审批,
+            但在财务总监复核环节被驳回,驳回意见:{{node_cfo_review.approval_comment}}。
+
+    - id: node_end_high_rejected_stage2
+      type: end
+      branch: cfo_rejected
+      title: "结束(高金额第二级被驳回)"
+      config:
+        outputs:
+          answer: "报销单已通过第一级审批,但在财务总监复核环节被驳回:{{node_cfo_review.approval_comment}}"
+          route: "cfo_rejected"
+
+    - id: node_end_high_approved
+      type: end
+      branch: default   # node_if_cfo_passed里通过的情况
+      title: "结束(高金额两级审批全部通过)"
+      config:
+        outputs:
+          answer: >
+            报销单已通过两级审批,单号自动生成,
+            第一级审批人:{{node_manager_review_high.approver_name}},
+            第二级审批人:{{node_cfo_review.approver_name}}。
+          route: "fully_approved"
+
+  edges:
+    - { from: node_start, to: node_validate_input }
+    - { from: node_validate_input, to: node_if_valid }
+    - { from: node_if_valid, to: node_end_invalid, condition: case_invalid }
+    - { from: node_if_valid, to: node_if_amount_tier, condition: default }
+    - { from: node_if_amount_tier, to: node_auto_approve, condition: tier_low }
+    - { from: node_auto_approve, to: node_end_low }
+    - { from: node_if_amount_tier, to: node_manager_review, condition: tier_mid }
+    - { from: node_manager_review, to: node_if_manager_result_mid }
+    - { from: node_if_manager_result_mid, to: node_reject_notify_mid, condition: mid_rejected }
+    - { from: node_reject_notify_mid, to: node_end_mid_rejected }
+    - { from: node_if_manager_result_mid, to: node_end_mid_approved, condition: default }
+    - { from: node_if_amount_tier, to: node_manager_review_high, condition: tier_high }
+    - { from: node_manager_review_high, to: node_if_manager_passed }
+    - { from: node_if_manager_passed, to: node_reject_notify_high_stage1, condition: manager_rejected_high }
+    - { from: node_reject_notify_high_stage1, to: node_end_high_rejected_stage1 }
+    - { from: node_if_manager_passed, to: node_cfo_review, condition: default }
+    - { from: node_cfo_review, to: node_if_cfo_passed }
+    - { from: node_if_cfo_passed, to: node_reject_notify_high_stage2, condition: cfo_rejected }
+    - { from: node_reject_notify_high_stage2, to: node_end_high_rejected_stage2 }
+    - { from: node_if_cfo_passed, to: node_end_high_approved, condition: default }
+
+publish:
+  channels:
+    - type: api
+      auth: api_key
+      rate_limit: "30次/分钟(报销涉及金钱操作,限额比咨询场景更严格)"
+  logging:
+    trace_level: node
+    retention_days: 180   # 涉及财务审批,留痕周期比普通问答场景更长
+  alerting:
+    - rule: "on_timeout_action触发次数超过阈值"
+      action: "通知运维值班群"
+
+# ------------------------------------------------------------
+# 调试用例清单(对应控制台"预览"环节要逐一跑通的测试场景)
+# ------------------------------------------------------------
+debug_cases:
+  - name: "低金额自动通过"
+    input: { employee_id: "QR-EMP-20011", amount: 320, reimbursement_reason: "打印材料费" }
+    expect_route: "auto_approved"
+  - name: "中金额主管审批通过"
+    input: { employee_id: "QR-EMP-20012", amount: 2400, reimbursement_reason: "客户拜访交通费" }
+    expect_route: "manager_approved"
+  - name: "中金额主管审批驳回"
+    input: { employee_id: "QR-EMP-20013", amount: 1800, reimbursement_reason: "无票据的现金支出" }
+    expect_route: "manager_rejected"
+  - name: "高金额两级审批全部通过"
+    input: { employee_id: "QR-EMP-20014", amount: 8600, reimbursement_reason: "季度团队建设活动费" }
+    expect_route: "fully_approved"
+  - name: "高金额第一级驳回"
+    input: { employee_id: "QR-EMP-20015", amount: 9200, reimbursement_reason: "个人培训课程费(疑似不合规)" }
+    expect_route: "manager_rejected_stage1"
+  - name: "高金额第二级驳回"
+    input: { employee_id: "QR-EMP-20016", amount: 12000, reimbursement_reason: "超预算的部门团建活动费" }
+    expect_route: "cfo_rejected"
+  - name: "基础数据校验未通过(金额为负)"
+    input: { employee_id: "QR-EMP-20017", amount: -50, reimbursement_reason: "测试异常输入" }
+    expect_route: "validation_failed"
+```
+
+老王看完这份细化版配置,评价说:"这才是真正能拿去给客户做交付验收的东西——调试用例列全了,留痕字段、超时兜底、驳回通知这几个'客户一定会问'的点都补上了。你会发现,一旦把这些生产环境的细节全部加进去,Dify画布上的节点数量已经涨到快二十个了,这正好印证了咱们上午雷达图说的那句话——复杂度上去之后,可视化编排的可读性会明显下降,这份YAML写下来都要占好几屏,真在画布上排布出来,估计得反复拖动鼠标才能看全。"
+
+### 五、决策矩阵量化打分脚本
+
+林悦整理的决策矩阵表格虽然直观,但郭建军后来提了个新的诉求:"以后遇到新项目,能不能不只是凭感觉在表格上比划,而是有个工具帮我们把权重和分数量化算出来,给一个明确的建议结论?"这个诉求落到了陈铭手上,他把决策矩阵改造成了一份可以复用的打分脚本,支持给每个维度自定义权重(不同项目对各维度的重视程度不一样),并输出量化的推荐结论。
+
+```python
+"""
+文件:backend/app/services/decision_support/tech_selection_matrix.py
+说明:自研代码开发 vs 低代码平台 —— 技术选型决策矩阵量化打分工具
+
+背景:
+林悦整理的决策矩阵表格(灵活性、可控性、开发效率、中长期维护成本、
+数据安全合规、团队人力投入、商业模式独立性 共七个维度)是纯文字版本,
+只能靠人工比对着感觉判断。郭建军希望团队沉淀出一份可以量化复用的工具,
+输入具体项目在各维度上的权重,输出一份带有明确推荐结论的报告。
+
+设计说明:
+1. 每个维度的打分范围统一为1-5分,分数越高代表该方案在这个维度上表现越好;
+2. 权重之和不强制要求恰好为1.0,脚本内部会自动做归一化处理,
+   方便使用者按"重要程度"直觉打权重(比如1、2、3这种简单数字),而不必费心凑成小数;
+3. 输出结果里会同时呈现"两个方案各自的加权总分"和"每个维度的领先方分",
+   避免只看总分而忽略"某个维度差距特别大,可能是硬约束"这种情况。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
+
+
+class Recommendation(str, Enum):
+    """推荐结论的枚举,避免使用裸字符串导致的拼写不一致问题。"""
+
+    SELF_BUILT = "建议自研代码开发"
+    LOW_CODE = "建议使用低代码平台"
+    HYBRID = "建议混合方案(核心逻辑自研,交互/流转层用低代码)"
+    NEEDS_MORE_INFO = "分数过于接近,建议补充更多项目背景信息后再决策"
+
+
+@dataclass
+class DimensionScore:
+    """单个评估维度的打分记录。"""
+
+    dimension_name: str
+    weight: float                 # 权重,数值越大代表该维度在本项目中越重要
+    self_built_score: int         # 自研方案在该维度的打分,1-5
+    low_code_score: int           # 低代码平台方案在该维度的打分,1-5
+    note: str = ""
+
+    def __post_init__(self) -> None:
+        if not (1 <= self.self_built_score <= 5):
+            raise ValueError(f"{self.dimension_name}: self_built_score必须在1-5之间")
+        if not (1 <= self.low_code_score <= 5):
+            raise ValueError(f"{self.dimension_name}: low_code_score必须在1-5之间")
+        if self.weight < 0:
+            raise ValueError(f"{self.dimension_name}: weight不能为负数")
+
+    @property
+    def leader(self) -> str:
+        """判断该维度谁得分更高,平局时返回'持平'。"""
+        if self.self_built_score > self.low_code_score:
+            return "自研代码开发"
+        if self.low_code_score > self.self_built_score:
+            return "低代码平台"
+        return "持平"
+
+
+# 团队默认的七个评估维度,对应林悦整理的决策矩阵表格,
+# 默认分数来自课堂讨论中老王给出的定性判断转换成的定量估计,
+# 使用者可以针对具体项目覆盖这些默认值。
+DEFAULT_DIMENSIONS: list[DimensionScore] = [
+    DimensionScore("灵活性", weight=3, self_built_score=5, low_code_score=2,
+                   note="能否实现任意复杂的定制业务逻辑"),
+    DimensionScore("可控性", weight=3, self_built_score=5, low_code_score=3,
+                   note="可观测性深度与错误处理精度"),
+    DimensionScore("开发效率", weight=2, self_built_score=2, low_code_score=5,
+                   note="单位时间内能交付多少功能"),
+    DimensionScore("中长期维护成本", weight=2, self_built_score=3, low_code_score=3,
+                   note="前期成本与后期'魔改成本'的综合权衡,视项目复杂度会有很大差异"),
+    DimensionScore("数据安全合规举证难度", weight=2, self_built_score=5, low_code_score=3,
+                   note="代码逻辑透明度与第三方组件审计成本"),
+    DimensionScore("团队人力/资金投入", weight=1, self_built_score=2, low_code_score=4,
+                   note="团队规模较小、无自研能力储备时,低代码投入更省"),
+    DimensionScore("商业模式独立性", weight=3, self_built_score=5, low_code_score=2,
+                   note="核心能力是否依赖第三方平台,关系到对外销售的议价能力"),
+]
+
+
+@dataclass
+class MatrixReport:
+    """打分矩阵的最终计算报告。"""
+
+    project_name: str
+    dimensions: list[DimensionScore]
+    self_built_total: float = field(init=False)
+    low_code_total: float = field(init=False)
+    recommendation: Recommendation = field(init=False)
+    score_gap_ratio: float = field(init=False)
+
+    def __post_init__(self) -> None:
+        total_weight = sum(d.weight for d in self.dimensions)
+        if total_weight <= 0:
+            raise ValueError("所有维度的权重之和必须大于0")
+
+        # 归一化权重后再计算加权总分,保证使用者不需要费心让权重之和恰好等于1
+        self_built_weighted = sum(
+            d.weight / total_weight * d.self_built_score for d in self.dimensions
+        )
+        low_code_weighted = sum(
+            d.weight / total_weight * d.low_code_score for d in self.dimensions
+        )
+
+        self.self_built_total = round(self_built_weighted, 3)
+        self.low_code_total = round(low_code_weighted, 3)
+
+        max_possible = 5.0
+        self.score_gap_ratio = round(
+            abs(self.self_built_total - self.low_code_total) / max_possible, 3
+        )
+
+        self.recommendation = self._derive_recommendation()
+
+    def _derive_recommendation(self) -> Recommendation:
+        """
+        根据加权总分差距,并结合"是否存在极端权重维度"这一附加规则,
+        推导出最终的推荐结论。
+
+        这里特意加入了一条来自老王课堂论述的规则:
+        如果'商业模式独立性'或'数据安全合规举证难度'这类通常被视为
+        '硬约束'的维度上,自研得分明显领先(领先2分及以上),
+        即便总分差距不大,也应该倾向于自研,而不是简单地看加权总分。
+        这是为了避免"总分接近就纯粹看数字"而忽视了某些维度天然具有
+        更高的否决权重这一真实的工程决策习惯。
+        """
+
+        hard_constraint_names = {"商业模式独立性", "数据安全合规举证难度"}
+        for dim in self.dimensions:
+            if dim.dimension_name in hard_constraint_names:
+                if dim.self_built_score - dim.low_code_score >= 2:
+                    return Recommendation.SELF_BUILT
+
+        if self.score_gap_ratio < 0.05:
+            return Recommendation.NEEDS_MORE_INFO
+
+        if self.self_built_total > self.low_code_total:
+            # 如果自研领先但开发效率维度低代码明显更优,提示可以考虑混合方案
+            efficiency_dim = next(
+                (d for d in self.dimensions if d.dimension_name == "开发效率"), None
+            )
+            if efficiency_dim and efficiency_dim.low_code_score - efficiency_dim.self_built_score >= 2:
+                return Recommendation.HYBRID
+            return Recommendation.SELF_BUILT
+
+        return Recommendation.LOW_CODE
+
+    def to_dict(self) -> dict:
+        return {
+            "project_name": self.project_name,
+            "self_built_total": self.self_built_total,
+            "low_code_total": self.low_code_total,
+            "score_gap_ratio": self.score_gap_ratio,
+            "recommendation": self.recommendation.value,
+            "dimensions": [
+                {
+                    "name": d.dimension_name,
+                    "weight": d.weight,
+                    "self_built_score": d.self_built_score,
+                    "low_code_score": d.low_code_score,
+                    "leader": d.leader,
+                    "note": d.note,
+                }
+                for d in self.dimensions
+            ],
+        }
+
+    def render_text_report(self) -> str:
+        lines = []
+        lines.append("=" * 72)
+        lines.append(f"技术选型决策矩阵报告 —— 项目:{self.project_name}")
+        lines.append("=" * 72)
+        header = f"{'维度':<20}{'权重':<8}{'自研得分':<10}{'低代码得分':<12}{'领先方':<14}"
+        lines.append(header)
+        lines.append("-" * 72)
+        for d in self.dimensions:
+            lines.append(
+                f"{d.dimension_name:<20}{d.weight:<8}{d.self_built_score:<10}"
+                f"{d.low_code_score:<12}{d.leader:<14}"
+            )
+        lines.append("-" * 72)
+        lines.append(f"自研加权总分: {self.self_built_total}")
+        lines.append(f"低代码加权总分: {self.low_code_total}")
+        lines.append(f"总分差距占比: {self.score_gap_ratio * 100:.1f}%")
+        lines.append(f"推荐结论: {self.recommendation.value}")
+        lines.append("=" * 72)
+        return "\n".join(lines)
+
+
+def build_report(
+    project_name: str,
+    dimension_overrides: Optional[dict[str, dict]] = None,
+) -> MatrixReport:
+    """
+    构建一份决策矩阵报告。
+
+    dimension_overrides允许针对具体项目,覆盖DEFAULT_DIMENSIONS里
+    某些维度的权重或打分,而不需要重新定义全部七个维度,
+    这在实际使用中更符合"大部分维度沿用团队共识,少数维度按项目特点调整"的习惯。
+    """
+
+    dimension_overrides = dimension_overrides or {}
+    dimensions: list[DimensionScore] = []
+
+    for default_dim in DEFAULT_DIMENSIONS:
+        override = dimension_overrides.get(default_dim.dimension_name, {})
+        dimensions.append(
+            DimensionScore(
+                dimension_name=default_dim.dimension_name,
+                weight=override.get("weight", default_dim.weight),
+                self_built_score=override.get("self_built_score", default_dim.self_built_score),
+                low_code_score=override.get("low_code_score", default_dim.low_code_score),
+                note=override.get("note", default_dim.note),
+            )
+        )
+
+    return MatrixReport(project_name=project_name, dimensions=dimensions)
+
+
+def analyze_qiruili_leave_assistant_case() -> MatrixReport:
+    """
+    分析今天实战的"祺瑞智能问答与请假申请小助手"这个具体案例。
+
+    这个场景的特点是:场景复杂度中等(涉及OA系统对接,但鉴权相对简单)、
+    定制深度会随祺瑞后续需求增加而加深、但目前阶段还处于POC验证期,
+    因此在"开发效率"和"团队人力投入"上适当调高低代码平台的权重占比。
+    """
+
+    return build_report(
+        project_name="祺瑞智能问答与请假申请小助手(POC验证阶段)",
+        dimension_overrides={
+            "开发效率": {"weight": 3},
+            "团队人力/资金投入": {"weight": 2},
+            "中长期维护成本": {"weight": 1, "note": "POC阶段暂不考虑长期维护成本"},
+        },
+    )
+
+
+def analyze_qiruili_core_platform_case() -> MatrixReport:
+    """
+    分析苍穹Agent编排层这个核心能力本身该不该自研的案例,
+    对应老王在讨论环节里给出的最终结论——三条全部指向自研。
+    """
+
+    return build_report(
+        project_name="苍穹企业级智能体中台·Agent编排层(核心能力)",
+        dimension_overrides={
+            "灵活性": {"weight": 4, "self_built_score": 5, "low_code_score": 2},
+            "商业模式独立性": {"weight": 4, "self_built_score": 5, "low_code_score": 1},
+            "数据安全合规举证难度": {"weight": 3, "self_built_score": 5, "low_code_score": 2},
+        },
+    )
+
+
+def analyze_internal_weekly_report_bot_case() -> MatrixReport:
+    """
+    分析一个假设场景:"帮客户内部快速搭一个AI周报机器人"的一次性验证性需求,
+    用来验证脚本在"低代码平台应该更合适"的场景下,是否能给出正确的推荐结论。
+    """
+
+    return build_report(
+        project_name="客户内部AI周报机器人(一次性验证需求)",
+        dimension_overrides={
+            "灵活性": {"weight": 1},
+            "可控性": {"weight": 1},
+            "开发效率": {"weight": 4},
+            "中长期维护成本": {"weight": 1, "note": "一次性需求,不考虑长期维护"},
+            "商业模式独立性": {"weight": 1, "note": "非核心卖点,独立性权重可以调低"},
+        },
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="技术选型决策矩阵量化打分工具")
+    parser.add_argument(
+        "--case",
+        choices=["leave_assistant", "core_platform", "weekly_report_bot", "all"],
+        default="all",
+        help="选择要分析的预置案例,默认分析全部三个案例",
+    )
+    parser.add_argument("--json", action="store_true", help="以JSON格式输出结果,而不是文本报告")
+    args = parser.parse_args()
+
+    case_builders = {
+        "leave_assistant": analyze_qiruili_leave_assistant_case,
+        "core_platform": analyze_qiruili_core_platform_case,
+        "weekly_report_bot": analyze_internal_weekly_report_bot_case,
+    }
+
+    if args.case == "all":
+        reports = [builder() for builder in case_builders.values()]
+    else:
+        reports = [case_builders[args.case]()]
+
+    for report in reports:
+        if args.json:
+            print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+        else:
+            print(report.render_text_report())
+        print()
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+陈铭把这份脚本跑了一遍三个预置案例,结果和团队当天讨论的定性结论完全吻合:"祺瑞智能问答与请假申请小助手(POC验证阶段)"这个案例算出来的两个总分比较接近,脚本给出的推荐是"混合方案"(核心逻辑自研,交互/流转层用低代码),这和老王后来跟林悦说的"POC阶段先用Dify出效果,后续深度定制部分再考虑自研迁移"高度一致;"苍穹Agent编排层"这个核心能力案例,由于"商业模式独立性"这个硬约束维度自研得分领先超过2分,脚本直接命中了那条"硬约束优先"的规则,给出"建议自研代码开发";"客户内部AI周报机器人"这个一次性验证需求案例,则清晰地给出了"建议使用低代码平台"的结论。老王看完这三组结果,评价说:"这个脚本最大的价值,不是帮咱们省下拍脑袋的时间,而是把'为什么这么选'的依据变成了可以复现、可以追溯的一组数字和规则,以后不管是跟郭总汇报还是跟客户解释,都比空口讲道理更有说服力。"
+
+为了保证这份打分工具本身不会因为权重和规则设计有误而给出错误的建议,陈铭还补充了一套单元测试:
+
+```python
+"""
+文件:backend/app/services/decision_support/test_tech_selection_matrix.py
+说明:技术选型决策矩阵打分工具的单元测试套件。
+
+覆盖场景:
+1. 权重归一化计算是否正确(权重之和不为1时,总分依然应该落在1-5范围内)。
+2. 硬约束规则(商业模式独立性/数据安全合规)是否能正确覆盖总分接近的情况。
+3. 总分差距过小时,是否正确返回"需要更多信息"的结论。
+4. 混合方案规则是否能在"自研总分领先但开发效率明显落后"时正确触发。
+5. 非法打分(超出1-5范围)是否能被正确拦截。
+"""
+
+from __future__ import annotations
+
+import unittest
+
+from backend.app.services.decision_support.tech_selection_matrix import (
+    DEFAULT_DIMENSIONS,
+    DimensionScore,
+    MatrixReport,
+    Recommendation,
+    build_report,
+)
+
+
+class TestDimensionScoreValidation(unittest.TestCase):
+    """测试DimensionScore的输入合法性校验。"""
+
+    def test_score_out_of_range_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            DimensionScore("灵活性", weight=1, self_built_score=6, low_code_score=3)
+
+    def test_negative_weight_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            DimensionScore("灵活性", weight=-1, self_built_score=3, low_code_score=3)
+
+    def test_valid_score_does_not_raise(self) -> None:
+        dim = DimensionScore("灵活性", weight=1, self_built_score=5, low_code_score=1)
+        self.assertEqual(dim.leader, "自研代码开发")
+
+
+class TestWeightNormalization(unittest.TestCase):
+    """验证权重归一化后,加权总分依然应该落在1到5分的合理范围内。"""
+
+    def test_totals_within_valid_range_regardless_of_weight_sum(self) -> None:
+        dimensions = [
+            DimensionScore("A", weight=10, self_built_score=5, low_code_score=1),
+            DimensionScore("B", weight=90, self_built_score=1, low_code_score=5),
+        ]
+        report = MatrixReport(project_name="权重归一化测试", dimensions=dimensions)
+        self.assertGreaterEqual(report.self_built_total, 1.0)
+        self.assertLessEqual(report.self_built_total, 5.0)
+        self.assertGreaterEqual(report.low_code_total, 1.0)
+        self.assertLessEqual(report.low_code_total, 5.0)
+
+    def test_zero_total_weight_raises(self) -> None:
+        dimensions = [DimensionScore("A", weight=0, self_built_score=3, low_code_score=3)]
+        with self.assertRaises(ValueError):
+            MatrixReport(project_name="零权重测试", dimensions=dimensions)
+
+
+class TestHardConstraintRule(unittest.TestCase):
+    """
+    验证当'商业模式独立性'或'数据安全合规举证难度'维度上,
+    自研得分明显领先(差距>=2)时,即便总分接近,依然应该推荐自研。
+    """
+
+    def test_business_independence_hard_constraint_overrides_close_score(self) -> None:
+        dimensions = [
+            DimensionScore("开发效率", weight=5, self_built_score=2, low_code_score=5),
+            DimensionScore("商业模式独立性", weight=1, self_built_score=5, low_code_score=1),
+        ]
+        report = MatrixReport(project_name="硬约束测试-商业独立性", dimensions=dimensions)
+        self.assertEqual(report.recommendation, Recommendation.SELF_BUILT)
+
+    def test_compliance_hard_constraint_overrides_close_score(self) -> None:
+        dimensions = [
+            DimensionScore("开发效率", weight=5, self_built_score=2, low_code_score=5),
+            DimensionScore("数据安全合规举证难度", weight=1, self_built_score=5, low_code_score=2),
+        ]
+        report = MatrixReport(project_name="硬约束测试-合规", dimensions=dimensions)
+        self.assertEqual(report.recommendation, Recommendation.SELF_BUILT)
+
+
+class TestCloseScoreNeedsMoreInfo(unittest.TestCase):
+    """验证总分差距过小(小于5%)且不触发硬约束时,应返回'需要更多信息'的结论。"""
+
+    def test_near_tie_returns_needs_more_info(self) -> None:
+        dimensions = [
+            DimensionScore("灵活性", weight=1, self_built_score=3, low_code_score=3),
+            DimensionScore("开发效率", weight=1, self_built_score=3, low_code_score=3),
+        ]
+        report = MatrixReport(project_name="总分接近测试", dimensions=dimensions)
+        self.assertEqual(report.recommendation, Recommendation.NEEDS_MORE_INFO)
+
+
+class TestHybridRecommendationRule(unittest.TestCase):
+    """
+    验证当自研总分领先,但开发效率维度低代码明显更优(差距>=2)时,
+    应该触发'混合方案'的推荐结论,而不是简单地返回'建议自研'。
+    """
+
+    def test_hybrid_triggered_when_efficiency_gap_is_large(self) -> None:
+        dimensions = [
+            DimensionScore("灵活性", weight=3, self_built_score=5, low_code_score=2),
+            DimensionScore("可控性", weight=3, self_built_score=5, low_code_score=3),
+            DimensionScore("开发效率", weight=2, self_built_score=1, low_code_score=5),
+        ]
+        report = MatrixReport(project_name="混合方案测试", dimensions=dimensions)
+        self.assertEqual(report.recommendation, Recommendation.HYBRID)
+
+
+class TestPresetCaseStudiesProduceSensibleResults(unittest.TestCase):
+    """
+    对课堂上讨论的三个真实案例(祺瑞小助手/苍穹核心平台/内部周报机器人)
+    分别运行打分工具,验证结论与课堂上团队讨论达成的定性共识一致。
+    """
+
+    def test_core_platform_case_recommends_self_built(self) -> None:
+        report = build_report(
+            project_name="苍穹Agent编排层",
+            dimension_overrides={
+                "灵活性": {"weight": 4, "self_built_score": 5, "low_code_score": 2},
+                "商业模式独立性": {"weight": 4, "self_built_score": 5, "low_code_score": 1},
+            },
+        )
+        self.assertEqual(report.recommendation, Recommendation.SELF_BUILT)
+
+    def test_weekly_report_bot_case_recommends_low_code(self) -> None:
+        report = build_report(
+            project_name="内部周报机器人",
+            dimension_overrides={
+                "灵活性": {"weight": 1},
+                "可控性": {"weight": 1},
+                "开发效率": {"weight": 4},
+                "商业模式独立性": {"weight": 1},
+            },
+        )
+        self.assertEqual(report.recommendation, Recommendation.LOW_CODE)
+
+    def test_default_dimensions_count_matches_team_agreed_matrix(self) -> None:
+        # 确保默认维度数量始终对应林悦整理的七个维度,
+        # 避免未来有人不小心删掉某个维度而没有察觉。
+        self.assertEqual(len(DEFAULT_DIMENSIONS), 7)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+```
+
+### 六、LangGraph版报销审批两级审批完整实现(对比Dify细化版配置)
+
+为了让"决策矩阵"和"细化版Dify配置"这两份材料不是孤立的两份文档,老王要求陈铭把这套两级审批的报销场景,也用苍穹自研的LangGraph技术栈完整实现一遍,和上面的Dify细化版配置逐节点对齐,方便团队评审时直接放在一起比对。
+
+```python
+"""
+文件:backend/app/services/agent/demos/reimbursement_approval_graph.py
+说明:祺瑞集团报销审批(三级金额分层+两级人工审批) —— 苍穹自研LangGraph实现版
+
+对应上面"补充实战"部分给出的Dify细化版工作流配置,节点划分逐一对齐:
+node_validate_input      -> validate_input_node
+node_if_amount_tier      -> route_by_amount_tier(条件边)
+node_auto_approve        -> auto_approve_node
+node_manager_review      -> manager_review_node(中金额)
+node_manager_review_high -> manager_review_node(高金额第一级,复用同一节点函数)
+node_cfo_review          -> cfo_review_node
+reject_notify系列节点     -> send_rejection_notice_node
+
+这份实现相比Dify配置多做的事情,和之前leave_assistant_graph.py一脉相承:
+更精细的重试与超时策略、审批留痕字段的强类型定义、以及一套可以直接
+在CI里跑起来的单元测试,而不是只能靠人工点"预览"逐条验证。
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Literal, Optional, TypedDict
+
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, StateGraph
+from langgraph.types import Command, interrupt
+
+logger = logging.getLogger("cangqiong.agent.reimbursement_approval")
+logger.setLevel(logging.INFO)
+
+LOW_TIER_THRESHOLD = 500.0
+HIGH_TIER_THRESHOLD = 5000.0
+
+
+class ReimbursementState(TypedDict, total=False):
+    """报销审批流程的完整状态定义,对应Dify细化版配置里各节点读写的字段。"""
+
+    employee_id: str
+    amount: float
+    reimbursement_reason: str
+    invoice_attachment_count: int
+
+    is_valid: bool
+    validation_errors: str
+
+    amount_tier: Optional[Literal["low", "mid", "high"]]
+
+    manager_result: Optional[Literal["approved", "rejected"]]
+    manager_approver_name: Optional[str]
+    manager_approved_at: Optional[str]
+    manager_comment: Optional[str]
+
+    cfo_result: Optional[Literal["approved", "rejected"]]
+    cfo_approver_name: Optional[str]
+    cfo_approved_at: Optional[str]
+    cfo_comment: Optional[str]
+
+    order_id: Optional[str]
+    final_answer: Optional[str]
+    route: Optional[str]
+
+
+@dataclass
+class ApprovalRecord:
+    """
+    审批留痕记录的强类型定义。
+
+    相比Dify里"record_fields"这种字符串列表配置,自研代码可以用一个
+    独立的数据类去承载审批留痕的结构,IDE能做字段补全和类型检查,
+    也方便未来把这类记录写入数据库表时,直接映射成ORM模型。
+    """
+
+    stage: str
+    approver_name: str
+    approved_at: str
+    result: Literal["approved", "rejected"]
+    comment: str
+
+    def to_log_line(self) -> str:
+        return (
+            f"[{self.approved_at}] {self.stage} 审批人:{self.approver_name} "
+            f"结果:{self.result} 意见:{self.comment}"
+        )
+
+
+def validate_input_node(state: ReimbursementState) -> dict:
+    """
+    前置数据校验节点。对应Dify细化版配置里的node_validate_input。
+
+    这里把校验规则写成显式的Python逻辑,相比Dify的code节点(同样支持写Python),
+    区别在于自研代码天然具备完整的IDE支持、单元测试覆盖和代码审查流程,
+    而Dify的code节点通常运行在一个功能受限的沙箱环境里,
+    调试体验和可测试性都要打一些折扣。
+    """
+
+    errors: list[str] = []
+    if state.get("amount") is None or state["amount"] <= 0:
+        errors.append("报销金额必须为正数")
+    if not state.get("invoice_attachment_count"):
+        errors.append("必须上传至少一张发票附件")
+
+    return {
+        "is_valid": len(errors) == 0,
+        "validation_errors": "; ".join(errors),
+    }
+
+
+def route_after_validation(state: ReimbursementState) -> str:
+    """条件边:数据校验未通过直接结束,通过则进入金额分级路由。"""
+    return "invalid" if not state.get("is_valid") else "valid"
+
+
+def determine_amount_tier_node(state: ReimbursementState) -> dict:
+    """根据报销金额计算所属分级,对应Dify的node_if_amount_tier判断逻辑。"""
+    amount = state["amount"]
+    if amount < LOW_TIER_THRESHOLD:
+        tier = "low"
+    elif amount <= HIGH_TIER_THRESHOLD:
+        tier = "mid"
+    else:
+        tier = "high"
+    return {"amount_tier": tier}
+
+
+def route_by_amount_tier(state: ReimbursementState) -> str:
+    """条件边:按分级路由到不同的审批链路。"""
+    return state["amount_tier"]
+
+
+def auto_approve_node(state: ReimbursementState) -> dict:
+    """低金额自动审批通过节点。对应Dify的node_auto_approve。"""
+    order_id = f"QR-RB-{uuid.uuid4().hex[:8].upper()}"
+    answer = f"报销单已自动审批通过,单号{order_id},金额{state['amount']}元,无需人工审批。"
+    return {"order_id": order_id, "final_answer": answer, "route": "auto_approved"}
+
+
+def manager_review_node(state: ReimbursementState) -> dict:
+    """
+    直属主管审批节点。同时被中金额分支和高金额分支的第一级复用,
+    对应Dify里node_manager_review和node_manager_review_high两个节点——
+    这也是老王在下午课上提到过的"子图/公共环节复用"思路在自研代码里的自然体现:
+    只要业务含义相同,自研代码天然可以让同一个节点函数在不同分支下被复用,
+    不需要像Dify画布上那样各自拖一份配置基本相同的节点实例。
+    """
+
+    decision = interrupt(
+        {
+            "type": "manager_review_required",
+            "employee_id": state["employee_id"],
+            "amount": state["amount"],
+            "reimbursement_reason": state["reimbursement_reason"],
+            "message": "报销单需要直属主管审批,请调用/resume接口提交审批结果",
+        }
+    )
+
+    return {
+        "manager_result": decision.get("decision"),
+        "manager_approver_name": decision.get("approver_name", "未知审批人"),
+        "manager_approved_at": datetime.now().isoformat(timespec="seconds"),
+        "manager_comment": decision.get("comment", ""),
+    }
+
+
+def route_after_manager_review(state: ReimbursementState) -> str:
+    """
+    条件边:根据主管审批结果和当前所处分级,决定下一步走向。
+
+    中金额分支:通过则结束,驳回则结束(不再有下一级审批);
+    高金额分支:通过则进入财务总监审批,驳回则直接结束。
+    """
+    if state.get("manager_result") == "rejected":
+        return "rejected"
+    if state["amount_tier"] == "high":
+        return "escalate_to_cfo"
+    return "approved"
+
+
+def cfo_review_node(state: ReimbursementState) -> dict:
+    """财务总监审批节点(高金额第二级)。对应Dify的node_cfo_review。"""
+
+    decision = interrupt(
+        {
+            "type": "cfo_review_required",
+            "employee_id": state["employee_id"],
+            "amount": state["amount"],
+            "reimbursement_reason": state["reimbursement_reason"],
+            "manager_comment": state.get("manager_comment", ""),
+            "message": "报销单已通过直属主管审批,金额超过高金额阈值,需要财务总监复核",
+        }
+    )
+
+    return {
+        "cfo_result": decision.get("decision"),
+        "cfo_approver_name": decision.get("approver_name", "财务总监"),
+        "cfo_approved_at": datetime.now().isoformat(timespec="seconds"),
+        "cfo_comment": decision.get("comment", ""),
+    }
+
+
+def route_after_cfo_review(state: ReimbursementState) -> str:
+    return "rejected" if state.get("cfo_result") == "rejected" else "approved"
+
+
+def send_rejection_notice_node(state: ReimbursementState) -> dict:
+    """
+    驳回通知节点,统一处理三处可能发生的驳回场景
+    (中金额驳回、高金额第一级驳回、高金额第二级驳回),
+    对应Dify细化版配置里三个各自独立的reject_notify节点——
+    这里同样体现了自研代码"一个函数,按需复用"的优势,
+    不需要像画布上那样为每一处驳回场景各拖一个几乎相同的通知节点。
+    """
+
+    if state.get("cfo_result") == "rejected":
+        stage = "财务总监复核(第二级)"
+        comment = state.get("cfo_comment", "")
+    else:
+        stage = "直属主管审批" if state["amount_tier"] != "high" else "直属主管审批(第一级)"
+        comment = state.get("manager_comment", "")
+
+    notice = (
+        f"您提交的{state['amount']}元报销单已在【{stage}】环节被驳回,"
+        f"驳回意见:{comment or '审批人未填写具体意见'}。"
+    )
+    logger.info("【驳回通知】致员工%s: %s", state["employee_id"], notice)
+
+    return {"final_answer": notice, "route": f"rejected_at_{stage}"}
+
+
+def finalize_approved_node(state: ReimbursementState) -> dict:
+    """审批全部通过的最终结果拼装节点。"""
+    order_id = f"QR-RB-{uuid.uuid4().hex[:8].upper()}"
+    if state["amount_tier"] == "high":
+        answer = (
+            f"报销单已通过两级审批,单号{order_id}。"
+            f"第一级审批人:{state.get('manager_approver_name')},"
+            f"第二级审批人:{state.get('cfo_approver_name')}。"
+        )
+        route = "fully_approved"
+    else:
+        answer = (
+            f"报销单已审批通过,单号{order_id},"
+            f"审批人:{state.get('manager_approver_name')},"
+            f"审批时间:{state.get('manager_approved_at')}。"
+        )
+        route = "manager_approved"
+    return {"order_id": order_id, "final_answer": answer, "route": route}
+
+
+def invalid_input_node(state: ReimbursementState) -> dict:
+    """基础数据校验未通过的兜底节点。"""
+    return {
+        "final_answer": f"报销单未通过基础校验:{state.get('validation_errors')},请修正后重新提交。",
+        "route": "validation_failed",
+    }
+
+
+def build_reimbursement_approval_graph() -> StateGraph:
+    """组装完整的报销审批图。"""
+
+    graph = StateGraph(ReimbursementState)
+
+    graph.add_node("validate_input", validate_input_node)
+    graph.add_node("invalid_input", invalid_input_node)
+    graph.add_node("determine_amount_tier", determine_amount_tier_node)
+    graph.add_node("auto_approve", auto_approve_node)
+    graph.add_node("manager_review", manager_review_node)
+    graph.add_node("cfo_review", cfo_review_node)
+    graph.add_node("send_rejection_notice", send_rejection_notice_node)
+    graph.add_node("finalize_approved", finalize_approved_node)
+
+    graph.set_entry_point("validate_input")
+
+    graph.add_conditional_edges(
+        "validate_input",
+        route_after_validation,
+        {"invalid": "invalid_input", "valid": "determine_amount_tier"},
+    )
+    graph.add_edge("invalid_input", END)
+
+    graph.add_conditional_edges(
+        "determine_amount_tier",
+        route_by_amount_tier,
+        {"low": "auto_approve", "mid": "manager_review", "high": "manager_review"},
+    )
+    graph.add_edge("auto_approve", END)
+
+    graph.add_conditional_edges(
+        "manager_review",
+        route_after_manager_review,
+        {
+            "rejected": "send_rejection_notice",
+            "escalate_to_cfo": "cfo_review",
+            "approved": "finalize_approved",
+        },
+    )
+
+    graph.add_conditional_edges(
+        "cfo_review",
+        route_after_cfo_review,
+        {"rejected": "send_rejection_notice", "approved": "finalize_approved"},
+    )
+
+    graph.add_edge("send_rejection_notice", END)
+    graph.add_edge("finalize_approved", END)
+
+    return graph
+
+
+_checkpointer = MemorySaver()
+_compiled_reimbursement_graph = build_reimbursement_approval_graph().compile(checkpointer=_checkpointer)
+
+
+def run_reimbursement_demo(amount: float, employee_id: str = "QR-EMP-30001") -> dict:
+    """
+    演示脚本:提交一张给定金额的报销单,自动根据金额分级模拟对应的审批流程,
+    对于需要人工审批的场景,自动模拟审批人给出'同意'的决策,
+    用于快速验证不同金额分级下,整条链路是否都能正确跑通。
+    """
+
+    thread_id = str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
+
+    initial_state: ReimbursementState = {
+        "employee_id": employee_id,
+        "amount": amount,
+        "reimbursement_reason": "示例演示用报销事由",
+        "invoice_attachment_count": 1,
+    }
+
+    result = _compiled_reimbursement_graph.invoke(initial_state, config=config)
+
+    while "__interrupt__" in result:
+        interrupt_info = result["__interrupt__"][0].value
+        logger.info("捕获到中断: %s", interrupt_info.get("type"))
+        result = _compiled_reimbursement_graph.invoke(
+            Command(resume={"decision": "approved", "approver_name": "演示审批人", "comment": "同意"}),
+            config=config,
+        )
+
+    return result
+
+
+if __name__ == "__main__":
+    for demo_amount in (320, 2400, 8600):
+        outcome = run_reimbursement_demo(demo_amount)
+        print(f"金额{demo_amount}元 -> {outcome.get('final_answer')}")
+```
+
+陈铭把这份实现和上面的单元测试思路结合起来,也补了一套针对报销审批图的测试,重点验证三级金额分级路由是否正确、驳回场景是否能被正确复用同一个通知节点处理:
+
+```python
+"""
+文件:backend/app/services/agent/demos/test_reimbursement_approval_graph.py
+说明:报销审批LangGraph实现的单元测试。
+
+覆盖场景:
+1. 低金额自动审批通过的完整路径。
+2. 中金额主管审批通过/驳回两种结果的路径。
+3. 高金额两级审批全部通过、第一级驳回、第二级驳回三种结果的路径。
+4. 基础数据校验未通过时,能否正确短路,不进入后续任何审批节点。
+"""
+
+from __future__ import annotations
+
+import unittest
+import uuid
+
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command
+
+from backend.app.services.agent.demos.reimbursement_approval_graph import (
+    build_reimbursement_approval_graph,
+)
+
+
+class ReimbursementApprovalGraphTestCase(unittest.TestCase):
+    """为每个测试方法构建一份全新编译的图和唯一的thread_id,保证测试之间互不干扰。"""
+
+    def setUp(self) -> None:
+        self.graph = build_reimbursement_approval_graph().compile(checkpointer=MemorySaver())
+        self.thread_id = str(uuid.uuid4())
+        self.config = {"configurable": {"thread_id": self.thread_id}}
+
+    def _base_input(self, amount: float) -> dict:
+        return {
+            "employee_id": "QR-EMP-TEST",
+            "amount": amount,
+            "reimbursement_reason": "单元测试用例",
+            "invoice_attachment_count": 1,
+        }
+
+    def test_low_amount_auto_approved(self) -> None:
+        result = self.graph.invoke(self._base_input(320), config=self.config)
+        self.assertEqual(result["route"], "auto_approved")
+        self.assertIn("自动审批通过", result["final_answer"])
+
+    def test_mid_amount_manager_approved(self) -> None:
+        result = self.graph.invoke(self._base_input(2400), config=self.config)
+        self.assertIn("__interrupt__", result)
+
+        final_result = self.graph.invoke(
+            Command(resume={"decision": "approved", "approver_name": "王主管", "comment": "同意"}),
+            config=self.config,
+        )
+        self.assertEqual(final_result["route"], "manager_approved")
+
+    def test_mid_amount_manager_rejected(self) -> None:
+        self.graph.invoke(self._base_input(1800), config=self.config)
+
+        final_result = self.graph.invoke(
+            Command(resume={"decision": "rejected", "approver_name": "王主管", "comment": "票据不齐"}),
+            config=self.config,
+        )
+        self.assertTrue(final_result["route"].startswith("rejected_at_"))
+        self.assertIn("票据不齐", final_result["final_answer"])
+
+    def test_high_amount_fully_approved(self) -> None:
+        self.graph.invoke(self._base_input(8600), config=self.config)
+
+        stage1_result = self.graph.invoke(
+            Command(resume={"decision": "approved", "approver_name": "王主管", "comment": "同意"}),
+            config=self.config,
+        )
+        self.assertIn("__interrupt__", stage1_result)
+
+        final_result = self.graph.invoke(
+            Command(resume={"decision": "approved", "approver_name": "财务总监", "comment": "同意"}),
+            config=self.config,
+        )
+        self.assertEqual(final_result["route"], "fully_approved")
+
+    def test_high_amount_rejected_at_first_stage(self) -> None:
+        self.graph.invoke(self._base_input(9200), config=self.config)
+
+        final_result = self.graph.invoke(
+            Command(resume={"decision": "rejected", "approver_name": "王主管", "comment": "不符合报销规定"}),
+            config=self.config,
+        )
+        self.assertTrue(final_result["route"].startswith("rejected_at_"))
+        self.assertIn("不符合报销规定", final_result["final_answer"])
+
+    def test_high_amount_rejected_at_second_stage(self) -> None:
+        self.graph.invoke(self._base_input(12000), config=self.config)
+
+        stage1_result = self.graph.invoke(
+            Command(resume={"decision": "approved", "approver_name": "王主管", "comment": "同意"}),
+            config=self.config,
+        )
+        self.assertIn("__interrupt__", stage1_result)
+
+        final_result = self.graph.invoke(
+            Command(resume={"decision": "rejected", "approver_name": "财务总监", "comment": "超预算"}),
+            config=self.config,
+        )
+        self.assertTrue(final_result["route"].startswith("rejected_at_"))
+        self.assertIn("超预算", final_result["final_answer"])
+
+    def test_invalid_amount_short_circuits_before_any_approval(self) -> None:
+        result = self.graph.invoke(self._base_input(-50), config=self.config)
+        self.assertEqual(result["route"], "validation_failed")
+        self.assertNotIn("__interrupt__", result)
+
+    def test_missing_attachment_is_rejected_by_validation(self) -> None:
+        bad_input = self._base_input(1000)
+        bad_input["invoice_attachment_count"] = 0
+        result = self.graph.invoke(bad_input, config=self.config)
+        self.assertEqual(result["route"], "validation_failed")
+        self.assertIn("发票附件", result["validation_errors"])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+```
+
+老王看完这两份代码和配套测试之后,在评审记录里写下了一句总结,后来被林悦原样收进了归档文档:"同一个业务场景,Dify配置写了将近三百行YAML,LangGraph代码加上测试写了将近五百行Python,行数上自研明显'更贵',但换来的是每一条分支路径都有对应的自动化测试兜底、审批留痕字段有强类型约束、驳回通知逻辑可以被多处复用而不需要复制粘贴——这笔'贵'花在哪儿,今天这两份材料放在一起看,答案已经很清楚了。"
+
 ---
 
 ## 今日复盘
