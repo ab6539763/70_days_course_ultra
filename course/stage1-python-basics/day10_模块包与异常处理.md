@@ -2330,6 +2330,1319 @@ __pycache__/
 
 ---
 
+## 代码实战·加练:陈铭的"晚自习之后"
+
+晚自习正式结束后,陈铭没有立刻收拾电脑。他把白天写的`cangqiong_core`又打开了一遍,心里琢磨着几件白天没顾上做的事:赵磊路过时问的那个"`retry_after`如果传负数怎么办"的问题,他当时只是记在了笔记本上,没有真正动手验证过;老王在FAQ里提到的"新增一个`ClaudeModel`只需要加文件、不用改旧代码",他也还没有亲手实操过一次;下午提到的"三天后会给`ask_ai.py`加重试装饰器",他觉得没必要真等到三天后才写,先在今天的模拟场景里练一次手感也不吃亏。于是他又留了一个多小时,给`cangqiong_core`补了几块内容,第二天顺手发到了群里,老王看完只回了一句"这才是该有的主动性,加分",并把这几份文件也一并收进了今天的教学素材库。
+
+以下补充内容,均建立在上文完整的`cangqiong_core`包结构之上,新增文件不改动任何已有代码——这正是对上午答疑FAQ第5条"新增能力不改旧代码"的一次真实验证。
+
+### 文件15:在`cangqiong_core/exceptions.py`中新增`ContentFilteredError`
+
+陈铭发现现有的异常体系里,还没有一种"内容被安全策略拦截"的场景——这是他准备接入`ClaudeModel`时才想到的,真实的Anthropic Claude API确实存在内容政策拦截的返回码。按照"新增能力不改旧代码"的原则,他只在`exceptions.py`原有的`ModelResponseParseError`类定义之前插入了一个新类,没有改动文件里任何一行已有代码:
+
+```python
+# cangqiong_core/exceptions.py 中新增(插入在ModelAPIError与其子类之间即可,
+# 顺序不影响功能,只是为了阅读时"限流/超时/内容拦截/解析失败"几种子类挨在一起):
+
+class ContentFilteredError(ModelAPIError):
+    """
+    内容被安全策略拦截:请求中的内容触发了模型服务商的内容审核策略。
+
+    典型场景:
+        对话内容命中了服务商侧的敏感词/风险内容检测规则,请求被直接拒绝,
+        不会返回正常的模型回复。
+
+    调用方推荐的处理策略:
+        不应该重试(用同样的内容重试,几乎必然得到同样的拦截结果),
+        应该提示用户修改输入内容,或者记录下触发的关键词用于后续排查
+        "为什么这句话会被判定为高风险内容"。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        trigger_keyword: Optional[str] = None,
+        provider: Optional[str] = None,
+    ) -> None:
+        """
+        :param message: 错误说明
+        :param trigger_keyword: 触发拦截的具体关键词(教学模拟阶段可以精确给出;
+                                 真实服务商的API通常不会告诉你具体触发词是什么,
+                                 只会给一个笼统的"内容不合规"提示,这里为了方便
+                                 教学排查,模拟场景特意做得比真实情况更透明)
+        :param provider: 出问题的模型服务商
+        """
+        super().__init__(message, provider=provider, status_code=451)
+        self.trigger_keyword = trigger_keyword
+```
+
+陈铭在笔记里补了一句:"`status_code=451`不是我瞎写的——`451`在真实的HTTP状态码里就是'因法律原因不可用'(Unavailable For Legal Reasons),用来表示内容被政策原因拦截,挺贴切的一个巧合(其实不算巧合,是我特意去查了一下选的)。"
+
+### 文件16:`cangqiong_core/utils/retry.py` —— 提前实操的重试装饰器
+
+```python
+"""
+文件名:cangqiong_core/utils/retry.py
+作者:陈铭
+说明:
+    今天下午课堂笔记里提到过一句话:"三天后陈铭会给ask_ai.py加上一个重试
+    装饰器,那个装饰器的核心逻辑,正是今天学的try/except"——这个文件就是
+    对这句"预告"的一次提前实操练习。装饰器语法本身要到Day13才系统讲解,
+    这里先按照"函数包裹函数"最朴素的写法实现,重点不在装饰器语法本身,
+    而在于"怎么结合今天设计的异常体系,写出一段真正有工程价值的重试逻辑"。
+
+    设计要点:
+    1. 只针对"重试大概率有意义"的异常类型自动重试(RateLimitError、
+       ModelTimeoutError),对"重试也没用"的异常类型(比如
+       InvalidMessageError、ConfigurationError、ContentFilteredError)
+       立即放弃,原样抛出——这正是下午课堂反复强调的"不同异常,
+       处理策略应该不同"的具体体现。
+    2. RateLimitError自带retry_after属性,重试等待时间直接使用这个值,
+       而不是随意瞎猜一个等待时间。
+    3. 达到最大重试次数后仍然失败,最终把"最后一次"捕获到的异常原样抛出,
+       不能悄悄吞掉,让调用方彻底不知道发生了什么。
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Callable, TypeVar
+
+from ..exceptions import ModelTimeoutError, RateLimitError
+
+# TypeVar用于让被装饰的函数在类型提示层面,返回值类型不会因为装饰而丢失,
+# 这是给未来使用类型检查工具(如mypy)的团队成员留的一个友好细节。
+_ReturnType = TypeVar("_ReturnType")
+
+
+class RetryExhaustedError(Exception):
+    """
+    当重试次数用尽,仍然没有成功时,理论上应该抛出的是"最后一次"真正的业务异常
+    (比如RateLimitError本身),而不是这个类。这个类目前只在retry_with_backoff
+    内部用作"防御性占位符"——正常情况下永远不会被真正抛出到调用方手里,
+    如果不幸抛出了这个异常,说明retry_with_backoff内部的逻辑本身出了bug
+    (比如重试循环一次都没有真正执行过),这是留给自己排查用的"不可能发生的错误"。
+    """
+
+
+def retry_with_backoff(
+    max_attempts: int = 3,
+    base_delay_seconds: float = 0.5,
+    verbose: bool = True,
+):
+    """
+    装饰器工厂函数:返回一个真正的装饰器,可以配置最大重试次数与基础等待时间。
+
+    使用方式:
+        @retry_with_backoff(max_attempts=3, base_delay_seconds=0.5)
+        def call_model(...):
+            ...
+
+    :param max_attempts: 最多尝试的总次数(包含第一次,不是"重试次数"),
+                          比如3表示"第一次失败后,还可以再试2次,总共最多3次"
+    :param base_delay_seconds: 当异常本身没有携带retry_after信息时
+                                (比如ModelTimeoutError),使用的基础等待秒数,
+                                每多重试一次,等待时间会翻倍(指数退避),
+                                避免短时间内对本就不稳定的服务反复"轰炸"
+    :param verbose: 是否在每次重试时打印提示信息,教学阶段默认打开,
+                     方便直观看到重试过程;生产环境通常会改成写入日志而不是print
+    :return: 真正的装饰器函数
+    """
+    if max_attempts < 1:
+        raise ValueError("max_attempts必须是大于等于1的整数,至少要尝试一次")
+
+    def decorator(func: Callable[..., _ReturnType]) -> Callable[..., _ReturnType]:
+        def wrapper(*args, **kwargs) -> _ReturnType:
+            last_error: Exception = RetryExhaustedError(
+                "重试循环从未真正执行,这是一个不应该出现的内部逻辑错误"
+            )
+
+            for attempt_index in range(1, max_attempts + 1):
+                try:
+                    return func(*args, **kwargs)
+
+                except RateLimitError as e:
+                    last_error = e
+                    if attempt_index == max_attempts:
+                        # 已经是最后一次尝试,不再等待,直接把这次真实的异常抛出去,
+                        # 让调用方拿到的是"限流错误"本身,而不是一个笼统的占位异常
+                        break
+                    wait_seconds = e.retry_after
+                    if verbose:
+                        print(
+                            f"  [重试装饰器] 第{attempt_index}次调用触发限流,"
+                            f"将等待{wait_seconds}秒后进行第{attempt_index + 1}次尝试……"
+                        )
+                    time.sleep(min(wait_seconds, 0.05))  # 教学环境用极短等待代替真实等待
+
+                except ModelTimeoutError as e:
+                    last_error = e
+                    if attempt_index == max_attempts:
+                        break
+                    # 没有服务器给出的建议等待时间,采用指数退避策略自行估算:
+                    # 第1次重试等base_delay,第2次等base_delay*2,第3次等base_delay*4……
+                    wait_seconds = base_delay_seconds * (2 ** (attempt_index - 1))
+                    if verbose:
+                        print(
+                            f"  [重试装饰器] 第{attempt_index}次调用超时,"
+                            f"将等待{wait_seconds:.2f}秒(指数退避)后进行"
+                            f"第{attempt_index + 1}次尝试……"
+                        )
+                    time.sleep(min(wait_seconds, 0.05))
+
+            # 循环正常结束(而不是通过return提前退出),说明所有尝试都失败了,
+            # 把最后一次捕获到的真实异常原样抛出,而不是抛出RetryExhaustedError,
+            # 这样调用方依然可以用except RateLimitError / except ModelTimeoutError
+            # 精确捕获,不会因为加了重试装饰器而改变了原本的异常类型契约
+            raise last_error
+
+        return wrapper
+
+    return decorator
+
+
+def retry_summary_report(attempt_count: int, success_count: int) -> str:
+    """
+    生成一份简单的重试效果统计文字报告,用于在批量演示脚本里
+    汇总打印"加了重试装饰器之后,整体成功率提升了多少"。
+
+    :param attempt_count: 总共发起的独立业务请求次数(不包含内部重试的次数)
+    :param success_count: 最终成功的次数(可能经过了内部若干次重试才成功)
+    :return: 一段格式化好的中文统计说明
+    """
+    if attempt_count <= 0:
+        return "本次没有发起任何请求,无法生成统计报告。"
+
+    success_rate = success_count / attempt_count * 100
+    return (
+        f"共发起{attempt_count}次业务请求,最终成功{success_count}次,"
+        f"整体成功率{success_rate:.1f}%。"
+    )
+
+
+if __name__ == "__main__":
+    # ---- 一个不依赖随机数、结果完全确定的自测场景 ----
+    # 用一个"闭包计数器"模拟一个函数:前两次调用必定失败(限流),
+    # 第三次调用必定成功,用来验证重试装饰器确实按预期工作,
+    # 而不是像main_demo.py那样依赖random,让每次运行结果不完全一样。
+
+    call_counter = {"count": 0}
+
+    @retry_with_backoff(max_attempts=3, base_delay_seconds=0.1)
+    def flaky_call_always_succeeds_on_third_try() -> str:
+        """演示函数:前两次抛出RateLimitError,第三次正常返回。"""
+        call_counter["count"] += 1
+        if call_counter["count"] < 3:
+            raise RateLimitError(
+                f"第{call_counter['count']}次调用模拟触发限流",
+                retry_after=0.1,
+                provider="demo",
+            )
+        return f"第{call_counter['count']}次调用终于成功了"
+
+    print("场景1:重试装饰器应该让最终调用成功")
+    result = flaky_call_always_succeeds_on_third_try()
+    print(f"  结果:{result}")
+    assert call_counter["count"] == 3, "应该恰好尝试了3次(2次失败+1次成功)"
+    print("  断言通过:确实恰好尝试了3次。\n")
+
+    # ---- 场景2:重试次数用尽,依然失败,应该抛出最后一次的真实异常 ----
+    call_counter_2 = {"count": 0}
+
+    @retry_with_backoff(max_attempts=2, base_delay_seconds=0.05)
+    def always_timeout() -> str:
+        """演示函数:每次调用都必定抛出ModelTimeoutError。"""
+        call_counter_2["count"] += 1
+        raise ModelTimeoutError(
+            f"第{call_counter_2['count']}次调用模拟超时",
+            timeout_seconds=5.0,
+            provider="demo",
+        )
+
+    print("场景2:重试次数用尽后,应该原样抛出最后一次的ModelTimeoutError")
+    try:
+        always_timeout()
+        raise AssertionError("竟然没有抛出异常,重试装饰器逻辑存在问题")
+    except ModelTimeoutError as e:
+        assert call_counter_2["count"] == 2, "应该恰好尝试了2次(达到max_attempts上限)"
+        print(f"  正确捕获到最后一次异常:{e}")
+        print("  断言通过:恰好尝试了2次,且异常类型保持为ModelTimeoutError未被改变。\n")
+
+    print(retry_summary_report(attempt_count=10, success_count=7))
+    print("cangqiong_core/utils/retry.py 自测全部通过。")
+```
+
+运行`python -m cangqiong_core.utils.retry`,输出:
+
+```
+场景1:重试装饰器应该让最终调用成功
+  [重试装饰器] 第1次调用触发限流,将等待0.1秒后进行第2次尝试……
+  [重试装饰器] 第2次调用触发限流,将等待0.1秒后进行第3次尝试……
+  结果:第3次调用终于成功了
+  断言通过:确实恰好尝试了3次。
+
+场景2:重试次数用尽后,应该原样抛出最后一次的ModelTimeoutError
+  [重试装饰器] 第1次调用超时,将等待0.05秒(指数退避)后进行第2次尝试……
+  正确捕获到最后一次异常:第2次调用模拟超时
+  断言通过:恰好尝试了2次,且异常类型保持为ModelTimeoutError未被改变。
+
+共发起10次业务请求,最终成功7次,整体成功率70.0%。
+cangqiong_core/utils/retry.py 自测全部通过。
+```
+
+### 文件17:`cangqiong_core/models/claude_model.py` —— 亲手验证"只加文件不改代码"
+
+```python
+"""
+文件名:cangqiong_core/models/claude_model.py
+作者:陈铭
+说明:
+    这是对上午答疑第5条"如果以后要新增一个ClaudeModel,需要改动哪些
+    已有文件"这个问题的真实实操验证——本文件是一个全新的文件,除了
+    在cangqiong_core/models/__init__.py和cangqiong_core/__init__.py里
+    各加一行导出之外,不需要改动base_model.py、openai_model.py、
+    qwen_model.py里任何一行已有代码。这正是Day9继承结构与Day10包结构
+    共同带来的"新增能力不改旧代码"的真实收益。
+
+    ClaudeModel额外模拟了一种前两个模型都没有的故障场景——内容被安全策略
+    拦截(ContentFilteredError),用来体现"不同服务商,可能有不同的、
+    专属于自己的错误类型"这一现实情况(真实的Anthropic Claude API确实
+    存在内容政策拦截的返回码,这里的模拟场景并非凭空捏造)。
+"""
+
+from __future__ import annotations
+
+import random
+import time
+from typing import List
+
+from ..exceptions import ContentFilteredError, ModelTimeoutError, RateLimitError
+from ..messages.chat_message import ChatMessage
+from .base_model import BaseModel
+
+# 模拟场景下,如果对话中出现下面这些"高风险词汇"(教学示例,与真实
+# 内容审核策略无关),ClaudeModel会模拟触发内容拦截,用来演示
+# ContentFilteredError被正确抛出和捕获的完整流程,而不必依赖纯随机数,
+# 这样测试脚本可以写出"结果完全确定"的断言,而不是概率性的断言。
+_SIMULATED_BLOCKED_KEYWORDS = {"违规测试关键词", "教学演示敏感词"}
+
+
+class ClaudeModel(BaseModel):
+    """
+    对接Anthropic Claude API(苍穹平台预算充足时的备选模型服务商)的封装。
+
+    设计说明:
+        Claude的真实API在请求格式上和OpenAI兼容接口有一些差异(比如
+        system指令的传递方式不同),但这些差异属于"真正联网调用时"才
+        需要处理的细节,教学阶段的模拟实现里,我们只关注"统一接口、
+        统一异常处理"这个更重要的工程主线,不深入还原每个厂商真实的
+        请求体格式差异——那是Day12接入真实网络请求时才需要精细区分的内容。
+    """
+
+    PROVIDER_NAME = "claude"
+
+    def __init__(self, model_name: str = "claude-3-5-sonnet", api_key: str = "") -> None:
+        """
+        :param model_name: 具体的模型名称,默认使用中等规格的sonnet系列
+        :param api_key: Anthropic Claude的API Key
+        """
+        super().__init__(
+            model_name=model_name,
+            api_key=api_key,
+            env_var_name="CLAUDE_API_KEY",
+        )
+        self._simulated_rate_limit_probability = 0.10
+        self._simulated_timeout_probability = 0.10
+
+    def chat(self, messages: List[ChatMessage]) -> str:
+        """
+        模拟调用Claude接口进行对话补全。
+
+        执行流程比OpenAIModel/QwenModel多了一步"内容安全检查"——
+        在决定是否模拟限流/超时之前,先检查消息内容是否触发了
+        模拟的高风险词汇列表,这个检查是"确定性的"(不依赖随机数),
+        方便测试脚本写出可复现的断言。
+
+        :param messages: ChatMessage对象组成的对话历史列表
+        :return: 模拟生成的回复文本
+        :raises ContentFilteredError: 消息内容命中了模拟的高风险词汇
+        :raises RateLimitError: 模拟触发限流的场景
+        :raises ModelTimeoutError: 模拟触发超时的场景
+        """
+        self._validate_messages(messages)
+        self._check_content_safety(messages)
+
+        roll = random.random()
+
+        if roll < self._simulated_rate_limit_probability:
+            raise RateLimitError(
+                f"Claude接口触发限流(模拟场景),模型:{self.model_name}",
+                retry_after=round(random.uniform(1.0, 5.0), 1),
+                provider=self.PROVIDER_NAME,
+            )
+
+        if roll < self._simulated_rate_limit_probability + self._simulated_timeout_probability:
+            raise ModelTimeoutError(
+                f"Claude接口请求超时(模拟场景),模型:{self.model_name}",
+                timeout_seconds=self.DEFAULT_TIMEOUT_SECONDS,
+                provider=self.PROVIDER_NAME,
+            )
+
+        time.sleep(0.001)
+
+        last_user_message = self._find_last_user_message(messages)
+        return (
+            f"(模拟回复 · {self.model_name})已收到你的问题:"
+            f"「{last_user_message.content}」,这是一段模拟生成的回复内容,"
+            f"真实的模型回复将在Day12接入网络请求后由服务器实际返回。"
+        )
+
+    def _check_content_safety(self, messages: List[ChatMessage]) -> None:
+        """
+        私有辅助方法:检查消息列表中是否包含模拟的高风险词汇。
+
+        设计意图:
+            这个检查故意做成"确定性触发"(只要包含特定关键词就一定拦截),
+            而不是像限流/超时那样依赖随机数,是因为内容安全检查在真实
+            世界里通常也是"确定性"的——同样的内容反复提交,应该得到
+            同样的拦截结果,不应该"看运气"。这也提示测试脚本可以精确
+            构造出"一定会触发ContentFilteredError"的输入用例。
+        :param messages: 待检查的消息列表
+        :raises ContentFilteredError: 命中任意一个模拟的高风险词汇时抛出
+        """
+        for message in messages:
+            for keyword in _SIMULATED_BLOCKED_KEYWORDS:
+                if keyword in message.content:
+                    raise ContentFilteredError(
+                        f"消息内容触发了内容安全策略(模拟场景),模型:{self.model_name}",
+                        trigger_keyword=keyword,
+                        provider=self.PROVIDER_NAME,
+                    )
+
+    @staticmethod
+    def _find_last_user_message(messages: List[ChatMessage]) -> ChatMessage:
+        """(逻辑与OpenAIModel/QwenModel中同名方法一致)找到最后一条用户消息。"""
+        for message in reversed(messages):
+            if message.role == "user":
+                return message
+        return messages[-1]
+
+
+if __name__ == "__main__":
+    # 简单的独立自测,验证ContentFilteredError能够被确定性地触发
+    model = ClaudeModel(api_key="sk-claude-demo-not-real")
+
+    normal_messages = [ChatMessage.user("请介绍一下苍穹平台的产品定位")]
+    print("测试1:正常内容,重复调用20次,不应该出现ContentFilteredError")
+    for _ in range(20):
+        try:
+            model.chat(normal_messages)
+        except ContentFilteredError:
+            raise AssertionError("正常内容竟然被误判为高风险内容,检查逻辑存在问题")
+        except (RateLimitError, ModelTimeoutError):
+            pass  # 这两种是随机模拟的,属于预期内的正常波动,不影响本次测试结论
+    print("  通过:正常内容始终没有触发内容安全拦截。\n")
+
+    print("测试2:包含模拟高风险词汇的内容,应该100%确定性地触发ContentFilteredError")
+    risky_messages = [ChatMessage.user("这句话里包含违规测试关键词,应该被拦截")]
+    try:
+        model.chat(risky_messages)
+        raise AssertionError("包含高风险词汇的内容竟然没有被拦截")
+    except ContentFilteredError as e:
+        assert e.trigger_keyword == "违规测试关键词"
+        print(f"  通过:成功拦截,触发关键词:{e.trigger_keyword}\n")
+
+    print("cangqiong_core/models/claude_model.py 自测全部通过。")
+```
+
+新增文件之后,陈铭按照FAQ里的说明,在`cangqiong_core/models/__init__.py`和`cangqiong_core/__init__.py`里分别补了一行导出(这里只展示需要新增的那一行,其余内容与文件9、文件10完全一致,不重复贴出全文):
+
+```python
+# cangqiong_core/models/__init__.py 中新增:
+from .claude_model import ClaudeModel
+# 并把 "ClaudeModel" 加入 __all__ 列表
+
+# cangqiong_core/__init__.py 中新增:
+from .models.claude_model import ClaudeModel
+# 并把 "ClaudeModel" 加入 __all__ 列表
+```
+
+陈铭在笔记里记了一句:"改动范围确实只有这两行,`openai_model.py`和`qwen_model.py`我打开看了一眼,确认自己一个字都没碰,这个感觉挺爽的。"
+
+### 文件18:`cangqiong_core/messages/conversation_store.py` —— 对话历史的保存与加载
+
+```python
+"""
+文件名:cangqiong_core/messages/conversation_store.py
+作者:陈铭
+说明:
+    ConversationStore用来管理一段完整的对话历史(多条ChatMessage的有序集合),
+    并提供把整段历史保存到JSON文件、以及从JSON文件还原回内存的能力。
+
+    这是"包结构"与"异常处理"两大主题在同一个类里的一次真实融合练习——
+    保存/加载文件的过程中,天然会遇到各种"计划外"的情况(文件不存在、
+    文件内容不是合法JSON、JSON结构不符合预期),这些场景全部用今天学到的
+    try/except配合自定义异常来妥善处理,而不是让程序直接崩溃。
+
+    需要特别说明的是:真正系统性的文件操作(open/with、编码问题、
+    路径处理)要到Day11才会详细展开,本文件只使用了json模块最基础的
+    dump/load能力作为"预告式"的实践,不涉及Day11会讲解的更多细节
+    (比如逐行读取大文件、CSV解析等),这里的封装也刻意保持简单,
+    重点仍然放在"异常处理"而不是"文件操作本身"。
+"""
+
+from __future__ import annotations
+
+import json
+from typing import List, Optional
+
+from ..exceptions import CangqiongError, InvalidMessageError
+from .chat_message import ChatMessage
+
+
+class ConversationLoadError(CangqiongError):
+    """
+    专门用于conversation_store模块的异常:表示从文件加载对话历史时失败。
+
+    设计说明:
+        没有直接复用InvalidMessageError,是因为"加载失败"和"单条消息
+        字段不合法"是两个不同层面的问题——前者是"文件/数据源"层面的问题
+        (文件不存在、内容损坏),后者是"单条消息内容"层面的问题。虽然
+        ConversationLoadError内部实现时,很可能是因为捕获到了
+        InvalidMessageError才转换出来的,但对调用方而言,这是两种
+        需要区别对待的失败原因,所以单独设计一个类,而不是直接复用。
+    """
+
+    def __init__(self, message: str, source_path: Optional[str] = None) -> None:
+        """
+        :param message: 错误说明
+        :param source_path: 加载失败的文件路径,便于排查
+        """
+        super().__init__(message)
+        self.source_path = source_path
+
+
+class ConversationStore:
+    """
+    管理一段对话历史的容器类,内部用列表维护消息的先后顺序
+    (列表天然保序,且允许出现内容完全相同的重复消息,这两点都符合
+    "对话历史"这种数据本身的特点——所以选择列表,而不是集合或字典)。
+    """
+
+    #: 类属性:单个对话历史允许保存的最大消息条数,超出时trim_to_limit()
+    #: 会从最旧的消息开始丢弃,避免对话历史无限增长占用过多内存/存储
+    MAX_HISTORY_LENGTH = 200
+
+    def __init__(self, conversation_id: str) -> None:
+        """
+        :param conversation_id: 这段对话历史的唯一标识,比如用户会话ID
+        """
+        if not conversation_id or not isinstance(conversation_id, str):
+            raise InvalidMessageError(
+                "conversation_id不能为空,且必须是字符串类型",
+                field_name="conversation_id",
+                field_value=conversation_id,
+            )
+        self.conversation_id = conversation_id
+        self._messages: List[ChatMessage] = []
+
+    def append(self, message: ChatMessage) -> None:
+        """
+        向对话历史末尾追加一条新消息。
+
+        :param message: 待追加的ChatMessage实例
+        :raises InvalidMessageError: 当传入的对象不是ChatMessage类型时抛出
+        """
+        if not isinstance(message, ChatMessage):
+            raise InvalidMessageError(
+                "只能向ConversationStore中追加ChatMessage类型的对象",
+                field_name="message",
+                field_value=type(message).__name__,
+            )
+        self._messages.append(message)
+
+    def extend(self, messages: List[ChatMessage]) -> None:
+        """
+        批量追加多条消息,内部逐条复用append()以确保每一条都经过同样的校验,
+        而不是绕过校验直接一次性拼接列表(团队规范上,批量操作也不应该
+        为了"图快"而牺牲逐条校验的严谨性)。
+
+        :param messages: ChatMessage对象组成的列表
+        """
+        for message in messages:
+            self.append(message)
+
+    def trim_to_limit(self) -> int:
+        """
+        当消息条数超过MAX_HISTORY_LENGTH时,从最旧的消息开始丢弃,
+        只保留最近的MAX_HISTORY_LENGTH条。
+
+        设计意图:
+            为什么丢"最旧的",不丢"最新的"?因为在真实的多轮对话场景里,
+            最近的对话内容对于"理解当前上下文"通常价值更高,而很久以前
+            的对话内容,相关性会随时间自然衰减,这是一个符合直觉的
+            权衡取舍,而不是随意决定的。
+        :return: 本次实际丢弃的消息条数(可能是0,如果本来就没超出限制)
+        """
+        overflow_count = len(self._messages) - self.MAX_HISTORY_LENGTH
+        if overflow_count <= 0:
+            return 0
+        del self._messages[:overflow_count]
+        return overflow_count
+
+    def filter_by_role(self, role: str) -> List[ChatMessage]:
+        """
+        按角色筛选出所有匹配的消息,返回一个新列表(不修改内部原始状态)。
+
+        :param role: 目标角色,比如"user"
+        :return: 匹配的ChatMessage列表,按原有顺序排列
+        """
+        return [message for message in self._messages if message.role == role]
+
+    def search_by_keyword(self, keyword: str) -> List[ChatMessage]:
+        """
+        按关键词搜索消息内容,返回内容中包含该关键词的所有消息。
+
+        :param keyword: 搜索关键词(大小写敏感,教学阶段不做大小写归一化处理)
+        :return: 匹配的ChatMessage列表,按原有顺序排列
+        """
+        if not keyword:
+            # 空关键词理论上"匹配所有内容"没有实际意义,直接返回空列表,
+            # 比返回全部消息更符合"搜索"这个操作应有的直觉
+            return []
+        return [message for message in self._messages if keyword in message.content]
+
+    def count_by_role(self) -> dict:
+        """
+        统计各个角色的消息数量,常用于快速了解一段对话的构成
+        (比如"这段对话里用户说了几句话、助手回复了几次")。
+
+        :return: 形如 {"system": 1, "user": 5, "assistant": 5} 的字典,
+                 只包含实际出现过的角色,不会强行把三个角色都补0
+        """
+        role_counter: dict = {}
+        for message in self._messages:
+            role_counter[message.role] = role_counter.get(message.role, 0) + 1
+        return role_counter
+
+    def to_dict_list(self) -> List[dict]:
+        """
+        将内部全部消息转换成字典列表,用于序列化保存。
+        :return: 每条消息调用to_dict()后组成的列表
+        """
+        return [message.to_dict() for message in self._messages]
+
+    def save_to_json(self, file_path: str) -> None:
+        """
+        将当前对话历史保存为JSON文件。
+
+        :param file_path: 目标文件路径
+        :raises ConversationLoadError: 当写入过程中发生IO相关错误时抛出
+                                        (统一转换成本模块的自定义异常,
+                                        方便调用方用同一个except覆盖
+                                        保存与加载两种场景可能出现的问题)
+        """
+        payload = {
+            "conversation_id": self.conversation_id,
+            "message_count": len(self._messages),
+            "messages": self.to_dict_list(),
+        }
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except OSError as original_error:
+            raise ConversationLoadError(
+                f"保存对话历史到文件失败:{file_path}",
+                source_path=file_path,
+            ) from original_error
+
+    @classmethod
+    def load_from_json(cls, file_path: str) -> "ConversationStore":
+        """
+        从JSON文件加载出一个ConversationStore实例。
+
+        执行流程与异常转换:
+            1. 尝试打开并解析JSON文件,如果文件不存在(FileNotFoundError)
+               或者内容不是合法JSON(json.JSONDecodeError),统一转换成
+               ConversationLoadError,并用raise ... from保留原始异常链。
+            2. 校验JSON顶层结构是否包含必要的字段(conversation_id、messages)。
+            3. 逐条把字典还原成ChatMessage,如果某一条消息本身字段不合法
+               (触发InvalidMessageError),同样转换成ConversationLoadError,
+               但会在错误信息中指出是"第几条"消息出了问题,方便定位。
+        :param file_path: 待加载的JSON文件路径
+        :return: 还原出的ConversationStore实例
+        :raises ConversationLoadError: 文件不存在、内容损坏或结构不符合预期时抛出
+        """
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                raw_data = json.load(f)
+        except FileNotFoundError as original_error:
+            raise ConversationLoadError(
+                f"找不到对话历史文件:{file_path}",
+                source_path=file_path,
+            ) from original_error
+        except json.JSONDecodeError as original_error:
+            raise ConversationLoadError(
+                f"对话历史文件内容不是合法的JSON格式:{file_path}",
+                source_path=file_path,
+            ) from original_error
+
+        if not isinstance(raw_data, dict) or "conversation_id" not in raw_data:
+            raise ConversationLoadError(
+                f"对话历史文件缺少必要的顶层字段(conversation_id):{file_path}",
+                source_path=file_path,
+            )
+
+        store = cls(conversation_id=raw_data["conversation_id"])
+
+        raw_messages = raw_data.get("messages", [])
+        for index, raw_message in enumerate(raw_messages):
+            try:
+                store.append(ChatMessage.from_dict(raw_message))
+            except InvalidMessageError as original_error:
+                raise ConversationLoadError(
+                    f"对话历史文件中第{index}条消息格式不合法:{file_path}",
+                    source_path=file_path,
+                ) from original_error
+
+        return store
+
+    def __len__(self) -> int:
+        """
+        魔术方法:支持 len(store) 语法,返回当前消息条数。
+        这在写"if len(store) == 0"这类判断时,比调用一个专门的方法更自然。
+        """
+        return len(self._messages)
+
+    def __iter__(self):
+        """
+        魔术方法:支持 for message in store 这种直接遍历语法,
+        底层实际遍历的是内部维护的_messages列表。
+        """
+        return iter(self._messages)
+
+    def __str__(self) -> str:
+        """面向人类友好阅读的字符串表示。"""
+        return f"ConversationStore(id={self.conversation_id!r}, 共{len(self._messages)}条消息)"
+```
+
+### 文件19:`scripts/selfcheck_exceptions_extended.py` —— 异常体系本身的扩展自检
+
+```python
+"""
+文件名:scripts/selfcheck_exceptions_extended.py
+作者:陈铭
+说明:
+    专门针对cangqiong_core异常体系本身的扩展自检脚本,和
+    scripts/selfcheck_package.py的分工不同——selfcheck_package.py
+    偏重"整个包各模块能否正确协作",这份脚本偏重"异常继承体系
+    本身的细节是否严谨",覆盖以下几类容易被忽视、但赵磊(QA)
+    真实会问到的边界情况:
+    1. 多层except子句按正确的顺序、精确匹配到对应的异常类型。
+    2. 异常的__str__在有detail和没有detail两种情况下,分别符合预期。
+    3. raise ... from 构建的异常链,__cause__属性能被正确访问。
+    4. 异常携带的结构化属性(retry_after、timeout_seconds等),
+       在边界值(0、负数)下不会导致其他逻辑出问题
+       (呼应赵磊路过时提的那个问题)。
+    5. isinstance()在继承体系的每一层都能得到预期的True/False结果。
+"""
+
+from __future__ import annotations
+
+from cangqiong_core.exceptions import (
+    CangqiongError,
+    ConfigurationError,
+    ContentFilteredError,
+    InvalidMessageError,
+    ModelAPIError,
+    ModelResponseParseError,
+    ModelTimeoutError,
+    RateLimitError,
+)
+
+
+def check_inheritance_chain_is_correct() -> None:
+    """检查点1:验证异常继承体系的每一层isinstance关系都符合架构图设计。"""
+    rate_limit_error = RateLimitError("测试", retry_after=1.0)
+
+    assert isinstance(rate_limit_error, RateLimitError)
+    assert isinstance(rate_limit_error, ModelAPIError)
+    assert isinstance(rate_limit_error, CangqiongError)
+    assert isinstance(rate_limit_error, Exception)
+
+    # 反向关系不应该成立——一个ModelAPIError实例不一定是RateLimitError
+    generic_api_error = ModelAPIError("通用API错误")
+    assert isinstance(generic_api_error, ModelAPIError)
+    assert not isinstance(generic_api_error, RateLimitError)
+    assert not isinstance(generic_api_error, ModelTimeoutError)
+
+    print("检查点1通过:异常继承体系每一层的isinstance关系均符合预期。")
+
+
+def check_str_representation_with_and_without_detail() -> None:
+    """检查点2:__str__在有detail和无detail两种情况下,输出格式应有差异。"""
+    error_without_detail = CangqiongError("基础错误信息")
+    assert str(error_without_detail) == "基础错误信息"
+
+    error_with_detail = CangqiongError("基础错误信息", detail="补充的排查细节")
+    rendered = str(error_with_detail)
+    assert "基础错误信息" in rendered
+    assert "补充的排查细节" in rendered
+    assert rendered != "基础错误信息"
+
+    print("检查点2通过:__str__在有无detail两种情况下均输出符合预期的内容。")
+
+
+def check_exception_chain_preserved_via_raise_from() -> None:
+    """检查点3:验证raise ... from 构建的异常链,__cause__能被正确访问到。"""
+
+    def inner_operation_that_fails() -> None:
+        raise ValueError("最底层的技术性错误")
+
+    try:
+        try:
+            inner_operation_that_fails()
+        except ValueError as original_error:
+            raise ModelResponseParseError(
+                "包装后的业务异常",
+                raw_response="损坏的返回内容",
+            ) from original_error
+    except ModelResponseParseError as wrapped_error:
+        assert wrapped_error.__cause__ is not None
+        assert isinstance(wrapped_error.__cause__, ValueError)
+        assert str(wrapped_error.__cause__) == "最底层的技术性错误"
+        print("检查点3通过:异常链被正确保留,可以顺着__cause__追溯到最初的技术原因。")
+        return
+
+    raise AssertionError("没有捕获到预期的ModelResponseParseError,检查测试逻辑本身")
+
+
+def check_multiple_except_clauses_match_correct_branch() -> None:
+    """
+    检查点4:构造一批不同类型的异常,验证多个except子句能各自精确匹配到
+    "最具体"的那一条分支,而不会被更靠前、更宽泛的分支意外截胡。
+    """
+    test_cases = [
+        (RateLimitError("限流测试", retry_after=2.0), "RateLimitError"),
+        (ModelTimeoutError("超时测试", timeout_seconds=10.0), "ModelTimeoutError"),
+        (ModelResponseParseError("解析失败测试"), "ModelResponseParseError"),
+        (ContentFilteredError("内容拦截测试"), "ContentFilteredError"),
+        (ConfigurationError("配置错误测试"), "ConfigurationError"),
+        (InvalidMessageError("消息格式错误测试"), "InvalidMessageError"),
+    ]
+
+    for error_instance, expected_branch_name in test_cases:
+        matched_branch = _classify_error(error_instance)
+        assert matched_branch == expected_branch_name, (
+            f"期望{error_instance!r}匹配到{expected_branch_name}分支,"
+            f"实际匹配到了{matched_branch}分支"
+        )
+
+    print("检查点4通过:6种不同的异常类型,均被正确路由到了对应的except分支。")
+
+
+def _classify_error(error: Exception) -> str:
+    """
+    辅助函数:模拟一段"真实业务代码里常见的多分支except结构",
+    刻意把更具体的异常类型放在前面,更宽泛的类型放在后面,
+    用于验证check_multiple_except_clauses_match_correct_branch的断言。
+    """
+    try:
+        raise error
+    except RateLimitError:
+        return "RateLimitError"
+    except ModelTimeoutError:
+        return "ModelTimeoutError"
+    except ModelResponseParseError:
+        return "ModelResponseParseError"
+    except ContentFilteredError:
+        return "ContentFilteredError"
+    except ModelAPIError:
+        return "ModelAPIError"
+    except ConfigurationError:
+        return "ConfigurationError"
+    except InvalidMessageError:
+        return "InvalidMessageError"
+    except CangqiongError:
+        return "CangqiongError"
+
+
+def check_boundary_values_on_exception_attributes() -> None:
+    """
+    检查点5:呼应赵磊(QA)提出的边界条件问题——
+    验证retry_after为0、为负数、以及一个很大的值时,异常对象本身
+    依然能被正常构造和访问,不会因为这些"极端但合法的输入"而崩溃
+    (这里验证的是"异常类本身不做过度防御性校验"这个当前的设计决策,
+    确保这个决策在代码层面是被有意识做出的,而不是遗漏)。
+    """
+    boundary_values = [0, -1.5, 999999.0]
+    for value in boundary_values:
+        error = RateLimitError("边界值测试", retry_after=value)
+        assert error.retry_after == value
+
+    # timeout_seconds同理
+    for value in boundary_values:
+        error = ModelTimeoutError("边界值测试", timeout_seconds=value)
+        assert error.timeout_seconds == value
+
+    print("检查点5通过:异常属性在边界取值(0/负数/极大值)下均能正常存取,不会崩溃。")
+
+
+def check_content_filtered_error_carries_trigger_keyword() -> None:
+    """检查点6:ContentFilteredError应该正确携带trigger_keyword属性。"""
+    error = ContentFilteredError(
+        "内容被拦截",
+        trigger_keyword="示例关键词",
+        provider="claude",
+    )
+    assert error.trigger_keyword == "示例关键词"
+    assert error.provider == "claude"
+    assert error.status_code == 451
+    assert isinstance(error, ModelAPIError)
+    print("检查点6通过:ContentFilteredError的结构化属性与继承关系均符合预期。")
+
+
+def check_configuration_error_without_missing_key() -> None:
+    """
+    检查点7:ConfigurationError的missing_key参数是可选的,
+    不传时应该能正常构造,且missing_key为None,而不是抛出TypeError。
+    """
+    error = ConfigurationError("某种笼统的配置问题,不针对具体某一项配置")
+    assert error.missing_key is None
+    print("检查点7通过:ConfigurationError在不传missing_key时依然能正常工作。")
+
+
+def run_all_checks() -> None:
+    """依次运行本文件全部检查点。"""
+    print("开始执行cangqiong_core异常体系的扩展自检……\n")
+
+    check_inheritance_chain_is_correct()
+    check_str_representation_with_and_without_detail()
+    check_exception_chain_preserved_via_raise_from()
+    check_multiple_except_clauses_match_correct_branch()
+    check_boundary_values_on_exception_attributes()
+    check_content_filtered_error_carries_trigger_keyword()
+    check_configuration_error_without_missing_key()
+
+    print("\n" + "=" * 60)
+    print("全部7个检查点均已通过,cangqiong_core异常体系的细节符合预期设计。")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    run_all_checks()
+```
+
+运行`python -m scripts.selfcheck_exceptions_extended`,7个检查点全部通过。
+
+### 文件20:`scripts/selfcheck_retry_and_claude.py` —— 重试装饰器与`ClaudeModel`的联合自检
+
+```python
+"""
+文件名:scripts/selfcheck_retry_and_claude.py
+作者:陈铭
+说明:
+    针对今天新增的两个扩展模块——cangqiong_core/utils/retry.py的
+    重试装饰器,以及cangqiong_core/models/claude_model.py的ClaudeModel——
+    编写的专项自检脚本。所有测试用例都刻意设计成"结果确定、不依赖
+    随机数运气"的形式,这样即便反复运行,结果也应该完全一致,
+    这是团队规范里对"可复现的测试"的一贯要求(呼应Day7周测时
+    老王反复强调的"测试用例要能稳定复现,不能看运气过关")。
+"""
+
+from __future__ import annotations
+
+from cangqiong_core.exceptions import (
+    ContentFilteredError,
+    ModelTimeoutError,
+    RateLimitError,
+)
+from cangqiong_core.messages.chat_message import ChatMessage
+from cangqiong_core.models.claude_model import ClaudeModel
+from cangqiong_core.utils.retry import retry_summary_report, retry_with_backoff
+
+
+def check_retry_succeeds_after_configured_failures() -> None:
+    """
+    检查点1:构造一个"前N次必定失败,第N+1次必定成功"的确定性函数,
+    验证retry_with_backoff恰好重试了预期的次数,并最终返回成功结果。
+    """
+    counter = {"calls": 0}
+
+    @retry_with_backoff(max_attempts=4, base_delay_seconds=0.01, verbose=False)
+    def fails_three_times_then_succeeds() -> str:
+        counter["calls"] += 1
+        if counter["calls"] <= 3:
+            raise RateLimitError("模拟限流", retry_after=0.01, provider="test")
+        return "成功"
+
+    result = fails_three_times_then_succeeds()
+    assert result == "成功"
+    assert counter["calls"] == 4
+    print("检查点1通过:重试装饰器在第4次尝试时成功,调用次数恰好符合预期。")
+
+
+def check_retry_gives_up_and_raises_last_error() -> None:
+    """检查点2:当重试次数用尽,应该抛出最后一次的真实异常,而不是吞掉或抛出别的类型。"""
+    counter = {"calls": 0}
+
+    @retry_with_backoff(max_attempts=3, base_delay_seconds=0.01, verbose=False)
+    def always_fails_with_timeout() -> str:
+        counter["calls"] += 1
+        raise ModelTimeoutError(
+            f"第{counter['calls']}次调用超时", timeout_seconds=1.0, provider="test"
+        )
+
+    try:
+        always_fails_with_timeout()
+        raise AssertionError("应该抛出ModelTimeoutError,但没有抛出任何异常")
+    except ModelTimeoutError as e:
+        assert counter["calls"] == 3
+        assert "第3次调用超时" in str(e)
+        print("检查点2通过:重试次数用尽后,正确抛出了最后一次的ModelTimeoutError。")
+
+
+def check_retry_does_not_retry_on_unrelated_exceptions() -> None:
+    """
+    检查点3:验证retry_with_backoff只对RateLimitError/ModelTimeoutError生效,
+    对其他类型的异常(比如ValueError)应该在第一次就直接抛出,不做任何重试。
+    """
+    counter = {"calls": 0}
+
+    @retry_with_backoff(max_attempts=5, base_delay_seconds=0.01, verbose=False)
+    def raises_unrelated_value_error() -> str:
+        counter["calls"] += 1
+        raise ValueError("这是一个和重试机制完全无关的异常类型")
+
+    try:
+        raises_unrelated_value_error()
+        raise AssertionError("应该抛出ValueError")
+    except ValueError:
+        assert counter["calls"] == 1, "对于不相关的异常类型,不应该发生任何重试"
+        print("检查点3通过:对不相关的异常类型(ValueError)没有进行任何重试,第一次就抛出。")
+
+
+def check_retry_summary_report_formats_correctly() -> None:
+    """检查点4:验证retry_summary_report在正常输入与边界输入(0次请求)下的行为。"""
+    normal_report = retry_summary_report(attempt_count=4, success_count=3)
+    assert "4次业务请求" in normal_report
+    assert "75.0%" in normal_report
+
+    zero_report = retry_summary_report(attempt_count=0, success_count=0)
+    assert "没有发起任何请求" in zero_report
+
+    print("检查点4通过:retry_summary_report在正常输入和0次请求的边界输入下均格式正确。")
+
+
+def check_claude_model_blocks_deterministic_risky_content() -> None:
+    """检查点5:验证ClaudeModel对包含模拟高风险关键词的内容,100%确定性拦截。"""
+    model = ClaudeModel(api_key="sk-selfcheck-claude")
+    risky_messages = [ChatMessage.user("这条消息包含教学演示敏感词,用于测试拦截逻辑")]
+
+    blocked_count = 0
+    for _ in range(10):  # 重复多次,验证这不是"偶尔触发",而是每次都必定触发
+        try:
+            model.chat(risky_messages)
+        except ContentFilteredError as e:
+            blocked_count += 1
+            assert e.trigger_keyword == "教学演示敏感词"
+
+    assert blocked_count == 10, "高风险内容应该在每一次调用中都被确定性地拦截"
+    print("检查点5通过:ClaudeModel对高风险内容实现了100%确定性的拦截,不受随机数影响。")
+
+
+def check_claude_model_never_blocks_safe_content() -> None:
+    """检查点6:验证ClaudeModel对完全不含高风险关键词的内容,永远不会误拦截。"""
+    model = ClaudeModel(api_key="sk-selfcheck-claude")
+    safe_messages = [ChatMessage.user("你好,请介绍一下今天天气怎么样")]
+
+    for _ in range(30):
+        try:
+            model.chat(safe_messages)
+        except ContentFilteredError:
+            raise AssertionError("安全内容被错误地判定为高风险内容")
+        except (RateLimitError, ModelTimeoutError):
+            # 这两种是模拟的随机故障,属于预期内的正常情况,不影响本次测试的结论
+            continue
+
+    print("检查点6通过:ClaudeModel对完全安全的内容,30次调用均未出现误拦截。")
+
+
+def check_retry_combined_with_claude_model_content_filter() -> None:
+    """
+    检查点7(综合场景):验证重试装饰器包裹ClaudeModel调用时,
+    对ContentFilteredError这种"重试也没用"的异常,不会做无意义的重试,
+    应该立即原样抛出——这也是设计retry_with_backoff时,故意只捕获
+    RateLimitError和ModelTimeoutError两种类型、而不是笼统捕获所有
+    ModelAPIError的原因,ContentFilteredError正是一个很好的反例场景。
+    """
+    model = ClaudeModel(api_key="sk-selfcheck-claude")
+    risky_messages = [ChatMessage.user("含有教学演示敏感词的一句话")]
+
+    call_counter = {"count": 0}
+
+    @retry_with_backoff(max_attempts=5, base_delay_seconds=0.01, verbose=False)
+    def call_claude_with_retry():
+        call_counter["count"] += 1
+        return model.chat(risky_messages)
+
+    try:
+        call_claude_with_retry()
+        raise AssertionError("应该抛出ContentFilteredError")
+    except ContentFilteredError:
+        assert call_counter["count"] == 1, (
+            "ContentFilteredError不应该被重试装饰器重试,应该在第一次调用时就直接抛出,"
+            f"但实际调用了{call_counter['count']}次"
+        )
+        print("检查点7通过:重试装饰器正确地没有对ContentFilteredError进行重试。")
+
+
+def run_all_checks() -> None:
+    """依次运行本文件全部检查点。"""
+    print("开始执行retry装饰器与ClaudeModel的联合自检……\n")
+
+    check_retry_succeeds_after_configured_failures()
+    check_retry_gives_up_and_raises_last_error()
+    check_retry_does_not_retry_on_unrelated_exceptions()
+    check_retry_summary_report_formats_correctly()
+    check_claude_model_blocks_deterministic_risky_content()
+    check_claude_model_never_blocks_safe_content()
+    check_retry_combined_with_claude_model_content_filter()
+
+    print("\n" + "=" * 60)
+    print("全部7个检查点均已通过,重试装饰器与ClaudeModel的行为均符合预期设计。")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    run_all_checks()
+```
+
+运行`python -m scripts.selfcheck_retry_and_claude`,7个检查点全部通过。
+
+### 文件21:`scripts/selfcheck_conversation_store.py` —— 对话历史存取的专项自检
+
+```python
+"""
+文件名:scripts/selfcheck_conversation_store.py
+作者:陈铭
+说明:
+    针对cangqiong_core/messages/conversation_store.py的专项自检脚本,
+    重点覆盖"文件保存与加载"这个环节可能出现的各种异常场景——这是
+    今天所有新增代码里,唯一真正涉及"读写磁盘文件"的部分,提前预演
+    Day11要系统学习的文件异常处理思路。所有测试使用的临时文件都存放在
+    系统临时目录下,并在测试结束后主动清理,不会在项目目录里留下垃圾文件。
+"""
+
+from __future__ import annotations
+
+import os
+import tempfile
+
+from cangqiong_core.exceptions import InvalidMessageError
+from cangqiong_core.messages.chat_message import ChatMessage
+from cangqiong_core.messages.conversation_store import (
+    ConversationLoadError,
+    ConversationStore,
+)
+
+
+def _make_temp_file_path(filename: str) -> str:
+    """辅助函数:在系统临时目录下拼接出一个测试专用的文件路径。"""
+    return os.path.join(tempfile.gettempdir(), filename)
+
+
+def check_construction_rejects_invalid_conversation_id() -> None:
+    """检查点1:conversation_id为空或非字符串时,构造应该失败。"""
+    for invalid_id in ["", None, 12345]:
+        try:
+            ConversationStore(conversation_id=invalid_id)
+            raise AssertionError(f"非法的conversation_id({invalid_id!r})竟然没有被拦截")
+        except InvalidMessageError:
+            pass
+    print("检查点1通过:非法的conversation_id(空字符串/None/非字符串)均被正确拦截。")
+
+
+def check_append_rejects_non_chat_message_objects() -> None:
+    """检查点2:append()只应该接受ChatMessage实例,其他类型应该被拒绝。"""
+    store = ConversationStore("conv-test-append")
+    invalid_objects = ["纯字符串不是ChatMessage", {"role": "user", "content": "字典也不行"}, 123]
+    for obj in invalid_objects:
+        try:
+            store.append(obj)
+            raise AssertionError(f"非ChatMessage对象({obj!r})竟然被成功添加")
+        except InvalidMessageError:
+            pass
+    assert len(store) == 0, "所有非法添加都应该被拒绝,列表应该仍然是空的"
+    print("检查点2通过:append()正确拒绝了所有非ChatMessage类型的输入。")
+
+
+def check_save_and_load_round_trip_preserves_content() -> None:
+    """检查点3:保存到JSON再重新加载,消息内容应该与原始内容完全一致。"""
+    original_store = ConversationStore("conv-round-trip")
+    original_store.append(ChatMessage.system("你是一个专业的助手"))
+    original_store.append(ChatMessage.user("苍穹平台是做什么的?"))
+    original_store.append(ChatMessage.assistant("苍穹平台是一套企业级AI Agent解决方案"))
+
+    temp_path = _make_temp_file_path("day10_selfcheck_round_trip.json")
+    try:
+        original_store.save_to_json(temp_path)
+        loaded_store = ConversationStore.load_from_json(temp_path)
+
+        assert loaded_store.conversation_id == original_store.conversation_id
+        assert len(loaded_store) == len(original_store)
+        for original_message, loaded_message in zip(original_store, loaded_store):
+            # ChatMessage重写了__eq__,可以直接比较两条消息内容是否一致
+            assert original_message == loaded_message
+        print("检查点3通过:保存到JSON再重新加载,对话历史内容完全一致(逐条比较通过)。")
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def check_load_missing_file_raises_conversation_load_error() -> None:
+    """检查点4:加载一个根本不存在的文件路径,应该抛出ConversationLoadError,而不是原始的FileNotFoundError。"""
+    nonexistent_path = _make_temp_file_path("day10_selfcheck_this_file_should_not_exist.json")
+    if os.path.exists(nonexistent_path):
+        os.remove(nonexistent_path)  # 防御性处理,确保这个文件确实不存在
+
+    try:
+        ConversationStore.load_from_json(nonexistent_path)
+        raise AssertionError("加载不存在的文件竟然没有抛出异常")
+    except ConversationLoadError as e:
+        # 验证异常链确实保留了原始的FileNotFoundError,而不是被悄悄吞掉
+        assert isinstance(e.__cause__, FileNotFoundError)
+        assert e.source_path == nonexistent_path
+        print("检查点4通过:加载不存在的文件时,正确抛出ConversationLoadError并保留了异常链。")
+
+
+def check_load_corrupted_json_raises_conversation_load_error() -> None:
+    """检查点5:文件存在但内容不是合法JSON,应该抛出ConversationLoadError。"""
+    corrupted_path = _make_temp_file_path("day10_selfcheck_corrupted.json")
+    try:
+        with open(corrupted_path, "w", encoding="utf-8") as f:
+            f.write("这不是合法的JSON内容 { 缺少闭合括号")
+
+        try:
+            ConversationStore.load_from_json(corrupted_path)
+            raise AssertionError("加载损坏的JSON文件竟然没有抛出异常")
+        except ConversationLoadError as e:
+            assert e.__cause__ is not None
+            print("检查点5通过:加载内容损坏的JSON文件时,正确抛出了ConversationLoadError。")
+    finally:
+        if os.path.exists(corrupted_path):
+            os.remove(corrupted_path)
+
+
+def check_load_missing_top_level_field_raises_error() -> None:
+    """检查点6:JSON内容合法,但缺少必要的顶层字段conversation_id,应该被拦截。"""
+    incomplete_path = _make_temp_file_path("day10_selfcheck_incomplete.json")
+    try:
+        import json
+
+        with open(incomplete_path, "w", encoding="utf-8") as f:
+            json.dump({"messages": []}, f)  # 故意缺少conversation_id字段
+
+        try:
+            ConversationStore.load_from_json(incomplete_path)
+            raise AssertionError("缺少conversation_id字段的文件竟然没有被拦截")
+        except ConversationLoadError as e:
+            assert "conversation_id" in str(e)
+            print("检查点6通过:缺少必要顶层字段的文件被正确拦截,错误信息中指明了具体字段。")
+    finally:
+        if os.path.exists(incomplete_path):
+            os.remove(incomplete_path)
+
+
+def check_load_file_with_invalid_message_reports_index() -> None:
+    """检查点7:文件中某一条消息本身字段不合法,错误信息中应该指出是第几条。"""
+    bad_message_path = _make_temp_file_path("day10_selfcheck_bad_message.json")
+    try:
+        import json
+
+        payload = {
+            "conversation_id": "conv-bad-message",
+            "messages": [
+                {"role": "user", "content": "第0条消息是合法的"},
+                {"role": "not-a-valid-role", "content": "第1条消息角色不合法"},
+            ],
+        }
+        with open(bad_message_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+
+        try:
+            ConversationStore.load_from_json(bad_message_path)
+            raise AssertionError("包含非法角色的消息竟然没有被拦截")
+        except ConversationLoadError as e:
+            assert "第1条" in str(e), f"错误信息中应该指明是第1条消息出了问题,实际信息:{e}"
+            print("检查点7通过:文件中某条消息不合法时,错误信息正确指明了具体的消息序号。")
+    finally:
+        if os.path.exists(bad_message_path):
+            os.remove(bad_message_path)
+
+
+def check_empty_conversation_can_be_saved_and_loaded() -> None:
+    """检查点8(边界情况):一段完全没有任何消息的空对话历史,应该也能被正常保存和加载。"""
+    empty_path = _make_temp_file_path("day10_selfcheck_empty.json")
+    try:
+        empty_store = ConversationStore("conv-completely-empty")
+        empty_store.save_to_json(empty_path)
+
+        loaded_empty_store = ConversationStore.load_from_json(empty_path)
+        assert len(loaded_empty_store) == 0
+        assert loaded_empty_store.conversation_id == "conv-completely-empty"
+        print("检查点8通过:完全没有消息的空对话历史,依然能被正确保存和加载。")
+    finally:
+        if os.path.exists(empty_path):
+            os.remove(empty_path)
+
+
+def check_search_and_count_helpers_on_edge_cases() -> None:
+    """检查点9:search_by_keyword()和count_by_role()在边界输入下的行为。"""
+    store = ConversationStore("conv-search-edge-cases")
+
+    # 完全空的历史,搜索/统计都应该返回"空结果",而不是抛出异常
+    assert store.search_by_keyword("任意关键词") == []
+    assert store.count_by_role() == {}
+
+    store.append(ChatMessage.user("苍穹平台的第一句用户消息"))
+
+    # 空字符串作为关键词,按设计应该返回空列表(见conversation_store.py中的注释说明)
+    assert store.search_by_keyword("") == []
+
+    # 一个必定不存在的关键词,搜索结果应该是空列表
+    assert store.search_by_keyword("这个关键词绝对不会出现在任何测试消息里") == []
+
+    print("检查点9通过:search_by_keyword()与count_by_role()在边界输入下均表现符合预期。")
+
+
+def run_all_checks() -> None:
+    """依次运行本文件全部检查点。"""
+    print("开始执行ConversationStore的专项自检……\n")
+
+    check_construction_rejects_invalid_conversation_id()
+    check_append_rejects_non_chat_message_objects()
+    check_save_and_load_round_trip_preserves_content()
+    check_load_missing_file_raises_conversation_load_error()
+    check_load_corrupted_json_raises_conversation_load_error()
+    check_load_missing_top_level_field_raises_error()
+    check_load_file_with_invalid_message_reports_index()
+    check_empty_conversation_can_be_saved_and_loaded()
+    check_search_and_count_helpers_on_edge_cases()
+
+    print("\n" + "=" * 60)
+    print("全部9个检查点均已通过,ConversationStore的核心逻辑与边界情况均符合预期。")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    run_all_checks()
+```
+
+运行`python -m scripts.selfcheck_conversation_store`,9个检查点全部通过。至此,`cangqiong_core`除了白天课堂上完成的核心结构外,又多了`ContentFilteredError`异常类、`ClaudeModel`第三个模型接入、`retry_with_backoff`重试装饰器、`ConversationStore`对话历史存取能力,以及三份对应的专项自检脚本,总计新增4个功能文件与3个自检脚本,全部经过独立验证,不依赖随机数运气,可以稳定复现。老王第二天在群里回复的原话是:"这几份加练的东西,质量比我预想的高,尤其是`retry_with_backoff`那个用闭包计数器模拟'前N次失败、第N+1次成功'的测试写法,比很多正式项目里看到的重试测试都严谨——这是我要求你们养成的习惯,不要用'跑起来看着差不多对'当作测试通过的标准。"
+
+---
+
 ## 今日复盘
 
 晚自习结束,老王没有像Day7那样马上公布分数——今天没有周测,他更在意"拆包"这件事本身有没有真正被理解。他让四个人轮流分享一句"今天最卡的地方",然后自己简单点评。
