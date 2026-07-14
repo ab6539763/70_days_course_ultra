@@ -2644,6 +2644,1588 @@ if __name__ == "__main__":
     run_isolation_attack_tests()
 ```
 
+### 7.11 合规审计日志导出与查询工具
+
+> 需求文档2.4.4提到的"数据保留与清理"和苏晴反复强调的"隔离要能证明",不能只停留在"我们做了隔离"这句口头承诺上,晚上七点前,老王让陈铭把审计日志补上一个可查询、可导出的工具,方便寰宇集团的合规团队随时抽查。
+
+```python
+"""
+audit_export_tool.py
+合规审计日志导出与查询工具
+
+背景:7.7节实现的PermissionController内部已经维护了_audit这个审计对象,
+但目前只能在Python进程内部查询,没有对外的导出能力。寰宇集团法务部
+张总在需求访谈里明确提过"我们内部有合规审计要求,任何跨部门的访问
+尝试,无论成功还是被拒绝,都要能追溯"。这个工具就是把内存里的审计
+记录,持久化并支持按维度筛选导出,供合规团队定期抽查使用。
+"""
+
+import csv
+import json
+import time
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta
+from typing import List, Optional, Dict, Any
+
+
+@dataclass
+class AuditExportRecord:
+    timestamp: float
+    actor_user_id: str
+    actor_department_id: str
+    action_type: str  # "tool_call" / "memory_read" / "session_read"
+    target_key: str
+    allowed: bool
+    reason: str
+
+
+class AuditExportTool:
+    """
+    审计日志导出工具。设计上与PermissionController解耦——不直接依赖
+    7.7节的内部实现细节,而是通过一个统一的record()接口接收审计事件,
+    这样即便未来审计源从"内存对象"换成"数据库表"或"消息队列",
+    这个导出工具的核心逻辑不需要跟着改动。
+    """
+
+    def __init__(self):
+        self._records: List[AuditExportRecord] = []
+
+    def record(
+        self,
+        actor_user_id: str,
+        actor_department_id: str,
+        action_type: str,
+        target_key: str,
+        allowed: bool,
+        reason: str,
+    ) -> None:
+        self._records.append(AuditExportRecord(
+            timestamp=time.time(),
+            actor_user_id=actor_user_id,
+            actor_department_id=actor_department_id,
+            action_type=action_type,
+            target_key=target_key,
+            allowed=allowed,
+            reason=reason,
+        ))
+
+    def ingest_from_permission_controller(self, controller) -> int:
+        """
+        从7.7节的PermissionController审计对象里批量导入历史记录,
+        兼容已有代码而不需要修改PermissionController本身的实现。
+        """
+        imported_count = 0
+        for log in controller._audit.query_denied():
+            self.record(
+                actor_user_id=log.actor_user_id,
+                actor_department_id=log.actor_department_id,
+                action_type="access_denied",
+                target_key=log.target_key,
+                allowed=False,
+                reason=log.reason,
+            )
+            imported_count += 1
+        return imported_count
+
+    def query(
+        self,
+        department_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        only_denied: bool = False,
+        since_hours: Optional[float] = None,
+    ) -> List[AuditExportRecord]:
+        results = self._records
+
+        if department_id:
+            results = [r for r in results if r.actor_department_id == department_id]
+        if user_id:
+            results = [r for r in results if r.actor_user_id == user_id]
+        if only_denied:
+            results = [r for r in results if not r.allowed]
+        if since_hours is not None:
+            cutoff = time.time() - since_hours * 3600
+            results = [r for r in results if r.timestamp >= cutoff]
+
+        return sorted(results, key=lambda r: r.timestamp, reverse=True)
+
+    def export_to_csv(self, records: List[AuditExportRecord], output_path: str) -> None:
+        with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(["时间", "操作人ID", "所属部门", "操作类型", "目标资源", "是否允许", "原因"])
+            for record in records:
+                readable_time = datetime.fromtimestamp(record.timestamp).strftime("%Y-%m-%d %H:%M:%S")
+                writer.writerow([
+                    readable_time, record.actor_user_id, record.actor_department_id,
+                    record.action_type, record.target_key,
+                    "允许" if record.allowed else "拒绝", record.reason,
+                ])
+        print(f"[完成] 已导出 {len(records)} 条审计记录到: {output_path}")
+
+    def export_to_json(self, records: List[AuditExportRecord], output_path: str) -> None:
+        payload = [asdict(r) for r in records]
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"[完成] 已导出 {len(records)} 条审计记录到: {output_path}")
+
+    def summarize_by_department(self) -> Dict[str, Dict[str, int]]:
+        """按部门统计访问尝试的总数、允许数、拒绝数,用于生成合规月报的汇总表。"""
+        summary: Dict[str, Dict[str, int]] = {}
+        for record in self._records:
+            dept = record.actor_department_id
+            if dept not in summary:
+                summary[dept] = {"total": 0, "allowed": 0, "denied": 0}
+            summary[dept]["total"] += 1
+            if record.allowed:
+                summary[dept]["allowed"] += 1
+            else:
+                summary[dept]["denied"] += 1
+        return summary
+
+    def render_compliance_report(self) -> str:
+        summary = self.summarize_by_department()
+        lines = ["# 寰宇集团项目 · 记忆隔离合规审计月报(示例)\n"]
+        lines.append("| 部门 | 总访问尝试 | 允许 | 拒绝 | 拒绝率 |")
+        lines.append("|---|---|---|---|---|")
+        for dept, stats in summary.items():
+            denial_rate = stats["denied"] / max(stats["total"], 1)
+            lines.append(f"| {dept} | {stats['total']} | {stats['allowed']} | {stats['denied']} | {denial_rate:.1%} |")
+
+        denied_records = self.query(only_denied=True)
+        if denied_records:
+            lines.append("\n## 被拒绝的访问明细(需重点关注是否存在异常尝试)\n")
+            for record in denied_records[:20]:
+                readable_time = datetime.fromtimestamp(record.timestamp).strftime("%Y-%m-%d %H:%M:%S")
+                lines.append(f"- [{readable_time}] {record.actor_user_id}({record.actor_department_id}) "
+                             f"尝试访问 {record.target_key},原因: {record.reason}")
+
+        return "\n".join(lines)
+
+
+def demo_run():
+    tool = AuditExportTool()
+
+    tool.record("u_chenming", "legal", "tool_call", "supplier_rating_tool", False, "跨部门工具调用被拒绝")
+    tool.record("u_chenming", "legal", "tool_call", "contract_search_tool", True, "正常调用")
+    tool.record("u_supplychain_zhang", "supply_chain", "memory_read", "dept_memory:legal", False, "跨部门记忆读取被拒绝")
+    tool.record("u_hr_li", "hr", "tool_call", "leave_balance_tool", True, "正常调用")
+
+    print(tool.render_compliance_report())
+
+    denied_only = tool.query(only_denied=True)
+    tool.export_to_csv(denied_only, "audit_denied_records.csv")
+
+
+if __name__ == "__main__":
+    demo_run()
+```
+
+### 7.12 违约金计算器单元测试与边界case补充
+
+> 老王在下午的巡场里特别提醒陈铭:"违约金计算器这个工具最容易出的问题不是算法错,是边界条件没考虑全——合同金额是0怎么办?逾期天数是负数怎么办?滞纳金比例配置成超过100%怎么办?这些边界case,今天必须补测试,不能等客户演示时才发现。"
+
+```python
+"""
+test_penalty_calculator_edge_cases.py
+违约金计算器边界条件与异常场景单元测试
+运行方式: pytest test_penalty_calculator_edge_cases.py -v
+
+覆盖范围:对应7.2节PenaltyCalculatorTool的实现,补充老王在巡场时
+特别点名的几类边界条件,防止客户演示现场出现算法层面的低级错误。
+"""
+
+import pytest
+
+
+class TestPenaltyCalculatorEdgeCases:
+
+    def setup_method(self):
+        from penalty_calculator_tool import PenaltyCalculatorTool
+        self.tool = PenaltyCalculatorTool()
+
+    def test_zero_contract_amount_returns_zero_penalty(self):
+        """合同金额为0时,违约金应为0,而不是抛出除零异常"""
+        result = self.tool.calculate(
+            contract_amount=0, daily_penalty_rate=0.001,
+            overdue_days=10, penalty_cap_ratio=0.1,
+        )
+        assert result["penalty_amount"] == 0
+
+    def test_negative_overdue_days_treated_as_no_penalty(self):
+        """逾期天数为负数(可能是数据录入错误或提前还款场景),
+        应视为未逾期,违约金为0,而不是产出一个负数金额"""
+        result = self.tool.calculate(
+            contract_amount=100000, daily_penalty_rate=0.001,
+            overdue_days=-5, penalty_cap_ratio=0.1,
+        )
+        assert result["penalty_amount"] == 0
+        assert "未逾期" in result.get("note", "") or result.get("overdue_days_used") == 0
+
+    def test_penalty_cap_ratio_enforced(self):
+        """当计算出的违约金超过封顶比例时,应按封顶比例结算,
+        并在结果中明确标注'已触发封顶'"""
+        result = self.tool.calculate(
+            contract_amount=1000000, daily_penalty_rate=0.01,  # 故意设置较高的日利率
+            overdue_days=100, penalty_cap_ratio=0.1,
+        )
+        expected_cap = 1000000 * 0.1
+        assert result["penalty_amount"] == expected_cap
+        assert result.get("cap_triggered") is True
+
+    def test_penalty_cap_ratio_exceeding_100_percent_rejected(self):
+        """滞纳金比例配置本身超过100%,属于明显的配置错误,
+        应该主动拒绝而不是静默接受一个不合理的封顶值"""
+        with pytest.raises(ValueError, match="封顶比例"):
+            self.tool.calculate(
+                contract_amount=100000, daily_penalty_rate=0.001,
+                overdue_days=10, penalty_cap_ratio=1.5,
+            )
+
+    def test_normal_calculation_within_cap(self):
+        """正常场景:违约金未触及封顶,应按标准公式计算"""
+        result = self.tool.calculate(
+            contract_amount=280000, daily_penalty_rate=0.005,
+            overdue_days=12, penalty_cap_ratio=0.1,
+        )
+        expected = 280000 * 0.005 * 12
+        assert abs(result["penalty_amount"] - expected) < 0.01
+        assert result.get("cap_triggered") is False
+
+    def test_negative_contract_amount_rejected(self):
+        """合同金额为负数是明显的脏数据,工具应主动拒绝,
+        而不是把负数带入公式产出一个没有业务意义的负数违约金"""
+        with pytest.raises(ValueError, match="合同金额"):
+            self.tool.calculate(
+                contract_amount=-50000, daily_penalty_rate=0.001,
+                overdue_days=10, penalty_cap_ratio=0.1,
+            )
+
+    def test_extremely_large_overdue_days_still_capped(self):
+        """逾期天数极端异常(比如系统时间错误导致算出几万天),
+        依然应该被封顶比例正确限制,不能因为天数异常而绕过封顶逻辑"""
+        result = self.tool.calculate(
+            contract_amount=500000, daily_penalty_rate=0.001,
+            overdue_days=99999, penalty_cap_ratio=0.1,
+        )
+        assert result["penalty_amount"] == 500000 * 0.1
+        assert result["cap_triggered"] is True
+
+    def test_missing_penalty_rate_uses_configured_default(self):
+        """如果调用方没有传入daily_penalty_rate(模型可能会漏填某些
+        非必填参数),工具应使用配置好的默认值,而不是直接报错崩溃"""
+        result = self.tool.calculate(
+            contract_amount=100000, daily_penalty_rate=None,
+            overdue_days=5, penalty_cap_ratio=0.1,
+        )
+        assert result["penalty_amount"] >= 0
+        assert "default_rate_used" in result
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+```
+
+### 7.13 多轮追问指代消解模块完整实现
+
+> 老王在晨会里提到的"那"、"这个"、"上面提到的"这类指代关系,7.8节的上下文拼接逻辑目前是"把历史消息原样拼接给模型,让模型自己去理解指代",这在多数场景下够用,但陈铭发现在一次内部测试里,当历史对话轮次较多、被截断掉一部分之后,模型偶尔会把"这个"错误地关联到已经被截断的旧实体上。他和老王商量后,决定在上下文拼接之前,加一层显式的指代消解预处理,把容易产生歧义的指代词替换成明确指向的实体,降低模型出错的概率。
+
+```python
+"""
+coreference_resolver.py
+多轮追问指代消解模块
+
+设计思路:
+不依赖复杂的NLP指代消解模型(那对于当前项目阶段是过度设计),
+而是维护一个"最近提及实体"的滑动栈,记录对话中出现过的关键实体
+(合同编号、供应商名称、员工姓名等),当用户新一轮提问中出现
+"这个""那个""上面提到的""刚才说的"这类指代词时,尝试用滑动栈里
+最近且类型匹配的实体去替换,生成一份"指代已解析"的显式提问,
+再交给模型处理,降低模型自己瞎猜指代对象的风险。
+"""
+
+import re
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import List, Optional, Dict
+
+
+class EntityType(Enum):
+    CONTRACT = "合同"
+    SUPPLIER = "供应商"
+    EMPLOYEE = "员工"
+    PRODUCT = "产品/物料"
+    POLICY = "政策文档"
+
+
+@dataclass
+class MentionedEntity:
+    entity_type: EntityType
+    entity_value: str
+    turn_index: int
+
+
+# 常见的指代词模式,按"指代词字面 -> 优先匹配的实体类型"进行映射,
+# 如果指代词本身没有明显的类型倾向(比如单独的"这个"),
+# 则退化为匹配栈顶最近提及的任意实体
+REFERENCE_PATTERNS: Dict[str, Optional[EntityType]] = {
+    "这份合同": EntityType.CONTRACT,
+    "那份合同": EntityType.CONTRACT,
+    "这个供应商": EntityType.SUPPLIER,
+    "那个供应商": EntityType.SUPPLIER,
+    "这个员工": EntityType.EMPLOYEE,
+    "上面提到的合同": EntityType.CONTRACT,
+    "刚才说的合同": EntityType.CONTRACT,
+    "这个": None,
+    "那个": None,
+    "上面提到的": None,
+    "刚才说的": None,
+    "它": None,
+}
+
+
+class CoreferenceResolver:
+    """
+    指代消解器主类。维护一个按对话轮次递增的"最近提及实体栈",
+    每处理完一轮对话,调用register_entities()把该轮次里明确出现的
+    实体登记进去;每次新提问到来时,调用resolve()尝试替换指代词。
+    """
+
+    MAX_STACK_SIZE = 30  # 栈的最大长度,防止长对话下无限增长
+
+    def __init__(self):
+        self._stack: List[MentionedEntity] = []
+        self._current_turn_index = 0
+
+    def register_entities(self, entities: List[MentionedEntity]) -> None:
+        self._current_turn_index += 1
+        for entity in entities:
+            entity.turn_index = self._current_turn_index
+            self._stack.append(entity)
+
+        if len(self._stack) > self.MAX_STACK_SIZE:
+            self._stack = self._stack[-self.MAX_STACK_SIZE:]
+
+    def _find_most_recent_entity(self, entity_type: Optional[EntityType]) -> Optional[MentionedEntity]:
+        for entity in reversed(self._stack):
+            if entity_type is None or entity.entity_type == entity_type:
+                return entity
+        return None
+
+    def resolve(self, user_query: str) -> Dict[str, any]:
+        """
+        尝试对用户提问中的指代词进行消解。返回结果包含:
+        - resolved_query: 指代词被替换后的显式提问(如果没有可替换的
+          指代词,则原样返回);
+        - resolutions: 记录本次做了哪些替换,便于调试和审计追溯;
+        - unresolved_references: 检测到指代词但栈里找不到可匹配实体的情况,
+          这种情况下应该让上层逻辑提示用户"您指的是哪一个,请明确说明"。
+        """
+        resolved_query = user_query
+        resolutions = []
+        unresolved_references = []
+
+        # 按模式字符串长度从长到短排序,保证"这份合同"优先于单字"这个"被匹配,
+        # 避免短模式提前替换掉长模式里的字符导致匹配错乱
+        sorted_patterns = sorted(REFERENCE_PATTERNS.items(), key=lambda kv: -len(kv[0]))
+
+        for pattern, entity_type in sorted_patterns:
+            if pattern not in resolved_query:
+                continue
+
+            matched_entity = self._find_most_recent_entity(entity_type)
+            if matched_entity is None:
+                unresolved_references.append(pattern)
+                continue
+
+            replacement = f"{matched_entity.entity_value}"
+            resolved_query = resolved_query.replace(pattern, replacement, 1)
+            resolutions.append({
+                "pattern": pattern,
+                "resolved_to": matched_entity.entity_value,
+                "entity_type": matched_entity.entity_type.value,
+                "source_turn": matched_entity.turn_index,
+            })
+
+        return {
+            "original_query": user_query,
+            "resolved_query": resolved_query,
+            "resolutions": resolutions,
+            "unresolved_references": unresolved_references,
+            "needs_clarification": len(unresolved_references) > 0 and len(resolutions) == 0,
+        }
+
+    def extract_entities_from_response(self, response_text: str) -> List[MentionedEntity]:
+        """
+        从系统的回答文本中,用简单的正则规则提取可能的实体,自动登记
+        进最近提及栈。生产环境中更严谨的做法是让工具调用结果结构化
+        携带实体信息,而不是从自然语言文本里用正则去猜,这里的正则
+        提取仅作为一种低成本的兜底补充手段。
+        """
+        entities = []
+
+        contract_matches = re.findall(r"《([^》]{2,40}合同[^》]{0,20})》", response_text)
+        for match in contract_matches:
+            entities.append(MentionedEntity(EntityType.CONTRACT, match, 0))
+
+        supplier_matches = re.findall(r"([\u4e00-\u9fa5]{2,10}(?:供应商|公司|集团))", response_text)
+        for match in supplier_matches:
+            entities.append(MentionedEntity(EntityType.SUPPLIER, match, 0))
+
+        return entities
+
+
+def demo_run():
+    resolver = CoreferenceResolver()
+
+    print("===== 第1轮:检索合同 =====")
+    resolver.register_entities([
+        MentionedEntity(EntityType.CONTRACT, "寰宇物流与东辰供应商运输服务合同(2024版)", 0),
+    ])
+    print("已登记实体:寰宇物流与东辰供应商运输服务合同(2024版)")
+
+    print("\n===== 第2轮:用户追问'这份合同里有没有保密条款' =====")
+    result = resolver.resolve("这份合同里有没有保密条款")
+    print(f"  原始提问: {result['original_query']}")
+    print(f"  解析后提问: {result['resolved_query']}")
+    print(f"  替换详情: {result['resolutions']}")
+
+    print("\n===== 第3轮:用户追问'那如果违反了呢' =====")
+    result = resolver.resolve("那如果违反了呢")
+    print(f"  原始提问: {result['original_query']}")
+    print(f"  解析后提问: {result['resolved_query']}")
+
+    print("\n===== 第4轮:切换话题,系统提及新的供应商实体 =====")
+    resolver.register_entities([MentionedEntity(EntityType.SUPPLIER, "恒源金属材料有限公司", 0)])
+    result = resolver.resolve("这个供应商的信用评级怎么样")
+    print(f"  解析后提问: {result['resolved_query']}")
+
+    print("\n===== 第5轮:用户提问指代模糊,栈里没有匹配实体类型 =====")
+    fresh_resolver = CoreferenceResolver()
+    result = fresh_resolver.resolve("这个员工的年假还剩多少")
+    print(f"  是否需要澄清: {result['needs_clarification']}")
+    print(f"  未解析的指代: {result['unresolved_references']}")
+
+
+if __name__ == "__main__":
+    demo_run()
+```
+
+### 7.14 记忆保留与清理定时任务(呼应需求文档2.4.4)
+
+> 需求文档2.4.4明确要求了数据保留与清理规则,这一项此前在紧张的工具开发中被暂时搁置,晚上八点前,陈铭把这块补齐,确保三重记忆隔离不只是"隔离得住",还要"该清的时候清得掉",避免历史数据无限堆积带来的存储成本和合规风险。
+
+```python
+"""
+memory_retention_cleaner.py
+记忆保留与清理定时任务
+
+对应需求:2.4.4 数据保留与清理
+- 会话级记忆:超过7天未活跃的会话,自动归档并从热存储中清理;
+- 用户级记忆:超过90天的用户级记忆条目,标记为待清理,经用户或
+  管理员确认后清理(不做自动强制删除,避免误删有价值的长期偏好记忆);
+- 部门级记忆:不设自动清理,但每季度生成一份清理建议报告供部门管理员审阅。
+"""
+
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import List, Dict, Optional
+
+
+class RetentionAction(Enum):
+    ARCHIVED = "已归档"
+    MARKED_FOR_REVIEW = "标记待人工确认"
+    NO_ACTION = "无需处理"
+
+
+@dataclass
+class MemoryRecord:
+    memory_key: str
+    memory_level: str  # "session" / "user" / "department"
+    owner_id: str
+    last_accessed_at: float
+    created_at: float
+    size_bytes: int = 0
+
+
+@dataclass
+class RetentionActionResult:
+    memory_key: str
+    memory_level: str
+    action: RetentionAction
+    reason: str
+
+
+class MemoryRetentionCleaner:
+    """
+    记忆保留与清理策略执行器。设计上刻意区分了"会话级可以自动清理"
+    和"用户级/部门级需要人工确认"两种力度,这是老王在需求评审时特别
+    强调的一条原则:"记忆这东西,清错了比不清代价更大,凡是拿不准
+    的,宁可先标记出来让人看一眼,别自动删。"
+    """
+
+    SESSION_INACTIVE_DAYS = 7
+    USER_MEMORY_STALE_DAYS = 90
+
+    def __init__(self):
+        self._archived_sessions: List[str] = []
+        self._pending_review: List[MemoryRecord] = []
+
+    def evaluate_session_memory(self, record: MemoryRecord) -> RetentionActionResult:
+        inactive_days = (time.time() - record.last_accessed_at) / 86400
+
+        if inactive_days >= self.SESSION_INACTIVE_DAYS:
+            self._archived_sessions.append(record.memory_key)
+            return RetentionActionResult(
+                memory_key=record.memory_key, memory_level="session",
+                action=RetentionAction.ARCHIVED,
+                reason=f"会话已{inactive_days:.1f}天未活跃,超过{self.SESSION_INACTIVE_DAYS}天阈值,自动归档",
+            )
+
+        return RetentionActionResult(
+            memory_key=record.memory_key, memory_level="session",
+            action=RetentionAction.NO_ACTION,
+            reason=f"会话{inactive_days:.1f}天前活跃过,仍在保留期内",
+        )
+
+    def evaluate_user_memory(self, record: MemoryRecord) -> RetentionActionResult:
+        stale_days = (time.time() - record.last_accessed_at) / 86400
+
+        if stale_days >= self.USER_MEMORY_STALE_DAYS:
+            self._pending_review.append(record)
+            return RetentionActionResult(
+                memory_key=record.memory_key, memory_level="user",
+                action=RetentionAction.MARKED_FOR_REVIEW,
+                reason=f"用户级记忆已{stale_days:.1f}天未被访问,超过{self.USER_MEMORY_STALE_DAYS}天阈值,"
+                       f"标记待人工确认清理,不自动删除",
+            )
+
+        return RetentionActionResult(
+            memory_key=record.memory_key, memory_level="user",
+            action=RetentionAction.NO_ACTION,
+            reason=f"用户级记忆{stale_days:.1f}天前被访问过,仍在保留期内",
+        )
+
+    def run_batch_evaluation(self, records: List[MemoryRecord]) -> List[RetentionActionResult]:
+        results = []
+        for record in records:
+            if record.memory_level == "session":
+                results.append(self.evaluate_session_memory(record))
+            elif record.memory_level == "user":
+                results.append(self.evaluate_user_memory(record))
+            else:
+                results.append(RetentionActionResult(
+                    memory_key=record.memory_key, memory_level=record.memory_level,
+                    action=RetentionAction.NO_ACTION,
+                    reason="部门级记忆不设自动清理策略,仅纳入季度清理建议报告",
+                ))
+        return results
+
+    def generate_quarterly_department_report(self, department_records: List[MemoryRecord]) -> str:
+        lines = ["# 部门级记忆季度清理建议报告(示例)\n"]
+        total_size_mb = sum(r.size_bytes for r in department_records) / (1024 * 1024)
+        lines.append(f"当前部门级记忆总条目数: {len(department_records)}")
+        lines.append(f"当前部门级记忆总占用空间: {total_size_mb:.2f} MB\n")
+
+        stale_candidates = [
+            r for r in department_records
+            if (time.time() - r.last_accessed_at) / 86400 >= 180
+        ]
+        if stale_candidates:
+            lines.append(f"发现 {len(stale_candidates)} 条超过180天未被访问的部门级记忆,建议部门管理员审阅是否需要清理:\n")
+            for record in stale_candidates:
+                last_accessed_str = datetime.fromtimestamp(record.last_accessed_at).strftime("%Y-%m-%d")
+                lines.append(f"  - {record.memory_key} (最后访问: {last_accessed_str}, 大小: {record.size_bytes} bytes)")
+        else:
+            lines.append("未发现明显的长期未访问记忆,暂无清理建议。")
+
+        return "\n".join(lines)
+
+    def render_summary(self, results: List[RetentionActionResult]) -> str:
+        archived_count = sum(1 for r in results if r.action == RetentionAction.ARCHIVED)
+        review_count = sum(1 for r in results if r.action == RetentionAction.MARKED_FOR_REVIEW)
+        no_action_count = sum(1 for r in results if r.action == RetentionAction.NO_ACTION)
+
+        lines = [
+            "===== 记忆保留与清理批处理结果汇总 =====",
+            f"本次评估记录总数: {len(results)}",
+            f"自动归档(会话级): {archived_count}",
+            f"标记待人工确认(用户级): {review_count}",
+            f"无需处理: {no_action_count}",
+        ]
+        return "\n".join(lines)
+
+
+def build_demo_records() -> List[MemoryRecord]:
+    now = time.time()
+    return [
+        MemoryRecord("session:u_chenming:sess_001", "session", "u_chenming",
+                      last_accessed_at=now - 2 * 86400, created_at=now - 10 * 86400, size_bytes=15000),
+        MemoryRecord("session:u_hr_li:sess_002", "session", "u_hr_li",
+                      last_accessed_at=now - 10 * 86400, created_at=now - 30 * 86400, size_bytes=8000),
+        MemoryRecord("user_memory:u_chenming:preferences", "user", "u_chenming",
+                      last_accessed_at=now - 5 * 86400, created_at=now - 100 * 86400, size_bytes=2000),
+        MemoryRecord("user_memory:u_supplychain_zhang:preferences", "user", "u_supplychain_zhang",
+                      last_accessed_at=now - 95 * 86400, created_at=now - 200 * 86400, size_bytes=3000),
+        MemoryRecord("dept_memory:legal:shared_context", "department", "legal",
+                      last_accessed_at=now - 200 * 86400, created_at=now - 300 * 86400, size_bytes=50000),
+    ]
+
+
+def demo_run():
+    cleaner = MemoryRetentionCleaner()
+    records = build_demo_records()
+
+    results = cleaner.run_batch_evaluation(records)
+    for result in results:
+        print(f"[{result.memory_level}] {result.memory_key}: {result.action.value} —— {result.reason}")
+
+    print()
+    print(cleaner.render_summary(results))
+
+    department_records = [r for r in records if r.memory_level == "department"]
+    print()
+    print(cleaner.generate_quarterly_department_report(department_records))
+
+
+if __name__ == "__main__":
+    demo_run()
+```
+
+### 7.15 工具调用限流与熔断保护(防止模型滥用工具)
+
+> 陈铭在下午测试的时候发现一个隐患:如果模型在某次推理里陷入"反复调用同一个工具"的循环(比如反复调用违约金计算器,每次参数只有微小差异),会在短时间内对数据源造成不必要的压力,甚至可能是Prompt注入攻击导致的异常行为。他和小胡商量后,决定给工具调度器加一层限流和熔断保护。
+
+```python
+"""
+tool_call_guard.py
+工具调用限流与熔断保护
+
+背景:7.9节的ToolDispatcher目前对工具调用没有任何频率限制,
+一旦模型在某次多步推理里陷入异常的重复调用循环(可能是模型自身的
+逻辑缺陷,也可能是恶意的Prompt注入试图榨取工具背后的数据源资源),
+现有架构没有任何防护手段。这个模块给ToolDispatcher包一层调用护栏,
+在不改动已有工具实现代码的前提下,统一拦截异常的高频调用行为。
+"""
+
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from enum import Enum
+from typing import Dict, Deque, Callable, Any
+
+
+class GuardDecision(Enum):
+    ALLOW = "允许"
+    RATE_LIMITED = "限流拒绝"
+    CIRCUIT_OPEN = "熔断拒绝"
+
+
+@dataclass
+class GuardConfig:
+    max_calls_per_window: int = 8       # 单个会话在窗口期内允许调用同一工具的最大次数
+    window_seconds: float = 30.0         # 限流统计窗口
+    failure_threshold: int = 5           # 单个工具连续失败次数达到该值触发熔断
+    circuit_open_seconds: float = 60.0    # 熔断持续时间
+
+
+class ToolCallGuard:
+    """
+    工具调用护栏,包裹在ToolDispatcher之外。核心能力:
+    1. 按(session_id, tool_name)维度做滑动窗口限流,防止单个会话
+       在短时间内异常高频调用同一个工具;
+    2. 按tool_name维度做熔断保护,如果某个工具本身连续报错
+       (比如数据源出现故障),暂时熔断该工具,避免持续无意义的重试
+       进一步加重故障中的数据源压力。
+    """
+
+    def __init__(self, dispatcher, config: GuardConfig = None):
+        self._dispatcher = dispatcher
+        self.config = config or GuardConfig()
+        self._call_windows: Dict[str, Deque[float]] = defaultdict(deque)
+        self._tool_failure_counts: Dict[str, int] = defaultdict(int)
+        self._circuit_opened_at: Dict[str, float] = {}
+
+    def _rate_limit_key(self, session_id: str, tool_name: str) -> str:
+        return f"{session_id}:{tool_name}"
+
+    def _check_rate_limit(self, session_id: str, tool_name: str) -> bool:
+        key = self._rate_limit_key(session_id, tool_name)
+        now = time.time()
+        window = self._call_windows[key]
+
+        while window and window[0] <= now - self.config.window_seconds:
+            window.popleft()
+
+        if len(window) >= self.config.max_calls_per_window:
+            return False
+
+        window.append(now)
+        return True
+
+    def _check_circuit_breaker(self, tool_name: str) -> bool:
+        opened_at = self._circuit_opened_at.get(tool_name)
+        if opened_at is None:
+            return True
+
+        if time.time() - opened_at >= self.config.circuit_open_seconds:
+            del self._circuit_opened_at[tool_name]
+            self._tool_failure_counts[tool_name] = 0
+            return True
+
+        return False
+
+    def _record_tool_outcome(self, tool_name: str, success: bool) -> None:
+        if success:
+            self._tool_failure_counts[tool_name] = 0
+            return
+
+        self._tool_failure_counts[tool_name] += 1
+        if self._tool_failure_counts[tool_name] >= self.config.failure_threshold:
+            self._circuit_opened_at[tool_name] = time.time()
+
+    def guarded_dispatch(self, actor, tool_name: str, params: dict, session_id: str) -> dict:
+        if not self._check_circuit_breaker(tool_name):
+            return {
+                "decision": GuardDecision.CIRCUIT_OPEN.value,
+                "success": False,
+                "error": f"工具'{tool_name}'当前处于熔断保护状态,请稍后再试",
+            }
+
+        if not self._check_rate_limit(session_id, tool_name):
+            return {
+                "decision": GuardDecision.RATE_LIMITED.value,
+                "success": False,
+                "error": (
+                    f"会话在{self.config.window_seconds}秒内调用工具'{tool_name}'次数"
+                    f"超过限制({self.config.max_calls_per_window}次),疑似异常调用模式,已拦截"
+                ),
+            }
+
+        try:
+            result = self._dispatcher.dispatch(actor, tool_name, params)
+            self._record_tool_outcome(tool_name, success=True)
+            return {"decision": GuardDecision.ALLOW.value, "success": True, "result": result}
+        except Exception as exc:  # noqa: BLE001
+            self._record_tool_outcome(tool_name, success=False)
+            return {"decision": GuardDecision.ALLOW.value, "success": False, "error": str(exc)}
+
+    def get_guard_status(self) -> dict:
+        return {
+            "active_rate_limit_windows": len(self._call_windows),
+            "tools_with_failures": dict(self._tool_failure_counts),
+            "circuit_open_tools": list(self._circuit_opened_at.keys()),
+        }
+
+
+def demo_run():
+    class MockDispatcher:
+        def dispatch(self, actor, tool_name, params):
+            if tool_name == "flaky_tool":
+                raise RuntimeError("模拟的数据源故障")
+            return {"tool": tool_name, "params": params, "output": "mock_result"}
+
+    class MockActor:
+        user_id = "u_test"
+        department_id = "legal"
+
+    guard = ToolCallGuard(MockDispatcher(), config=GuardConfig(max_calls_per_window=3, window_seconds=10, failure_threshold=2))
+    actor = MockActor()
+
+    print("===== 场景一:正常调用不触发限流 =====")
+    for i in range(3):
+        result = guard.guarded_dispatch(actor, "contract_search_tool", {"query": f"合同{i}"}, session_id="sess_1")
+        print(f"  第{i+1}次调用: {result['decision']}")
+
+    print("\n===== 场景二:超过限流阈值被拦截 =====")
+    result = guard.guarded_dispatch(actor, "contract_search_tool", {"query": "合同4"}, session_id="sess_1")
+    print(f"  第4次调用: {result['decision']} —— {result.get('error')}")
+
+    print("\n===== 场景三:工具连续失败触发熔断 =====")
+    for i in range(2):
+        result = guard.guarded_dispatch(actor, "flaky_tool", {}, session_id="sess_2")
+        print(f"  第{i+1}次调用flaky_tool: success={result['success']}")
+    result = guard.guarded_dispatch(actor, "flaky_tool", {}, session_id="sess_2")
+    print(f"  第3次调用flaky_tool(应被熔断): {result['decision']} —— {result.get('error')}")
+
+    print("\n护栏状态:", guard.get_guard_status())
+
+
+if __name__ == "__main__":
+    demo_run()
+```
+
+### 7.16 六工具并发性能基准压测脚本
+
+> 苏晴强调"下周三客户要来现场看演示",老王补了一句:"演示现场万一有人同时点了好几个案例,六个工具要能扛住基本的并发压力,今天收尾前跑一次简单的并发基准测试,心里有个数。"
+
+```python
+"""
+tool_concurrency_benchmark.py
+六个业务工具的并发调用性能基准测试
+
+用途:在正式对外演示前,对法务、人力、供应链三大场景的六个工具
+分别做一轮简单的并发压测,记录平均延迟、P95延迟、成功率,
+作为"工具是否已经准备好接受演示现场并发访问"的量化依据。
+"""
+
+import asyncio
+import random
+import statistics
+import time
+from dataclasses import dataclass, field
+from typing import List, Callable, Awaitable, Dict
+
+
+@dataclass
+class BenchmarkResult:
+    tool_name: str
+    total_calls: int
+    success_count: int
+    latencies_ms: List[float] = field(default_factory=list)
+
+    @property
+    def success_rate(self) -> float:
+        return self.success_count / max(self.total_calls, 1)
+
+    def percentile(self, p: float) -> float:
+        if not self.latencies_ms:
+            return 0.0
+        sorted_latencies = sorted(self.latencies_ms)
+        idx = min(int(len(sorted_latencies) * p / 100), len(sorted_latencies) - 1)
+        return sorted_latencies[idx]
+
+    def summary(self) -> str:
+        return (
+            f"{self.tool_name}: 成功率={self.success_rate:.1%}  "
+            f"平均延迟={statistics.mean(self.latencies_ms) if self.latencies_ms else 0:.1f}ms  "
+            f"P95={self.percentile(95):.1f}ms  P99={self.percentile(99):.1f}ms"
+        )
+
+
+async def _benchmark_single_tool(
+    tool_name: str,
+    call_fn: Callable[[], Awaitable[bool]],
+    concurrency: int,
+    total_calls: int,
+) -> BenchmarkResult:
+    result = BenchmarkResult(tool_name=tool_name, total_calls=total_calls, success_count=0)
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def run_one():
+        async with semaphore:
+            start = time.time()
+            success = await call_fn()
+            elapsed_ms = (time.time() - start) * 1000
+            result.latencies_ms.append(elapsed_ms)
+            if success:
+                result.success_count += 1
+
+    await asyncio.gather(*(run_one() for _ in range(total_calls)))
+    return result
+
+
+async def _mock_contract_search_call() -> bool:
+    await asyncio.sleep(random.uniform(0.1, 0.4))
+    return random.random() > 0.02
+
+
+async def _mock_penalty_calculator_call() -> bool:
+    await asyncio.sleep(random.uniform(0.02, 0.08))
+    return random.random() > 0.01
+
+
+async def _mock_hr_policy_query_call() -> bool:
+    await asyncio.sleep(random.uniform(0.1, 0.3))
+    return random.random() > 0.02
+
+
+async def _mock_leave_balance_call() -> bool:
+    await asyncio.sleep(random.uniform(0.03, 0.1))
+    return random.random() > 0.01
+
+
+async def _mock_inventory_query_call() -> bool:
+    await asyncio.sleep(random.uniform(0.15, 0.5))
+    return random.random() > 0.03
+
+
+async def _mock_supplier_rating_call() -> bool:
+    await asyncio.sleep(random.uniform(0.1, 0.35))
+    return random.random() > 0.02
+
+
+TOOL_BENCHMARKS: Dict[str, Callable[[], Awaitable[bool]]] = {
+    "合同检索工具": _mock_contract_search_call,
+    "违约金计算器": _mock_penalty_calculator_call,
+    "人力政策查询工具": _mock_hr_policy_query_call,
+    "请假余额查询工具": _mock_leave_balance_call,
+    "供应链库存查询工具": _mock_inventory_query_call,
+    "供应商评级查询工具": _mock_supplier_rating_call,
+}
+
+
+async def run_all_benchmarks(concurrency: int = 10, total_calls_per_tool: int = 50) -> List[BenchmarkResult]:
+    results = []
+    for tool_name, call_fn in TOOL_BENCHMARKS.items():
+        result = await _benchmark_single_tool(tool_name, call_fn, concurrency, total_calls_per_tool)
+        results.append(result)
+        print(result.summary())
+    return results
+
+
+def render_benchmark_report(results: List[BenchmarkResult]) -> str:
+    lines = ["# 六工具并发性能基准测试报告(演示前准备)\n"]
+    lines.append("| 工具名称 | 成功率 | 平均延迟(ms) | P95(ms) | P99(ms) |")
+    lines.append("|---|---|---|---|---|")
+    for result in results:
+        avg_latency = statistics.mean(result.latencies_ms) if result.latencies_ms else 0
+        lines.append(
+            f"| {result.tool_name} | {result.success_rate:.1%} | {avg_latency:.1f} | "
+            f"{result.percentile(95):.1f} | {result.percentile(99):.1f} |"
+        )
+
+    low_success_tools = [r for r in results if r.success_rate < 0.95]
+    if low_success_tools:
+        lines.append("\n**需要重点关注的工具(成功率低于95%)**:")
+        for r in low_success_tools:
+            lines.append(f"  - {r.tool_name}: 成功率仅{r.success_rate:.1%},建议演示前排查原因")
+    else:
+        lines.append("\n全部六个工具成功率均达标(>=95%),可以进入客户演示准备的下一阶段。")
+
+    return "\n".join(lines)
+
+
+async def main():
+    print("===== 开始执行六工具并发性能基准测试(并发度=10,每工具50次调用) =====\n")
+    results = await run_all_benchmarks(concurrency=10, total_calls_per_tool=50)
+
+    report = render_benchmark_report(results)
+    print("\n" + report)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### 7.17 记忆快照与灰度回滚工具完整实现
+
+老王在压测报告评审会上又抛出一个新问题:"如果某次记忆写入(比如部门规则被人手误改成了错误的违约金计算参数)污染了记忆数据,我们有没有办法'时光倒流',把某个部门/用户的记忆恢复到污染发生之前的状态?"这个问题正好对应了企业级系统里非常常见的"数据可回滚"需求——不能只依赖"不出错",还要为"出错之后怎么补救"准备好工具。下面实现一套记忆快照与回滚系统,在每次关键写操作之前自动打快照,支持按时间点或按快照ID恢复。
+
+```python
+"""
+memory_snapshot_rollback.py
+
+记忆快照与灰度回滚工具 —— 苍穹平台多轮交互记忆子系统的"数据安全网"
+
+设计背景:
+    MemoryAccessController 统一收敛了记忆的读写入口,但"统一入口"解决的是
+    "谁能写、写哪里"的权限问题,并不能防止"写错了内容"这类业务性错误——
+    比如运营同事在后台误操作把供应链部门的"逾期宽限天数"从 5 天改成了 50 天,
+    这类错误不会被权限校验拦下来,因为操作者本身就有权限做这个修改,
+    只是修改的"内容"是错的。
+
+    本模块提供的能力:
+    1. 在每一次通过 MemoryAccessController 的写操作之前,自动落一份快照
+       (Snapshot-Before-Write 策略),快照本身是不可变的、只追加的。
+    2. 支持按快照ID、按时间点两种方式回滚记忆状态。
+    3. 回滚操作本身也会经过审计日志记录,并且回滚前会再打一次"回滚前快照",
+       保证回滚动作本身也是可逆的,不会出现"回滚也回滚错了就再也找不回来"的情况。
+    4. 提供快照差异对比(diff)能力,让运营人员在决定是否回滚之前,
+       能先看清楚"如果回滚,具体会变回什么样子"。
+
+设计取舍:
+    快照采用"全量深拷贝 + 追加式存储"而不是"增量补丁(patch)"方案,
+    理由是记忆数据体量在当前阶段(部门级规则、用户级偏好)并不大,
+    全量快照的存储成本可以接受,而全量快照的回滚逻辑远比增量补丁简单、
+    出错概率更低——对于恢复类工具,"简单可靠"比"存储高效"优先级更高,
+    这是用空间换正确性的典型权衡。如果后续记忆数据量级增长导致快照存储
+    成本过高,再考虑引入增量快照 + 定期全量快照相结合的方案。
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import uuid
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+
+class SnapshotTrigger(str, Enum):
+    """触发快照的场景类型,用于后续排查问题时快速定位是哪一类操作导致的变更"""
+
+    BEFORE_RULE_UPDATE = "部门规则变更前自动快照"
+    BEFORE_USER_MEMORY_UPDATE = "用户记忆变更前自动快照"
+    BEFORE_MANUAL_ROLLBACK = "手动回滚操作前自动快照"
+    SCHEDULED_DAILY = "每日定时快照"
+    MANUAL_REQUEST = "运营人员手动触发快照"
+
+
+@dataclass
+class MemorySnapshot:
+    """
+    单份记忆快照的完整记录。
+
+    snapshot_id: 全局唯一快照ID,回滚时以此为定位依据
+    scope_type: 快照所属的记忆层级,取值 "department" 或 "user"
+    scope_key: 具体的部门ID或用户ID
+    trigger: 触发快照的场景
+    payload: 快照当时刻的记忆数据完整深拷贝
+    created_at: 快照创建时间
+    created_by: 触发快照的操作者身份(可能是系统自动触发,也可能是人工触发)
+    note: 快照备注,人工触发时通常会填写触发原因
+    """
+
+    snapshot_id: str
+    scope_type: str
+    scope_key: str
+    trigger: SnapshotTrigger
+    payload: Dict[str, Any]
+    created_at: datetime = field(default_factory=datetime.now)
+    created_by: str = "system"
+    note: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        data["trigger"] = self.trigger.value
+        data["created_at"] = self.created_at.isoformat()
+        return data
+
+
+@dataclass
+class RollbackRecord:
+    """一次回滚操作的完整审计记录,包括回滚前后的快照ID,方便二次追溯"""
+
+    rollback_id: str
+    scope_type: str
+    scope_key: str
+    target_snapshot_id: str
+    pre_rollback_snapshot_id: str
+    executed_by: str
+    reason: str
+    executed_at: datetime = field(default_factory=datetime.now)
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        data["executed_at"] = self.executed_at.isoformat()
+        return data
+
+
+class MemorySnapshotStore:
+    """
+    快照存储引擎,负责快照的创建、检索、按时间点定位、回滚执行。
+
+    真实生产环境中,这里的存储层应该替换为对象存储(比如 S3/OSS)+
+    数据库索引的组合——快照体本身存对象存储(体量可能较大,且访问频率低),
+    索引信息(snapshot_id、scope、created_at)存数据库,便于快速检索。
+    本工具用内存字典模拟,聚焦在快照/回滚的业务逻辑本身。
+    """
+
+    def __init__(self) -> None:
+        self._snapshots: Dict[str, MemorySnapshot] = {}
+        self._snapshots_by_scope: Dict[str, List[str]] = {}
+        self._rollback_records: List[RollbackRecord] = []
+
+    def _scope_key(self, scope_type: str, scope_key: str) -> str:
+        return f"{scope_type}:{scope_key}"
+
+    def create_snapshot(
+        self,
+        scope_type: str,
+        scope_key: str,
+        current_payload: Dict[str, Any],
+        trigger: SnapshotTrigger,
+        created_by: str = "system",
+        note: str = "",
+    ) -> MemorySnapshot:
+        """
+        为指定 scope 的当前记忆状态创建一份快照。
+
+        payload 使用 copy.deepcopy 而非直接引用,是为了避免快照被后续的
+        记忆写操作意外污染——如果不做深拷贝,快照里存的其实是原对象的引用,
+        原数据一旦被修改,"历史快照"也会跟着变,快照就失去了意义。
+        """
+        snapshot = MemorySnapshot(
+            snapshot_id=str(uuid.uuid4()),
+            scope_type=scope_type,
+            scope_key=scope_key,
+            trigger=trigger,
+            payload=copy.deepcopy(current_payload),
+            created_by=created_by,
+            note=note,
+        )
+        self._snapshots[snapshot.snapshot_id] = snapshot
+        composite_key = self._scope_key(scope_type, scope_key)
+        self._snapshots_by_scope.setdefault(composite_key, []).append(snapshot.snapshot_id)
+        return snapshot
+
+    def list_snapshots(self, scope_type: str, scope_key: str) -> List[MemorySnapshot]:
+        """按时间正序返回指定 scope 的全部历史快照"""
+        composite_key = self._scope_key(scope_type, scope_key)
+        snapshot_ids = self._snapshots_by_scope.get(composite_key, [])
+        snapshots = [self._snapshots[sid] for sid in snapshot_ids]
+        return sorted(snapshots, key=lambda s: s.created_at)
+
+    def get_snapshot_at_or_before(
+        self, scope_type: str, scope_key: str, target_time: datetime
+    ) -> Optional[MemorySnapshot]:
+        """
+        按时间点定位快照:找到指定时间点"之前最近一次"的快照。
+
+        这个语义很重要——回滚到"某个时间点"的正确理解是"回滚到那个时间点
+        当时生效的状态",而不是"找到时间上最接近的快照"(因为最接近的
+        快照可能是在目标时间点之后创建的,那样回滚反而是把未来的状态
+        错误地应用到了过去)。
+        """
+        candidates = [
+            s for s in self.list_snapshots(scope_type, scope_key) if s.created_at <= target_time
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda s: s.created_at)
+
+    def diff_snapshot_with_current(
+        self, snapshot_id: str, current_payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        对比一份历史快照与当前记忆状态的差异,供运营人员在回滚前预览影响面。
+
+        返回结构:
+            added: 当前状态里有、快照里没有的字段(回滚后会被删除)
+            removed: 快照里有、当前状态里没有的字段(回滚后会被重新加回来)
+            changed: 两边都有但取值不同的字段,附带旧值和新值
+        """
+        snapshot = self._snapshots.get(snapshot_id)
+        if snapshot is None:
+            raise KeyError(f"快照不存在: {snapshot_id}")
+
+        old_payload = snapshot.payload
+        added = {k: v for k, v in current_payload.items() if k not in old_payload}
+        removed = {k: v for k, v in old_payload.items() if k not in current_payload}
+        changed = {}
+        for key in set(old_payload.keys()) & set(current_payload.keys()):
+            if old_payload[key] != current_payload[key]:
+                changed[key] = {"回滚后的值": old_payload[key], "当前值": current_payload[key]}
+
+        return {"added_will_be_removed": added, "removed_will_be_restored": removed, "changed": changed}
+
+    def execute_rollback(
+        self,
+        scope_type: str,
+        scope_key: str,
+        target_snapshot_id: str,
+        current_payload: Dict[str, Any],
+        executed_by: str,
+        reason: str,
+    ) -> Dict[str, Any]:
+        """
+        执行回滚操作,返回回滚后应写入的记忆数据。
+
+        关键设计点:回滚前先对"当前状态"打一份快照(pre_rollback_snapshot),
+        这样即使回滚本身是误操作,依然可以通过 pre_rollback_snapshot 再次
+        回滚回去,不会出现"回滚了但回滚错了,又找不回原状态"的死锁局面。
+
+        本方法只负责计算"应该写入的数据"并记录回滚审计日志,真正的写入
+        动作仍然必须交由 MemoryAccessController.write_department_memory /
+        update_user_memory 等既有入口完成,保证权限校验链路不被绕过——
+        这是本工具与前面 7.1~7.16 各模块之间的集成边界,回滚不是新的写入
+        通道,而是"决定写入什么内容"的一种特殊来源。
+        """
+        target_snapshot = self._snapshots.get(target_snapshot_id)
+        if target_snapshot is None:
+            raise KeyError(f"目标快照不存在: {target_snapshot_id}")
+        if target_snapshot.scope_type != scope_type or target_snapshot.scope_key != scope_key:
+            raise ValueError("目标快照与请求回滚的 scope 不匹配,拒绝执行,避免跨部门/跨用户误回滚")
+
+        pre_rollback_snapshot = self.create_snapshot(
+            scope_type=scope_type,
+            scope_key=scope_key,
+            current_payload=current_payload,
+            trigger=SnapshotTrigger.BEFORE_MANUAL_ROLLBACK,
+            created_by=executed_by,
+            note=f"回滚前自动快照,目标回滚至快照 {target_snapshot_id}",
+        )
+
+        rollback_record = RollbackRecord(
+            rollback_id=str(uuid.uuid4()),
+            scope_type=scope_type,
+            scope_key=scope_key,
+            target_snapshot_id=target_snapshot_id,
+            pre_rollback_snapshot_id=pre_rollback_snapshot.snapshot_id,
+            executed_by=executed_by,
+            reason=reason,
+        )
+        self._rollback_records.append(rollback_record)
+
+        return {
+            "restored_payload": copy.deepcopy(target_snapshot.payload),
+            "rollback_record": rollback_record.to_dict(),
+        }
+
+    def get_rollback_history(self, scope_type: str, scope_key: str) -> List[RollbackRecord]:
+        """查询指定 scope 的历史回滚记录,用于审计追溯"""
+        return [
+            r
+            for r in self._rollback_records
+            if r.scope_type == scope_type and r.scope_key == scope_key
+        ]
+
+    def export_snapshot_index(self) -> str:
+        """导出全部快照的索引信息(不含完整payload,避免导出文件过大),用于快照台账巡检"""
+        index = []
+        for snapshot in self._snapshots.values():
+            index.append(
+                {
+                    "snapshot_id": snapshot.snapshot_id,
+                    "scope_type": snapshot.scope_type,
+                    "scope_key": snapshot.scope_key,
+                    "trigger": snapshot.trigger.value,
+                    "created_at": snapshot.created_at.isoformat(),
+                    "created_by": snapshot.created_by,
+                }
+            )
+        index.sort(key=lambda item: item["created_at"])
+        return json.dumps(index, ensure_ascii=False, indent=2)
+
+
+class SnapshotAwareMemoryWriter:
+    """
+    在真实写入动作外面包一层"自动打快照"的装饰逻辑。
+
+    这个类演示了如何把 MemorySnapshotStore 无缝集成到既有的
+    MemoryAccessController 写操作路径中,而不需要改动控制器本身的代码——
+    通过组合而不是修改,降低了引入快照能力对既有代码的侵入性。
+    """
+
+    def __init__(self, snapshot_store: MemorySnapshotStore) -> None:
+        self.snapshot_store = snapshot_store
+
+    def write_with_auto_snapshot(
+        self,
+        scope_type: str,
+        scope_key: str,
+        current_payload_before_write: Dict[str, Any],
+        new_payload: Dict[str, Any],
+        actor: str,
+        real_write_func,
+    ) -> Dict[str, Any]:
+        """
+        real_write_func: 真正执行写入的函数引用,签名为 (scope_key, new_payload) -> None,
+        通常就是 MemoryAccessController.write_department_memory 之类的既有方法。
+        """
+        trigger = (
+            SnapshotTrigger.BEFORE_RULE_UPDATE
+            if scope_type == "department"
+            else SnapshotTrigger.BEFORE_USER_MEMORY_UPDATE
+        )
+        snapshot = self.snapshot_store.create_snapshot(
+            scope_type=scope_type,
+            scope_key=scope_key,
+            current_payload=current_payload_before_write,
+            trigger=trigger,
+            created_by=actor,
+        )
+        real_write_func(scope_key, new_payload)
+        return {"snapshot_taken": snapshot.snapshot_id, "write_completed": True}
+
+
+def demo_run() -> None:
+    """演示:模拟一次错误的部门规则修改,以及之后的快照对比与回滚全流程"""
+    store = MemorySnapshotStore()
+    writer = SnapshotAwareMemoryWriter(store)
+
+    scm_department_memory: Dict[str, Any] = {"逾期宽限天数": 5, "违约金封顶比例": 0.30}
+
+    def fake_write(scope_key: str, new_payload: Dict[str, Any]) -> None:
+        scm_department_memory.clear()
+        scm_department_memory.update(new_payload)
+
+    print("===== 初始状态 =====")
+    print(scm_department_memory)
+
+    writer.write_with_auto_snapshot(
+        scope_type="department",
+        scope_key="scm",
+        current_payload_before_write=dict(scm_department_memory),
+        new_payload={"逾期宽限天数": 50, "违约金封顶比例": 0.30},
+        actor="运营-张三(误操作)",
+        real_write_func=fake_write,
+    )
+    print("\n===== 误操作后的状态(逾期宽限天数被错误改为50) =====")
+    print(scm_department_memory)
+
+    history = store.list_snapshots("department", "scm")
+    first_snapshot_id = history[0].snapshot_id
+    diff = store.diff_snapshot_with_current(first_snapshot_id, scm_department_memory)
+    print("\n===== 回滚前的差异预览 =====")
+    print(json.dumps(diff, ensure_ascii=False, indent=2))
+
+    result = store.execute_rollback(
+        scope_type="department",
+        scope_key="scm",
+        target_snapshot_id=first_snapshot_id,
+        current_payload=dict(scm_department_memory),
+        executed_by="运营主管-李四",
+        reason="发现逾期宽限天数被误改为50天,回滚至误操作前的正确配置",
+    )
+    fake_write("scm", result["restored_payload"])
+    print("\n===== 回滚后的状态(已恢复为正确配置) =====")
+    print(scm_department_memory)
+
+    print("\n===== 回滚审计记录 =====")
+    print(json.dumps(result["rollback_record"], ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    demo_run()
+```
+
+### 7.18 单元测试:快照回滚工具的正确性验证 (`test_memory_snapshot_rollback.py`)
+
+快照回滚工具本身承担的是"系统出错之后的最后一道安全网"的角色,如果这道安全网自己有 bug,那么后果比没有它更严重——运营人员会误以为"回滚了就一定安全",却实际上回滚到了错误的状态。因此这部分的单元测试覆盖要格外严格,尤其是"跨 scope 误回滚保护"和"回滚前自动快照"这两个关键安全机制。
+
+```python
+"""
+test_memory_snapshot_rollback.py
+
+针对 memory_snapshot_rollback.py 的单元测试套件。
+
+覆盖重点:
+1. 快照创建后的深拷贝隔离性——原数据修改不应影响已创建的快照。
+2. 按时间点定位快照的边界语义——必须是"目标时间点之前最近一次",不能取反。
+3. 跨 scope 回滚保护——不允许把部门A的快照回滚到部门B。
+4. 回滚前自动快照机制——每次回滚都必须留痕,保证回滚本身可逆。
+5. 快照差异对比的正确性——新增/删除/变更三类字段都要能正确识别。
+"""
+
+import copy
+from datetime import datetime, timedelta
+
+import pytest
+
+from memory_snapshot_rollback import (
+    MemorySnapshotStore,
+    SnapshotAwareMemoryWriter,
+    SnapshotTrigger,
+)
+
+
+@pytest.fixture
+def store() -> MemorySnapshotStore:
+    return MemorySnapshotStore()
+
+
+class TestSnapshotCreationIsolation:
+    """验证快照创建时的深拷贝隔离性"""
+
+    def test_snapshot_not_affected_by_later_mutation(self, store: MemorySnapshotStore):
+        original_payload = {"逾期宽限天数": 5, "nested": {"违约金封顶比例": 0.30}}
+        snapshot = store.create_snapshot(
+            scope_type="department",
+            scope_key="scm",
+            current_payload=original_payload,
+            trigger=SnapshotTrigger.MANUAL_REQUEST,
+        )
+
+        original_payload["逾期宽限天数"] = 999
+        original_payload["nested"]["违约金封顶比例"] = 0.99
+
+        assert snapshot.payload["逾期宽限天数"] == 5, "快照应保留创建时刻的数据,不应受后续原数据修改影响"
+        assert snapshot.payload["nested"]["违约金封顶比例"] == 0.30, "嵌套字典也必须是深拷贝隔离"
+
+    def test_each_snapshot_has_unique_id(self, store: MemorySnapshotStore):
+        s1 = store.create_snapshot("department", "scm", {"a": 1}, SnapshotTrigger.MANUAL_REQUEST)
+        s2 = store.create_snapshot("department", "scm", {"a": 2}, SnapshotTrigger.MANUAL_REQUEST)
+        assert s1.snapshot_id != s2.snapshot_id
+
+
+class TestSnapshotTimeLocating:
+    """验证按时间点定位快照的边界语义"""
+
+    def test_locate_returns_nearest_snapshot_before_target_time(self, store: MemorySnapshotStore):
+        base_time = datetime(2025, 1, 1, 10, 0, 0)
+        s1 = store.create_snapshot("department", "scm", {"v": 1}, SnapshotTrigger.SCHEDULED_DAILY)
+        s1.created_at = base_time
+        s2 = store.create_snapshot("department", "scm", {"v": 2}, SnapshotTrigger.SCHEDULED_DAILY)
+        s2.created_at = base_time + timedelta(hours=2)
+        s3 = store.create_snapshot("department", "scm", {"v": 3}, SnapshotTrigger.SCHEDULED_DAILY)
+        s3.created_at = base_time + timedelta(hours=5)
+
+        target_time = base_time + timedelta(hours=3)
+        located = store.get_snapshot_at_or_before("department", "scm", target_time)
+
+        assert located is not None
+        assert located.snapshot_id == s2.snapshot_id, "应定位到目标时间点之前最近的那一次快照(s2),不能取到之后的s3"
+
+    def test_locate_returns_none_when_target_time_before_all_snapshots(self, store: MemorySnapshotStore):
+        base_time = datetime(2025, 1, 1, 10, 0, 0)
+        s1 = store.create_snapshot("department", "scm", {"v": 1}, SnapshotTrigger.SCHEDULED_DAILY)
+        s1.created_at = base_time
+
+        located = store.get_snapshot_at_or_before(
+            "department", "scm", base_time - timedelta(days=1)
+        )
+        assert located is None, "如果目标时间点早于所有快照,应返回None,不能错误地返回最早的快照"
+
+
+class TestCrossScopeRollbackProtection:
+    """验证跨 scope 误回滚保护机制"""
+
+    def test_rollback_rejects_mismatched_scope(self, store: MemorySnapshotStore):
+        snapshot = store.create_snapshot(
+            "department", "legal", {"审批阈值": 50000}, SnapshotTrigger.MANUAL_REQUEST
+        )
+
+        with pytest.raises(ValueError, match="scope"):
+            store.execute_rollback(
+                scope_type="department",
+                scope_key="scm",  # 故意传入与快照不匹配的 scope_key
+                target_snapshot_id=snapshot.snapshot_id,
+                current_payload={"逾期宽限天数": 50},
+                executed_by="测试人员",
+                reason="测试跨scope保护",
+            )
+
+    def test_rollback_rejects_mismatched_scope_type(self, store: MemorySnapshotStore):
+        snapshot = store.create_snapshot(
+            "department", "scm", {"逾期宽限天数": 5}, SnapshotTrigger.MANUAL_REQUEST
+        )
+
+        with pytest.raises(ValueError):
+            store.execute_rollback(
+                scope_type="user",  # scope_type 也不匹配
+                scope_key="scm",
+                target_snapshot_id=snapshot.snapshot_id,
+                current_payload={},
+                executed_by="测试人员",
+                reason="测试scope_type不匹配保护",
+            )
+
+
+class TestRollbackLeavesAuditTrail:
+    """验证回滚前自动打快照、回滚记录留痕的机制"""
+
+    def test_rollback_creates_pre_rollback_snapshot(self, store: MemorySnapshotStore):
+        original = store.create_snapshot(
+            "department", "scm", {"逾期宽限天数": 5}, SnapshotTrigger.MANUAL_REQUEST
+        )
+        corrupted_state = {"逾期宽限天数": 999}
+
+        result = store.execute_rollback(
+            scope_type="department",
+            scope_key="scm",
+            target_snapshot_id=original.snapshot_id,
+            current_payload=corrupted_state,
+            executed_by="运营主管",
+            reason="修正误操作",
+        )
+
+        assert result["restored_payload"]["逾期宽限天数"] == 5
+        pre_rollback_id = result["rollback_record"]["pre_rollback_snapshot_id"]
+        assert pre_rollback_id in store._snapshots, "回滚前必须自动创建一份'回滚前状态'的快照"
+        assert store._snapshots[pre_rollback_id].payload == corrupted_state, (
+            "回滚前快照的内容应该是回滚发生前的(错误)状态,这样即使回滚本身出错也能找回来"
+        )
+
+    def test_rollback_history_is_queryable(self, store: MemorySnapshotStore):
+        original = store.create_snapshot(
+            "department", "scm", {"逾期宽限天数": 5}, SnapshotTrigger.MANUAL_REQUEST
+        )
+        store.execute_rollback(
+            scope_type="department",
+            scope_key="scm",
+            target_snapshot_id=original.snapshot_id,
+            current_payload={"逾期宽限天数": 999},
+            executed_by="运营主管",
+            reason="第一次修正",
+        )
+
+        history = store.get_rollback_history("department", "scm")
+        assert len(history) == 1
+        assert history[0].reason == "第一次修正"
+
+
+class TestSnapshotDiff:
+    """验证快照差异对比逻辑的正确性"""
+
+    def test_diff_identifies_added_removed_changed_fields(self, store: MemorySnapshotStore):
+        snapshot = store.create_snapshot(
+            "department",
+            "scm",
+            {"逾期宽限天数": 5, "违约金封顶比例": 0.30, "旧字段": "将被删除"},
+            SnapshotTrigger.MANUAL_REQUEST,
+        )
+        current_payload = {"逾期宽限天数": 50, "违约金封顶比例": 0.30, "新字段": "回滚后会消失"}
+
+        diff = store.diff_snapshot_with_current(snapshot.snapshot_id, current_payload)
+
+        assert "新字段" in diff["added_will_be_removed"]
+        assert "旧字段" in diff["removed_will_be_restored"]
+        assert "逾期宽限天数" in diff["changed"]
+        assert diff["changed"]["逾期宽限天数"]["回滚后的值"] == 5
+        assert diff["changed"]["逾期宽限天数"]["当前值"] == 50
+        assert "违约金封顶比例" not in diff["changed"], "取值相同的字段不应出现在changed里"
+
+    def test_diff_raises_when_snapshot_not_found(self, store: MemorySnapshotStore):
+        with pytest.raises(KeyError):
+            store.diff_snapshot_with_current("不存在的快照ID", {})
+
+
+class TestSnapshotAwareMemoryWriter:
+    """验证自动打快照的写入包装器与真实写入函数的集成正确性"""
+
+    def test_write_with_auto_snapshot_calls_real_write_and_creates_snapshot(
+        self, store: MemorySnapshotStore
+    ):
+        writer = SnapshotAwareMemoryWriter(store)
+        fake_storage = {"逾期宽限天数": 5}
+
+        def real_write(scope_key: str, new_payload: dict):
+            fake_storage.clear()
+            fake_storage.update(new_payload)
+
+        result = writer.write_with_auto_snapshot(
+            scope_type="department",
+            scope_key="scm",
+            current_payload_before_write=dict(fake_storage),
+            new_payload={"逾期宽限天数": 10},
+            actor="张三",
+            real_write_func=real_write,
+        )
+
+        assert fake_storage["逾期宽限天数"] == 10, "真实写入函数必须被调用,数据要真的发生变化"
+        assert result["write_completed"] is True
+        snapshots = store.list_snapshots("department", "scm")
+        assert len(snapshots) == 1
+        assert snapshots[0].payload["逾期宽限天数"] == 5, "快照应保存写入前的旧值,而不是写入后的新值"
+
+
+class TestExportSnapshotIndex:
+    """验证快照索引导出功能"""
+
+    def test_export_returns_valid_json_sorted_by_time(self, store: MemorySnapshotStore):
+        import json
+
+        base_time = datetime(2025, 1, 1)
+        s1 = store.create_snapshot("department", "scm", {}, SnapshotTrigger.SCHEDULED_DAILY)
+        s1.created_at = base_time + timedelta(hours=5)
+        s2 = store.create_snapshot("department", "scm", {}, SnapshotTrigger.SCHEDULED_DAILY)
+        s2.created_at = base_time
+
+        exported = store.export_snapshot_index()
+        parsed = json.loads(exported)
+
+        assert len(parsed) == 2
+        assert parsed[0]["snapshot_id"] == s2.snapshot_id, "导出的索引应按创建时间升序排列"
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+```
+
 ---
 
 ## 八、今日复盘
