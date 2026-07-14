@@ -1661,6 +1661,1047 @@ cutoff_len= 2048  覆盖样本数:  450/450 (100.0%)  将被截断样本数: 0
 
 陈铭看完这个结果,原本还纠结要不要直接设成1536保证100%覆盖,但后来他和老王讨论后决定还是用1024——理由是98%的覆盖率已经足够高,剩下9条样本大多是个别特别长的多轮对话(手动抽查过,截断掉的部分主要是对话末尾的礼貌性结束语,不影响核心内容的学习),而1024相比1536能明显减少每个batch的计算量和显存占用,在数据量本就不大的情况下,没必要为了极少数长尾样本去牺牲整体训练效率。这个决策过程他也记在了笔记里,作为以后类似场景做参数权衡的参考。
 
+晚上七点前,陈铭把主体训练流程跑完之后,还有一点时间。他想起晨会上阿雅提到测试组想尽快拿到可验证版本,又想起老王在参数配置那部分课堂笔记里反复强调的"今天先按经验值走一版,不用追求一次调到最优"这句话——如果只跑一版就直接交给明天做效果验证,一旦效果不理想,回头再排查是数据问题还是参数问题,会比较低效。于是他给自己加了两个"课后自选动作":一是把训练监控脚本做得更完整一些,除了实时打印状态,还要能在真的出问题的时候主动"喊人";二是干脆利用训练机的空闲时间,把几组不同的LoRA超参数拿去跑一遍对比实验,这样明天做效果验证的时候,手上就不只有一个模型版本可选,而是有几个版本可以横向比较,万一今天这一版效果不够好,不至于要重新等训练。
+
+### 九、训练监控脚本升级版:异常自动告警 + 历史趋势记录
+
+陈铭在下午写的`monitor_training.py`基础上做了扩展,主要补了两块能力:一是把每次采集到的指标持久化记录下来(原来的脚本只在终端打印,关掉窗口数据就没了),二是引入了更完整的异常判定逻辑,并支持把告警推送到一个可插拔的通知渠道(比如企业微信机器人webhook),而不是只能靠人一直盯着终端。
+
+```python
+#!/usr/bin/env python3
+# =============================================================
+# 文件名: monitor_training_v2.py
+# 说明:   训练过程监控脚本升级版,支持历史记录持久化、
+#         多维度异常判定、可插拔的告警通知渠道
+# 作者:   陈铭
+# 用法:   python monitor_training_v2.py \
+#             --log_file logs/day53/train_20260713_154012.log \
+#             --history_file logs/day53/monitor_history.jsonl \
+#             --interval 30 \
+#             --webhook_url ""   # 留空则只在终端打印告警,不真实发送
+# =============================================================
+
+import argparse
+import json
+import re
+import subprocess
+import time
+import urllib.request
+import urllib.error
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="训练过程监控脚本升级版")
+    parser.add_argument("--log_file", type=str, required=True)
+    parser.add_argument("--history_file", type=str, required=True, help="监控历史记录持久化文件(jsonl)")
+    parser.add_argument("--interval", type=int, default=30)
+    parser.add_argument("--gpu_index", type=int, default=0)
+    parser.add_argument("--loss_spike_threshold", type=float, default=5.0)
+    parser.add_argument("--grad_norm_threshold", type=float, default=5.0)
+    parser.add_argument(
+        "--stagnation_window", type=int, default=15,
+        help="判定'训练停滞'的连续观测窗口大小,窗口内loss几乎不变则告警",
+    )
+    parser.add_argument(
+        "--stagnation_delta", type=float, default=0.002,
+        help="窗口内loss波动小于该值,判定为疑似训练停滞",
+    )
+    parser.add_argument(
+        "--memory_growth_window", type=int, default=10,
+        help="用于判断显存是否持续单向增长(疑似泄漏)的观测窗口大小",
+    )
+    parser.add_argument("--webhook_url", type=str, default="", help="告警推送webhook地址,留空则不真实发送")
+    return parser.parse_args()
+
+
+def get_gpu_status(gpu_index: int) -> dict:
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                f"--id={gpu_index}",
+                "--query-gpu=memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        fields = [f.strip() for f in result.stdout.strip().split(",")]
+        return {
+            "memory_used_mb": float(fields[0]),
+            "memory_total_mb": float(fields[1]),
+            "gpu_util_pct": float(fields[2]),
+            "temperature_c": float(fields[3]),
+            "power_draw_w": float(fields[4]) if len(fields) > 4 else None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        print(f"[警告] 获取GPU状态失败: {exc}")
+        return {}
+
+
+LOG_LINE_PATTERN = re.compile(
+    r"\{'loss':\s*([\d.]+).*?'grad_norm':\s*([\d.]+).*?'learning_rate':\s*([\d.eE+-]+).*?'epoch':\s*([\d.]+)\}"
+)
+
+
+def parse_latest_metrics(log_file: str) -> dict:
+    latest = {}
+    try:
+        with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return latest
+
+    for line in reversed(lines[-200:]):
+        match = LOG_LINE_PATTERN.search(line)
+        if match:
+            latest = {
+                "loss": float(match.group(1)),
+                "grad_norm": float(match.group(2)),
+                "learning_rate": float(match.group(3)),
+                "epoch": float(match.group(4)),
+            }
+            break
+    return latest
+
+
+class TrainingHealthMonitor:
+    """
+    训练健康度监控器,维护近期历史数据,并基于历史窗口做更复杂的
+    异常模式判定(单点阈值判定 + 趋势判定 + 显存增长判定)。
+    """
+
+    def __init__(
+        self,
+        history_file: str,
+        loss_spike_threshold: float,
+        grad_norm_threshold: float,
+        stagnation_window: int,
+        stagnation_delta: float,
+        memory_growth_window: int,
+        webhook_url: str = "",
+    ):
+        self.history_file = Path(history_file)
+        self.history_file.parent.mkdir(parents=True, exist_ok=True)
+        self.loss_spike_threshold = loss_spike_threshold
+        self.grad_norm_threshold = grad_norm_threshold
+        self.stagnation_window = stagnation_window
+        self.stagnation_delta = stagnation_delta
+        self.memory_growth_window = memory_growth_window
+        self.webhook_url = webhook_url
+
+        self.loss_history = deque(maxlen=max(stagnation_window, 50))
+        self.memory_history = deque(maxlen=max(memory_growth_window, 50))
+        self._already_alerted_stagnation = False
+        self._already_alerted_memory_growth = False
+
+    def record(self, gpu_status: dict, metrics: dict) -> None:
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "gpu_status": gpu_status,
+            "metrics": metrics,
+        }
+        with open(self.history_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        if metrics.get("loss") is not None:
+            self.loss_history.append(metrics["loss"])
+        if gpu_status.get("memory_used_mb") is not None:
+            self.memory_history.append(gpu_status["memory_used_mb"])
+
+    def check_point_alerts(self, metrics: dict) -> list:
+        alerts = []
+        if not metrics:
+            return alerts
+        loss = metrics.get("loss")
+        grad_norm = metrics.get("grad_norm")
+
+        if loss is not None and loss > self.loss_spike_threshold:
+            alerts.append(f"[严重] 当前loss={loss:.4f},超过阈值{self.loss_spike_threshold},疑似训练发散")
+        if grad_norm is not None and grad_norm > self.grad_norm_threshold:
+            alerts.append(f"[严重] 当前grad_norm={grad_norm:.4f},超过阈值{self.grad_norm_threshold},疑似梯度不稳定")
+        return alerts
+
+    def check_stagnation(self) -> list:
+        """判断loss是否长期停滞不动,可能意味着学习率过小或LoRA未生效"""
+        if len(self.loss_history) < self.stagnation_window:
+            return []
+        recent = list(self.loss_history)[-self.stagnation_window:]
+        loss_range = max(recent) - min(recent)
+        if loss_range < self.stagnation_delta and not self._already_alerted_stagnation:
+            self._already_alerted_stagnation = True
+            return [
+                f"[警告] 最近{self.stagnation_window}次记录的loss波动范围仅{loss_range:.5f},"
+                f"疑似训练停滞,建议检查学习率设置或确认LoRA参数是否真的在更新"
+            ]
+        if loss_range >= self.stagnation_delta:
+            self._already_alerted_stagnation = False
+        return []
+
+    def check_memory_growth(self) -> list:
+        """判断显存占用是否呈现持续单向增长趋势,疑似显存泄漏"""
+        if len(self.memory_history) < self.memory_growth_window:
+            return []
+        recent = list(self.memory_history)[-self.memory_growth_window:]
+        is_monotonic_increasing = all(
+            recent[i] <= recent[i + 1] for i in range(len(recent) - 1)
+        )
+        total_growth = recent[-1] - recent[0]
+        if is_monotonic_increasing and total_growth > 500 and not self._already_alerted_memory_growth:
+            self._already_alerted_memory_growth = True
+            return [
+                f"[警告] 最近{self.memory_growth_window}次采集显存持续单向增长,"
+                f"累计增长{total_growth:.0f}MB,疑似存在显存泄漏,建议关注"
+            ]
+        if not is_monotonic_increasing:
+            self._already_alerted_memory_growth = False
+        return []
+
+    def dispatch_alert(self, alert_text: str) -> None:
+        """
+        将告警信息发送到指定渠道。教学环境默认只打印到终端,
+        真实生产环境中,可以把 webhook_url 配置为企业微信/钉钉的
+        群机器人地址,这里的实现遵循企业微信群机器人的通用请求格式,
+        实际接入时按目标平台的具体接口协议调整请求体结构即可。
+        """
+        print(f"\033[1;31m{alert_text}\033[0m")
+        if not self.webhook_url:
+            return
+        payload = json.dumps({
+            "msgtype": "text",
+            "text": {"content": f"[LoRA微调训练告警]\n{alert_text}"},
+        }).encode("utf-8")
+        try:
+            req = urllib.request.Request(
+                self.webhook_url, data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=5)
+        except urllib.error.URLError as exc:
+            print(f"[警告] 告警推送失败: {exc}")
+
+
+def format_status_line(gpu_status: dict, metrics: dict) -> str:
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    parts = [f"[{timestamp}]"]
+    if gpu_status:
+        mem_used = gpu_status.get("memory_used_mb", 0)
+        mem_total = gpu_status.get("memory_total_mb", 0)
+        util = gpu_status.get("gpu_util_pct", 0)
+        mem_pct = (mem_used / mem_total * 100) if mem_total else 0
+        parts.append(f"GPU显存: {mem_used:.0f}/{mem_total:.0f}MB ({mem_pct:.1f}%)  利用率: {util:.0f}%")
+    if metrics:
+        parts.append(
+            f"| epoch={metrics.get('epoch', 0):.2f}  loss={metrics.get('loss', 0):.4f}  "
+            f"grad_norm={metrics.get('grad_norm', 0):.4f}  lr={metrics.get('learning_rate', 0):.2e}"
+        )
+    else:
+        parts.append("| 暂未解析到训练指标")
+    return "  ".join(parts)
+
+
+def main():
+    args = parse_args()
+    monitor = TrainingHealthMonitor(
+        history_file=args.history_file,
+        loss_spike_threshold=args.loss_spike_threshold,
+        grad_norm_threshold=args.grad_norm_threshold,
+        stagnation_window=args.stagnation_window,
+        stagnation_delta=args.stagnation_delta,
+        memory_growth_window=args.memory_growth_window,
+        webhook_url=args.webhook_url,
+    )
+
+    print("=" * 70)
+    print("  训练健康度监控(升级版)已启动")
+    print(f"  历史记录文件: {args.history_file}")
+    print(f"  告警推送渠道: {'已配置' if args.webhook_url else '未配置(仅终端打印)'}")
+    print("=" * 70)
+
+    try:
+        while True:
+            gpu_status = get_gpu_status(args.gpu_index)
+            metrics = parse_latest_metrics(args.log_file)
+
+            print(format_status_line(gpu_status, metrics))
+            monitor.record(gpu_status, metrics)
+
+            all_alerts = (
+                monitor.check_point_alerts(metrics)
+                + monitor.check_stagnation()
+                + monitor.check_memory_growth()
+            )
+            for alert in all_alerts:
+                monitor.dispatch_alert(alert)
+
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print("\n监控已停止(训练进程未受影响)。")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+陈铭这次特意把"训练停滞检测"和"显存增长检测"这两条规则设计成了"只在第一次命中时告警,之后指标恢复正常又会重新允许再次告警"的模式(通过`_already_alerted_stagnation`和`_already_alerted_memory_growth`这两个状态位实现),避免同一个问题反复刷屏发出几十条一模一样的告警——他记得老王之前提过一句类似的话,监控系统如果告警噪声太大,大家反而会把真正重要的告警也一起忽略掉,这跟Day52数据质检脚本里讨论过的"审核疲劳"是一个道理,不同场景但底层的工程原则是相通的。
+
+### 十、多组超参数对比实验配置与批量运行脚本
+
+第二块自选动作,是趁着训练机今晚闲着,多跑几组超参数组合做对比。陈铭没有漫无目的地乱试,而是结合下午课堂笔记里梳理的几个关键参数(学习率、LoRA rank、epoch数),设计了一组"控制变量"式的对比实验——每次只改动一个维度,尽量让实验结果之间具备可比性,而不是把好几个参数一起改了之后,说不清楚效果差异到底是哪个参数导致的。
+
+```yaml
+# =====================================================================
+# 文件名: configs/experiments/exp_baseline.yaml
+# 说明:   对比实验基线配置(即今天下午跑的正式配置的完整复刻),
+#         其余几组实验配置都以此为基础,只调整其中一个维度的参数
+# =====================================================================
+model_name_or_path: Qwen/Qwen2.5-7B-Instruct
+trust_remote_code: true
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_target: all
+dataset: yufeng_sft_v3
+eval_dataset: yufeng_sft_v3_eval
+template: qwen
+cutoff_len: 1024
+overwrite_cache: true
+preprocessing_num_workers: 8
+output_dir: saves/qwen2.5-7b/lora/exp_baseline
+overwrite_output_dir: true
+logging_steps: 5
+save_steps: 20
+save_total_limit: 2
+plot_loss: true
+report_to: tensorboard
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 4
+per_device_eval_batch_size: 4
+learning_rate: 2.0e-4
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+max_grad_norm: 1.0
+bf16: true
+gradient_checkpointing: true
+flash_attn: fa2
+eval_strategy: steps
+eval_steps: 20
+seed: 42
+```
+
+```yaml
+# =====================================================================
+# 文件名: configs/experiments/exp_lr_low.yaml
+# 说明:   对比实验组一:仅调整学习率(2e-4 -> 5e-5),验证学习率
+#         对收敛速度和最终效果的影响,其余参数与baseline完全一致
+# =====================================================================
+model_name_or_path: Qwen/Qwen2.5-7B-Instruct
+trust_remote_code: true
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_target: all
+dataset: yufeng_sft_v3
+eval_dataset: yufeng_sft_v3_eval
+template: qwen
+cutoff_len: 1024
+overwrite_cache: true
+preprocessing_num_workers: 8
+output_dir: saves/qwen2.5-7b/lora/exp_lr_low
+overwrite_output_dir: true
+logging_steps: 5
+save_steps: 20
+save_total_limit: 2
+plot_loss: true
+report_to: tensorboard
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 4
+per_device_eval_batch_size: 4
+learning_rate: 5.0e-5   # 唯一改动项:学习率下调4倍
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+max_grad_norm: 1.0
+bf16: true
+gradient_checkpointing: true
+flash_attn: fa2
+eval_strategy: steps
+eval_steps: 20
+seed: 42
+```
+
+```yaml
+# =====================================================================
+# 文件名: configs/experiments/exp_rank_high.yaml
+# 说明:   对比实验组二:仅调整LoRA rank(8 -> 32,alpha同步调整为64
+#         以维持alpha/r=2的经验缩放系数),验证增大参数容量对
+#         效果的影响,同时观察是否引入更明显的过拟合风险
+# =====================================================================
+model_name_or_path: Qwen/Qwen2.5-7B-Instruct
+trust_remote_code: true
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 32      # 唯一改动项之一:rank从8调整到32
+lora_alpha: 64     # 唯一改动项之一:同步保持alpha/r=2
+lora_dropout: 0.05
+lora_target: all
+dataset: yufeng_sft_v3
+eval_dataset: yufeng_sft_v3_eval
+template: qwen
+cutoff_len: 1024
+overwrite_cache: true
+preprocessing_num_workers: 8
+output_dir: saves/qwen2.5-7b/lora/exp_rank_high
+overwrite_output_dir: true
+logging_steps: 5
+save_steps: 20
+save_total_limit: 2
+plot_loss: true
+report_to: tensorboard
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 4
+per_device_eval_batch_size: 4
+learning_rate: 2.0e-4
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+max_grad_norm: 1.0
+bf16: true
+gradient_checkpointing: true
+flash_attn: fa2
+eval_strategy: steps
+eval_steps: 20
+seed: 42
+```
+
+```yaml
+# =====================================================================
+# 文件名: configs/experiments/exp_epoch_more.yaml
+# 说明:   对比实验组三:仅调整epoch数(3 -> 6),验证更多轮次
+#         训练是否会导致明显的过拟合(train/eval loss差距扩大)
+# =====================================================================
+model_name_or_path: Qwen/Qwen2.5-7B-Instruct
+trust_remote_code: true
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_target: all
+dataset: yufeng_sft_v3
+eval_dataset: yufeng_sft_v3_eval
+template: qwen
+cutoff_len: 1024
+overwrite_cache: true
+preprocessing_num_workers: 8
+output_dir: saves/qwen2.5-7b/lora/exp_epoch_more
+overwrite_output_dir: true
+logging_steps: 5
+save_steps: 20
+save_total_limit: 3
+plot_loss: true
+report_to: tensorboard
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 4
+per_device_eval_batch_size: 4
+learning_rate: 2.0e-4
+num_train_epochs: 6.0   # 唯一改动项:epoch数从3增加到6
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+max_grad_norm: 1.0
+bf16: true
+gradient_checkpointing: true
+flash_attn: fa2
+eval_strategy: steps
+eval_steps: 20
+seed: 42
+```
+
+四份配置文件写好之后,陈铭又写了一个批量运行 + 结果汇总对比的脚本,让这几组实验可以在训练机空闲的时候依次自动跑完,不需要他一直守在电脑前手动一个个启动。
+
+```python
+#!/usr/bin/env python3
+# =============================================================
+# 文件名: run_experiment_suite.py
+# 说明:   批量运行一组超参数对比实验,并汇总各组实验的关键指标,
+#         生成一份对比报告,辅助判断哪一组参数配置更值得深入验证
+# 作者:   陈铭
+# 用法:   python run_experiment_suite.py \
+#             --config_dir configs/experiments \
+#             --report_output reports/day53_experiment_comparison.json
+# =============================================================
+
+import argparse
+import json
+import subprocess
+import time
+from datetime import datetime
+from pathlib import Path
+
+import yaml
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="批量运行超参数对比实验")
+    parser.add_argument("--config_dir", type=str, required=True, help="存放多份实验yaml配置的目录")
+    parser.add_argument("--report_output", type=str, required=True, help="对比报告输出路径")
+    parser.add_argument(
+        "--dry_run", action="store_true",
+        help="仅打印将要执行的实验列表,不真正启动训练(用于提前检查配置是否齐全)",
+    )
+    return parser.parse_args()
+
+
+def discover_experiment_configs(config_dir: str) -> list:
+    config_path = Path(config_dir)
+    configs = sorted(config_path.glob("*.yaml"))
+    if not configs:
+        raise FileNotFoundError(f"目录 {config_dir} 下未找到任何 .yaml 配置文件")
+    return configs
+
+
+def load_output_dir(config_file: Path) -> str:
+    with open(config_file, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    return cfg.get("output_dir", "")
+
+
+def run_single_experiment(config_file: Path) -> dict:
+    """
+    启动单组实验训练,阻塞等待其完成。真实场景中单卡资源有限,
+    多组实验通常只能串行跑,这也是为什么今天选择在训练机
+    空闲的晚间时段,依次跑完这几组对比实验,而不是并行跑,
+    避免几组实验互相抢占同一张卡的显存和算力资源。
+    """
+    print(f"\n{'=' * 70}")
+    print(f"  开始实验: {config_file.name}")
+    print(f"  启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'=' * 70}")
+
+    start_time = time.time()
+    result = subprocess.run(
+        ["llamafactory-cli", "train", str(config_file)],
+        capture_output=True, text=True,
+    )
+    elapsed_seconds = time.time() - start_time
+
+    success = result.returncode == 0
+    status = "成功" if success else "失败"
+    print(f"  实验 {config_file.name} 执行{status},耗时 {elapsed_seconds/60:.1f} 分钟")
+    if not success:
+        print(f"  错误输出(末尾500字符): ...{result.stderr[-500:]}")
+
+    return {
+        "config_name": config_file.name,
+        "success": success,
+        "elapsed_minutes": round(elapsed_seconds / 60, 1),
+        "output_dir": load_output_dir(config_file),
+    }
+
+
+def load_final_metrics(output_dir: str) -> dict:
+    """从训练产出的trainer_log.jsonl中提取最后一条训练记录与最优验证记录"""
+    log_path = Path(output_dir) / "trainer_log.jsonl"
+    if not log_path.exists():
+        return {}
+
+    records = []
+    with open(log_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+
+    if not records:
+        return {}
+
+    train_records = [r for r in records if "loss" in r and r.get("loss") is not None]
+    eval_records = [r for r in records if "eval_loss" in r and r.get("eval_loss") is not None]
+
+    final_train_loss = train_records[-1]["loss"] if train_records else None
+    best_eval_loss = min((r["eval_loss"] for r in eval_records), default=None)
+    final_eval_loss = eval_records[-1]["eval_loss"] if eval_records else None
+
+    overfit_gap = None
+    if final_train_loss is not None and final_eval_loss is not None:
+        overfit_gap = round(final_eval_loss - final_train_loss, 4)
+
+    return {
+        "final_train_loss": final_train_loss,
+        "final_eval_loss": final_eval_loss,
+        "best_eval_loss": best_eval_loss,
+        "overfit_gap": overfit_gap,
+        "total_logged_steps": len(train_records),
+    }
+
+
+def generate_comparison_report(experiment_results: list, report_output: str) -> None:
+    report = {
+        "generated_at": datetime.now().isoformat(),
+        "experiments": experiment_results,
+    }
+    Path(report_output).parent.mkdir(parents=True, exist_ok=True)
+    with open(report_output, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+    print(f"\n{'=' * 70}")
+    print("  实验对比报告汇总")
+    print(f"{'=' * 70}")
+    print(f"{'实验名称':<24}{'状态':<6}{'耗时(分)':<10}{'最终train_loss':<16}{'最终eval_loss':<16}{'过拟合差值':<10}")
+    for exp in experiment_results:
+        metrics = exp.get("metrics", {})
+        print(
+            f"{exp['config_name']:<24}"
+            f"{'成功' if exp['success'] else '失败':<6}"
+            f"{exp['elapsed_minutes']:<10}"
+            f"{str(metrics.get('final_train_loss', '-')):<16}"
+            f"{str(metrics.get('final_eval_loss', '-')):<16}"
+            f"{str(metrics.get('overfit_gap', '-')):<10}"
+        )
+    print(f"{'=' * 70}")
+    print(f"完整报告已保存至: {report_output}")
+
+
+def main():
+    args = parse_args()
+    config_files = discover_experiment_configs(args.config_dir)
+
+    print(f"发现 {len(config_files)} 组待运行的实验配置:")
+    for cfg in config_files:
+        print(f"  - {cfg.name}")
+
+    if args.dry_run:
+        print("\n[dry_run模式] 仅列出实验清单,不实际启动训练。")
+        return
+
+    experiment_results = []
+    for config_file in config_files:
+        result = run_single_experiment(config_file)
+        if result["success"] and result["output_dir"]:
+            result["metrics"] = load_final_metrics(result["output_dir"])
+        else:
+            result["metrics"] = {}
+        experiment_results.append(result)
+
+    generate_comparison_report(experiment_results, args.report_output)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+陈铭把这套批量实验脚本设置成晚上下班前启动,让它在训练机上过夜依次跑完四组实验(baseline、低学习率、高rank、多epoch),脚本本身设计成串行执行、每组实验独立保存到各自的`output_dir`,互不覆盖,第二天早上到工位第一件事就是看这份汇总报告。他在脚本注释里也提醒了自己一点:今天写的这版对比脚本是串行执行,单卡资源场景下这是唯一现实的选择,但如果以后训练机资源扩展到多卡,理论上是可以把不同实验分配到不同卡上并行跑的,不过那需要脚本层面增加更复杂的资源调度逻辑,今天不做过度设计,先满足单卡场景的实际需求。
+
+老王晚上看到陈铭在群里发的这个"多组实验过夜跑"的计划,回复说:"这个思路是对的,比明天到时候发现效果不理想再手忙脚乱重跑要主动得多。不过记住,这几组对比实验的结果,只是给你提供方向参考,不代表明天效果验证就直接拿实验组的模型用,还是要按今天讨论过的完整验证流程走一遍,不能因为某组实验的loss数字更好看就跳过验证环节直接采用。"陈铭把这句话也记了下来——数字好看是一个参考信号,不是可以跳过人工验证的理由,这和Day52数据质检那天讨论"自动化规则不能替代专业判断"的思路,本质上是同一件事的不同表现形式。
+
+### 十一、最优Checkpoint自动挑选工具
+
+写完批量实验脚本,陈铭又想到一个问题:每组实验按`save_steps=20`的频率会产生好几个中间checkpoint,如果只留最后一个checkpoint,前面提到的"过拟合导致最后一个checkpoint未必是最优"的问题就没有解决;但如果每次都要打开trainer_log.jsonl手动去找eval_loss最小的那个step对应的checkpoint目录,几组实验下来也挺麻烦。他干脆把这个"挑最优checkpoint"的逻辑也写成了一个小工具,明天效果验证阶段可以直接拿这个工具选出来的checkpoint作为起点,而不是想当然地用训练完成时的最后一个。
+
+```python
+#!/usr/bin/env python3
+# =============================================================
+# 文件名: select_best_checkpoint.py
+# 说明:   根据验证集loss,从训练产出的多个checkpoint中自动挑选
+#         "最优"的一个,避免直接采用最后一个checkpoint而忽略了
+#         中途可能已经出现的过拟合拐点
+# 作者:   陈铭
+# 用法:   python select_best_checkpoint.py \
+#             --output_dir saves/qwen2.5-7b/lora/yufeng_sft_20260713
+# =============================================================
+
+import argparse
+import json
+import re
+from pathlib import Path
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="最优Checkpoint自动挑选工具")
+    parser.add_argument("--output_dir", type=str, required=True, help="训练输出目录")
+    parser.add_argument(
+        "--metric", type=str, default="eval_loss", choices=["eval_loss", "loss"],
+        help="用于挑选最优checkpoint的指标,默认使用验证集loss,数据量小、"
+             "未配置验证集评估的场景可以退化为使用训练loss(不推荐,仅作兜底)",
+    )
+    return parser.parse_args()
+
+
+def load_trainer_log(output_dir: str) -> list:
+    log_path = Path(output_dir) / "trainer_log.jsonl"
+    if not log_path.exists():
+        raise FileNotFoundError(f"未找到训练日志文件: {log_path}")
+
+    records = []
+    with open(log_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records
+
+
+def list_available_checkpoints(output_dir: str) -> list:
+    """列出该输出目录下所有checkpoint-N子目录,并解析出对应的step编号"""
+    checkpoints = []
+    for path in Path(output_dir).glob("checkpoint-*"):
+        if not path.is_dir():
+            continue
+        match = re.search(r"checkpoint-(\d+)", path.name)
+        if match:
+            checkpoints.append((int(match.group(1)), path))
+    checkpoints.sort(key=lambda x: x[0])
+    return checkpoints
+
+
+def find_best_step(records: list, metric: str) -> dict:
+    """
+    在所有带有目标指标的日志记录中,找出该指标最小的那一条,
+    返回对应的step编号与指标值。loss类指标是"越小越好",
+    这里统一按最小值挑选。
+    """
+    candidates = [r for r in records if metric in r and r.get(metric) is not None]
+    if not candidates:
+        raise ValueError(f"训练日志中未找到任何包含 '{metric}' 字段的记录,无法完成挑选")
+
+    best_record = min(candidates, key=lambda r: r[metric])
+    return {
+        "step": best_record.get("current_steps"),
+        "metric_value": best_record[metric],
+        "epoch": best_record.get("epoch"),
+    }
+
+
+def match_checkpoint_for_step(checkpoints: list, target_step: int):
+    """
+    由于save_steps和eval_steps的间隔未必完全对齐(比如eval_steps=20但
+    save_steps也是20,理想情况下每次评估都恰好有一个对应的checkpoint,
+    但如果两者数值不同,最优评估点未必刚好落在某次保存的step上),
+    这里的策略是:找不到精确匹配的checkpoint时,选择"不晚于"目标step
+    的、最接近的一个已保存checkpoint,而不是选择比目标step更靠后的
+    checkpoint(那样可能已经越过了最优点,训练更多步反而效果更差)。
+    """
+    exact_matches = [cp for step, cp in checkpoints if step == target_step]
+    if exact_matches:
+        return exact_matches[0], target_step
+
+    earlier_checkpoints = [(step, cp) for step, cp in checkpoints if step <= target_step]
+    if earlier_checkpoints:
+        best_step, best_cp = max(earlier_checkpoints, key=lambda x: x[0])
+        return best_cp, best_step
+
+    if checkpoints:
+        return checkpoints[0][1], checkpoints[0][0]
+
+    return None, None
+
+
+def main():
+    args = parse_args()
+
+    records = load_trainer_log(args.output_dir)
+    checkpoints = list_available_checkpoints(args.output_dir)
+
+    if not checkpoints:
+        print(f"[警告] 在 {args.output_dir} 下未找到任何 checkpoint-* 目录")
+        return
+
+    print(f"共发现 {len(checkpoints)} 个已保存的checkpoint: "
+          f"{[step for step, _ in checkpoints]}")
+
+    best_info = find_best_step(records, args.metric)
+    print(f"\n按指标 '{args.metric}' 挑选出的最优记录:")
+    print(f"  对应step   : {best_info['step']}")
+    print(f"  对应epoch  : {best_info['epoch']:.2f}" if best_info["epoch"] is not None else "  对应epoch  : 未知")
+    print(f"  指标值     : {best_info['metric_value']:.4f}")
+
+    matched_checkpoint, matched_step = match_checkpoint_for_step(checkpoints, best_info["step"])
+
+    print(f"\n{'=' * 60}")
+    if matched_checkpoint is not None:
+        print(f"  推荐使用的checkpoint: {matched_checkpoint}")
+        print(f"  该checkpoint对应step: {matched_step}")
+        if matched_step != best_info["step"]:
+            print(
+                f"  [说明] 最优指标出现在step={best_info['step']},"
+                f"但该step未保存独立checkpoint,已就近选择不晚于该step的"
+                f"已保存checkpoint(step={matched_step})作为替代。"
+            )
+        last_step, last_checkpoint = checkpoints[-1]
+        if matched_step == last_step:
+            print("  [说明] 本次推荐结果与训练最终checkpoint一致,说明训练全程未出现明显的过拟合拐点。")
+        else:
+            print(
+                f"  [提示] 推荐结果并非最后一个checkpoint(最终checkpoint为step={last_step}),"
+                f"说明训练后期指标已经开始变差,建议使用本工具推荐的中间checkpoint,而非训练结束时的最后一个。"
+            )
+    else:
+        print("  未能匹配到任何可用checkpoint,请检查save_steps配置与训练日志是否一致")
+    print(f"{'=' * 60}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+陈铭拿今天下午正式训练产出的checkpoint目录跑了一下这个工具,结果显示最优的eval_loss出现在最后一个epoch附近,对应的checkpoint恰好就是训练结束时保存的最后一个,这也间接印证了他在"今日复盘"里对train/eval loss差值(0.17)判断为"过拟合风险可控"的结论——如果真的存在明显过拟合,这个工具应该会推荐一个比最后一个更靠前的中间checkpoint。他把这个交叉验证的过程也记进了笔记里,提醒自己以后不要只依赖单一维度的判断,同一个结论最好能找到第二个独立的信号相互印证,这样才更让人放心。
+
+选完最优checkpoint之后,陈铭又想到老王之前反复强调过的一句话——"训练这件事,三个月之后你自己都会忘记今天到底是怎么调出来的,所以必须让机器帮你把'怎么调出来的'这件事记下来"。他打算在正式收工前,再补一个"训练可复现清单生成工具",把这一次训练涉及到的所有关键信息——训练配置、数据集版本、代码版本、硬件环境、最终选定的checkpoint——一次性固化成一份JSON manifest文件,和模型权重放在一起归档,这样即使几个月后要复现这次训练结果,或者要排查"为什么这一版模型的效果和上一版不一样",都能有据可查,而不是只能凭记忆或者聊天记录去拼凑当时的训练细节。
+
+```python
+# 文件名: generate_training_manifest.py
+# 用途:   为一次LLaMA-Factory微调训练生成完整的"可复现清单"(manifest)
+#         汇总训练配置、数据集版本、代码版本、硬件环境、最优checkpoint等关键信息,
+#         输出为一份结构化的JSON文件,与训练产物一起归档,方便未来追溯与复现。
+# 作者:   陈铭
+# 使用示例:
+#   python generate_training_manifest.py \
+#       --config configs/qwen2_5_7b_lora_sft.yaml \
+#       --output-dir saves/qwen2.5-7b-yufeng-lora/checkpoint-best \
+#       --dataset-version v1.2.0 \
+#       --manifest-out saves/qwen2.5-7b-yufeng-lora/training_manifest.json
+
+import argparse
+import json
+import os
+import platform
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+try:
+    import torch
+except ImportError:
+    torch = None
+
+
+def run_shell(cmd: list) -> Optional[str]:
+    """执行一条shell命令并返回标准输出(去除首尾空白);命令执行失败时返回None,不抛异常中断主流程。"""
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10, check=False
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+        return None
+    except Exception:
+        return None
+
+
+def collect_git_info(repo_dir: str = ".") -> Dict[str, Any]:
+    """采集当前代码仓库的git信息:commit哈希、分支名、是否存在未提交的改动。
+
+    这三项信息对于"复现训练结果"至关重要——如果训练当时代码仓库存在未提交的
+    改动(即dirty状态),那么仅凭commit哈希是无法完整还原当时实际运行的代码的,
+    必须在manifest里明确标注出来,提醒后续排查的人这一点。
+    """
+    commit = run_shell(["git", "-C", repo_dir, "rev-parse", "HEAD"])
+    branch = run_shell(["git", "-C", repo_dir, "rev-parse", "--abbrev-ref", "HEAD"])
+    status = run_shell(["git", "-C", repo_dir, "status", "--porcelain"])
+    is_dirty = bool(status)
+    return {
+        "commit": commit or "未知(可能不在git仓库中)",
+        "branch": branch or "未知",
+        "is_dirty": is_dirty,
+        "dirty_files": status.splitlines() if status else [],
+    }
+
+
+def collect_hardware_info() -> Dict[str, Any]:
+    """采集本次训练所使用的硬件与软件环境信息,包括GPU型号、CUDA版本、PyTorch版本、操作系统等。"""
+    info: Dict[str, Any] = {
+        "hostname": platform.node(),
+        "os": f"{platform.system()} {platform.release()}",
+        "python_version": sys.version.split()[0],
+    }
+    if torch is not None:
+        info["torch_version"] = torch.__version__
+        info["cuda_available"] = torch.cuda.is_available()
+        if torch.cuda.is_available():
+            info["cuda_version"] = torch.version.cuda
+            info["gpu_count"] = torch.cuda.device_count()
+            info["gpu_names"] = [
+                torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())
+            ]
+    else:
+        info["torch_version"] = "未安装torch,无法采集GPU相关信息"
+    return info
+
+
+def load_training_config(config_path: str) -> Dict[str, Any]:
+    """加载LLaMA-Factory的训练配置YAML文件,提取关键超参数字段用于归档。"""
+    if yaml is None:
+        return {"警告": "未安装PyYAML,无法解析配置文件,请pip install pyyaml后重试"}
+    if not os.path.exists(config_path):
+        return {"警告": f"未找到配置文件: {config_path}"}
+    with open(config_path, "r", encoding="utf-8") as f:
+        full_config = yaml.safe_load(f) or {}
+
+    # 只挑选对"复现训练结果"最关键的一部分字段进行归档,
+    # 避免把整份配置(可能包含大量与复现无关的路径、日志配置)全部堆进manifest,
+    # 造成核心信息被淹没在无关细节里。
+    key_fields = [
+        "model_name_or_path", "stage", "finetuning_type", "lora_rank", "lora_alpha",
+        "lora_dropout", "lora_target", "dataset", "dataset_dir", "template",
+        "cutoff_len", "learning_rate", "num_train_epochs", "per_device_train_batch_size",
+        "gradient_accumulation_steps", "lr_scheduler_type", "warmup_ratio", "bf16",
+        "flash_attn", "gradient_checkpointing", "seed",
+    ]
+    extracted = {k: full_config.get(k) for k in key_fields if k in full_config}
+    extracted["_config_file_path"] = os.path.abspath(config_path)
+    return extracted
+
+
+def find_best_checkpoint_dir(output_dir: str) -> Optional[str]:
+    """在output_dir下查找已保存的checkpoint目录,返回按step排序后最新的一个作为默认参考。
+
+    注意:如果已经运行过select_best_checkpoint.py挑选出了"最优"checkpoint,
+    应该优先使用该工具输出的推荐结果,这里仅作为manifest中"默认可用checkpoint"的兜底填充。
+    """
+    if not os.path.isdir(output_dir):
+        return None
+    candidates = []
+    for name in os.listdir(output_dir):
+        if name.startswith("checkpoint-"):
+            try:
+                step = int(name.split("-")[-1])
+                candidates.append((step, name))
+            except ValueError:
+                continue
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[-1][1]
+
+
+def collect_dataset_manifest(dataset_dir: str, dataset_name: str) -> Dict[str, Any]:
+    """尝试从dataset_info.json中提取指定数据集的记录数量、文件路径等信息,补充进manifest。"""
+    dataset_info_path = os.path.join(dataset_dir, "dataset_info.json")
+    if not os.path.exists(dataset_info_path):
+        return {"警告": f"未找到dataset_info.json: {dataset_info_path}"}
+    with open(dataset_info_path, "r", encoding="utf-8") as f:
+        dataset_info = json.load(f)
+    entry = dataset_info.get(dataset_name)
+    if entry is None:
+        return {"警告": f"dataset_info.json中未找到数据集: {dataset_name}"}
+
+    data_file_path = os.path.join(dataset_dir, entry.get("file_name", ""))
+    record_count = None
+    if os.path.exists(data_file_path):
+        try:
+            with open(data_file_path, "r", encoding="utf-8") as f:
+                content = json.load(f)
+                record_count = len(content) if isinstance(content, list) else None
+        except Exception:
+            record_count = None
+
+    return {
+        "dataset_name": dataset_name,
+        "file_name": entry.get("file_name"),
+        "formatting": entry.get("formatting"),
+        "record_count": record_count,
+    }
+
+
+def build_manifest(
+    config_path: str,
+    output_dir: str,
+    dataset_version: str,
+    repo_dir: str,
+) -> Dict[str, Any]:
+    """汇总所有信息,构造完整的training manifest字典。"""
+    training_config = load_training_config(config_path)
+    dataset_name = training_config.get("dataset", "未知")
+    dataset_dir = training_config.get("dataset_dir", "data")
+
+    manifest = {
+        "manifest_version": "1.0",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "project": {
+            "customer": "御风金融",
+            "task": "客服问答风格与业务术语适配微调",
+            "responsible_engineer": "陈铭",
+        },
+        "code_repo": collect_git_info(repo_dir),
+        "hardware_environment": collect_hardware_info(),
+        "training_config": training_config,
+        "dataset": {
+            "declared_version": dataset_version,
+            **collect_dataset_manifest(dataset_dir, dataset_name),
+        },
+        "output": {
+            "output_dir": os.path.abspath(output_dir),
+            "latest_checkpoint": find_best_checkpoint_dir(output_dir),
+        },
+    }
+    return manifest
+
+
+def main():
+    parser = argparse.ArgumentParser(description="生成训练可复现清单(manifest)")
+    parser.add_argument("--config", required=True, help="训练配置YAML文件路径")
+    parser.add_argument("--output-dir", required=True, help="训练输出目录(saves/xxx)")
+    parser.add_argument("--dataset-version", required=True, help="本次训练使用的数据集语义化版本号")
+    parser.add_argument("--repo-dir", default=".", help="代码仓库根目录,默认为当前目录")
+    parser.add_argument("--manifest-out", default=None, help="manifest输出路径,默认写入output_dir下")
+    args = parser.parse_args()
+
+    manifest = build_manifest(
+        config_path=args.config,
+        output_dir=args.output_dir,
+        dataset_version=args.dataset_version,
+        repo_dir=args.repo_dir,
+    )
+
+    manifest_out = args.manifest_out or os.path.join(args.output_dir, "training_manifest.json")
+    Path(os.path.dirname(manifest_out) or ".").mkdir(parents=True, exist_ok=True)
+    with open(manifest_out, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+    print(f"[完成] 训练可复现清单已生成: {manifest_out}")
+    print(f"  代码commit  : {manifest['code_repo']['commit'][:12]}"
+          f"{'  [警告:存在未提交改动!]' if manifest['code_repo']['is_dirty'] else ''}")
+    print(f"  数据集版本  : {manifest['dataset']['declared_version']}")
+    print(f"  最新checkpoint: {manifest['output']['latest_checkpoint']}")
+    if manifest["code_repo"]["is_dirty"]:
+        print(
+            "\n[重要提醒] 检测到代码仓库存在未提交的改动(dirty working tree),"
+            "本次训练结果可能无法仅凭commit哈希完整复现,"
+            "建议尽快提交或至少用git stash/diff方式归档当时的改动内容。"
+        )
+
+
+if __name__ == "__main__":
+    main()
+```
+
+陈铭跑完这个脚本,生成的manifest里果然弹出了那条"存在未提交改动"的提醒——他这才想起来,自己为了临时调试数据加载逻辑,在本地改了一行`data_utils.py`还没有提交。他赶紧把这行改动补充提交了一次,重新生成了一份manifest确认干净无误,才把这份JSON文件和最终选定的checkpoint一起打包,放进了今天要提交给老王和阿雅存档的交付材料里。他心里清楚,这份看似"多此一举"的manifest,很可能会在几周甚至几个月后的某一次复盘或者故障排查里,成为唯一能说清楚"这个模型到底是怎么来的"的凭证。
+
 ---
 
 ## 今日复盘
