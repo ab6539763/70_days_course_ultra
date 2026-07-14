@@ -296,7 +296,7 @@ flowchart TB
 
 ## 代码实战
 
-> 以下代码基于Day33完成的"混合检索+重排序"版本RAG系统展开,新增评估相关的三个核心模块:测试集构建脚本、Ragas评估调用脚本、评估报告自动生成脚本(含图表化展示)。代码风格延续团队既有规范:PEP8、中文docstring、关键逻辑配中文行内注释。
+> 以下代码基于Day33完成的"混合检索+重排序"版本RAG系统展开,新增评估相关的七个核心模块:测试集构建脚本、Ragas评估调用脚本、评估报告自动生成脚本(含图表化展示),以及晚自习补充的CI集成评估门禁脚本、历史评估结果追踪与版本对比、进阶可视化(箱线图/热力图)、评估工具链单元测试。代码风格延续团队既有规范:PEP8、中文docstring、关键逻辑配中文行内注释。
 
 ### 环境准备
 
@@ -1753,6 +1753,980 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+```
+
+晚自习环节,老王又追加了一个要求:"今天上午和下午的三个模块,已经能完整跑通‘构建测试集→执行评估→生成报告’这条链路,但这套东西目前还只能‘人工触发、人工看结果’,离真正的工程化交付,还差‘持续集成’这一步——如果哪天有同事不小心改坏了Prompt模板,或者不小心调错了chunk_size,评估指标掉下去了,不能靠‘正好今天有人手动跑了一次评估’才被发现,应该做成CI流水线里的一道自动门禁,指标不达标就直接拦住,不让代码合并。"陈铭当天晚上又补充了四个文件,分别是"CI评估门禁脚本"、"历史评估结果追踪与对比"、"进阶可视化(箱线图、热力图)"、"框架级单元测试",作为今天评估体系的收尾。
+
+### 模块四:`ci_evaluation_gate.py` —— CI集成的评估门禁脚本
+
+```python
+"""
+backend/app/rag/evaluation/ci_evaluation_gate.py
+
+海纳制造集团RAG问答系统 · CI集成评估门禁脚本
+
+功能说明:
+1. 读取run_ragas_evaluation.py产出的最新评估结果。
+2. 依据团队约定的阈值规则(基本达标线、警戒线),判断本次评估是否"通过门禁"。
+3. 以标准的进程退出码(exit code)形式,把判断结果传递给CI流水线
+   (如GitHub Actions、GitLab CI),0表示通过,非0表示拦截。
+4. 生成一份简明的门禁判定报告,写入CI的构建日志,方便合并请求评审时快速查看。
+
+设计说明:
+    这个脚本刻意不依赖任何具体CI平台的专有API,只使用标准的
+    sys.exit()和标准输出,这样它可以无缝接入GitHub Actions、GitLab CI、
+    Jenkins等任意主流CI系统,只需要在流水线配置文件里加一行
+    "python ci_evaluation_gate.py"即可,不需要额外的平台适配代码。
+"""
+
+import json
+import os
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Dict, List, Optional
+
+import pandas as pd
+
+# 复用report_generator.py里已经定义好的指标名称映射与阈值常量,
+# 避免在两个文件里各维护一份容易走样的重复配置。
+from generate_report import (
+    METRIC_NAME_MAP,
+    PASS_THRESHOLD,
+    WARNING_THRESHOLD,
+    compute_overall_stats,
+    compute_dimension_breakdown,
+    load_evaluation_result,
+)
+
+
+@dataclass
+class GateRule:
+    """单条门禁规则的数据结构。
+
+    字段说明:
+        metric_key: 指标英文字段名,如"faithfulness"。
+        min_value: 该指标允许的最低均值,低于此值视为门禁不通过。
+        severity: 规则严重级别,"blocking"表示不达标直接拦截CI,
+                  "warning"表示不达标只发出警告、不拦截CI(用于逐步收紧标准的过渡期)。
+    """
+
+    metric_key: str
+    min_value: float
+    severity: str = "blocking"
+
+
+@dataclass
+class GateResult:
+    """门禁判定的完整结果。"""
+
+    passed: bool
+    blocking_violations: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    checked_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    detail_lines: List[str] = field(default_factory=list)
+
+
+# 团队约定的默认门禁规则集:四项核心指标均要求不低于PASS_THRESHOLD才算真正达标,
+# 但考虑到上下文召回率目前是已知的短板(今天评估出来是0.68),暂定为"warning"级别,
+# 不阻塞CI流水线,给团队留出渐进式改进的空间,其余三项已经达标的指标,
+# 一旦出现明显回退,则应该严格拦截,防止"改一个地方,坏了另一个地方"这种回归问题被合并进主干。
+DEFAULT_GATE_RULES: List[GateRule] = [
+    GateRule(metric_key="faithfulness", min_value=PASS_THRESHOLD, severity="blocking"),
+    GateRule(metric_key="answer_relevancy", min_value=PASS_THRESHOLD, severity="blocking"),
+    GateRule(metric_key="context_precision", min_value=WARNING_THRESHOLD, severity="blocking"),
+    GateRule(metric_key="context_recall", min_value=WARNING_THRESHOLD, severity="warning"),
+]
+
+
+def evaluate_gate(
+    overall_stats: Dict[str, Dict[str, float]],
+    rules: Optional[List[GateRule]] = None,
+) -> GateResult:
+    """根据门禁规则集,对最新一次评估结果的整体统计做门禁判定。
+
+    :param overall_stats: compute_overall_stats()的输出结果
+    :param rules: 门禁规则列表,默认使用DEFAULT_GATE_RULES
+    :return: GateResult门禁判定结果
+    """
+    rules = rules if rules is not None else DEFAULT_GATE_RULES
+    result = GateResult(passed=True)
+
+    for rule in rules:
+        metric_stats = overall_stats.get(rule.metric_key)
+        metric_name = METRIC_NAME_MAP.get(rule.metric_key, rule.metric_key)
+
+        if metric_stats is None:
+            result.detail_lines.append(
+                f"[跳过] 指标 {metric_name} 在本次评估结果中未找到对应数据,无法判定该规则。"
+            )
+            continue
+
+        actual_value = metric_stats["均值"]
+        line = (
+            f"[{rule.severity}] {metric_name}: 实际均值={actual_value:.3f}, "
+            f"门禁要求最低值={rule.min_value:.3f}"
+        )
+
+        if actual_value < rule.min_value:
+            line += "  → 未达标"
+            if rule.severity == "blocking":
+                result.passed = False
+                result.blocking_violations.append(
+                    f"{metric_name}实际得分{actual_value:.3f}低于门禁要求的{rule.min_value:.3f}"
+                )
+            else:
+                result.warnings.append(
+                    f"{metric_name}实际得分{actual_value:.3f}低于建议阈值{rule.min_value:.3f}(非阻塞级警告)"
+                )
+        else:
+            line += "  → 达标"
+
+        result.detail_lines.append(line)
+
+    return result
+
+
+def check_regression_against_baseline(
+    current_stats: Dict[str, Dict[str, float]],
+    baseline_stats: Dict[str, Dict[str, float]],
+    max_allowed_drop: float = 0.05,
+) -> List[str]:
+    """检查本次评估结果相较历史基线,是否存在明显的指标回退。
+
+    设计意图:
+        门禁规则只能保证"不低于绝对阈值",但如果某项指标此前一直
+        稳定在0.95左右,这次意外掉到0.80,虽然依然高于0.75的门禁线、
+        不会被evaluate_gate()拦截,但这种"相对大幅下滑"本身就是一个
+        危险信号,值得单独检测出来提醒团队关注,即便还没有跌破硬性红线。
+    :param current_stats: 本次评估的整体统计结果
+    :param baseline_stats: 历史基线(如上一个已知稳定版本)的整体统计结果
+    :param max_allowed_drop: 允许的最大下滑幅度,超过此值视为回归
+    :return: 检测到的回归问题描述列表
+    """
+    regressions: List[str] = []
+
+    for metric_key, metric_name in METRIC_NAME_MAP.items():
+        current_value = current_stats.get(metric_key, {}).get("均值")
+        baseline_value = baseline_stats.get(metric_key, {}).get("均值")
+
+        if current_value is None or baseline_value is None:
+            continue
+
+        drop = baseline_value - current_value
+        if drop > max_allowed_drop:
+            regressions.append(
+                f"{metric_name}相较基线版本下滑{drop:.3f}"
+                f"(基线{baseline_value:.3f} → 本次{current_value:.3f}),"
+                f"超过允许的最大下滑幅度{max_allowed_drop:.3f},疑似发生回归,建议人工复核。"
+            )
+
+    return regressions
+
+
+def render_gate_report_markdown(gate_result: GateResult, regressions: List[str]) -> str:
+    """把门禁判定结果渲染成一份适合直接粘贴进CI日志或PR评论区的Markdown文本。
+
+    :param gate_result: evaluate_gate()的判定结果
+    :param regressions: check_regression_against_baseline()检测到的回归问题列表
+    :return: 渲染好的Markdown文本
+    """
+    lines: List[str] = []
+    status_emoji = "✅" if gate_result.passed else "❌"
+    lines.append(f"## {status_emoji} RAG评估门禁检查结果")
+    lines.append("")
+    lines.append(f"检查时间:{gate_result.checked_at}")
+    lines.append("")
+    lines.append("### 指标详情")
+    lines.append("")
+    for line in gate_result.detail_lines:
+        lines.append(f"- {line}")
+    lines.append("")
+
+    if gate_result.blocking_violations:
+        lines.append("### 阻塞性问题(必须修复才能合并)")
+        lines.append("")
+        for violation in gate_result.blocking_violations:
+            lines.append(f"- ❌ {violation}")
+        lines.append("")
+
+    if gate_result.warnings:
+        lines.append("### 非阻塞警告(建议关注,不影响本次合并)")
+        lines.append("")
+        for warning in gate_result.warnings:
+            lines.append(f"- ⚠️ {warning}")
+        lines.append("")
+
+    if regressions:
+        lines.append("### 相对历史基线的回归检测")
+        lines.append("")
+        for regression in regressions:
+            lines.append(f"- ⚠️ {regression}")
+        lines.append("")
+
+    lines.append("---")
+    lines.append(
+        "结论:" + ("本次变更未触发任何阻塞性门禁规则,可以继续合并流程。"
+                   if gate_result.passed else
+                   "本次变更触发了阻塞性门禁规则,请先修复相关问题后再重新提交评估。")
+    )
+
+    return "\n".join(lines)
+
+
+def load_baseline_stats(baseline_path: str) -> Optional[Dict[str, Dict[str, float]]]:
+    """加载历史基线的整体统计结果,用于回归检测。
+
+    :param baseline_path: 基线统计结果JSON文件路径
+    :return: 基线统计字典,文件不存在时返回None(表示尚无历史基线,跳过回归检测)
+    """
+    if not os.path.exists(baseline_path):
+        return None
+    with open(baseline_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_current_stats_as_baseline(overall_stats: Dict[str, Dict[str, float]], baseline_path: str) -> None:
+    """将本次评估结果保存为新的基线,供下一次CI运行做回归对比。
+
+    设计意图:
+        只有在门禁判定为"通过"的情况下才应该调用这个函数更新基线,
+        避免一个本身就不达标的评估结果被错误地固化为新的参照标准,
+        这个调用时机的约束在ci_evaluation_gate的main()流程中体现。
+    :param overall_stats: 本次评估的整体统计结果
+    :param baseline_path: 基线保存路径
+    """
+    os.makedirs(os.path.dirname(baseline_path), exist_ok=True)
+    with open(baseline_path, "w", encoding="utf-8") as f:
+        json.dump(overall_stats, f, ensure_ascii=False, indent=2)
+    print(f"已将本次评估结果保存为新的基线:{baseline_path}")
+
+
+def main() -> None:
+    """CI门禁脚本主流程,供CI流水线直接调用。
+
+    退出码约定:
+        0  —— 门禁通过,CI流水线可以继续后续步骤(如合并、部署)
+        1  —— 门禁未通过,CI流水线应当终止,阻止代码合并
+    """
+    result_csv_path = os.environ.get(
+        "RAG_EVAL_RESULT_CSV",
+        "backend/app/rag/evaluation/results/evaluation_result_latest.csv",
+    )
+    baseline_path = os.environ.get(
+        "RAG_EVAL_BASELINE_JSON",
+        "backend/app/rag/evaluation/results/baseline_stats.json",
+    )
+
+    if not os.path.exists(result_csv_path):
+        print(f"错误:未找到评估结果文件 {result_csv_path},门禁检查无法执行。")
+        sys.exit(1)
+
+    result_df = load_evaluation_result(result_csv_path)
+    overall_stats = compute_overall_stats(result_df)
+
+    gate_result = evaluate_gate(overall_stats)
+
+    baseline_stats = load_baseline_stats(baseline_path)
+    regressions = (
+        check_regression_against_baseline(overall_stats, baseline_stats)
+        if baseline_stats is not None
+        else []
+    )
+    if regressions:
+        # 回归问题即便不属于绝对阈值意义上的"未达标",也应该体现在
+        # 是否放行的决策里——团队约定,任何指标的显著回归,同样应当拦截CI,
+        # 避免"温水煮青蛘"式的渐进式质量劣化在多次小幅下滑中被忽视。
+        gate_result.passed = False
+        gate_result.blocking_violations.extend(regressions)
+
+    report_text = render_gate_report_markdown(gate_result, regressions)
+    print(report_text)
+
+    report_output_path = os.environ.get(
+        "RAG_EVAL_GATE_REPORT_PATH",
+        "backend/app/rag/evaluation/report/gate_report.md",
+    )
+    os.makedirs(os.path.dirname(report_output_path), exist_ok=True)
+    with open(report_output_path, "w", encoding="utf-8") as f:
+        f.write(report_text)
+
+    if gate_result.passed:
+        save_current_stats_as_baseline(overall_stats, baseline_path)
+        sys.exit(0)
+    else:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+上面这份脚本对应的GitHub Actions配置片段大致如下(仅作教学参考,实际接入海纳项目CI流水线时,由张凡负责最终落地调整):
+
+```yaml
+# .github/workflows/rag_evaluation_gate.yml
+name: RAG评估门禁检查
+
+on:
+  pull_request:
+    paths:
+      - "backend/app/rag/**"
+
+jobs:
+  evaluation-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装依赖
+        run: pip install -r backend/requirements.txt
+      - name: 运行Ragas评估
+        run: python backend/app/rag/evaluation/run_ragas_evaluation.py
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      - name: 执行评估门禁检查
+        run: python backend/app/rag/evaluation/ci_evaluation_gate.py
+```
+
+### 模块五:`evaluation_history_tracker.py` —— 历史评估结果追踪与版本对比
+
+```python
+"""
+backend/app/rag/evaluation/evaluation_history_tracker.py
+
+海纳制造集团RAG问答系统 · 历史评估结果追踪与版本对比脚本
+
+功能说明:
+1. 把每一次评估的关键统计结果,追加记录到一份持久化的历史追踪文件里,
+   形成一条随时间推移的指标变化时间线。
+2. 支持任意两次历史评估结果之间的对比,生成"哪些指标提升了、哪些下降了"
+   的差异分析,用于团队复盘"这次代码改动到底带来了什么真实影响"。
+3. 提供简单的趋势图绘制能力,把某项指标随时间的变化画成折线图。
+
+设计意图:
+    评估这件事最容易犯的错误,是"只看这一次的结果,不看历史的变化趋势"。
+    今天上午architecture图里强调的"评估应该是持续迭代的闭环",
+    如果没有一份长期积累的历史记录,这句话就只是一句口号,
+    团队没有任何数据支撑去回答"我们是不是真的在变好"这个问题。
+"""
+
+import json
+import os
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from typing import Dict, List, Optional
+
+import matplotlib
+import matplotlib.pyplot as plt
+
+matplotlib.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "Arial Unicode MS"]
+matplotlib.rcParams["axes.unicode_minus"] = False
+
+
+@dataclass
+class EvaluationHistoryEntry:
+    """单次评估结果在历史追踪文件中的记录条目。
+
+    字段说明:
+        run_id: 本次评估的唯一标识,通常用时间戳生成。
+        run_at: 评估执行时间。
+        rag_system_version: 被评估的RAG系统版本标识(如"Day33混合检索+重排序版本")。
+        testset_version: 使用的测试集版本。
+        metric_scores: 四项核心指标的均值,以字典形式保存。
+        note: 补充说明,例如本次评估对应的代码改动摘要。
+    """
+
+    run_id: str
+    run_at: str
+    rag_system_version: str
+    testset_version: str
+    metric_scores: Dict[str, float]
+    note: str = ""
+
+
+class EvaluationHistoryTracker:
+    """历史评估结果追踪器,负责把评估记录持久化到JSON文件,并支持查询与对比。"""
+
+    def __init__(self, history_path: str):
+        """
+        :param history_path: 历史追踪文件路径
+        """
+        self.history_path = history_path
+        self._entries: List[EvaluationHistoryEntry] = self._load()
+
+    def _load(self) -> List[EvaluationHistoryEntry]:
+        """从磁盘加载已有的历史记录,文件不存在时返回空列表。"""
+        if not os.path.exists(self.history_path):
+            return []
+        with open(self.history_path, "r", encoding="utf-8") as f:
+            raw_entries = json.load(f)
+        return [EvaluationHistoryEntry(**entry) for entry in raw_entries]
+
+    def _persist(self) -> None:
+        """把当前内存中的全部历史记录,完整写回磁盘文件。"""
+        os.makedirs(os.path.dirname(self.history_path), exist_ok=True)
+        with open(self.history_path, "w", encoding="utf-8") as f:
+            json.dump([asdict(entry) for entry in self._entries], f, ensure_ascii=False, indent=2)
+
+    def record(
+        self,
+        overall_stats: Dict[str, Dict[str, float]],
+        rag_system_version: str,
+        testset_version: str,
+        note: str = "",
+    ) -> EvaluationHistoryEntry:
+        """记录一次新的评估结果到历史追踪文件。
+
+        :param overall_stats: compute_overall_stats()的输出结果
+        :param rag_system_version: 被评估的RAG系统版本标识
+        :param testset_version: 使用的测试集版本
+        :param note: 补充说明
+        :return: 新创建的历史记录条目
+        """
+        run_id = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+        metric_scores = {
+            metric_key: stats["均值"] for metric_key, stats in overall_stats.items()
+        }
+
+        entry = EvaluationHistoryEntry(
+            run_id=run_id,
+            run_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            rag_system_version=rag_system_version,
+            testset_version=testset_version,
+            metric_scores=metric_scores,
+            note=note,
+        )
+        self._entries.append(entry)
+        self._persist()
+        return entry
+
+    def get_all_entries(self) -> List[EvaluationHistoryEntry]:
+        """返回全部历史记录条目(按记录时间顺序)。"""
+        return list(self._entries)
+
+    def get_latest_entry(self) -> Optional[EvaluationHistoryEntry]:
+        """返回最近一次的历史记录条目,历史为空时返回None。"""
+        return self._entries[-1] if self._entries else None
+
+    def compare(self, run_id_a: str, run_id_b: str) -> Dict[str, Dict[str, float]]:
+        """对比两次历史评估结果的差异。
+
+        :param run_id_a: 第一次评估的run_id(视为"较早"的一次,用作对比基准)
+        :param run_id_b: 第二次评估的run_id(视为"较晚"的一次)
+        :return: 每项指标的{"较早": x, "较晚": y, "变化量": y-x}对比字典
+        :raises ValueError: 当任意一个run_id在历史记录中找不到时抛出
+        """
+        entry_a = next((e for e in self._entries if e.run_id == run_id_a), None)
+        entry_b = next((e for e in self._entries if e.run_id == run_id_b), None)
+
+        if entry_a is None:
+            raise ValueError(f"未找到run_id为{run_id_a}的历史记录")
+        if entry_b is None:
+            raise ValueError(f"未找到run_id为{run_id_b}的历史记录")
+
+        comparison: Dict[str, Dict[str, float]] = {}
+        all_metric_keys = set(entry_a.metric_scores.keys()) | set(entry_b.metric_scores.keys())
+
+        for metric_key in all_metric_keys:
+            before = entry_a.metric_scores.get(metric_key, 0.0)
+            after = entry_b.metric_scores.get(metric_key, 0.0)
+            comparison[metric_key] = {
+                "较早": round(before, 4),
+                "较晚": round(after, 4),
+                "变化量": round(after - before, 4),
+            }
+
+        return comparison
+
+    def plot_metric_trend(self, metric_key: str, output_path: str) -> None:
+        """绘制某一项指标随历史评估时间推移的变化折线图。
+
+        :param metric_key: 要绘制的指标英文字段名
+        :param output_path: 图片输出路径
+        """
+        run_labels = [entry.run_id.replace("run_", "") for entry in self._entries]
+        values = [entry.metric_scores.get(metric_key, None) for entry in self._entries]
+
+        # 过滤掉某些历史版本可能没有记录该指标的情况(比如早期版本还没引入这项指标)
+        filtered = [(label, value) for label, value in zip(run_labels, values) if value is not None]
+        if not filtered:
+            print(f"警告:历史记录中没有任何一次评估记录了指标{metric_key},无法绘制趋势图。")
+            return
+
+        filtered_labels, filtered_values = zip(*filtered)
+
+        fig, ax = plt.subplots(figsize=(9, 4))
+        ax.plot(filtered_labels, filtered_values, marker="o", linewidth=2, color="#2E86AB")
+        ax.set_title(f"{metric_key} 指标历史趋势")
+        ax.set_ylabel("指标得分")
+        ax.set_ylim(0, 1)
+        ax.tick_params(axis="x", rotation=45)
+        ax.grid(True, linestyle="--", alpha=0.4)
+
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=150)
+        plt.close(fig)
+        print(f"指标历史趋势图已保存至:{output_path}")
+
+
+def render_comparison_markdown(comparison: Dict[str, Dict[str, float]], metric_name_map: Dict[str, str]) -> str:
+    """把compare()的对比结果,渲染成一段Markdown表格文本,便于写入报告或PR评论。
+
+    :param comparison: EvaluationHistoryTracker.compare()的输出结果
+    :param metric_name_map: 指标英文字段名到中文名称的映射
+    :return: 渲染好的Markdown文本
+    """
+    lines = ["| 指标 | 较早得分 | 较晚得分 | 变化量 | 变化方向 |", "|---|---|---|---|---|"]
+    for metric_key, values in comparison.items():
+        name = metric_name_map.get(metric_key, metric_key)
+        change = values["变化量"]
+        direction = "📈 提升" if change > 0 else ("📉 下降" if change < 0 else "➡️ 持平")
+        lines.append(
+            f"| {name} | {values['较早']:.3f} | {values['较晚']:.3f} | "
+            f"{change:+.3f} | {direction} |"
+        )
+    return "\n".join(lines)
+```
+
+### 模块六:`advanced_visualization.py` —— 进阶可视化(箱线图与热力图)
+
+```python
+"""
+backend/app/rag/evaluation/advanced_visualization.py
+
+海纳制造集团RAG问答系统 · 评估结果进阶可视化脚本
+
+功能说明:
+    在generate_report.py已有的雷达图、柱状图基础上,补充两种更能揭示
+    数据分布细节的图表类型:
+    1. 箱线图(Box Plot):展示每项指标的得分分布情况(中位数、四分位、异常值),
+       弥补"只看均值和标准差,看不出具体分布形态"的局限。
+    2. 热力图(Heatmap):展示"业务类型 × 难度分级"这个二维交叉视角下,
+       某项指标(默认为上下文召回率,因为它是今天暴露出的最大短板)的
+       表现分布,直观定位"哪个业务类型的哪个难度档,是短板最集中的区域"。
+"""
+
+import os
+from typing import Dict, List
+
+import numpy as np
+import pandas as pd
+import matplotlib
+import matplotlib.pyplot as plt
+
+matplotlib.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "Arial Unicode MS"]
+matplotlib.rcParams["axes.unicode_minus"] = False
+
+from generate_report import METRIC_NAME_MAP, PASS_THRESHOLD
+
+
+def plot_metric_boxplot(result_df: pd.DataFrame, output_path: str) -> None:
+    """绘制四项核心指标的箱线图,展示得分分布细节。
+
+    :param result_df: 评估结果明细DataFrame(即run_ragas_evaluation.py产出的结果)
+    :param output_path: 图片保存路径
+    """
+    metric_keys = [k for k in METRIC_NAME_MAP.keys() if k in result_df.columns]
+    labels = [METRIC_NAME_MAP[k] for k in metric_keys]
+    data = [result_df[k].dropna().tolist() for k in metric_keys]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    box = ax.boxplot(
+        data,
+        labels=labels,
+        patch_artist=True,
+        showmeans=True,
+        meanline=True,
+    )
+
+    colors = ["#1565c0", "#ad1457", "#2e7d32", "#c9a227"]
+    for patch, color in zip(box["boxes"], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.35)
+
+    ax.axhline(y=PASS_THRESHOLD, color="#c0392b", linewidth=1, linestyle="--", label="基本达标线 0.75")
+    ax.set_ylim(0, 1.05)
+    ax.set_ylabel("指标得分")
+    ax.set_title("四项核心指标得分分布箱线图")
+    ax.legend(loc="lower left")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"箱线图已保存至:{output_path}")
+
+
+def plot_cross_dimension_heatmap(
+    result_df: pd.DataFrame,
+    metric_key: str,
+    output_path: str,
+) -> None:
+    """绘制"业务类型 × 难度分级"二维交叉视角下,某项指标的表现热力图。
+
+    :param result_df: 评估结果明细DataFrame
+    :param metric_key: 要展示的指标英文字段名,默认建议传入"context_recall"
+    :param output_path: 图片保存路径
+    """
+    metric_name = METRIC_NAME_MAP.get(metric_key, metric_key)
+
+    pivot_table = result_df.pivot_table(
+        index="business_type",
+        columns="difficulty",
+        values=metric_key,
+        aggfunc="mean",
+    )
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    im = ax.imshow(pivot_table.values, cmap="RdYlGn", vmin=0, vmax=1, aspect="auto")
+
+    ax.set_xticks(np.arange(len(pivot_table.columns)))
+    ax.set_xticklabels(pivot_table.columns, rotation=20, ha="right")
+    ax.set_yticks(np.arange(len(pivot_table.index)))
+    ax.set_yticklabels(pivot_table.index)
+
+    # 在每个格子里标注具体数值,方便直接读数,不需要额外对照颜色刻度条估算
+    for i in range(len(pivot_table.index)):
+        for j in range(len(pivot_table.columns)):
+            value = pivot_table.values[i, j]
+            if not np.isnan(value):
+                text_color = "white" if value < 0.5 else "black"
+                ax.text(j, i, f"{value:.2f}", ha="center", va="center", color=text_color, fontsize=10)
+
+    ax.set_title(f"{metric_name} · 业务类型×难度分级 交叉热力图")
+    fig.colorbar(im, ax=ax, label=f"{metric_name}得分")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"交叉热力图已保存至:{output_path}")
+
+
+def find_worst_cross_dimension_cell(
+    result_df: pd.DataFrame, metric_key: str
+) -> Dict[str, object]:
+    """从"业务类型×难度分级"交叉统计表里,找出表现最差的那个格子,
+    用于报告中直接点名"短板最集中的具体场景"。
+
+    :param result_df: 评估结果明细DataFrame
+    :param metric_key: 要分析的指标英文字段名
+    :return: 包含最差格子的业务类型、难度分级、得分的字典
+    """
+    pivot_table = result_df.pivot_table(
+        index="business_type",
+        columns="difficulty",
+        values=metric_key,
+        aggfunc="mean",
+    )
+
+    # stack()把二维交叉表展平成一维,方便用idxmin()直接定位最小值所在的(行, 列)组合
+    stacked = pivot_table.stack()
+    worst_business_type, worst_difficulty = stacked.idxmin()
+    worst_score = stacked.min()
+
+    return {
+        "业务类型": worst_business_type,
+        "难度分级": worst_difficulty,
+        "得分": round(float(worst_score), 4),
+    }
+
+
+def generate_advanced_visualization_bundle(result_df: pd.DataFrame, output_dir: str) -> List[str]:
+    """一次性生成本模块提供的全部进阶可视化图表,返回生成的文件路径列表。
+
+    :param result_df: 评估结果明细DataFrame
+    :param output_dir: 图片输出目录
+    :return: 已生成的图片文件路径列表
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    generated_paths = []
+
+    boxplot_path = os.path.join(output_dir, "metric_boxplot.png")
+    plot_metric_boxplot(result_df, boxplot_path)
+    generated_paths.append(boxplot_path)
+
+    heatmap_path = os.path.join(output_dir, "context_recall_heatmap.png")
+    plot_cross_dimension_heatmap(result_df, "context_recall", heatmap_path)
+    generated_paths.append(heatmap_path)
+
+    worst_cell = find_worst_cross_dimension_cell(result_df, "context_recall")
+    print(
+        f"上下文召回率表现最差的交叉场景:业务类型={worst_cell['业务类型']}, "
+        f"难度分级={worst_cell['难度分级']}, 得分={worst_cell['得分']}"
+    )
+
+    return generated_paths
+```
+
+### 模块七:`test_evaluation_toolkit.py` —— 评估工具链单元测试(pytest风格)
+
+```python
+"""
+backend/app/rag/evaluation/test_evaluation_toolkit.py
+
+海纳制造集团RAG问答系统 · 评估工具链单元测试
+
+功能说明:
+    覆盖今天新补充的三个模块(ci_evaluation_gate.py、
+    evaluation_history_tracker.py、advanced_visualization.py)的核心逻辑,
+    以及对build_testset.py测试集校验逻辑的补充测试。全部测试均使用
+    构造好的模拟数据,不依赖真实的Ragas评估调用或大模型API,
+    可以在任何环境下快速独立运行。
+
+运行方式:
+    pytest backend/app/rag/evaluation/test_evaluation_toolkit.py -v
+"""
+
+import os
+import tempfile
+
+import pandas as pd
+import pytest
+
+from build_testset import (
+    BusinessType,
+    DifficultyLevel,
+    TestCase,
+    validate_testset,
+)
+from ci_evaluation_gate import (
+    GateRule,
+    evaluate_gate,
+    check_regression_against_baseline,
+)
+from evaluation_history_tracker import EvaluationHistoryTracker
+from advanced_visualization import find_worst_cross_dimension_cell
+
+
+# ============================================================
+# build_testset.py 补充测试
+# ============================================================
+
+class TestValidateTestset:
+    """针对测试集质量校验逻辑的测试类。"""
+
+    def _make_case(self, case_id, business_type, difficulty):
+        """构造一条简化的测试用例,仅用于校验逻辑测试,不关注具体业务内容。"""
+        return TestCase(
+            case_id=case_id,
+            question="测试问题",
+            ground_truth="测试标准答案",
+            business_type=business_type,
+            difficulty=difficulty,
+        )
+
+    def test_validate_testset_detects_insufficient_sample_size(self):
+        """样本量不足30条时,应该被正确识别为不满足最低样本量要求。"""
+        small_testset = [
+            self._make_case(f"T-{i}", BusinessType.OPERATION, DifficultyLevel.EASY)
+            for i in range(10)
+        ]
+        result = validate_testset(small_testset)
+        assert result["是否满足最低样本量要求"] is False
+        assert result["总样本量"] == 10
+
+    def test_validate_testset_detects_missing_business_type(self):
+        """当某个业务类型完全没有样本覆盖时,应该被正确列在"缺失的业务类型"里。"""
+        testset = [
+            self._make_case(f"T-{i}", BusinessType.OPERATION, DifficultyLevel.EASY)
+            for i in range(35)
+        ]
+        result = validate_testset(testset)
+        missing = set(result["缺失的业务类型"])
+        assert BusinessType.SAFETY.value in missing
+        assert BusinessType.ALARM_CODE.value in missing
+
+    def test_validate_testset_passes_with_full_coverage(self):
+        """当样本量充足且五大业务类型均有覆盖时,应正确判定为满足要求。"""
+        business_types = list(BusinessType)
+        testset = []
+        for i in range(35):
+            business_type = business_types[i % len(business_types)]
+            testset.append(self._make_case(f"T-{i}", business_type, DifficultyLevel.EASY))
+
+        result = validate_testset(testset)
+        assert result["是否满足最低样本量要求"] is True
+        assert result["缺失的业务类型"] == []
+
+
+# ============================================================
+# ci_evaluation_gate.py 测试
+# ============================================================
+
+class TestEvaluationGate:
+    """针对CI评估门禁判定逻辑的测试类。"""
+
+    def test_evaluate_gate_passes_when_all_metrics_meet_threshold(self):
+        """所有指标均达标时,门禁应判定为通过,且没有任何阻塞性问题。"""
+        overall_stats = {
+            "faithfulness": {"均值": 0.86},
+            "answer_relevancy": {"均值": 0.81},
+            "context_precision": {"均值": 0.79},
+            "context_recall": {"均值": 0.68},
+        }
+        result = evaluate_gate(overall_stats)
+        assert result.passed is True
+        assert result.blocking_violations == []
+
+    def test_evaluate_gate_blocks_when_blocking_metric_fails(self):
+        """当"blocking"级别的规则不达标时,门禁应判定为不通过。"""
+        overall_stats = {
+            "faithfulness": {"均值": 0.50},  # 明显低于0.75的门禁要求
+            "answer_relevancy": {"均值": 0.81},
+            "context_precision": {"均值": 0.79},
+            "context_recall": {"均值": 0.68},
+        }
+        result = evaluate_gate(overall_stats)
+        assert result.passed is False
+        assert len(result.blocking_violations) == 1
+        assert "忠实度" in result.blocking_violations[0]
+
+    def test_evaluate_gate_warning_metric_does_not_block(self):
+        """当只有"warning"级别的规则不达标时,门禁依然应该判定为通过。"""
+        overall_stats = {
+            "faithfulness": {"均值": 0.86},
+            "answer_relevancy": {"均值": 0.81},
+            "context_precision": {"均值": 0.79},
+            "context_recall": {"均值": 0.10},  # 明显偏低,但context_recall是warning级别规则
+        }
+        result = evaluate_gate(overall_stats)
+        assert result.passed is True
+        assert len(result.warnings) == 1
+
+    def test_evaluate_gate_custom_rules(self):
+        """验证门禁函数支持传入自定义规则集,不局限于默认规则。"""
+        custom_rules = [
+            GateRule(metric_key="faithfulness", min_value=0.95, severity="blocking"),
+        ]
+        overall_stats = {"faithfulness": {"均值": 0.86}}
+        result = evaluate_gate(overall_stats, rules=custom_rules)
+        assert result.passed is False
+
+    def test_evaluate_gate_handles_missing_metric_gracefully(self):
+        """当整体统计结果中缺失某项规则要求的指标时,不应该抛出异常,
+        应该跳过该规则并在详情中说明情况。"""
+        overall_stats = {"faithfulness": {"均值": 0.86}}
+        result = evaluate_gate(overall_stats)
+        assert result.passed is True
+        assert any("跳过" in line for line in result.detail_lines)
+
+
+class TestRegressionCheck:
+    """针对历史基线回归检测逻辑的测试类。"""
+
+    def test_detects_regression_beyond_allowed_drop(self):
+        """当某项指标相较基线下滑幅度超过允许范围时,应正确检测出回归问题。"""
+        current_stats = {"faithfulness": {"均值": 0.70}}
+        baseline_stats = {"faithfulness": {"均值": 0.86}}
+        regressions = check_regression_against_baseline(
+            current_stats, baseline_stats, max_allowed_drop=0.05
+        )
+        assert len(regressions) == 1
+        assert "忠实度" in regressions[0]
+
+    def test_no_regression_within_allowed_drop(self):
+        """当指标下滑幅度在允许范围内时(轻微波动),不应该被判定为回归。"""
+        current_stats = {"faithfulness": {"均值": 0.84}}
+        baseline_stats = {"faithfulness": {"均值": 0.86}}
+        regressions = check_regression_against_baseline(
+            current_stats, baseline_stats, max_allowed_drop=0.05
+        )
+        assert regressions == []
+
+    def test_no_regression_when_metric_improves(self):
+        """当指标相较基线反而提升时,自然不应该被判定为回归。"""
+        current_stats = {"faithfulness": {"均值": 0.90}}
+        baseline_stats = {"faithfulness": {"均值": 0.86}}
+        regressions = check_regression_against_baseline(current_stats, baseline_stats)
+        assert regressions == []
+
+
+# ============================================================
+# evaluation_history_tracker.py 测试
+# ============================================================
+
+class TestEvaluationHistoryTracker:
+    """针对历史评估结果追踪器的测试类。"""
+
+    def test_record_and_reload_persists_correctly(self):
+        """记录一次评估结果并持久化后,重新创建追踪器实例读取同一个文件,
+        应该能正确恢复历史记录(模拟"进程重启后继续追踪"的场景)。"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            history_path = os.path.join(tmp_dir, "history.json")
+            overall_stats = {"faithfulness": {"均值": 0.86}}
+
+            tracker_1 = EvaluationHistoryTracker(history_path)
+            entry = tracker_1.record(
+                overall_stats, rag_system_version="v1", testset_version="v2.0"
+            )
+
+            tracker_2 = EvaluationHistoryTracker(history_path)
+            latest = tracker_2.get_latest_entry()
+            assert latest is not None
+            assert latest.run_id == entry.run_id
+            assert latest.metric_scores["faithfulness"] == 0.86
+
+    def test_get_latest_entry_returns_none_when_empty(self):
+        """历史记录为空时,get_latest_entry()应该返回None,而不是抛出异常。"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            history_path = os.path.join(tmp_dir, "history.json")
+            tracker = EvaluationHistoryTracker(history_path)
+            assert tracker.get_latest_entry() is None
+
+    def test_compare_two_runs_computes_correct_delta(self):
+        """对比两次历史记录时,变化量的计算应该正确(较晚减较早)。"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            history_path = os.path.join(tmp_dir, "history.json")
+            tracker = EvaluationHistoryTracker(history_path)
+
+            entry_a = tracker.record(
+                {"faithfulness": {"均值": 0.70}}, rag_system_version="v1", testset_version="v1.0"
+            )
+            entry_b = tracker.record(
+                {"faithfulness": {"均值": 0.86}}, rag_system_version="v2", testset_version="v2.0"
+            )
+
+            comparison = tracker.compare(entry_a.run_id, entry_b.run_id)
+            assert comparison["faithfulness"]["较早"] == 0.70
+            assert comparison["faithfulness"]["较晚"] == 0.86
+            assert abs(comparison["faithfulness"]["变化量"] - 0.16) < 1e-6
+
+    def test_compare_raises_when_run_id_not_found(self):
+        """当传入的run_id在历史记录中找不到时,应该抛出ValueError,
+        提前暴露调用方传参错误,而不是静默返回一个错误的空结果。"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            history_path = os.path.join(tmp_dir, "history.json")
+            tracker = EvaluationHistoryTracker(history_path)
+            tracker.record({"faithfulness": {"均值": 0.70}}, "v1", "v1.0")
+
+            with pytest.raises(ValueError):
+                tracker.compare("run_not_exist", "run_also_not_exist")
+
+
+# ============================================================
+# advanced_visualization.py 测试
+# ============================================================
+
+class TestAdvancedVisualization:
+    """针对进阶可视化模块中不依赖真实图形渲染的纯数据分析逻辑的测试类。"""
+
+    def _make_sample_dataframe(self):
+        """构造一个用于测试的简化评估结果DataFrame,覆盖两个业务类型、两个难度分级。"""
+        return pd.DataFrame({
+            "business_type": ["操作规程", "操作规程", "报警代码", "报警代码"],
+            "difficulty": ["简单-关键词直接匹配", "困难-需综合多处文档内容"] * 2,
+            "context_recall": [0.90, 0.30, 0.85, 0.20],
+        })
+
+    def test_find_worst_cross_dimension_cell_identifies_correct_cell(self):
+        """应该正确定位到得分最低的"业务类型×难度分级"组合。"""
+        df = self._make_sample_dataframe()
+        worst = find_worst_cross_dimension_cell(df, "context_recall")
+        assert worst["业务类型"] == "报警代码"
+        assert worst["难度分级"] == "困难-需综合多处文档内容"
+        assert worst["得分"] == 0.20
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
 ```
 
 ---
