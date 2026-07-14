@@ -2393,6 +2393,1710 @@ if __name__ == "__main__":
     run_all_checks()
 ```
 
+### 文件4:`model_hierarchy_advanced.py` —— 继承体系扩展练习(新增私有化部署模型 + 比较魔术方法 + 注册中心)
+
+> 说明:老王在晚自习点评完大家的`BaseModel`继承体系之后,提出了两个"如果……会怎样"的追问,促成了这份补充代码——"如果半年后要接入私有化部署的开源模型,现有代码需要改动吗"以及"如果手里有十几个模型实例,想按调用成本排序,该怎么写"。这份文件新增了`PrivateDeployedModel`子类(验证开闭原则)、为`BaseModel`补充了`__eq__`/`__lt__`等比较魔术方法与`__len__`/`__hash__`,并新增了`ModelRegistry`这个用类方法实现的简易"厂商注册中心",进一步深化F8需求(类方法/静态方法的合理复用)背后的工厂模式思想。
+
+```python
+"""
+文件名:model_hierarchy_advanced.py
+作者:陈铭
+说明:
+    这份文件是对model_hierarchy.py的扩展练习,老王在晚自习点评完
+    大家的`BaseModel`继承体系之后,提出了两个"如果……会怎样"的追问,
+    促成了这份补充代码:
+
+    追问一:"如果半年后,公司真的要接入私有化部署的开源模型(不通过
+    任何厂商的公开API,而是调用公司内部服务器上自己跑起来的模型服务),
+    你们现在这套`BaseModel`结构,需要改动`OpenAIModel`或者`QwenModel`
+    里的哪怕一行代码吗?"——这份文件里新增的`PrivateDeployedModel`,
+    就是用来回答这个问题的:答案应该是"完全不需要改动任何已有代码,
+    只需要新增一个继承`BaseModel`的子类"，这正是"开闭原则"最直观的验证。
+
+    追问二:"如果我现在手里有十几个模型实例,想按调用成本从低到高排序,
+    你们打算怎么写?"——这份文件里给`BaseModel`补充的比较魔术方法
+    (`__eq__`、`__lt__`)，就是用来回答这个问题的：Python内置的
+    `sorted()`函数，只要对象支持比较，就能直接拿来用，不需要自己手写
+    冒泡排序或者传一个笨拙的排序函数。
+
+    另外还补充了一个`ModelRegistry`类，用类方法实现一个简易的"厂商注册中心"
+    ——这是对F8(类方法/静态方法的合理复用)这条需求的进一步深化，也是
+    "工厂模式"这个后面会反复出现的设计模式思想的第一次朴素实践。
+
+    知识范围说明:同model_hierarchy.py，不使用Day1-Day9尚未学过的模块，
+    不引入任何import语句。
+"""
+
+
+# ============================================================
+# 第一部分:BaseModel(在原版基础上补充比较魔术方法与__len__)
+# ============================================================
+
+class BaseModel:
+    """
+    模型接入层的抽象基类，在model_hierarchy.py原版的基础上，补充了：
+        __eq__/__ne__/__lt__/__le__/__gt__/__ge__ —— 让模型实例之间可以直接比较,
+            比较的依据是"预估的单次调用成本"（用max_tokens和temperature
+            粗略模拟出一个"复杂度分数"，越复杂的调用预期成本越高）。
+        __len__ —— 返回这个模型实例已经被调用过的次数，
+            让`len(model_instance)`这种写法也能有意义的返回值。
+        __hash__ —— 由于定义了__eq__，Python默认会把这个类变成不可哈希的
+            (无法放入set，无法作为dict的key)，这里显式补充__hash__，
+            让模型实例依然可以被放入集合、字典键中，这是一个容易被忽略、
+            但在真实工程代码里经常踩坑的细节。
+    """
+
+    MIN_TEMPERATURE = 0.0
+    MAX_TEMPERATURE = 2.0
+    _total_call_count = 0
+
+    def __init__(self, model_name, api_key, temperature=0.7, max_tokens=1024, timeout=30):
+        self._model_name = model_name
+        self._api_key = self._validate_api_key(api_key)
+        self._timeout = timeout
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self._call_count = 0
+
+    @staticmethod
+    def _validate_api_key(api_key):
+        """静态方法:校验api_key必须是非空字符串,与之前的判断保持一致。"""
+        if not isinstance(api_key, str) or not api_key.strip():
+            raise ValueError("api_key必须是一个非空字符串")
+        return api_key.strip()
+
+    @property
+    def temperature(self):
+        return self._temperature
+
+    @temperature.setter
+    def temperature(self, value):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise TypeError(f"temperature必须是数字,收到的是{type(value).__name__}")
+        if not (self.MIN_TEMPERATURE <= value <= self.MAX_TEMPERATURE):
+            raise ValueError(f"temperature必须在{self.MIN_TEMPERATURE}到{self.MAX_TEMPERATURE}之间")
+        self._temperature = float(value)
+
+    @property
+    def max_tokens(self):
+        return self._max_tokens
+
+    @max_tokens.setter
+    def max_tokens(self, value):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"max_tokens必须是整数,收到的是{type(value).__name__}")
+        if value <= 0:
+            raise ValueError(f"max_tokens必须是正整数,收到的是{value}")
+        self._max_tokens = value
+
+    @property
+    def api_key(self):
+        """脱敏后的api_key,规则与model_hierarchy.py保持完全一致。"""
+        key = self._api_key
+        if len(key) <= 8:
+            return "*" * len(key)
+        return key[:4] + "*" * (len(key) - 8) + key[-4:]
+
+    @property
+    def model_name(self):
+        return self._model_name
+
+    @property
+    def call_count(self):
+        """只读属性:这个实例已经被成功调用过的次数。"""
+        return self._call_count
+
+    @property
+    def complexity_score(self):
+        """
+        只读派生属性:用max_tokens和temperature粗略估算一个"调用复杂度分数",
+        分数越高,意味着这次调用预期占用的计算资源越多、成本也越高。
+
+        这只是一个教学用的简化公式,真实的成本计算(Day9晚自习点评里
+        老王提到"真实生产代码会用真实的token计费规则")要复杂得多,
+        但作为"给模型排序"这个练习的排序依据,已经足够说明问题。
+        """
+        return round(self._max_tokens * (1 + self._temperature), 2)
+
+    def build_request_payload(self, messages):
+        """组装请求体,逻辑与model_hierarchy.py保持一致。"""
+        return {
+            "model": self._model_name,
+            "messages": messages,
+            "temperature": self._temperature,
+            "max_tokens": self._max_tokens,
+        }
+
+    def chat(self, messages):
+        """父类的chat()必须被子类重写,直接调用会抛出NotImplementedError。"""
+        raise NotImplementedError(f"{type(self).__name__}还没有重写chat()方法")
+
+    def __call__(self, prompt_or_messages):
+        BaseModel._total_call_count += 1
+        self._call_count += 1
+        messages = self._normalize_input(prompt_or_messages)
+        return self.chat(messages)
+
+    @staticmethod
+    def _normalize_input(prompt_or_messages):
+        if isinstance(prompt_or_messages, str):
+            return [{"role": "user", "content": prompt_or_messages}]
+        if isinstance(prompt_or_messages, list):
+            return prompt_or_messages
+        raise TypeError("入参必须是字符串或messages列表")
+
+    def __str__(self):
+        return f"<{type(self).__name__} model_name={self._model_name!r} temperature={self._temperature}>"
+
+    def __repr__(self):
+        return (
+            f"{type(self).__name__}(model_name={self._model_name!r}, "
+            f"api_key={self.api_key!r}, temperature={self._temperature}, "
+            f"max_tokens={self._max_tokens})"
+        )
+
+    def __len__(self):
+        """
+        len(model_instance)返回这个实例已经被调用的次数。
+
+        选择用调用次数作为__len__的语义,是因为__len__的返回值必须是
+        非负整数,调用次数天然满足这个要求,而且"这个模型实例已经工作了
+        多少次"是一个直觉上说得通的"长度"概念——类似"这个对象里已经
+        累积了多少条记录"。
+        """
+        return self._call_count
+
+    def __eq__(self, other):
+        """
+        两个模型实例"相等"，定义为:它们的complexity_score完全相同。
+
+        注意:这里选择用complexity_score判断相等,而不是判断
+        model_name/api_key等是否完全一致,是因为__eq__在这个场景下
+        的设计目的，是配合下面的__lt__一起支撑"按成本排序"这个功能，
+        不是判断"是否是同一个模型配置"，这是需要在文档字符串里
+        明确写清楚的设计取舍,避免使用者产生"相等"就是"配置完全一样"
+        的误解。
+        """
+        if not isinstance(other, BaseModel):
+            return NotImplemented
+        return self.complexity_score == other.complexity_score
+
+    def __lt__(self, other):
+        """定义"小于": complexity_score更低的模型实例"更小"。"""
+        if not isinstance(other, BaseModel):
+            return NotImplemented
+        return self.complexity_score < other.complexity_score
+
+    def __le__(self, other):
+        if not isinstance(other, BaseModel):
+            return NotImplemented
+        return self.complexity_score <= other.complexity_score
+
+    def __gt__(self, other):
+        if not isinstance(other, BaseModel):
+            return NotImplemented
+        return self.complexity_score > other.complexity_score
+
+    def __ge__(self, other):
+        if not isinstance(other, BaseModel):
+            return NotImplemented
+        return self.complexity_score >= other.complexity_score
+
+    def __hash__(self):
+        """
+        Python的规则是:一旦一个类定义了__eq__,它就会自动丢失默认的
+        __hash__实现(变成unhashable,无法放进set,也不能作为dict的key)。
+        这里显式补一个__hash__,哈希值必须严格只依据__eq__判断"相等"
+        所用的那个字段(complexity_score)来计算——这是一条必须遵守的
+        铁律:如果a == b为True,那么hash(a)必须等于hash(b),否则集合和
+        字典的内部机制会出现无法预料的错误行为(比如两个"相等"的对象,
+        因为哈希值不同,被集合误判为两个不同的元素,导致去重失效)。
+        这里如果像很多人第一反应那样,把model_name也纳入哈希计算,
+        就会出现"两个complexity_score相同但model_name不同的实例,
+        __eq__判断为相等,但hash值不同"的矛盾状态,是一个非常容易
+        埋下隐患的错误写法,这里特别留意避开。
+        """
+        return hash(self.complexity_score)
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(
+            model_name=config.get("model_name"),
+            api_key=config.get("api_key"),
+            temperature=config.get("temperature", 0.7),
+            max_tokens=config.get("max_tokens", 1024),
+            timeout=config.get("timeout", 30),
+        )
+
+    @staticmethod
+    def estimate_cost(prompt_tokens, completion_tokens, price_per_1k_input, price_per_1k_output):
+        input_cost = (prompt_tokens / 1000) * price_per_1k_input
+        output_cost = (completion_tokens / 1000) * price_per_1k_output
+        return round(input_cost + output_cost, 6)
+
+    @classmethod
+    def get_total_call_count(cls):
+        return cls._total_call_count
+
+
+class OpenAIModel(BaseModel):
+    """面向"OpenAI兼容接口"的具体实现,逻辑与model_hierarchy.py一致。"""
+
+    DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
+    DEFAULT_MODEL_NAME = "deepseek-chat"
+    PROVIDER_LABEL = "openai_compatible"
+
+    def __init__(self, api_key, model_name=None, base_url=None,
+                 temperature=0.7, max_tokens=1024, timeout=30):
+        super().__init__(
+            model_name=model_name or self.DEFAULT_MODEL_NAME,
+            api_key=api_key, temperature=temperature,
+            max_tokens=max_tokens, timeout=timeout,
+        )
+        self._base_url = base_url or self.DEFAULT_BASE_URL
+
+    def chat(self, messages):
+        payload = self.build_request_payload(messages)
+        response_data = self._mock_send_request(payload, messages)
+        return self._parse_response(response_data)
+
+    def _mock_send_request(self, payload, messages):
+        last_user_message = messages[-1]["content"] if messages else ""
+        fake_reply_text = f"[OpenAI兼容模拟回复] 收到:{last_user_message}"
+        return {"choices": [{"message": {"role": "assistant", "content": fake_reply_text}}]}
+
+    @staticmethod
+    def _parse_response(response_data):
+        try:
+            return response_data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError) as exc:
+            raise ValueError(f"响应结构不符合预期:{exc}") from exc
+
+
+class QwenModel(BaseModel):
+    """面向通义千问DashScope接口的具体实现,逻辑与model_hierarchy.py一致。"""
+
+    DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    DEFAULT_MODEL_NAME = "qwen-plus"
+    PROVIDER_LABEL = "qwen_dashscope"
+
+    def __init__(self, api_key, model_name=None, base_url=None, enable_search=False,
+                 temperature=0.7, max_tokens=1024, timeout=30):
+        super().__init__(
+            model_name=model_name or self.DEFAULT_MODEL_NAME,
+            api_key=api_key, temperature=temperature,
+            max_tokens=max_tokens, timeout=timeout,
+        )
+        self._base_url = base_url or self.DEFAULT_BASE_URL
+        self._enable_search = bool(enable_search)
+
+    def chat(self, messages):
+        payload = self.build_request_payload(messages)
+        payload["enable_search"] = self._enable_search
+        response_data = self._mock_send_request(payload, messages)
+        return self._parse_response(response_data)
+
+    def _mock_send_request(self, payload, messages):
+        last_user_message = messages[-1]["content"] if messages else ""
+        fake_reply_text = f"[千问兼容模拟回复] 收到:{last_user_message}"
+        return {"choices": [{"message": {"role": "assistant", "content": fake_reply_text}}]}
+
+    @staticmethod
+    def _parse_response(response_data):
+        try:
+            return response_data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError) as exc:
+            raise ValueError(f"响应结构不符合预期:{exc}") from exc
+
+
+class PrivateDeployedModel(BaseModel):
+    """
+    新增子类:面向私有化部署模型的具体实现。
+
+    业务背景:
+        老王在晚自习点评时提到,公司的技术选型里"保留对接……未来
+        私有化部署开源模型的能力"这句话,不是随口一说——不少企业客户
+        (尤其是金融、政务这类对数据出境有严格要求的行业客户)会明确
+        要求"模型必须部署在客户自己的机房内网里，不能把任何数据发送到
+        公司之外的第三方API"。这种场景下,苍穹平台需要调用的不再是
+        某个厂商的公开云端API,而是客户内网里一台服务器上跑起来的
+        推理服务(往往是兼容OpenAI接口规范的自建推理框架)。
+
+    这个子类的存在本身就是"开闭原则"最直接的证明:从BaseModel到
+    OpenAIModel、QwenModel,再到今天新增的PrivateDeployedModel,
+    整个过程中，BaseModel、OpenAIModel、QwenModel的代码一行都没有改动。
+    """
+
+    DEFAULT_BASE_URL = "http://internal-inference-server:8000/v1"
+    DEFAULT_MODEL_NAME = "self-hosted-llm"
+    PROVIDER_LABEL = "private_deployed"
+
+    def __init__(self, api_key, internal_host, model_name=None,
+                 temperature=0.7, max_tokens=1024, timeout=60):
+        # 私有化部署场景下,api_key往往只是一个内部约定的访问令牌,
+        # 校验规则依然复用父类的_validate_api_key,不需要重新写一遍
+        super().__init__(
+            model_name=model_name or self.DEFAULT_MODEL_NAME,
+            api_key=api_key, temperature=temperature,
+            max_tokens=max_tokens, timeout=timeout,
+        )
+        self._internal_host = self._validate_internal_host(internal_host)
+
+    @staticmethod
+    def _validate_internal_host(internal_host):
+        """
+        静态方法:校验内网地址的基本格式——私有化部署场景下,这个地址
+        通常是客户内网的一个域名或IP,不应该是空字符串,也不应该
+        意外地指向了外部公网地址(这里只做一个简化的、教学用的检查,
+        真实场景里内网地址的合法性校验会复杂得多)。
+        """
+        if not isinstance(internal_host, str) or not internal_host.strip():
+            raise ValueError("internal_host必须是一个非空字符串,标识客户内网的推理服务地址")
+        return internal_host.strip()
+
+    @property
+    def internal_host(self):
+        return self._internal_host
+
+    def chat(self, messages):
+        payload = self.build_request_payload(messages)
+        payload["internal_host"] = self._internal_host
+        response_data = self._mock_send_request(payload, messages)
+        return self._parse_response(response_data)
+
+    def _mock_send_request(self, payload, messages):
+        last_user_message = messages[-1]["content"] if messages else ""
+        fake_reply_text = (
+            f"[私有化部署模拟回复, 来自内网{self._internal_host}] 收到:{last_user_message}"
+        )
+        return {"choices": [{"message": {"role": "assistant", "content": fake_reply_text}}]}
+
+    @staticmethod
+    def _parse_response(response_data):
+        try:
+            return response_data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError) as exc:
+            raise ValueError(f"响应结构不符合预期:{exc}") from exc
+
+    def __str__(self):
+        """
+        重写父类的__str__,补充一个internal_host信息——这是一个体现
+        "子类可以在super()基础上有选择地补充信息,而不是完全推倒重写"
+        的例子(虽然这里为了行文简洁选择了完全重写而不是调用super(),
+        但下面__repr__的实现会展示如何用super()来复用父类逻辑)。
+        """
+        return (
+            f"<{type(self).__name__} model_name={self._model_name!r} "
+            f"temperature={self._temperature} internal_host={self._internal_host!r}>"
+        )
+
+    def __repr__(self):
+        """
+        这里演示如何用super()复用父类的__repr__逻辑,再在结果基础上
+        补充子类特有的字段,而不是把父类里model_name/api_key/temperature/
+        max_tokens的拼接逻辑重新抄一遍——这正是继承带来的"代码复用"价值
+        在魔术方法重写场景下的具体体现。
+        """
+        base_repr = super().__repr__()
+        # 父类的__repr__形如"PrivateDeployedModel(model_name=..., ...)",
+        # 去掉最后的右括号,插入internal_host字段,再补回右括号
+        return f"{base_repr[:-1]}, internal_host={self._internal_host!r})"
+
+
+# ============================================================
+# 第二部分:ModelRegistry —— 用类方法实现的简易厂商注册中心
+# ============================================================
+
+class ModelRegistry:
+    """
+    一个用来集中管理"厂商标识 -> 具体模型类"映射关系的注册中心。
+
+    设计动机:
+        如果没有这个注册中心,调用方要根据一个字符串(比如从配置文件里
+        读到的"provider": "qwen")创建对应的模型实例,往往会写成一长串
+        if/elif分支:
+            if provider == "openai": model = OpenAIModel(...)
+            elif provider == "qwen": model = QwenModel(...)
+            elif provider == "private": model = PrivateDeployedModel(...)
+            ...
+        这种写法每新增一个厂商,就要在这一长串if/elif里加一个分支,
+        且这个"创建逻辑"往往会散落在代码的很多个不同角落，一旦有一个
+        角落忘了同步更新，就会出现"明明代码里有这个子类，但某个入口
+        用不了"的不一致问题。
+
+        用一个字典（"注册表"）加类方法的方式，把"厂商标识 -> 类"的映射
+        关系集中维护在一个地方，新增厂商时只需要调用一次register()，
+        不需要去修改任何已有的调用方代码——这是"开闭原则"在"对象创建"
+        这个场景下的具体应用,通常被称为"简单工厂模式"或者
+        "注册式工厂模式"。
+    """
+
+    _provider_registry = {}
+
+    @classmethod
+    def register(cls, provider_key, model_class):
+        """
+        注册一个"厂商标识 -> 模型类"的映射关系。
+        :param provider_key: 厂商标识字符串,如"openai"、"qwen"
+        :param model_class: 对应的模型类,必须是BaseModel的子类
+        """
+        if not issubclass(model_class, BaseModel):
+            raise TypeError(f"{model_class.__name__}必须是BaseModel的子类才能注册")
+        cls._provider_registry[provider_key] = model_class
+
+    @classmethod
+    def create(cls, provider_key, **kwargs):
+        """
+        根据厂商标识,创建对应的模型实例。
+        :param provider_key: 厂商标识字符串
+        :param kwargs: 传递给对应模型类构造函数的关键字参数
+        :return: 创建好的模型实例
+        :raises ValueError: 如果provider_key没有被注册过
+        """
+        if provider_key not in cls._provider_registry:
+            available = list(cls._provider_registry.keys())
+            raise ValueError(f"未注册的厂商标识:{provider_key!r},当前已注册:{available}")
+        model_class = cls._provider_registry[provider_key]
+        return model_class(**kwargs)
+
+    @classmethod
+    def list_registered_providers(cls):
+        """返回当前已注册的所有厂商标识列表,便于外部代码查询"支持哪些厂商"。"""
+        return list(cls._provider_registry.keys())
+
+    @classmethod
+    def is_registered(cls, provider_key):
+        return provider_key in cls._provider_registry
+
+
+# 模块加载时,立即完成三个已知厂商的注册,后续新增厂商只需要调用
+# ModelRegistry.register(新的厂商标识, 新的模型类),不需要改动其他代码
+ModelRegistry.register("openai", OpenAIModel)
+ModelRegistry.register("qwen", QwenModel)
+ModelRegistry.register("private", PrivateDeployedModel)
+
+
+# ============================================================
+# 第三部分:演示函数
+# ============================================================
+
+def demo_private_deployed_model_does_not_touch_existing_code():
+    """
+    演示:PrivateDeployedModel的加入,完全不需要改动OpenAIModel和QwenModel
+    的任何一行代码——三个子类各自独立继承BaseModel,互不干扰。
+    """
+    print("=" * 70)
+    print("演示1: 新增PrivateDeployedModel,验证开闭原则")
+    print("=" * 70)
+
+    private_model = PrivateDeployedModel(
+        api_key="internal-token-abc123456",
+        internal_host="10.20.30.40:8000",
+    )
+    reply = private_model("请问今天的日期是?")
+    print(f"私有化部署模型的回复: {reply}")
+    print(f"私有化部署模型的repr(): {repr(private_model)}")
+    print()
+
+
+def demo_comparison_and_sorting():
+    """演示BaseModel子类实例之间的比较与排序,依据是complexity_score。"""
+    print("=" * 70)
+    print("演示2: 模型实例的比较与排序(依据complexity_score)")
+    print("=" * 70)
+
+    cheap_model = OpenAIModel(api_key="sk-cheap-0000000000", temperature=0.2, max_tokens=256)
+    medium_model = QwenModel(api_key="sk-medium-0000000000", temperature=0.7, max_tokens=1024)
+    expensive_model = PrivateDeployedModel(
+        api_key="internal-token-0000000000",
+        internal_host="10.0.0.1",
+        temperature=1.5,
+        max_tokens=4096,
+    )
+
+    print(f"cheap_model.complexity_score = {cheap_model.complexity_score}")
+    print(f"medium_model.complexity_score = {medium_model.complexity_score}")
+    print(f"expensive_model.complexity_score = {expensive_model.complexity_score}")
+
+    print(f"\ncheap_model < medium_model ? {cheap_model < medium_model}")
+    print(f"expensive_model > medium_model ? {expensive_model > medium_model}")
+
+    all_models = [expensive_model, cheap_model, medium_model]
+    sorted_models = sorted(all_models)
+    print("\n用sorted()按成本从低到高排序后的结果:")
+    for model in sorted_models:
+        print(f"  {model} -> complexity_score={model.complexity_score}")
+    print()
+
+
+def demo_len_and_hash():
+    """演示__len__(调用次数)与__hash__(放入集合/字典键)的效果。"""
+    print("=" * 70)
+    print("演示3: __len__与__hash__")
+    print("=" * 70)
+
+    model = OpenAIModel(api_key="sk-len-demo-0000000000")
+    print(f"刚创建时 len(model) = {len(model)}")
+
+    model("第一次调用")
+    model("第二次调用")
+    model("第三次调用")
+    print(f"调用三次之后 len(model) = {len(model)}")
+
+    # 演示放入set: 因为定义了__eq__和__hash__,可以被正常放入集合
+    another_model_with_same_score = QwenModel(
+        api_key="sk-len-demo-2-0000000000", temperature=0.7, max_tokens=1024
+    )
+    model_set = {model, another_model_with_same_score}
+    print(
+        f"\n放入集合后的元素个数(两者complexity_score都是1740.8, "
+        f"即使model_name不同也应视为同一个元素): {len(model_set)}"
+    )
+    print()
+
+
+def demo_model_registry():
+    """演示ModelRegistry的注册与工厂创建功能。"""
+    print("=" * 70)
+    print("演示4: ModelRegistry注册式工厂")
+    print("=" * 70)
+
+    print(f"当前已注册的厂商标识: {ModelRegistry.list_registered_providers()}")
+
+    created_model = ModelRegistry.create(
+        "qwen", api_key="sk-from-registry-0000000000", temperature=0.5
+    )
+    print(f"通过注册中心创建出的实例类型: {type(created_model).__name__}")
+    print(f"调用结果: {created_model('通过注册中心创建的模型,你好')}")
+
+    try:
+        ModelRegistry.create("some_unknown_provider", api_key="sk-x")
+    except ValueError as exc:
+        print(f"\n尝试创建未注册厂商时被正确拦截: {exc}")
+    print()
+
+
+def main():
+    demo_private_deployed_model_does_not_touch_existing_code()
+    demo_comparison_and_sorting()
+    demo_len_and_hash()
+    demo_model_registry()
+    print("=" * 70)
+    print("model_hierarchy_advanced.py 全部演示运行完毕。")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 文件5:`model_hierarchy_advanced_selfcheck.py` —— 扩展行为自检脚本
+
+> 说明:针对文件4新增的三块内容(私有化部署子类、比较魔术方法、注册中心)补充的assert自检脚本,覆盖10个核心检查点,延续Day7养成的"写完代码要主动验证行为"的习惯。
+
+```python
+"""
+文件名:model_hierarchy_advanced_selfcheck.py
+作者:陈铭
+说明:
+    针对model_hierarchy_advanced.py新增的三块内容——
+    PrivateDeployedModel子类、比较魔术方法(__eq__/__lt__等)、
+    __len__、__hash__、ModelRegistry注册中心——补充的assert自检脚本。
+
+    延续Day7、以及model_hierarchy_selfcheck.py养成的习惯:在没有系统
+    学习unittest(那是更后面才会正式引入的内容)之前,先用assert语句
+    培养"写完代码要主动验证行为是否符合预期"的习惯,而不是靠肉眼
+    一条条核对print()输出。
+
+    知识范围说明:与之前的自检脚本保持一致,本文件在内部重新定义了
+    一套结构相同、经过适度精简的类体系,不依赖跨文件import。
+"""
+
+
+# ============================================================
+# 第一部分:核心类的精简复刻版(保留全部新增行为)
+# ============================================================
+
+class BaseModel:
+    """(与model_hierarchy_advanced.py中的BaseModel逻辑一致,仅保留核心部分)"""
+
+    MIN_TEMPERATURE = 0.0
+    MAX_TEMPERATURE = 2.0
+    _total_call_count = 0
+
+    def __init__(self, model_name, api_key, temperature=0.7, max_tokens=1024, timeout=30):
+        self._model_name = model_name
+        self._api_key = self._validate_api_key(api_key)
+        self._timeout = timeout
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self._call_count = 0
+
+    @staticmethod
+    def _validate_api_key(api_key):
+        if not isinstance(api_key, str) or not api_key.strip():
+            raise ValueError("api_key必须是一个非空字符串")
+        return api_key.strip()
+
+    @property
+    def temperature(self):
+        return self._temperature
+
+    @temperature.setter
+    def temperature(self, value):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise TypeError(f"temperature必须是数字,收到的是{type(value).__name__}")
+        if not (self.MIN_TEMPERATURE <= value <= self.MAX_TEMPERATURE):
+            raise ValueError(f"temperature必须在{self.MIN_TEMPERATURE}到{self.MAX_TEMPERATURE}之间")
+        self._temperature = float(value)
+
+    @property
+    def max_tokens(self):
+        return self._max_tokens
+
+    @max_tokens.setter
+    def max_tokens(self, value):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"max_tokens必须是整数,收到的是{type(value).__name__}")
+        if value <= 0:
+            raise ValueError(f"max_tokens必须是正整数,收到的是{value}")
+        self._max_tokens = value
+
+    @property
+    def api_key(self):
+        key = self._api_key
+        if len(key) <= 8:
+            return "*" * len(key)
+        return key[:4] + "*" * (len(key) - 8) + key[-4:]
+
+    @property
+    def model_name(self):
+        return self._model_name
+
+    @property
+    def call_count(self):
+        return self._call_count
+
+    @property
+    def complexity_score(self):
+        return round(self._max_tokens * (1 + self._temperature), 2)
+
+    def build_request_payload(self, messages):
+        return {
+            "model": self._model_name,
+            "messages": messages,
+            "temperature": self._temperature,
+            "max_tokens": self._max_tokens,
+        }
+
+    def chat(self, messages):
+        raise NotImplementedError(f"{type(self).__name__}还没有重写chat()方法")
+
+    def __call__(self, prompt_or_messages):
+        BaseModel._total_call_count += 1
+        self._call_count += 1
+        messages = self._normalize_input(prompt_or_messages)
+        return self.chat(messages)
+
+    @staticmethod
+    def _normalize_input(prompt_or_messages):
+        if isinstance(prompt_or_messages, str):
+            return [{"role": "user", "content": prompt_or_messages}]
+        if isinstance(prompt_or_messages, list):
+            return prompt_or_messages
+        raise TypeError("入参必须是字符串或messages列表")
+
+    def __str__(self):
+        return f"<{type(self).__name__} model_name={self._model_name!r} temperature={self._temperature}>"
+
+    def __repr__(self):
+        return (
+            f"{type(self).__name__}(model_name={self._model_name!r}, "
+            f"api_key={self.api_key!r}, temperature={self._temperature}, "
+            f"max_tokens={self._max_tokens})"
+        )
+
+    def __len__(self):
+        return self._call_count
+
+    def __eq__(self, other):
+        if not isinstance(other, BaseModel):
+            return NotImplemented
+        return self.complexity_score == other.complexity_score
+
+    def __lt__(self, other):
+        if not isinstance(other, BaseModel):
+            return NotImplemented
+        return self.complexity_score < other.complexity_score
+
+    def __le__(self, other):
+        if not isinstance(other, BaseModel):
+            return NotImplemented
+        return self.complexity_score <= other.complexity_score
+
+    def __gt__(self, other):
+        if not isinstance(other, BaseModel):
+            return NotImplemented
+        return self.complexity_score > other.complexity_score
+
+    def __ge__(self, other):
+        if not isinstance(other, BaseModel):
+            return NotImplemented
+        return self.complexity_score >= other.complexity_score
+
+    def __hash__(self):
+        return hash(self.complexity_score)
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(
+            model_name=config.get("model_name"),
+            api_key=config.get("api_key"),
+            temperature=config.get("temperature", 0.7),
+            max_tokens=config.get("max_tokens", 1024),
+            timeout=config.get("timeout", 30),
+        )
+
+    @classmethod
+    def get_total_call_count(cls):
+        return cls._total_call_count
+
+
+class OpenAIModel(BaseModel):
+    """(精简复刻版, 逻辑与model_hierarchy_advanced.py一致)"""
+
+    DEFAULT_MODEL_NAME = "deepseek-chat"
+
+    def __init__(self, api_key, model_name=None, temperature=0.7, max_tokens=1024, timeout=30):
+        super().__init__(
+            model_name=model_name or self.DEFAULT_MODEL_NAME,
+            api_key=api_key, temperature=temperature,
+            max_tokens=max_tokens, timeout=timeout,
+        )
+
+    def chat(self, messages):
+        last_user_message = messages[-1]["content"] if messages else ""
+        return f"[OpenAI兼容模拟回复] 收到:{last_user_message}"
+
+
+class QwenModel(BaseModel):
+    """(精简复刻版, 逻辑与model_hierarchy_advanced.py一致)"""
+
+    DEFAULT_MODEL_NAME = "qwen-plus"
+
+    def __init__(self, api_key, model_name=None, enable_search=False,
+                 temperature=0.7, max_tokens=1024, timeout=30):
+        super().__init__(
+            model_name=model_name or self.DEFAULT_MODEL_NAME,
+            api_key=api_key, temperature=temperature,
+            max_tokens=max_tokens, timeout=timeout,
+        )
+        self._enable_search = bool(enable_search)
+
+    def chat(self, messages):
+        last_user_message = messages[-1]["content"] if messages else ""
+        return f"[千问兼容模拟回复] 收到:{last_user_message}"
+
+
+class PrivateDeployedModel(BaseModel):
+    """(精简复刻版, 逻辑与model_hierarchy_advanced.py一致)"""
+
+    DEFAULT_MODEL_NAME = "self-hosted-llm"
+
+    def __init__(self, api_key, internal_host, model_name=None,
+                 temperature=0.7, max_tokens=1024, timeout=60):
+        super().__init__(
+            model_name=model_name or self.DEFAULT_MODEL_NAME,
+            api_key=api_key, temperature=temperature,
+            max_tokens=max_tokens, timeout=timeout,
+        )
+        self._internal_host = self._validate_internal_host(internal_host)
+
+    @staticmethod
+    def _validate_internal_host(internal_host):
+        if not isinstance(internal_host, str) or not internal_host.strip():
+            raise ValueError("internal_host必须是一个非空字符串")
+        return internal_host.strip()
+
+    @property
+    def internal_host(self):
+        return self._internal_host
+
+    def chat(self, messages):
+        last_user_message = messages[-1]["content"] if messages else ""
+        return f"[私有化部署模拟回复, 来自内网{self._internal_host}] 收到:{last_user_message}"
+
+
+class ModelRegistry:
+    """(精简复刻版, 逻辑与model_hierarchy_advanced.py一致)"""
+
+    _provider_registry = {}
+
+    @classmethod
+    def register(cls, provider_key, model_class):
+        if not issubclass(model_class, BaseModel):
+            raise TypeError(f"{model_class.__name__}必须是BaseModel的子类才能注册")
+        cls._provider_registry[provider_key] = model_class
+
+    @classmethod
+    def create(cls, provider_key, **kwargs):
+        if provider_key not in cls._provider_registry:
+            available = list(cls._provider_registry.keys())
+            raise ValueError(f"未注册的厂商标识:{provider_key!r},当前已注册:{available}")
+        model_class = cls._provider_registry[provider_key]
+        return model_class(**kwargs)
+
+    @classmethod
+    def list_registered_providers(cls):
+        return list(cls._provider_registry.keys())
+
+    @classmethod
+    def is_registered(cls, provider_key):
+        return provider_key in cls._provider_registry
+
+
+ModelRegistry.register("openai", OpenAIModel)
+ModelRegistry.register("qwen", QwenModel)
+ModelRegistry.register("private", PrivateDeployedModel)
+
+
+# ============================================================
+# 第二部分:自检用例
+# ============================================================
+
+def check_private_model_inherits_all_base_behavior():
+    """检查点1: PrivateDeployedModel应该完整继承BaseModel的全部校验与调用行为。"""
+    model = PrivateDeployedModel(
+        api_key="internal-token-1234567890", internal_host="10.0.0.5:8000"
+    )
+    assert model.internal_host == "10.0.0.5:8000"
+    assert isinstance(model, BaseModel), "PrivateDeployedModel必须是BaseModel的子类"
+
+    reply = model("你好")
+    assert "私有化部署模拟回复" in reply, "PrivateDeployedModel的回复应该体现出私有化部署的特征标记"
+    assert "10.0.0.5:8000" in reply, "回复中应该能看到internal_host信息"
+
+    print("检查点1通过:PrivateDeployedModel正确继承了BaseModel的全部核心行为。")
+
+
+def check_private_model_rejects_empty_internal_host():
+    """检查点2: internal_host为空字符串或纯空白时,应该被拒绝创建。"""
+    try:
+        PrivateDeployedModel(api_key="internal-token-1234567890", internal_host="")
+        assert False, "internal_host为空字符串应该抛出ValueError,但没有抛出"
+    except ValueError:
+        pass
+
+    try:
+        PrivateDeployedModel(api_key="internal-token-1234567890", internal_host="   ")
+        assert False, "internal_host为纯空白字符串应该抛出ValueError,但没有抛出"
+    except ValueError:
+        pass
+
+    print("检查点2通过:PrivateDeployedModel正确拒绝了非法的internal_host。")
+
+
+def check_comparison_operators_based_on_complexity_score():
+    """检查点3: 比较魔术方法应该严格依据complexity_score判断大小关系。"""
+    low = OpenAIModel(api_key="sk-low-1234567890", temperature=0.0, max_tokens=100)
+    high = OpenAIModel(api_key="sk-high-1234567890", temperature=2.0, max_tokens=1000)
+
+    assert low.complexity_score < high.complexity_score
+    assert low < high, "complexity_score更低的实例应该判定为更小"
+    assert high > low
+    assert low <= low
+    assert high >= high
+    assert not (low == high), "complexity_score不同的实例不应该判定为相等"
+
+    print("检查点3通过:比较魔术方法的行为严格依据complexity_score。")
+
+
+def check_equal_complexity_score_are_treated_as_equal():
+    """检查点4: 即使是不同的子类,只要complexity_score恰好相同,也应该判定为相等。"""
+    model_a = OpenAIModel(api_key="sk-a-1234567890", temperature=0.7, max_tokens=1024)
+    model_b = QwenModel(api_key="sk-b-1234567890", temperature=0.7, max_tokens=1024)
+
+    assert model_a.complexity_score == model_b.complexity_score
+    assert model_a == model_b, "complexity_score相同的不同子类实例,应该判定为相等"
+    assert hash(model_a) == hash(model_b), "相等的对象,哈希值也必须相等,这是Python的硬性约定"
+
+    print("检查点4通过:相等判断与哈希值的一致性符合Python的约定。")
+
+
+def check_sorted_produces_ascending_complexity_order():
+    """检查点5: sorted()应该能直接对模型实例列表按complexity_score从低到高排序。"""
+    m1 = OpenAIModel(api_key="sk-1-1234567890", temperature=0.1, max_tokens=200)
+    m2 = QwenModel(api_key="sk-2-1234567890", temperature=1.0, max_tokens=800)
+    m3 = PrivateDeployedModel(
+        api_key="internal-3-1234567890", internal_host="10.0.0.1", temperature=1.9, max_tokens=3000
+    )
+
+    sorted_models = sorted([m3, m1, m2])
+    scores = [model.complexity_score for model in sorted_models]
+
+    assert scores == sorted(scores), "排序结果的complexity_score序列应该是严格升序的"
+    assert sorted_models[0] is m1, "complexity_score最低的m1应该排在最前面"
+    assert sorted_models[-1] is m3, "complexity_score最高的m3应该排在最后面"
+
+    print("检查点5通过:sorted()能正确地按complexity_score对异构的模型子类实例排序。")
+
+
+def check_len_tracks_call_count():
+    """检查点6: len(model_instance)应该准确反映调用次数,且随调用递增。"""
+    model = OpenAIModel(api_key="sk-len-1234567890")
+    assert len(model) == 0, "刚创建、尚未被调用过的模型,len()应该是0"
+
+    model("第一次")
+    assert len(model) == 1
+
+    model("第二次")
+    model("第三次")
+    assert len(model) == 3, f"调用三次后len()应该是3,实际是{len(model)}"
+
+    print("检查点6通过:__len__准确反映了模型实例的调用次数。")
+
+
+def check_hashable_objects_can_be_used_in_set_and_dict_keys():
+    """检查点7: 定义了__eq__之后补充的__hash__,应该让实例依然可以放入set和用作dict的key。"""
+    model_a = OpenAIModel(api_key="sk-hash-a-1234567890", temperature=0.5, max_tokens=500)
+    model_b = OpenAIModel(api_key="sk-hash-b-1234567890", temperature=0.5, max_tokens=500)
+
+    try:
+        model_set = {model_a, model_b}
+    except TypeError:
+        assert False, "定义了__hash__之后,模型实例应该能被正常放入set,但抛出了TypeError"
+
+    # model_a和model_b的complexity_score相同(都是500*1.5=750),应该被视为同一个元素
+    assert len(model_set) == 1, "complexity_score相同的两个实例放入set后,应该被去重为1个元素"
+
+    lookup_table = {model_a: "第一个模型的备注"}
+    assert model_a in lookup_table, "模型实例应该能作为dict的key被正常使用"
+
+    print("检查点7通过:补充的__hash__使模型实例能被正常用于set和dict的key。")
+
+
+def check_model_registry_create_returns_correct_subclass_instance():
+    """检查点8: ModelRegistry.create()应该根据provider_key创建出正确的子类实例。"""
+    created_openai = ModelRegistry.create("openai", api_key="sk-registry-1234567890")
+    created_qwen = ModelRegistry.create("qwen", api_key="sk-registry-1234567890")
+    created_private = ModelRegistry.create(
+        "private", api_key="internal-registry-1234567890", internal_host="10.0.0.9"
+    )
+
+    assert isinstance(created_openai, OpenAIModel)
+    assert isinstance(created_qwen, QwenModel)
+    assert isinstance(created_private, PrivateDeployedModel)
+    assert not isinstance(created_openai, QwenModel)
+
+    print("检查点8通过:ModelRegistry.create()正确地按provider_key分发创建了对应的子类实例。")
+
+
+def check_model_registry_rejects_unknown_provider():
+    """检查点9: ModelRegistry.create()对未注册的provider_key,应该明确拒绝而不是静默失败。"""
+    try:
+        ModelRegistry.create("totally_unknown_provider", api_key="sk-x")
+        assert False, "对未注册的provider_key,应该抛出ValueError,但没有抛出"
+    except ValueError as exc:
+        assert "totally_unknown_provider" in str(exc), "错误信息里应该包含具体是哪个未注册的provider_key"
+
+    print("检查点9通过:ModelRegistry.create()对未注册厂商的拒绝逻辑符合预期。")
+
+
+def check_model_registry_register_rejects_non_base_model_subclass():
+    """检查点10: register()应该拒绝注册任何不是BaseModel子类的类型。"""
+
+    class NotAModel:
+        """一个完全无关的类,故意用来测试register()的类型检查逻辑。"""
+
+    try:
+        ModelRegistry.register("invalid_provider", NotAModel)
+        assert False, "register()对非BaseModel子类应该抛出TypeError,但没有抛出"
+    except TypeError:
+        pass
+
+    assert not ModelRegistry.is_registered("invalid_provider"), (
+        "由于register()应该在类型检查失败时拒绝注册,invalid_provider不应该出现在注册表里"
+    )
+
+    print("检查点10通过:register()正确拒绝了非BaseModel子类的注册请求。")
+
+
+def run_all_checks():
+    """依次运行全部检查点,并打印汇总结果。"""
+    print("开始执行model_hierarchy_advanced核心行为自检……\n")
+
+    check_private_model_inherits_all_base_behavior()
+    check_private_model_rejects_empty_internal_host()
+    check_comparison_operators_based_on_complexity_score()
+    check_equal_complexity_score_are_treated_as_equal()
+    check_sorted_produces_ascending_complexity_order()
+    check_len_tracks_call_count()
+    check_hashable_objects_can_be_used_in_set_and_dict_keys()
+    check_model_registry_create_returns_correct_subclass_instance()
+    check_model_registry_rejects_unknown_provider()
+    check_model_registry_register_rejects_non_base_model_subclass()
+
+    print("\n" + "=" * 50)
+    print("全部10个检查点均已通过,model_hierarchy_advanced核心行为符合预期。")
+    print("=" * 50)
+
+
+if __name__ == "__main__":
+    run_all_checks()
+```
+
+### 文件6:`magic_methods_lab_extended.py` —— 容器协议魔术方法与运算符重载补充练习
+
+> 说明:老王在下午课后留了一个课后思考——除了`__str__`、`__repr__`、`__call__`、`@property`之外,Python里还有一大类魔术方法专门用来让自定义类"表现得像内置容器类型"。这份文件通过`ConversationHistory`(表现得像列表的对话历史容器,实现`__len__`/`__getitem__`/`__contains__`/`__iter__`/`__add__`)和`ModelPricingPlan`(计费方案对象,实现`__eq__`/`__lt__`/`__add__`)两个例子,把这类"容器协议"魔术方法与运算符重载练习补齐。
+
+```python
+"""
+文件名:magic_methods_lab_extended.py
+作者:陈铭
+说明:
+    这份文件是对magic_methods_lab.py的补充练习。老王在下午课后留了一个
+    "课后思考":除了__str__、__repr__、__call__、@property这几个今天
+    重点讲的魔术方法之外,Python里还有一大类魔术方法专门用来让自定义的类
+    "表现得像内置的容器类型(比如list、dict)"——这份文件就是对这类
+    "容器协议"魔术方法的补充练习,同时也补充了运算符重载相关的
+    __add__、以及和比较相关的__eq__/__lt__在另一个业务场景里的应用。
+
+    包含两个例子:
+        ConversationHistory —— 一个"表现得像列表"的对话历史容器,
+            实现__len__、__getitem__、__contains__、__iter__、__add__。
+        ModelPricingPlan —— 一个模型计费方案对象,实现__eq__、__lt__、
+            以及__add__(合并两个计费方案得到一个"组合套餐")。
+
+    知识范围说明:同model_hierarchy.py,不引入任何import语句，
+    不使用Day1-Day9尚未学过的模块。
+"""
+
+
+# ============================================================
+# 第一部分:ConversationHistory —— 让自定义类"表现得像列表"
+# ============================================================
+
+class ConversationHistory:
+    """
+    一个对话历史容器,内部维护一份消息列表(每条消息是一个包含role和content
+    的字典,格式与Day8的ChatMessage.to_dict()保持一致)。
+
+    这个类不是简单地"包一层list"就完事——它额外提供了消息数量上限校验、
+    按角色过滤等业务逻辑,但对外的使用体验,希望尽量贴近Python内置list
+    的使用习惯(可以用len()查长度、可以用[]按下标取值、可以用in判断
+    是否包含某条消息、可以用for循环遍历),这正是需要用一系列"容器协议"
+    魔术方法来实现的。
+    """
+
+    def __init__(self, max_size=50):
+        self._max_size = self._validate_max_size(max_size)
+        self._messages = []
+
+    @staticmethod
+    def _validate_max_size(max_size):
+        if not isinstance(max_size, int) or isinstance(max_size, bool) or max_size <= 0:
+            raise ValueError(f"max_size必须是正整数,收到的是{max_size}")
+        return max_size
+
+    @property
+    def max_size(self):
+        return self._max_size
+
+    def append(self, role, content):
+        """
+        添加一条新消息。如果添加后会超过max_size上限,自动丢弃最早的一条消息
+        (这是一个简化的"滑动窗口"策略,和真实对话系统里"上下文窗口超限后
+        丢弃最早消息"的思路是一致的,只是真实场景通常还会考虑token数量
+        而不是单纯的消息条数)。
+        :param role: 消息角色,复用Day8学过的三种取值约定
+        :param content: 消息内容
+        """
+        if role not in ("system", "user", "assistant"):
+            raise ValueError(f"role必须是system/user/assistant之一,收到的是{role!r}")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("content必须是非空字符串")
+
+        self._messages.append({"role": role, "content": content})
+        if len(self._messages) > self._max_size:
+            self._messages.pop(0)
+
+    def __len__(self):
+        """
+        实现__len__之后,len(history)就能直接返回消息条数,
+        不需要外部代码写len(history.messages)或者history.count()
+        这类不那么直观的写法。
+        """
+        return len(self._messages)
+
+    def __getitem__(self, index):
+        """
+        实现__getitem__之后,history[0]、history[-1]、甚至history[1:3]
+        这种切片写法都会自动生效(因为底层self._messages本身就是list,
+        list原生支持切片,这里只是把索引操作转发给它)。
+
+        这是"魔术方法让自定义类复用内置类型能力"的一个典型例子——
+        不需要自己重新实现切片逻辑,只需要把操作委托给内部真正的list。
+        """
+        return self._messages[index]
+
+    def __contains__(self, content_keyword):
+        """
+        实现__contains__之后,'某个关键词' in history这种写法就会生效,
+        这里的语义定义为:"历史消息中是否存在某一条的content包含这个关键词"
+        (而不是判断某条完整消息字典是否存在,那样使用起来会很不方便)。
+        :param content_keyword: 待查找的关键词字符串
+        :return: 是否存在任意一条消息的content包含这个关键词
+        """
+        return any(content_keyword in message["content"] for message in self._messages)
+
+    def __iter__(self):
+        """
+        实现__iter__之后,for message in history这种写法就会生效。
+
+        这里选择直接返回self._messages的迭代器(通过iter()获取),
+        而不是把self._messages原样返回——这是一个值得注意的细节:
+        如果直接return self._messages,外部代码拿到的其实是内部list
+        本身的迭代器,效果上没有本质区别,但显式调用iter()更能体现
+        "我在实现迭代器协议"这个意图,也是更规范的写法。
+        """
+        return iter(self._messages)
+
+    def __add__(self, other):
+        """
+        实现__add__之后,history_a + history_b这种写法就会生效，
+        语义定义为:"把两份对话历史的消息按顺序合并成一份新的历史"。
+
+        注意这里返回的是一个新的ConversationHistory实例，而不是直接
+        修改self._messages——这遵循了Python内置类型的一贯习惯(比如
+        list_a + list_b也是返回一个新列表,不会修改list_a本身)，
+        这种"不修改原对象,返回新对象"的行为，通常被称为"immutable风格"
+        的运算符重载，能有效避免"相加之后原来的两份历史被意外改动"
+        这种容易踩坑的副作用。
+        :param other: 另一个ConversationHistory实例
+        :return: 合并后的新ConversationHistory实例(max_size取两者较大值)
+        """
+        if not isinstance(other, ConversationHistory):
+            return NotImplemented
+
+        merged = ConversationHistory(max_size=max(self._max_size, other._max_size))
+        for message in self._messages:
+            merged.append(message["role"], message["content"])
+        for message in other._messages:
+            merged.append(message["role"], message["content"])
+        return merged
+
+    def filter_by_role(self, role):
+        """返回只包含指定role的消息列表(纯粹的普通方法,不是魔术方法)。"""
+        return [message for message in self._messages if message["role"] == role]
+
+    def __str__(self):
+        return f"ConversationHistory(共{len(self._messages)}条消息, 上限{self._max_size}条)"
+
+    def __repr__(self):
+        return f"ConversationHistory(max_size={self._max_size}, messages={self._messages!r})"
+
+
+def demo_conversation_history_container_protocol():
+    """演示ConversationHistory的各种"表现得像列表"的用法。"""
+    print("=" * 70)
+    print("演示1: ConversationHistory —— __len__/__getitem__/__contains__/__iter__/__add__")
+    print("=" * 70)
+
+    history = ConversationHistory(max_size=5)
+    history.append("system", "你是一个专业的技术助手")
+    history.append("user", "什么是继承?")
+    history.append("assistant", "继承是面向对象编程中……")
+    history.append("user", "那多态呢?")
+
+    print(f"\n[__len__] len(history) = {len(history)}")
+    print(f"[__getitem__, 索引0] history[0] = {history[0]}")
+    print(f"[__getitem__, 索引-1] history[-1] = {history[-1]}")
+    print(f"[__getitem__, 切片] history[1:3] = {history[1:3]}")
+    print(f"[__contains__] '多态' in history ? {'多态' in history}")
+    print(f"[__contains__] '张量' in history ? {'张量' in history}")
+
+    print("\n[__iter__] 用for循环遍历所有消息:")
+    for index, message in enumerate(history):
+        print(f"  第{index}条: [{message['role']}] {message['content']}")
+
+    another_history = ConversationHistory(max_size=5)
+    another_history.append("user", "继续问一个问题")
+    another_history.append("assistant", "好的,请说")
+
+    merged_history = history + another_history
+    print(f"\n[__add__] 合并前: history有{len(history)}条, another_history有{len(another_history)}条")
+    print(f"[__add__] 合并后: merged_history有{len(merged_history)}条")
+    print(f"[__add__] 原history是否被修改: len(history)依然是{len(history)}(未被修改,符合预期)")
+    print()
+
+
+def demo_sliding_window_eviction():
+    """演示max_size超限后,自动丢弃最早消息的滑动窗口行为。"""
+    print("=" * 70)
+    print("演示2: max_size超限的滑动窗口淘汰策略")
+    print("=" * 70)
+
+    small_history = ConversationHistory(max_size=3)
+    for i in range(1, 6):
+        small_history.append("user", f"第{i}条问题")
+
+    print(f"添加了5条消息,但max_size=3,当前长度: {len(small_history)}")
+    print("当前保留的消息(应该只剩最后3条,即第3/4/5条问题):")
+    for message in small_history:
+        print(f"  {message['content']}")
+    print()
+
+
+# ============================================================
+# 第二部分:ModelPricingPlan —— 比较魔术方法 + 运算符重载
+# ============================================================
+
+class ModelPricingPlan:
+    """
+    一个模型计费方案对象,记录"每1000个输入token的价格"和
+    "每1000个输入token的价格"。
+
+    补充这个例子的动机: model_hierarchy_advanced.py里的比较魔术方法,
+    是围绕BaseModel子类实例本身设计的(依据complexity_score判断大小)。
+    这里换一个更单纯、更聚焦"计费方案比较与合并"这一件事的独立例子,
+    避免比较逻辑和"这是不是同一个模型实例"这类复杂语境混在一起，
+    能让__eq__、__lt__、__add__这三个魔术方法的意图更纯粹、更容易理解。
+    """
+
+    def __init__(self, plan_name, price_per_1k_input, price_per_1k_output):
+        self.plan_name = self._validate_plan_name(plan_name)
+        self.price_per_1k_input = self._validate_price(price_per_1k_input, "price_per_1k_input")
+        self.price_per_1k_output = self._validate_price(price_per_1k_output, "price_per_1k_output")
+
+    @staticmethod
+    def _validate_plan_name(plan_name):
+        if not isinstance(plan_name, str) or not plan_name.strip():
+            raise ValueError("plan_name必须是非空字符串")
+        return plan_name.strip()
+
+    @staticmethod
+    def _validate_price(price, field_name):
+        if not isinstance(price, (int, float)) or isinstance(price, bool):
+            raise TypeError(f"{field_name}必须是数字,收到的是{type(price).__name__}")
+        if price < 0:
+            raise ValueError(f"{field_name}不能为负数,收到的是{price}")
+        return float(price)
+
+    @property
+    def total_price_per_1k(self):
+        """一个简化的综合价格指标: 输入价格与输出价格之和,用于比较"哪个方案更便宜"。"""
+        return round(self.price_per_1k_input + self.price_per_1k_output, 6)
+
+    def __eq__(self, other):
+        """两个计费方案"相等",定义为综合价格完全一致(不要求plan_name相同)。"""
+        if not isinstance(other, ModelPricingPlan):
+            return NotImplemented
+        return self.total_price_per_1k == other.total_price_per_1k
+
+    def __lt__(self, other):
+        if not isinstance(other, ModelPricingPlan):
+            return NotImplemented
+        return self.total_price_per_1k < other.total_price_per_1k
+
+    def __le__(self, other):
+        if not isinstance(other, ModelPricingPlan):
+            return NotImplemented
+        return self.total_price_per_1k <= other.total_price_per_1k
+
+    def __hash__(self):
+        return hash((self.total_price_per_1k,))
+
+    def __add__(self, other):
+        """
+        实现__add__,让两个计费方案可以直接用+号"叠加"成一个新的组合方案。
+
+        业务场景类比: 如果苍穹某个客户同时购买了"文本模型套餐"和
+        "语音转写套餐",系统需要计算出一个"综合套餐"用于统一展示总价——
+        这正是__add__在这个场景下天然贴合的地方，比起写一个
+        combine_pricing_plans(plan_a, plan_b)函数，plan_a + plan_b
+        这种写法在语义上更直观、更贴近"两个东西叠加在一起"这个直觉。
+        :param other: 另一个ModelPricingPlan实例
+        :return: 叠加后的新ModelPricingPlan实例
+        """
+        if not isinstance(other, ModelPricingPlan):
+            return NotImplemented
+        return ModelPricingPlan(
+            plan_name=f"{self.plan_name}+{other.plan_name}",
+            price_per_1k_input=self.price_per_1k_input + other.price_per_1k_input,
+            price_per_1k_output=self.price_per_1k_output + other.price_per_1k_output,
+        )
+
+    def __str__(self):
+        return (
+            f"{self.plan_name}: 输入{self.price_per_1k_input}/1k, "
+            f"输出{self.price_per_1k_output}/1k, 综合{self.total_price_per_1k}/1k"
+        )
+
+    def __repr__(self):
+        return (
+            f"ModelPricingPlan(plan_name={self.plan_name!r}, "
+            f"price_per_1k_input={self.price_per_1k_input}, "
+            f"price_per_1k_output={self.price_per_1k_output})"
+        )
+
+
+def demo_pricing_plan_comparison_and_combination():
+    """演示ModelPricingPlan的比较排序与+号叠加。"""
+    print("=" * 70)
+    print("演示3: ModelPricingPlan —— __eq__/__lt__/__add__")
+    print("=" * 70)
+
+    basic_plan = ModelPricingPlan("基础版", price_per_1k_input=0.001, price_per_1k_output=0.002)
+    pro_plan = ModelPricingPlan("专业版", price_per_1k_input=0.005, price_per_1k_output=0.01)
+    another_basic_plan = ModelPricingPlan("基础版镜像", price_per_1k_input=0.001, price_per_1k_output=0.002)
+
+    print(f"\n{basic_plan}")
+    print(f"{pro_plan}")
+
+    print(f"\nbasic_plan < pro_plan ? {basic_plan < pro_plan}")
+    print(f"basic_plan == another_basic_plan ? {basic_plan == another_basic_plan}"
+          f"(综合价格相同, 即使plan_name不同也判定为相等)")
+
+    plans = [pro_plan, basic_plan]
+    print(f"\n按价格从低到高排序: {[plan.plan_name for plan in sorted(plans)]}")
+
+    combined_plan = basic_plan + pro_plan
+    print(f"\n[__add__] 叠加后的组合套餐: {combined_plan}")
+    print(f"[__add__] 原basic_plan未被修改: {basic_plan}")
+    print()
+
+
+def main():
+    demo_conversation_history_container_protocol()
+    demo_sliding_window_eviction()
+    demo_pricing_plan_comparison_and_combination()
+
+    print("=" * 70)
+    print("magic_methods_lab_extended.py 全部演示运行完毕。")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 文件7:`magic_methods_lab_extended_selfcheck.py` —— 容器协议与运算符重载自检脚本
+
+> 说明:针对文件6里`ConversationHistory`和`ModelPricingPlan`两个类的assert自检脚本,覆盖容器协议魔术方法与比较/运算符重载的核心行为,共10个检查点。
+
+```python
+"""
+文件名:magic_methods_lab_extended_selfcheck.py
+作者:陈铭
+说明:
+    针对magic_methods_lab_extended.py里ConversationHistory和
+    ModelPricingPlan两个类的assert自检脚本,覆盖容器协议魔术方法
+    (__len__/__getitem__/__contains__/__iter__/__add__)与比较运算符
+    重载(__eq__/__lt__/__add__)的核心行为。
+
+    知识范围说明:与其他自检脚本保持一致,在本文件内部重新定义了
+    结构相同的精简版类,不依赖跨文件import。
+"""
+
+
+# ============================================================
+# 第一部分:精简复刻版类定义
+# ============================================================
+
+class ConversationHistory:
+    """(精简复刻版, 逻辑与magic_methods_lab_extended.py一致)"""
+
+    def __init__(self, max_size=50):
+        self._max_size = self._validate_max_size(max_size)
+        self._messages = []
+
+    @staticmethod
+    def _validate_max_size(max_size):
+        if not isinstance(max_size, int) or isinstance(max_size, bool) or max_size <= 0:
+            raise ValueError(f"max_size必须是正整数,收到的是{max_size}")
+        return max_size
+
+    @property
+    def max_size(self):
+        return self._max_size
+
+    def append(self, role, content):
+        if role not in ("system", "user", "assistant"):
+            raise ValueError(f"role必须是system/user/assistant之一,收到的是{role!r}")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("content必须是非空字符串")
+
+        self._messages.append({"role": role, "content": content})
+        if len(self._messages) > self._max_size:
+            self._messages.pop(0)
+
+    def __len__(self):
+        return len(self._messages)
+
+    def __getitem__(self, index):
+        return self._messages[index]
+
+    def __contains__(self, content_keyword):
+        return any(content_keyword in message["content"] for message in self._messages)
+
+    def __iter__(self):
+        return iter(self._messages)
+
+    def __add__(self, other):
+        if not isinstance(other, ConversationHistory):
+            return NotImplemented
+        merged = ConversationHistory(max_size=max(self._max_size, other._max_size))
+        for message in self._messages:
+            merged.append(message["role"], message["content"])
+        for message in other._messages:
+            merged.append(message["role"], message["content"])
+        return merged
+
+    def filter_by_role(self, role):
+        return [message for message in self._messages if message["role"] == role]
+
+    def __str__(self):
+        return f"ConversationHistory(共{len(self._messages)}条消息, 上限{self._max_size}条)"
+
+    def __repr__(self):
+        return f"ConversationHistory(max_size={self._max_size}, messages={self._messages!r})"
+
+
+class ModelPricingPlan:
+    """(精简复刻版, 逻辑与magic_methods_lab_extended.py一致)"""
+
+    def __init__(self, plan_name, price_per_1k_input, price_per_1k_output):
+        self.plan_name = self._validate_plan_name(plan_name)
+        self.price_per_1k_input = self._validate_price(price_per_1k_input, "price_per_1k_input")
+        self.price_per_1k_output = self._validate_price(price_per_1k_output, "price_per_1k_output")
+
+    @staticmethod
+    def _validate_plan_name(plan_name):
+        if not isinstance(plan_name, str) or not plan_name.strip():
+            raise ValueError("plan_name必须是非空字符串")
+        return plan_name.strip()
+
+    @staticmethod
+    def _validate_price(price, field_name):
+        if not isinstance(price, (int, float)) or isinstance(price, bool):
+            raise TypeError(f"{field_name}必须是数字,收到的是{type(price).__name__}")
+        if price < 0:
+            raise ValueError(f"{field_name}不能为负数,收到的是{price}")
+        return float(price)
+
+    @property
+    def total_price_per_1k(self):
+        return round(self.price_per_1k_input + self.price_per_1k_output, 6)
+
+    def __eq__(self, other):
+        if not isinstance(other, ModelPricingPlan):
+            return NotImplemented
+        return self.total_price_per_1k == other.total_price_per_1k
+
+    def __lt__(self, other):
+        if not isinstance(other, ModelPricingPlan):
+            return NotImplemented
+        return self.total_price_per_1k < other.total_price_per_1k
+
+    def __le__(self, other):
+        if not isinstance(other, ModelPricingPlan):
+            return NotImplemented
+        return self.total_price_per_1k <= other.total_price_per_1k
+
+    def __hash__(self):
+        return hash((self.total_price_per_1k,))
+
+    def __add__(self, other):
+        if not isinstance(other, ModelPricingPlan):
+            return NotImplemented
+        return ModelPricingPlan(
+            plan_name=f"{self.plan_name}+{other.plan_name}",
+            price_per_1k_input=self.price_per_1k_input + other.price_per_1k_input,
+            price_per_1k_output=self.price_per_1k_output + other.price_per_1k_output,
+        )
+
+    def __str__(self):
+        return (
+            f"{self.plan_name}: 输入{self.price_per_1k_input}/1k, "
+            f"输出{self.price_per_1k_output}/1k, 综合{self.total_price_per_1k}/1k"
+        )
+
+    def __repr__(self):
+        return (
+            f"ModelPricingPlan(plan_name={self.plan_name!r}, "
+            f"price_per_1k_input={self.price_per_1k_input}, "
+            f"price_per_1k_output={self.price_per_1k_output})"
+        )
+
+
+# ============================================================
+# 第二部分:自检用例
+# ============================================================
+
+def check_len_reflects_message_count():
+    """检查点1: __len__应该准确反映当前消息条数。"""
+    history = ConversationHistory(max_size=10)
+    assert len(history) == 0
+
+    history.append("user", "第一条")
+    history.append("assistant", "第一条的回复")
+    assert len(history) == 2
+
+    print("检查点1通过:__len__准确反映消息条数。")
+
+
+def check_getitem_supports_index_and_slice():
+    """检查点2: __getitem__应该同时支持单个索引和切片两种访问方式。"""
+    history = ConversationHistory(max_size=10)
+    for i in range(1, 6):
+        history.append("user", f"问题{i}")
+
+    assert history[0]["content"] == "问题1"
+    assert history[-1]["content"] == "问题5"
+
+    sliced = history[1:3]
+    assert isinstance(sliced, list), "切片操作应该返回一个list(委托给底层list的切片行为)"
+    assert [m["content"] for m in sliced] == ["问题2", "问题3"]
+
+    print("检查点2通过:__getitem__同时正确支持索引访问与切片访问。")
+
+
+def check_contains_matches_substring_in_any_message():
+    """检查点3: __contains__应该判断关键词是否出现在任意一条消息的content中。"""
+    history = ConversationHistory(max_size=10)
+    history.append("user", "请解释一下继承和多态")
+    history.append("assistant", "继承是……多态是……")
+
+    assert "继承" in history
+    assert "多态" in history
+    assert "张量并行" not in history
+
+    print("检查点3通过:__contains__正确判断关键词是否存在于历史消息中。")
+
+
+def check_iter_yields_messages_in_insertion_order():
+    """检查点4: __iter__应该按插入顺序依次产出消息,不能乱序或遗漏。"""
+    history = ConversationHistory(max_size=10)
+    expected_contents = ["第一", "第二", "第三"]
+    for content in expected_contents:
+        history.append("user", content)
+
+    collected = [message["content"] for message in history]
+    assert collected == expected_contents, f"迭代顺序不符合预期,期望{expected_contents},实际{collected}"
+
+    print("检查点4通过:__iter__按插入顺序正确产出全部消息。")
+
+
+def check_sliding_window_evicts_oldest_message_first():
+    """检查点5: 超过max_size时,应该优先淘汰最早添加的消息。"""
+    history = ConversationHistory(max_size=3)
+    for i in range(1, 6):
+        history.append("user", f"第{i}条")
+
+    assert len(history) == 3, "超限之后消息条数应该被限制在max_size以内"
+    remaining_contents = [message["content"] for message in history]
+    assert remaining_contents == ["第3条", "第4条", "第5条"], (
+        f"滑动窗口应该保留最新的3条,实际保留的是{remaining_contents}"
+    )
+
+    print("检查点5通过:滑动窗口淘汰策略正确保留了最新的消息。")
+
+
+def check_add_merges_without_mutating_originals():
+    """检查点6: __add__应该返回一个新对象,且不修改参与相加的两个原始对象。"""
+    history_a = ConversationHistory(max_size=10)
+    history_a.append("user", "来自a的消息")
+
+    history_b = ConversationHistory(max_size=10)
+    history_b.append("user", "来自b的消息")
+
+    merged = history_a + history_b
+
+    assert len(merged) == 2, "合并后的新对象应该包含两边全部的消息"
+    assert len(history_a) == 1, "相加操作不应该修改history_a本身"
+    assert len(history_b) == 1, "相加操作不应该修改history_b本身"
+    assert merged is not history_a and merged is not history_b, "合并结果应该是一个全新的对象"
+
+    print("检查点6通过:__add__正确合并且未修改任何一个原始对象。")
+
+
+def check_pricing_plan_equality_based_on_total_price():
+    """检查点7: 两个ModelPricingPlan,只要total_price_per_1k相同,就应该判定为相等。"""
+    plan_a = ModelPricingPlan("方案A", price_per_1k_input=0.002, price_per_1k_output=0.003)
+    plan_b = ModelPricingPlan("方案B(名字不同)", price_per_1k_input=0.001, price_per_1k_output=0.004)
+
+    assert plan_a.total_price_per_1k == plan_b.total_price_per_1k == 0.005
+    assert plan_a == plan_b, "综合价格相同的两个计费方案应该判定为相等,即使名字不同"
+
+    print("检查点7通过:ModelPricingPlan的相等判断严格依据综合价格。")
+
+
+def check_pricing_plan_sorting_by_total_price():
+    """检查点8: sorted()应该能按ModelPricingPlan的综合价格从低到高排序。"""
+    cheap = ModelPricingPlan("经济版", price_per_1k_input=0.0005, price_per_1k_output=0.001)
+    expensive = ModelPricingPlan("旗舰版", price_per_1k_input=0.01, price_per_1k_output=0.02)
+    medium = ModelPricingPlan("标准版", price_per_1k_input=0.002, price_per_1k_output=0.003)
+
+    sorted_plans = sorted([expensive, cheap, medium])
+    names_in_order = [plan.plan_name for plan in sorted_plans]
+
+    assert names_in_order == ["经济版", "标准版", "旗舰版"], (
+        f"按价格从低到高排序的结果不符合预期,实际得到{names_in_order}"
+    )
+
+    print("检查点8通过:sorted()正确按ModelPricingPlan的综合价格升序排列。")
+
+
+def check_pricing_plan_add_combines_prices_correctly():
+    """检查点9: __add__生成的组合套餐,价格应该是两个原方案价格的精确相加。"""
+    plan_a = ModelPricingPlan("文本套餐", price_per_1k_input=0.001, price_per_1k_output=0.002)
+    plan_b = ModelPricingPlan("语音套餐", price_per_1k_input=0.003, price_per_1k_output=0.004)
+
+    combined = plan_a + plan_b
+
+    assert combined.price_per_1k_input == 0.004, f"组合套餐的输入价格应该是0.004,实际是{combined.price_per_1k_input}"
+    assert combined.price_per_1k_output == 0.006, f"组合套餐的输出价格应该是0.006,实际是{combined.price_per_1k_output}"
+    assert combined.plan_name == "文本套餐+语音套餐"
+    assert plan_a.price_per_1k_input == 0.001, "相加操作不应该修改原方案plan_a"
+
+    print("检查点9通过:ModelPricingPlan的__add__正确合并了两个方案的价格,且未修改原方案。")
+
+
+def check_pricing_plan_rejects_negative_price():
+    """检查点10: 创建ModelPricingPlan时,价格为负数应该被拒绝。"""
+    try:
+        ModelPricingPlan("非法方案", price_per_1k_input=-0.001, price_per_1k_output=0.002)
+        assert False, "价格为负数应该抛出ValueError,但没有抛出"
+    except ValueError:
+        pass
+
+    print("检查点10通过:ModelPricingPlan正确拒绝了负数价格。")
+
+
+def run_all_checks():
+    """依次运行全部检查点,并打印汇总结果。"""
+    print("开始执行magic_methods_lab_extended核心行为自检……\n")
+
+    check_len_reflects_message_count()
+    check_getitem_supports_index_and_slice()
+    check_contains_matches_substring_in_any_message()
+    check_iter_yields_messages_in_insertion_order()
+    check_sliding_window_evicts_oldest_message_first()
+    check_add_merges_without_mutating_originals()
+    check_pricing_plan_equality_based_on_total_price()
+    check_pricing_plan_sorting_by_total_price()
+    check_pricing_plan_add_combines_prices_correctly()
+    check_pricing_plan_rejects_negative_price()
+
+    print("\n" + "=" * 50)
+    print("全部10个检查点均已通过,magic_methods_lab_extended核心行为符合预期。")
+    print("=" * 50)
+
+
+if __name__ == "__main__":
+    run_all_checks()
+```
+
 ---
 
 ## 今日复盘
