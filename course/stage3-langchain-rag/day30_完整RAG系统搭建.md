@@ -2365,6 +2365,927 @@ def test_format_answer_with_citations_end_to_end():
 
 他把这几份新增的文件也一并整理进了项目目录,准备明天带着这套相对完整的代码去参加效果调优实验。
 
+### 加练:补上老王上午提过的去重逻辑,再给明天的调优实验预备一套评估工具
+
+十点前,陈铭把单元测试跑完,时间还够,他又翻回上午的笔记——老王在讲第四道工序"存储"和第五道工序"检索"之间那段话时,专门提到过"确定性chunk_id"和"写入向量库之前的去重判断",还说"今天时间有限,不强制要求今天就把去重逻辑写进代码,但下周如果谁的demo在效果评估阶段出现‘同一份资料被检索出来两次’的诡异现象,大概就是这个坑"。陈铭想,既然`_generate_chunk_id`已经是确定性哈希,去重判断只差最后一步,不趁热打铁写完,以后遇到真的踩坑现场再回头补,反而更麻烦。他又想起下午课后讨论里赵磊反复强调的"引用来源标注准确率不低于90%""兜底正确识别率不低于90%"这两条硬性验收指标——这两个数字,今晚的`quick_self_check.py`只是定性地跑了几个用例,离"能拿出一个百分比数字"还差一步,而这一步,恰好是明天Day31调优实验要用到的东西。他把这两块内容也发到项目群里问了一句,老王回复"可以写,但别耽误你明天笔试复习,量力而行"。于是陈铭把接下来一个多小时,分给了这两件事——一是把去重逻辑正式补进`VectorStore`和`ingest.py`,二是搭一套小型的评估工具,把PRD第五节验收标准里那两个百分比指标,变成一个可以自动跑出来的数字。
+
+#### 加练文件一:`store/vector_store.py` 补充去重方法
+
+```python
+# -*- coding: utf-8 -*-
+"""
+本次改动追加在 store/vector_store.py 文件末尾(VectorStore类内部新增两个方法),
+不改动上文已经写好的 __init__ / add_chunks / similarity_search / count 四个方法,
+只是在原有类基础上补全"写入前查重"这一步能力。
+
+设计说明:
+上午课堂笔记里老王提到的风险是——同一份文档被重复执行 `python ingest.py`
+导入两次,如果不做任何查重,向量库里会出现两条内容完全一样、chunk_id也
+完全一样的记录(Chroma对相同id的add操作,实际行为是覆盖而不是追加,
+但如果换成"文档内容没变、但整体重新切分导致部分chunk_id发生偏移"这种更
+隐蔽的场景,历史遗留的旧chunk有可能既没被覆盖也没被清理,形成脏数据)。
+补充的这两个方法,把"这批chunk_id哪些已经存在"和"清理某份文档的旧记录"
+这两件事,变成显式可调用的操作,交给ingest.py在合适的时机调用,而不是
+把去重逻辑悄悄埋进add_chunks内部——是否要去重、怎么去重,应该由调用方
+根据场景决定,VectorStore只提供"查、删、增"这几个基础能力。
+"""
+
+    def get_existing_chunk_ids(self, candidate_ids: list[str]) -> set[str]:
+        """
+        查询给定的chunk_id列表中,哪些已经存在于向量库中。
+
+        参数:
+            candidate_ids: 待检查的chunk_id列表。
+
+        返回:
+            已经存在于向量库中的chunk_id集合。
+
+        工程说明:
+            Chroma的get接口对不存在的id不会报错,只会在返回结果里跳过它们,
+            这里直接调用get并检查返回的ids字段,是最简单可靠的存在性判断方式,
+            不需要额外维护一份本地缓存的id清单。
+        """
+        if not candidate_ids:
+            return set()
+
+        result = self._collection.get(ids=candidate_ids)
+        existing_ids = set(result.get("ids", []))
+
+        if existing_ids:
+            logger.info("检测到 %d 个chunk_id已存在于向量库中", len(existing_ids))
+
+        return existing_ids
+
+    def delete_by_source_file(self, source_file: str) -> int:
+        """
+        删除向量库中来源于指定文件名的全部记录。
+
+        参数:
+            source_file: 来源文件名(与metadata中的source_file字段完全匹配)。
+
+        返回:
+            被删除的记录数量。
+
+        使用场景:
+            当同一份文档被重新处理(比如分割参数调整之后重新导入)时,
+            旧版本的chunk很可能因为chunk_id生成规则里包含了序号,
+            导致新旧版本的chunk_id并不完全一致,单纯的"存在则跳过"策略
+            无法清理掉旧版本里"多出来的"那些chunk。这时候更稳妥的做法,
+            是先按source_file整体清空这份文档的旧记录,再重新写入新的一批,
+            保证向量库里不会残留任何"孤儿"数据。
+        """
+        matched = self._collection.get(where={"source_file": source_file})
+        matched_ids = matched.get("ids", [])
+
+        if not matched_ids:
+            logger.info("向量库中未找到来源为 %s 的既有记录,无需删除", source_file)
+            return 0
+
+        self._collection.delete(ids=matched_ids)
+        logger.info("已删除来源为 %s 的 %d 条既有记录", source_file, len(matched_ids))
+        return len(matched_ids)
+```
+
+#### 加练文件二:`ingest.py` 补充去重调用逻辑(在原有main函数基础上修改)
+
+```python
+# -*- coding: utf-8 -*-
+"""
+ingest.py(晚间加练修订版)
+
+在正文版本的基础上,补充"重新导入前先清理旧记录"这一步,
+调用今晚新增的 delete_by_source_file 方法,配合一个新的命令行参数
+--rebuild,让使用者可以显式选择"增量写入(默认,遇到重复chunk_id跳过)"
+还是"整体重建(先删除同名来源文件的旧记录,再重新写入全部新记录)"。
+"""
+
+import argparse
+import sys
+
+from config import settings
+from embeddings.embedding_service import EmbeddingService
+from loaders.document_loader import load_and_clean_documents
+from logger_setup import setup_logger
+from processing.text_splitter import split_documents_into_chunks
+from store.vector_store import VectorStore
+
+logger = setup_logger(__name__, settings.paths.log_dir)
+
+
+def parse_args() -> argparse.Namespace:
+    """
+    解析命令行参数。
+
+    --rebuild:如果指定,会在写入新数据之前,先按来源文件名删除向量库中
+        已存在的旧记录,适合"文档内容或分割参数发生变化,需要彻底刷新"
+        的场景;不指定则走默认的增量写入逻辑,遇到chunk_id已存在的记录
+        会自动跳过,不会产生重复数据,但也不会主动清理"孤儿"记录。
+    """
+    parser = argparse.ArgumentParser(description="海纳集团知识库构建脚本")
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="是否在写入前清空同名来源文件的旧记录,进行整体重建",
+    )
+    return parser.parse_args()
+
+
+def _filter_new_chunks(vector_store: VectorStore, chunks: list) -> list:
+    """
+    在增量写入模式下,过滤出向量库中尚不存在的新chunk,跳过已存在的部分。
+
+    参数:
+        vector_store: 向量数据库实例。
+        chunks: 本次分割产出的完整chunk列表。
+
+    返回:
+        过滤后需要真正写入的chunk列表。
+    """
+    candidate_ids = [chunk.chunk_id for chunk in chunks]
+    existing_ids = vector_store.get_existing_chunk_ids(candidate_ids)
+
+    if not existing_ids:
+        return chunks
+
+    new_chunks = [chunk for chunk in chunks if chunk.chunk_id not in existing_ids]
+    logger.info(
+        "增量写入模式:本次共产出%d个chunk,其中%d个已存在于向量库,实际写入%d个新chunk",
+        len(chunks),
+        len(existing_ids),
+        len(new_chunks),
+    )
+    return new_chunks
+
+
+def main() -> int:
+    """知识库构建主流程,返回值作为进程退出码,0表示成功,非0表示失败。"""
+    args = parse_args()
+    logger.info("===== 海纳集团知识库构建流程启动(模式:%s) =====", "整体重建" if args.rebuild else "增量写入")
+
+    raw_documents = load_and_clean_documents(settings.paths.raw_documents_dir)
+    if not raw_documents:
+        logger.error("未能加载到任何有效文档,请检查原始文档目录:%s", settings.paths.raw_documents_dir)
+        return 1
+
+    chunks = split_documents_into_chunks(raw_documents)
+    if not chunks:
+        logger.error("文本分割后未产出任何文本块,流程终止")
+        return 1
+
+    embedding_service = EmbeddingService()
+    vector_store = VectorStore(embedding_service)
+
+    if args.rebuild:
+        # 整体重建模式:先按来源文件名逐一清空旧记录,再写入全部新记录,
+        # 保证不会残留"孤儿"chunk(比如上一次分割参数不同,产生过更多的chunk)
+        source_files = {doc.source_file for doc in raw_documents}
+        total_deleted = 0
+        for source_file in sorted(source_files):
+            total_deleted += vector_store.delete_by_source_file(source_file)
+        logger.info("整体重建模式:共清理 %d 条旧记录,准备写入 %d 个新chunk", total_deleted, len(chunks))
+        chunks_to_write = chunks
+    else:
+        chunks_to_write = _filter_new_chunks(vector_store, chunks)
+
+    if chunks_to_write:
+        vector_store.add_chunks(chunks_to_write)
+    else:
+        logger.info("没有新的chunk需要写入,向量库保持不变")
+
+    logger.info(
+        "===== 知识库构建完成,本次实际写入 %d 个文本块,当前向量库总记录数=%d =====",
+        len(chunks_to_write),
+        vector_store.count(),
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+#### 加练文件三:`generation/llm_retry.py` —— 大模型调用的指数退避重试
+
+```python
+# -*- coding: utf-8 -*-
+"""
+llm_retry.py
+大模型调用重试装饰器。
+
+设计说明:
+陈铭在写完quick_self_check.py之后,回头看了一眼rag_chain.py里的_invoke_llm方法,
+发现自己只用了一层try/except做兜底,大模型调用一旦因为网络抖动或者临时限流失败,
+会直接落到"抱歉,当前系统暂时无法生成回答"这句话,而没有给一次"稍等一下重试"的机会。
+这让他想起Day13、Day21反复用过的指数退避重试装饰器——虽然那两天的场景是纯粹的
+模型客户端调用,和今天的RAGChain场景不完全一样,但重试这件事本身的原理是通用的,
+值得原样搬过来复用,而不是每个新项目都重新发明一遍轮子。
+"""
+
+import functools
+import time
+
+from logger_setup import setup_logger
+from config import settings
+
+logger = setup_logger(__name__, settings.paths.log_dir)
+
+
+class LLMTransientError(Exception):
+    """
+    标记一次大模型调用失败是否属于"临时性"错误(网络抖动、限流、超时等,
+    值得重试),而不是"永久性"错误(比如API Key配置错误、模型名称不存在,
+    这类错误重试多少次结果都一样,不应该浪费时间和调用次数去重试)。
+
+    上层代码在识别到具体的异常类型之后,应该主动把可重试的异常包装成
+    这个类型抛出,retry_with_backoff装饰器只对这个类型的异常执行重试逻辑。
+    """
+
+    pass
+
+
+def retry_with_backoff(max_retries: int = 2, base_delay: float = 1.0):
+    """
+    带指数退避的重试装饰器,专门用于包裹大模型调用这类"偶发性失败,
+    重试大概率能恢复"的操作。
+
+    设计说明:
+    max_retries默认只给2次,而不是Day21模型客户端封装里用过的3次——
+    这是刻意的选择,因为RAGChain场景下,用户在命令行里等待回答的
+    容忍时间比后台批处理场景更短,重试次数越多,用户等待的时间越长,
+    需要在"提高成功率"和"避免用户等太久"之间做一个更谨慎的取舍。
+
+    :param max_retries: 最大重试次数(不含首次调用)
+    :param base_delay: 首次重试前的等待秒数,之后每次翻倍
+    """
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_error = None
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except LLMTransientError as exc:
+                    last_error = exc
+                    if attempt < max_retries:
+                        delay = base_delay * (2**attempt)
+                        logger.warning(
+                            "大模型调用出现临时性错误(第%d次尝试),%.1f秒后重试:%s",
+                            attempt + 1,
+                            delay,
+                            exc,
+                        )
+                        time.sleep(delay)
+                    else:
+                        logger.error("大模型调用已达到最大重试次数(%d次),放弃重试", max_retries)
+                        raise
+            if last_error is not None:
+                raise last_error
+            raise LLMTransientError("未知原因导致大模型调用失败")
+
+        return wrapper
+
+    return decorator
+
+
+def classify_llm_exception(exc: Exception) -> Exception:
+    """
+    对大模型SDK抛出的原始异常做一次分类,决定是包装成可重试的
+    LLMTransientError,还是原样保留(视为不可重试的永久性错误)。
+
+    分类规则是一套基于异常信息关键字的启发式判断,和Day28
+    batch_processing_pipeline.py里categorize_error的设计思路一致——
+    先用一套朴素但覆盖大部分常见场景的规则跑起来,后续遇到新的
+    异常模式再持续补充。
+    """
+    error_text = str(exc).lower()
+    transient_keywords = ["timeout", "timed out", "connection", "rate limit", "429", "503", "502"]
+
+    if any(keyword in error_text for keyword in transient_keywords):
+        return LLMTransientError(str(exc))
+    return exc
+```
+
+#### 加练文件四:`rag_chain.py` 中 `_invoke_llm` 方法的加练修订版
+
+```python
+# -*- coding: utf-8 -*-
+"""
+本次改动只涉及 generation/rag_chain.py 中 _invoke_llm 这一个方法的实现,
+其余代码(RAGChain类的其他方法、RAGAnswer数据结构)保持正文版本不变,
+这里单独贴出修订后的完整方法,方便对照。
+"""
+
+    from generation.llm_retry import LLMTransientError, classify_llm_exception, retry_with_backoff
+
+    @retry_with_backoff(max_retries=2, base_delay=1.0)
+    def _invoke_llm_with_retry(self, prompt: str) -> str:
+        """
+        真正执行大模型调用的内部方法,套上重试装饰器。
+
+        与正文版本的区别:
+        正文版本的_invoke_llm方法,把"调用大模型"和"兜底成一句错误提示"
+        这两件事写在了一起,一旦调用失败就直接返回兜底文案,没有给
+        重试的机会。加练版本把这两件事拆开——本方法只负责"调用+必要时
+        向上抛出可重试异常",是否要在多次重试后依然失败的情况下兜底成
+        一句提示语,交给外层_invoke_llm方法决定。
+        """
+        try:
+            response = self._llm.invoke(prompt)
+            return response.content
+        except Exception as exc:  # noqa: BLE001 需要捕获底层SDK可能抛出的各类异常
+            classified = classify_llm_exception(exc)
+            if isinstance(classified, LLMTransientError):
+                raise classified from exc
+            # 非临时性错误,不重试,直接向上抛出原始异常,
+            # 由外层_invoke_llm方法统一捕获并兜底成用户可见的提示语
+            raise
+
+    def _invoke_llm(self, prompt: str) -> str:
+        """
+        对外暴露的大模型调用入口,内部调用带重试的_invoke_llm_with_retry,
+        并在重试全部耗尽或者遇到不可重试的永久性错误时,统一兜底成
+        一句对用户友好的提示语,保证CLI程序不会因为大模型调用失败而崩溃。
+        """
+        try:
+            return self._invoke_llm_with_retry(prompt)
+        except Exception as exc:  # noqa: BLE001 顶层兜底,确保任何异常都不会向上传播导致进程崩溃
+            logger.error("大模型调用最终失败(已尝试重试):%s", exc)
+            return "抱歉,当前系统暂时无法生成回答,请稍后重试。[资料0]"
+```
+
+#### 加练文件五:`generation/query_preprocessor.py` —— 口语化问题的轻量归一化
+
+```python
+# -*- coding: utf-8 -*-
+"""
+query_preprocessor.py
+用户问题预处理模块(轻量版查询改写)。
+
+设计说明:
+下午作业第7题里已经点出了一个尚未解决的问题——一线员工的口语化提问
+(比如"机器老是报警",而文档写的是"系统会自动触发报警"),和文档的
+书面化表述之间存在语义鸿沟,固定的相关度阈值很难同时兼顾两类问题。
+老王在作业参考答案里提到的正式解法是"查询改写"(Query Rewriting),
+并且说明这是Sprint 3才会系统学习的高级RAG技术。今晚陈铭想先做一个
+"能力范围内、不需要额外调用大模型的轻量版本"练练手——用一份手工维护
+的口语化词汇到规范术语的映射表,在问题送入向量化之前做一次同义词替换,
+不追求解决所有语义鸿沟问题,只是先验证"哪怕是最朴素的归一化,
+能不能带来一点点检索效果的改善"这个假设,为Sprint3正式学习打个前站。
+"""
+
+import re
+
+from logger_setup import setup_logger
+from config import settings
+
+logger = setup_logger(__name__, settings.paths.log_dir)
+
+
+# 口语化表达 -> 文档规范术语的映射表。
+# 这份映射表目前是陈铭根据Day28处理过的样本文档、以及今天下午自己测试时
+# 想到的几个常见口语化说法,手工整理的一份"够用就好"的初版清单,
+# 随着后续接触更多真实用户提问记录,应该持续补充和调整,
+# 而不是指望今天一次性列全。
+COLLOQUIAL_TO_FORMAL_MAP: dict[str, str] = {
+    "老是报警": "触发报警",
+    "总是报警": "触发报警",
+    "机器坏了": "设备故障",
+    "声音不对": "异常噪音",
+    "该保养了": "达到保养周期",
+    "多久保养一次": "保养周期",
+    "怎么修": "排查步骤",
+    "什么问题": "故障原因",
+}
+
+
+def normalize_query(raw_question: str) -> str:
+    """
+    对用户输入的原始问题,执行轻量级的口语化归一化处理。
+
+    参数:
+        raw_question: 用户输入的原始问题文本。
+
+    返回:
+        归一化处理后的问题文本。如果没有匹配到任何映射规则,原样返回。
+
+    工程说明:
+        这里刻意选择"在原文后面追加规范术语",而不是"直接替换掉原始表述"——
+        因为向量检索本身对语义的容忍度并不是零,原始的口语化表述可能
+        依然包含检索有用的信息,直接替换有可能丢失掉这部分信息;
+        追加规范术语的方式,相当于给问题多提供了一个"文档更可能使用的
+        表达角度",双管齐下,理论上比单纯替换更稳妥。这是一个简化处理,
+        更严谨的查询改写通常会调用大模型生成多个改写版本,分别检索
+        后再融合结果,这部分留给Sprint3展开。
+    """
+    matched_terms = []
+    for colloquial, formal in COLLOQUIAL_TO_FORMAL_MAP.items():
+        if colloquial in raw_question:
+            matched_terms.append(formal)
+
+    if not matched_terms:
+        return raw_question
+
+    normalized = raw_question + "(" + "、".join(matched_terms) + ")"
+    logger.info("问题归一化:原始问题=[%s],补充规范术语后=[%s]", raw_question, normalized)
+    return normalized
+
+
+def strip_redundant_punctuation(text: str) -> str:
+    """
+    清理问题文本中口语场景常见的冗余标点与语气词,避免这些内容
+    干扰向量化时的语义表示。
+
+    这是一个很朴素的正则清理,只处理最常见的几种情况
+    (连续的问号/感叹号、句尾的"啊""呀""呢"这类语气助词),
+    不追求覆盖全部口语现象。
+    """
+    text = re.sub(r"[?!]{2,}", "?", text)
+    text = re.sub(r"[啊呀呢吧啦]+$", "", text.strip())
+    return text.strip()
+
+
+def preprocess_query(raw_question: str) -> str:
+    """
+    问题预处理的统一入口,依次执行标点清理与口语化归一化。
+
+    参数:
+        raw_question: 用户输入的原始问题文本。
+
+    返回:
+        预处理后的问题文本,可以直接送入向量化与检索流程。
+    """
+    cleaned = strip_redundant_punctuation(raw_question)
+    normalized = normalize_query(cleaned)
+    return normalized
+```
+
+#### 加练文件六:`evaluation/metrics_evaluator.py` —— 引用准确率与兜底识别率评估工具
+
+```python
+# -*- coding: utf-8 -*-
+"""
+metrics_evaluator.py
+量化评估工具,把PRD第五节验收标准里的两个百分比指标
+("引用来源标注的准确率不低于90%""兜底逻辑正确识别率不低于90%")
+变成一个可以自动跑出来的具体数字。
+
+设计说明:
+本模块不是要取代Day31正式的效果调优实验(那份实验需要覆盖海纳集团
+提供的真实业务问题集,并产出完整的调优报告),而是提前给正式实验
+准备好"评估用的数据结构"和"计算指标的核心函数",让明天的实验脚本
+可以直接复用这里的calculate_citation_accuracy和
+calculate_fallback_recognition_rate两个函数,不需要从零开始设计
+"怎么判断一次回答算不算通过"这件事。
+"""
+
+from dataclasses import dataclass, field
+
+from generation.rag_chain import RAGAnswer, RAGChain
+from logger_setup import setup_logger
+from config import settings
+
+logger = setup_logger(__name__, settings.paths.log_dir)
+
+
+@dataclass
+class CitationTestCase:
+    """
+    引用准确率测试用例。
+
+    属性:
+        question: 测试问题。
+        expected_source_keywords: 期望答案的引用来源里,应当出现的关键词列表
+            (比如文件名的一部分),用于人工事先标注"这个问题的正确答案
+            应该引用哪份文档"。只要引用清单中包含任意一个关键词,
+            即视为本条用例的引用来源"命中"。
+    """
+
+    question: str
+    expected_source_keywords: list[str]
+
+
+@dataclass
+class FallbackTestCase:
+    """
+    兜底识别率测试用例。
+
+    属性:
+        question: 测试问题(通常是知识库中确实不存在答案的陷阱问题)。
+        should_trigger_fallback: 期望系统的行为,陷阱问题这里应为True。
+    """
+
+    question: str
+    should_trigger_fallback: bool = True
+
+
+@dataclass
+class CitationEvaluationResult:
+    """引用准确率评估结果汇总。"""
+
+    total_cases: int
+    passed_cases: int
+    failed_questions: list[str] = field(default_factory=list)
+
+    @property
+    def accuracy_rate(self) -> float:
+        """计算引用准确率,总用例数为0时返回0.0,避免除零错误。"""
+        if self.total_cases == 0:
+            return 0.0
+        return self.passed_cases / self.total_cases
+
+
+@dataclass
+class FallbackEvaluationResult:
+    """兜底识别率评估结果汇总。"""
+
+    total_cases: int
+    passed_cases: int
+    failed_questions: list[str] = field(default_factory=list)
+
+    @property
+    def recognition_rate(self) -> float:
+        """计算兜底正确识别率,总用例数为0时返回0.0,避免除零错误。"""
+        if self.total_cases == 0:
+            return 0.0
+        return self.passed_cases / self.total_cases
+
+
+def calculate_citation_accuracy(
+    rag_chain: RAGChain, test_cases: list[CitationTestCase]
+) -> CitationEvaluationResult:
+    """
+    计算引用来源标注的准确率。
+
+    判断标准:对每个测试用例,系统生成的回答如果不是兜底回复,
+    就检查其引用来源清单文本中,是否包含该用例事先标注好的
+    任意一个"期望关键词"——命中即视为这条用例通过。
+    如果系统本应正常回答却触发了兜底,或者引用来源清单中完全
+    没有命中任何期望关键词,都视为不通过。
+
+    参数:
+        rag_chain: 已经初始化完成的RAGChain实例。
+        test_cases: 引用准确率测试用例列表。
+
+    返回:
+        CitationEvaluationResult汇总结果。
+    """
+    passed = 0
+    failed_questions = []
+
+    for case in test_cases:
+        answer: RAGAnswer = rag_chain.answer(case.question)
+
+        if answer.is_fallback:
+            logger.warning("引用准确率测试用例意外触发兜底,视为不通过:%s", case.question)
+            failed_questions.append(case.question)
+            continue
+
+        matched = any(keyword in answer.citation_list for keyword in case.expected_source_keywords)
+        if matched:
+            passed += 1
+        else:
+            logger.warning(
+                "引用准确率测试用例未命中期望来源,问题=%s,期望关键词=%s,实际引用清单=%s",
+                case.question,
+                case.expected_source_keywords,
+                answer.citation_list,
+            )
+            failed_questions.append(case.question)
+
+    result = CitationEvaluationResult(
+        total_cases=len(test_cases), passed_cases=passed, failed_questions=failed_questions
+    )
+    logger.info(
+        "引用准确率评估完成:%d/%d 通过,准确率=%.1f%%",
+        result.passed_cases,
+        result.total_cases,
+        result.accuracy_rate * 100,
+    )
+    return result
+
+
+def calculate_fallback_recognition_rate(
+    rag_chain: RAGChain, test_cases: list[FallbackTestCase]
+) -> FallbackEvaluationResult:
+    """
+    计算兜底逻辑的正确识别率。
+
+    判断标准:对每个陷阱问题测试用例,检查系统实际的is_fallback行为
+    是否与期望一致——期望触发兜底的用例,系统确实触发了才算通过。
+
+    参数:
+        rag_chain: 已经初始化完成的RAGChain实例。
+        test_cases: 兜底识别率测试用例列表。
+
+    返回:
+        FallbackEvaluationResult汇总结果。
+    """
+    passed = 0
+    failed_questions = []
+
+    for case in test_cases:
+        answer: RAGAnswer = rag_chain.answer(case.question)
+        if answer.is_fallback == case.should_trigger_fallback:
+            passed += 1
+        else:
+            logger.warning(
+                "兜底识别率测试用例不符合预期,问题=%s,期望触发兜底=%s,实际触发兜底=%s",
+                case.question,
+                case.should_trigger_fallback,
+                answer.is_fallback,
+            )
+            failed_questions.append(case.question)
+
+    result = FallbackEvaluationResult(
+        total_cases=len(test_cases), passed_cases=passed, failed_questions=failed_questions
+    )
+    logger.info(
+        "兜底识别率评估完成:%d/%d 通过,识别率=%.1f%%",
+        result.passed_cases,
+        result.total_cases,
+        result.recognition_rate * 100,
+    )
+    return result
+
+
+def print_evaluation_report(
+    citation_result: CitationEvaluationResult, fallback_result: FallbackEvaluationResult
+) -> None:
+    """
+    打印一份简明的评估报告,对照PRD第五节验收标准里"不低于90%"这条硬性指标,
+    直观地展示当前版本的达标情况。
+    """
+    print("=" * 60)
+    print("海纳集团知识库问答系统 · 量化评估报告")
+    print("=" * 60)
+    print(f"引用来源标注准确率:{citation_result.accuracy_rate * 100:.1f}%(验收标准:不低于90%)")
+    print(f"  {'达标' if citation_result.accuracy_rate >= 0.9 else '未达标'}")
+    if citation_result.failed_questions:
+        print(f"  未通过的问题:{citation_result.failed_questions}")
+
+    print(f"兜底逻辑正确识别率:{fallback_result.recognition_rate * 100:.1f}%(验收标准:不低于90%)")
+    print(f"  {'达标' if fallback_result.recognition_rate >= 0.9 else '未达标'}")
+    if fallback_result.failed_questions:
+        print(f"  未通过的问题:{fallback_result.failed_questions}")
+    print("=" * 60)
+```
+
+#### 加练文件七:`evaluation/run_lite_evaluation.py` —— 评估工具的可运行入口
+
+```python
+# -*- coding: utf-8 -*-
+"""
+run_lite_evaluation.py
+量化评估工具的可运行入口脚本,把metrics_evaluator.py里的能力串起来,
+用今天已有的样本文档信息,手工标注一批测试用例跑一遍,验证评估工具本身
+是否好用——这是"给明天Day31正式实验预备工具"这件事里,今晚能做的
+最后一步:先确认工具本身跑得通,明天直接换上海纳集团提供的真实业务
+问题集,就能立刻产出正式的评估报告,不需要在Day31当天临时现场debug
+评估脚本本身的问题。
+
+用法:
+    python -m evaluation.run_lite_evaluation
+"""
+
+import sys
+
+from config import settings
+from embeddings.embedding_service import EmbeddingService
+from evaluation.metrics_evaluator import (
+    CitationTestCase,
+    FallbackTestCase,
+    calculate_citation_accuracy,
+    calculate_fallback_recognition_rate,
+    print_evaluation_report,
+)
+from generation.rag_chain import RAGChain
+from logger_setup import setup_logger
+from retrieval.retriever import Retriever
+from store.vector_store import VectorStore
+
+logger = setup_logger(__name__, settings.paths.log_dir)
+
+
+# 引用准确率测试用例:陈铭对照今天已经导入的两份样本文档手工标注,
+# 明天替换成海纳集团提供的十个真实业务问题时,只需要重新填写这份列表,
+# 其余评估流程代码完全不需要改动。
+CITATION_TEST_CASES = [
+    CitationTestCase(
+        question="XJ-500的保养周期是怎么规定的",
+        expected_source_keywords=["设备保养作业指导书"],
+    ),
+    CitationTestCase(
+        question="螺杆转速超过额定值多少会触发报警",
+        expected_source_keywords=["操作维护手册", "手册"],
+    ),
+]
+
+# 兜底识别率测试用例,复用quick_self_check.py中已经验证过的陷阱问题集合,
+# 保持评估口径一致,方便后续版本迭代时做前后对比。
+FALLBACK_TEST_CASES = [
+    FallbackTestCase(question="YJ-9000型注塑机的保养周期是多少"),
+    FallbackTestCase(question="今年公司的年终奖发放标准是什么"),
+    FallbackTestCase(question="E-99报警代码代表什么意思"),
+]
+
+
+def main() -> int:
+    """执行一轮完整的量化评估,并打印报告。"""
+    embedding_service = EmbeddingService()
+    vector_store = VectorStore(embedding_service)
+    retriever = Retriever(vector_store)
+    rag_chain = RAGChain(retriever)
+
+    citation_result = calculate_citation_accuracy(rag_chain, CITATION_TEST_CASES)
+    fallback_result = calculate_fallback_recognition_rate(rag_chain, FALLBACK_TEST_CASES)
+
+    print_evaluation_report(citation_result, fallback_result)
+
+    both_pass = citation_result.accuracy_rate >= 0.9 and fallback_result.recognition_rate >= 0.9
+    return 0 if both_pass else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+#### 加练文件八:`tests/test_query_preprocessor.py` 与 `tests/test_metrics_evaluator.py`
+
+```python
+# -*- coding: utf-8 -*-
+"""
+test_query_preprocessor.py
+query_preprocessor 模块的基础单元测试。
+"""
+
+from generation.query_preprocessor import (
+    normalize_query,
+    preprocess_query,
+    strip_redundant_punctuation,
+)
+
+
+def test_normalize_query_appends_formal_term_when_matched():
+    """当问题中出现口语化表达时,归一化结果应包含对应的规范术语。"""
+    result = normalize_query("机器老是报警怎么办")
+    assert "触发报警" in result
+    assert "机器老是报警怎么办" in result  # 原始表述应被保留,不是直接替换掉
+
+
+def test_normalize_query_returns_original_when_no_match():
+    """当问题中不包含任何已知口语化表达时,应原样返回,不做任何修改。"""
+    original = "螺杆转速超过额定值多少会触发报警"
+    assert normalize_query(original) == original
+
+
+def test_normalize_query_can_match_multiple_terms():
+    """当问题中同时包含多个口语化表达时,应全部补充对应的规范术语。"""
+    result = normalize_query("机器坏了,声音不对,该保养了吗")
+    assert "设备故障" in result
+    assert "异常噪音" in result
+    assert "达到保养周期" in result
+
+
+def test_strip_redundant_punctuation_collapses_repeated_marks():
+    """连续的问号/感叹号应被压缩为单个问号。"""
+    assert strip_redundant_punctuation("这是怎么回事???") == "这是怎么回事?"
+
+
+def test_strip_redundant_punctuation_removes_trailing_particles():
+    """句尾常见语气助词应被清理掉。"""
+    assert strip_redundant_punctuation("到底是怎么回事呢") == "到底是怎么回事"
+
+
+def test_preprocess_query_combines_both_steps():
+    """完整预处理流程应同时完成标点清理与口语化归一化两个步骤。"""
+    result = preprocess_query("机器老是报警啊,咋整呀???")
+    assert "触发报警" in result
+    assert "?" in result and "???" not in result
+```
+
+```python
+# -*- coding: utf-8 -*-
+"""
+test_metrics_evaluator.py
+metrics_evaluator 模块的基础单元测试。
+
+设计说明:
+这里没有引入真实的RAGChain(依赖真实向量库和大模型调用,不适合单元测试),
+而是构造一个假的RAGChain替身(Fake Object),只实现answer()方法,
+返回测试用例需要的固定结果,从而独立验证calculate_citation_accuracy和
+calculate_fallback_recognition_rate这两个函数的统计逻辑本身是否正确。
+"""
+
+from generation.rag_chain import RAGAnswer
+from evaluation.metrics_evaluator import (
+    CitationTestCase,
+    FallbackTestCase,
+    calculate_citation_accuracy,
+    calculate_fallback_recognition_rate,
+)
+
+
+class _FakeRAGChain:
+    """
+    用于测试的假RAGChain,按照question字符串匹配预先设定的固定回答,
+    不涉及任何真实的检索、向量化、大模型调用。
+    """
+
+    def __init__(self, canned_answers: dict[str, RAGAnswer]):
+        self._canned_answers = canned_answers
+
+    def answer(self, question: str) -> RAGAnswer:
+        return self._canned_answers[question]
+
+
+def _make_answer(question: str, is_fallback: bool, citation_list: str = "") -> RAGAnswer:
+    return RAGAnswer(
+        question=question,
+        is_fallback=is_fallback,
+        answer_text="测试回答内容",
+        citation_list=citation_list,
+        retrieved_count=1,
+    )
+
+
+def test_calculate_citation_accuracy_all_pass():
+    """当所有测试用例的引用清单都命中期望关键词时,准确率应为100%。"""
+    fake_chain = _FakeRAGChain({
+        "问题A": _make_answer("问题A", is_fallback=False, citation_list="[资料1]《设备保养作业指导书.docx》"),
+    })
+    cases = [CitationTestCase(question="问题A", expected_source_keywords=["设备保养作业指导书"])]
+
+    result = calculate_citation_accuracy(fake_chain, cases)
+    assert result.accuracy_rate == 1.0
+    assert result.failed_questions == []
+
+
+def test_calculate_citation_accuracy_fails_on_wrong_source():
+    """当引用清单不包含期望关键词时,该用例应计为不通过。"""
+    fake_chain = _FakeRAGChain({
+        "问题B": _make_answer("问题B", is_fallback=False, citation_list="[资料1]《质量检验规范.pdf》"),
+    })
+    cases = [CitationTestCase(question="问题B", expected_source_keywords=["设备保养作业指导书"])]
+
+    result = calculate_citation_accuracy(fake_chain, cases)
+    assert result.accuracy_rate == 0.0
+    assert "问题B" in result.failed_questions
+
+
+def test_calculate_citation_accuracy_fails_when_unexpectedly_fallback():
+    """当本应正常回答的问题却触发了兜底,该用例应计为不通过。"""
+    fake_chain = _FakeRAGChain({
+        "问题C": _make_answer("问题C", is_fallback=True),
+    })
+    cases = [CitationTestCase(question="问题C", expected_source_keywords=["任意关键词"])]
+
+    result = calculate_citation_accuracy(fake_chain, cases)
+    assert result.accuracy_rate == 0.0
+
+
+def test_calculate_fallback_recognition_rate_all_pass():
+    """当所有陷阱问题都被正确识别为兜底时,识别率应为100%。"""
+    fake_chain = _FakeRAGChain({
+        "陷阱问题A": _make_answer("陷阱问题A", is_fallback=True),
+        "陷阱问题B": _make_answer("陷阱问题B", is_fallback=True),
+    })
+    cases = [
+        FallbackTestCase(question="陷阱问题A"),
+        FallbackTestCase(question="陷阱问题B"),
+    ]
+
+    result = calculate_fallback_recognition_rate(fake_chain, cases)
+    assert result.recognition_rate == 1.0
+
+
+def test_calculate_fallback_recognition_rate_detects_hallucination():
+    """当系统本应触发兜底却给出了正常回答(疑似编造),该用例应计为不通过。"""
+    fake_chain = _FakeRAGChain({
+        "陷阱问题C": _make_answer("陷阱问题C", is_fallback=False, citation_list="[资料1]《某份文档》"),
+    })
+    cases = [FallbackTestCase(question="陷阱问题C")]
+
+    result = calculate_fallback_recognition_rate(fake_chain, cases)
+    assert result.recognition_rate == 0.0
+    assert "陷阱问题C" in result.failed_questions
+
+
+def test_empty_test_cases_return_zero_rate_without_error():
+    """测试用例列表为空时,不应抛出除零异常,应返回0.0。"""
+    fake_chain = _FakeRAGChain({})
+    citation_result = calculate_citation_accuracy(fake_chain, [])
+    fallback_result = calculate_fallback_recognition_rate(fake_chain, [])
+    assert citation_result.accuracy_rate == 0.0
+    assert fallback_result.recognition_rate == 0.0
+```
+
+十一点四十分左右,陈铭把`run_lite_evaluation.py`跑了一遍,输出的报告显示引用准确率和兜底识别率都是100%——他心里清楚,这只是因为测试用例数量太少、还是自己精心挑选的问题,离真正有说服力的评估还差得远,但至少这套工具本身证明是能跑通的。他把这个结果和这几份加练代码整理好,发到项目群里,附了一句话:"上午提到的去重逻辑补上了,顺手把量化评估的小工具也搭出来了,明天可以直接换成真实业务问题集,不用现场再搭一遍架子。"
+
+老王隔了一会儿回复:"去重那部分做得很扎实,‘增量写入’和‘整体重建’两种模式分开,这个设计比我预想的更周全。评估工具这个思路也是对的——先把‘怎么算这个指标’这件事在工具层面钉死,明天大家就不会因为‘我这边是这么算的,你那边是那么算的’而产生不必要的争论,统一的度量标准,是团队协作里经常被低估的一件事。不过你现在这两个百分之百的结果,别太当真,明天用真实问题集测完,大概率会掉下来不少,这才是正常的,别被今晚这两个100%的假象影响了心态。早点睡,明天有笔试。"
+
+陈铭看着这句话笑了一下,把电脑关了。
+
 晚上十点二十分左右,陈铭把上面这套代码在本地跑完了`python ingest.py`,把Day28处理好的那份`XJ-500_chunks.jsonl`对应的原始文档重新走了一遍完整流水线,写入了47个文本块的向量库,紧接着运行了`python cli.py`,在提示符后面敲下了他准备了很久的第一个测试问题——"XJ-500的保养周期是怎么规定的"。
 
 命令行安静了大概两三秒(向量检索加大模型调用的耗时),然后回答出现了:
