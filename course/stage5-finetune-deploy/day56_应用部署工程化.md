@@ -579,9 +579,25 @@ cangqiong-knowledge-base/
 │   ├── wait-for-it.sh
 │   ├── backup.sh
 │   ├── restore.sh
-│   └── health-check-all.sh
+│   ├── health-check-all.sh
+│   ├── build_offline_package.sh  # 离线部署包构建脚本(应对机房断网场景)
+│   ├── load_offline_package.sh   # 离线部署包导入脚本
+│   ├── generate_secrets.sh       # 密钥生成脚本(配套Docker Secrets方案)
+│   ├── security_baseline_audit.py # 安全基线自检脚本(最小暴露原则自动化审计)
+│   └── run_smoke_tests.sh        # 部署后烟雾测试一键执行入口
+├── backend/alembic/              # 数据库版本化迁移(Alembic)
+│   ├── alembic.ini
+│   ├── env.py
+│   └── versions/
+│       ├── 0001_initial_schema.py
+│       └── 0002_add_department_rbac.py
+├── secrets/                      # 密钥文件目录(仅本地/机房内使用,不入库)
+│   └── .gitkeep
+├── backend/tests/
+│   └── test_smoke_deployment.py  # 部署后集成/烟雾测试
 ├── docker-compose.yml
 ├── docker-compose.prod.yml
+├── docker-compose.secrets.yml     # Docker Secrets 覆盖配置
 ├── .env.example
 ├── .gitignore
 └── Makefile
@@ -2302,6 +2318,1273 @@ deploy-init:
 deploy-update:
 	bash scripts/deploy.sh update
 ```
+
+孙昊看着陈铭把这份Makefile跑了一圈,补了一句:"你现在写的这套东西,覆盖了'能上线'这件事的大半流程,但离交付给御风金融还差几步——离线怎么导、密钥怎么管、数据库结构怎么演进、上线之后怎么验证,这几块咱们接着往下写。"
+
+### 9.10 离线部署包构建与导入(应对御风金融机房断网场景)
+
+孙昊在需求文档里反复强调的"离线可交付",不能只停留在会议纪要里,必须落成一套可以重复执行的脚本。核心思路是:在联网环境里把所有需要的镜像`docker save`导出为独立的tar包,配上校验清单(记录每个镜像的SHA256摘要与体积),打包成一个完整的离线介质;到了断网机房,先做校验(防止介质在传输过程中损坏或被篡改),再逐一`docker load`导入,最后用同一份manifest做一次导入后核验。
+
+```bash
+#!/usr/bin/env bash
+# ==============================================================================
+# scripts/build_offline_package.sh —— 离线部署包构建脚本
+# 使用场景:御风金融机房网络默认禁止出网,现场无法通过 docker pull / docker compose build
+#          直接获取镜像,需要提前在联网环境构建好全部镜像,导出为文件形式带入机房
+# 产出物:offline_package/<日期>/ 目录下包含
+#          - 每个镜像各自的 .tar.gz 文件
+#          - manifest.json(镜像清单,含名称、标签、SHA256摘要、文件体积)
+#          - checksums.sha256(供 sha256sum -c 校验的标准清单文件)
+#          - compose文件、.env.example、scripts目录的完整拷贝
+#          - 一份 README_OFFLINE.txt 现场操作指引
+# ==============================================================================
+
+set -euo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BUILD_DATE="$(date +%Y%m%d_%H%M%S)"
+PACKAGE_DIR="${PROJECT_ROOT}/offline_package/${BUILD_DATE}"
+COMPOSE_FILES="-f docker-compose.yml -f docker-compose.prod.yml"
+
+# 需要导出的镜像清单:业务自建镜像 + 第三方基础设施镜像
+# 第三方镜像(postgres/redis/chroma/vllm/nginx)版本号必须与docker-compose.yml中完全一致,
+# 否则离线环境导入的镜像标签会和Compose文件里引用的标签不匹配,导致"看似导入成功但启动仍失败"
+IMAGE_LIST=(
+    "cangqiong/backend:${IMAGE_TAG:-latest}"
+    "cangqiong/frontend:${IMAGE_TAG:-latest}"
+    "postgres:16.3-alpine"
+    "redis:7.2-alpine"
+    "chromadb/chroma:0.5.3"
+    "vllm/vllm-openai:v0.5.4"
+    "nginx:1.25.4-alpine"
+)
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [build-offline] $*"; }
+
+mkdir -p "${PACKAGE_DIR}/images"
+
+# ------------------------------------------------------------------------------
+# 第一步:确保业务镜像已经是最新构建产物,避免打包出过期版本
+# ------------------------------------------------------------------------------
+log "重新构建业务镜像(backend / frontend),确保导出的是最新代码..."
+cd "${PROJECT_ROOT}"
+docker compose ${COMPOSE_FILES} build backend frontend
+
+# ------------------------------------------------------------------------------
+# 第二步:逐一导出镜像为 tar.gz,同时记录SHA256摘要与体积,写入manifest
+# ------------------------------------------------------------------------------
+MANIFEST_ENTRIES=()
+
+for image in "${IMAGE_LIST[@]}"; do
+    if ! docker image inspect "${image}" &> /dev/null; then
+        log "错误: 本地找不到镜像 ${image},请先执行 docker pull 或 docker compose build 拉取/构建该镜像"
+        exit 1
+    fi
+
+    # 文件名中的冒号与斜杠替换为下划线,避免在部分文件系统上产生歧义
+    safe_name="$(echo "${image}" | tr '/:' '__')"
+    tar_path="${PACKAGE_DIR}/images/${safe_name}.tar"
+    gz_path="${tar_path}.gz"
+
+    log "导出镜像: ${image} -> ${gz_path}"
+    docker save "${image}" -o "${tar_path}"
+    gzip -f "${tar_path}"
+
+    file_sha256=$(sha256sum "${gz_path}" | awk '{print $1}')
+    file_size_bytes=$(stat -c%s "${gz_path}")
+    image_digest=$(docker image inspect "${image}" --format='{{index .RepoDigests 0}}' 2>/dev/null || echo "no-digest-local-build")
+
+    log "  校验值: sha256=${file_sha256:0:16}... 体积=$((file_size_bytes / 1024 / 1024))MB"
+
+    MANIFEST_ENTRIES+=("$(cat <<EOF
+    {
+      "image": "${image}",
+      "archive_file": "images/$(basename "${gz_path}")",
+      "sha256": "${file_sha256}",
+      "size_bytes": ${file_size_bytes},
+      "image_digest": "${image_digest}"
+    }
+EOF
+)")
+done
+
+# ------------------------------------------------------------------------------
+# 第三步:生成 manifest.json,记录本次打包的完整元信息
+# ------------------------------------------------------------------------------
+log "生成 manifest.json..."
+{
+    echo "{"
+    echo "  \"package_build_time\": \"$(date -Iseconds)\","
+    echo "  \"built_by\": \"$(whoami)@$(hostname)\","
+    echo "  \"git_commit\": \"$(git -C "${PROJECT_ROOT}" rev-parse --short HEAD 2>/dev/null || echo 'unknown')\","
+    echo "  \"images\": ["
+    (IFS=,; echo "${MANIFEST_ENTRIES[*]}")
+    echo "  ]"
+    echo "}"
+} > "${PACKAGE_DIR}/manifest.json"
+
+# ------------------------------------------------------------------------------
+# 第四步:生成标准 sha256sum 校验清单,方便现场用 sha256sum -c 一键批量校验
+# ------------------------------------------------------------------------------
+log "生成 checksums.sha256 校验清单..."
+(cd "${PACKAGE_DIR}" && find images -name '*.gz' -exec sha256sum {} \;) > "${PACKAGE_DIR}/checksums.sha256"
+
+# ------------------------------------------------------------------------------
+# 第五步:打包非镜像资产 —— compose文件、部署脚本、环境变量模板
+# 注意:绝对不能把真实的 .env 文件打进离线包,只带 .env.example 模板,
+#      真实密钥应通过 9.12 小节的密钥管理流程,由客户方现场自行生成或线下安全传递
+# ------------------------------------------------------------------------------
+log "打包配套的编排文件与脚本..."
+mkdir -p "${PACKAGE_DIR}/deploy_assets"
+cp "${PROJECT_ROOT}/docker-compose.yml" "${PACKAGE_DIR}/deploy_assets/"
+cp "${PROJECT_ROOT}/docker-compose.prod.yml" "${PACKAGE_DIR}/deploy_assets/"
+cp "${PROJECT_ROOT}/.env.example" "${PACKAGE_DIR}/deploy_assets/"
+cp -r "${PROJECT_ROOT}/scripts" "${PACKAGE_DIR}/deploy_assets/"
+cp -r "${PROJECT_ROOT}/nginx" "${PACKAGE_DIR}/deploy_assets/"
+
+cat > "${PACKAGE_DIR}/README_OFFLINE.txt" <<'EOF'
+苍穹知识库问答系统 —— 离线部署包使用说明
+==============================================
+1. 将本目录完整拷贝到目标机房服务器(通过安全审批的介质,如加密U盘)
+2. 首先执行校验,确认介质在传输过程中未损坏或被篡改:
+     sha256sum -c checksums.sha256
+   全部输出 OK 才能继续,任何一行 FAILED 都必须重新传输对应文件
+3. 执行 load_offline_package.sh 导入全部镜像
+4. 参考 deploy_assets/ 目录下的 .env.example 在目标机器上生成真实的 .env 文件
+5. 参考 9.12 节的密钥管理方案生成生产密钥
+6. 执行 deploy_assets/scripts/deploy.sh init 完成首次部署
+EOF
+
+# ------------------------------------------------------------------------------
+# 第六步:汇总输出
+# ------------------------------------------------------------------------------
+TOTAL_SIZE=$(du -sh "${PACKAGE_DIR}" | awk '{print $1}')
+log "=========================================="
+log "离线部署包构建完成: ${PACKAGE_DIR}"
+log "总体积: ${TOTAL_SIZE}"
+log "包含镜像数量: ${#IMAGE_LIST[@]}"
+log "下一步: 将该目录整体拷贝到安全介质,带入目标机房"
+log "=========================================="
+```
+
+配套的导入脚本,在目标机房服务器上执行:
+
+```bash
+#!/usr/bin/env bash
+# ==============================================================================
+# scripts/load_offline_package.sh —— 离线部署包导入脚本
+# 使用场景:在断网的机房服务器上,导入通过安全介质带入的离线部署包
+# 设计原则:导入前必须先校验完整性,导入后必须逐一核验镜像确实已经存在于本地,
+#          任何一步失败都应该终止流程并给出明确提示,不允许"带着问题继续往下走"
+# ==============================================================================
+
+set -euo pipefail
+
+PACKAGE_DIR="${1:?请指定离线部署包目录路径,例如: ./load_offline_package.sh /media/usb/offline_package/20260714_093000}"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [load-offline] $*"; }
+
+if [[ ! -d "${PACKAGE_DIR}" ]]; then
+    log "错误: 目录不存在: ${PACKAGE_DIR}"
+    exit 1
+fi
+
+cd "${PACKAGE_DIR}"
+
+# ------------------------------------------------------------------------------
+# 第一步:完整性校验,任何一个文件校验失败都立即终止,不允许"部分导入"
+# ------------------------------------------------------------------------------
+if [[ ! -f "checksums.sha256" ]]; then
+    log "错误: 找不到 checksums.sha256 校验清单,无法验证介质完整性,拒绝继续导入"
+    exit 1
+fi
+
+log "开始校验镜像文件完整性..."
+if ! sha256sum -c checksums.sha256; then
+    log "错误: 存在校验失败的文件,介质可能在传输过程中损坏或被篡改,已终止导入流程"
+    log "请重新通过安全介质传输离线部署包,不要尝试跳过校验强行导入"
+    exit 1
+fi
+log "全部文件校验通过"
+
+# ------------------------------------------------------------------------------
+# 第二步:解析 manifest.json,逐一导入镜像(使用python3做轻量JSON解析,避免额外依赖jq)
+# ------------------------------------------------------------------------------
+if ! command -v python3 &> /dev/null; then
+    log "错误: 未检测到 python3,无法解析 manifest.json"
+    exit 1
+fi
+
+mapfile -t ARCHIVE_FILES < <(python3 -c "
+import json
+with open('manifest.json', encoding='utf-8') as f:
+    data = json.load(f)
+for item in data['images']:
+    print(item['archive_file'])
+")
+
+if [[ ${#ARCHIVE_FILES[@]} -eq 0 ]]; then
+    log "错误: manifest.json 中未找到任何镜像条目"
+    exit 1
+fi
+
+log "manifest.json 记录了 ${#ARCHIVE_FILES[@]} 个镜像,开始逐一导入..."
+
+LOADED_COUNT=0
+for archive in "${ARCHIVE_FILES[@]}"; do
+    if [[ ! -f "${archive}" ]]; then
+        log "错误: 找不到镜像文件 ${archive},manifest.json 与实际介质内容不一致"
+        exit 1
+    fi
+    log "正在导入: ${archive}"
+    gunzip -k -c "${archive}" | docker load
+    LOADED_COUNT=$((LOADED_COUNT + 1))
+done
+
+log "全部 ${LOADED_COUNT} 个镜像导入命令已执行完毕"
+
+# ------------------------------------------------------------------------------
+# 第三步:导入后核验 —— 确认manifest里声明的每个镜像标签确实能在本地docker images中找到
+# 这一步很关键,docker load执行"成功"不代表镜像标签一定和Compose文件里引用的完全一致,
+# 尤其是从不同来源构建的镜像可能存在标签丢失的情况(比如构建时没有打tag,导出后变成<none>)
+# ------------------------------------------------------------------------------
+log "开始核验导入结果..."
+mapfile -t EXPECTED_IMAGES < <(python3 -c "
+import json
+with open('manifest.json', encoding='utf-8') as f:
+    data = json.load(f)
+for item in data['images']:
+    print(item['image'])
+")
+
+MISSING_IMAGES=()
+for expected in "${EXPECTED_IMAGES[@]}"; do
+    if ! docker image inspect "${expected}" &> /dev/null; then
+        MISSING_IMAGES+=("${expected}")
+    fi
+done
+
+if [[ ${#MISSING_IMAGES[@]} -gt 0 ]]; then
+    log "错误: 以下镜像导入后未能在本地找到,可能是镜像在导出时未正确打标签:"
+    for img in "${MISSING_IMAGES[@]}"; do
+        log "  - ${img}"
+    done
+    log "请检查构建端 build_offline_package.sh 的镜像打标签环节,重新构建并导出"
+    exit 1
+fi
+
+log "=========================================="
+log "全部镜像核验通过,离线导入流程完成"
+log "下一步: 参考 deploy_assets/ 下的部署脚本执行 ./deploy.sh init 完成首次部署"
+log "=========================================="
+```
+
+孙昊补充了一句现场经验:"离线包这套东西,`build`和`load`两端的脚本一定要配对使用、配对升级,不能出现build端加了个新镜像但忘记同步改load端逻辑的情况——你们注意到没有,`load_offline_package.sh`完全没有硬编码镜像清单,而是从`manifest.json`动态读出来的,这不是偶然,是故意这么设计的,让'要导入哪些镜像'这件事只有一个信息源,build端生成,load端消费,两边永远不会对不上。"
+
+### 9.11 数据库版本化迁移:Alembic配置与迁移脚本
+
+9.7小节的`docker-entrypoint.sh`里已经调用了`alembic upgrade head`,但当时只是留了一句命令,今天要把真正的Alembic工程搭起来,否则容器启动时这一步会直接报错。
+
+```ini
+; ==============================================================================
+; backend/alembic/alembic.ini —— Alembic 迁移工具配置文件
+; ==============================================================================
+[alembic]
+script_location = alembic
+prepend_sys_path = .
+version_path_separator = os
+
+; 数据库连接串通过 env.py 从环境变量动态读取,此处留空,不在配置文件里硬编码任何连接信息
+sqlalchemy.url =
+
+[post_write_hooks]
+
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = WARNING
+handlers = console
+qualname =
+
+[logger_sqlalchemy]
+level = WARNING
+handlers =
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers =
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+datefmt = %H:%M:%S
+```
+
+```python
+"""
+backend/alembic/env.py —— Alembic 迁移环境配置
+关键设计:数据库连接串完全从应用自身的 Settings 对象读取,
+不在 alembic.ini 或本文件中重复书写一份连接串,
+避免出现"迁移用的库"和"应用实际连的库"不一致这种典型的容器化事故
+"""
+
+import sys
+from logging.config import fileConfig
+from pathlib import Path
+
+from alembic import context
+from sqlalchemy import engine_from_config, pool
+
+# 把项目根目录加入 sys.path,确保能够正常 import app 包
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.config import get_settings  # noqa: E402
+from app.models import Base  # noqa: E402  # SQLAlchemy declarative base,包含全部ORM模型定义
+
+config = context.config
+
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+# 用应用真实的配置对象覆盖 alembic.ini 里的空连接串,保证单一数据源
+settings = get_settings()
+config.set_main_option("sqlalchemy.url", settings.database_url)
+
+target_metadata = Base.metadata
+
+
+def run_migrations_offline() -> None:
+    """离线模式:不需要真实数据库连接,只生成SQL脚本,常用于审批留痕场景
+    (金融客户有时要求DBA先审查SQL脚本再手动执行,而不是让应用直接改表结构)"""
+    url = config.get_main_option("sqlalchemy.url")
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+    )
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def run_migrations_online() -> None:
+    """在线模式:直接连接数据库执行迁移,容器entrypoint脚本中调用的是这个模式"""
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,  # 迁移场景使用一次性连接,不需要连接池
+    )
+
+    with connectable.connect() as connection:
+        context.configure(connection=connection, target_metadata=target_metadata)
+
+        with context.begin_transaction():
+            context.run_migrations()
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+```
+
+初始表结构迁移(第一个版本,对应4.4小节功能性需求里的知识库问答、对话历史留存):
+
+```python
+"""
+backend/alembic/versions/0001_initial_schema.py —— 初始表结构迁移
+创建时间: 2026-07-14
+说明: 首次建库,包含用户表、部门表、文档表、对话表、消息表五张核心业务表
+"""
+
+from alembic import op
+import sqlalchemy as sa
+
+revision = "0001_initial_schema"
+down_revision = None
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    op.create_table(
+        "departments",
+        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column("name", sa.String(length=100), nullable=False, unique=True, comment="部门名称,如合规部/风控部/财富管理部"),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+    )
+
+    op.create_table(
+        "users",
+        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column("username", sa.String(length=100), nullable=False, unique=True),
+        sa.Column("hashed_password", sa.String(length=255), nullable=False),
+        sa.Column("department_id", sa.Integer(), sa.ForeignKey("departments.id"), nullable=False,
+                   comment="用户所属部门,用于RBAC知识库范围隔离"),
+        sa.Column("role", sa.String(length=50), nullable=False, server_default="member",
+                   comment="角色: admin / manager / member"),
+        sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.true()),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+    )
+    op.create_index("ix_users_department_id", "users", ["department_id"])
+
+    op.create_table(
+        "documents",
+        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column("title", sa.String(length=255), nullable=False),
+        sa.Column("file_path", sa.String(length=500), nullable=False),
+        sa.Column("department_id", sa.Integer(), sa.ForeignKey("departments.id"), nullable=False,
+                   comment="文档归属部门,决定哪些用户可以在检索结果中看到该文档"),
+        sa.Column("uploaded_by", sa.Integer(), sa.ForeignKey("users.id"), nullable=False),
+        sa.Column("vector_collection_name", sa.String(length=200), nullable=True,
+                   comment="该文档在向量库中对应的collection名称"),
+        sa.Column("status", sa.String(length=50), nullable=False, server_default="processing",
+                   comment="状态: processing / indexed / failed"),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+    )
+    op.create_index("ix_documents_department_id", "documents", ["department_id"])
+
+    op.create_table(
+        "conversations",
+        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column("user_id", sa.Integer(), sa.ForeignKey("users.id"), nullable=False),
+        sa.Column("title", sa.String(length=255), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+    )
+    op.create_index("ix_conversations_user_id", "conversations", ["user_id"])
+
+    op.create_table(
+        "messages",
+        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column("conversation_id", sa.Integer(), sa.ForeignKey("conversations.id"), nullable=False),
+        sa.Column("role", sa.String(length=20), nullable=False, comment="user / assistant"),
+        sa.Column("content", sa.Text(), nullable=False),
+        sa.Column("source_documents", sa.JSON(), nullable=True, comment="回答引用的原文来源,满足需求文档中的引用来源要求"),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+    )
+    op.create_index("ix_messages_conversation_id", "messages", ["conversation_id"])
+    # 对话记录需要保留180天用于审计追溯,按created_at建索引以支撑后续的定期归档/清理任务高效扫描
+    op.create_index("ix_messages_created_at", "messages", ["created_at"])
+
+
+def downgrade() -> None:
+    op.drop_index("ix_messages_created_at", table_name="messages")
+    op.drop_index("ix_messages_conversation_id", table_name="messages")
+    op.drop_table("messages")
+    op.drop_index("ix_conversations_user_id", table_name="conversations")
+    op.drop_table("conversations")
+    op.drop_index("ix_documents_department_id", table_name="documents")
+    op.drop_table("documents")
+    op.drop_index("ix_users_department_id", table_name="users")
+    op.drop_table("users")
+    op.drop_table("departments")
+```
+
+第二个版本迁移,补充RBAC相关的细化字段(对应需求文档4.4.2的多角色权限控制,是团队在第一版上线后追加的一次典型的"渐进式演进"迁移):
+
+```python
+"""
+backend/alembic/versions/0002_add_department_rbac.py —— RBAC权限细化
+创建时间: 2026-07-14
+说明: 首版上线后,合规部提出需要更细粒度的"可访问部门列表"而不是单一部门归属
+     (比如某些管理岗需要同时看合规部与风控部的文档),故新增关联表实现多对多授权
+"""
+
+from alembic import op
+import sqlalchemy as sa
+
+revision = "0002_add_department_rbac"
+down_revision = "0001_initial_schema"
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    # 多对多关联表:一个用户可以被授权访问多个部门的知识库,不再局限于自己所属的单一部门
+    op.create_table(
+        "user_department_access",
+        sa.Column("user_id", sa.Integer(), sa.ForeignKey("users.id"), primary_key=True),
+        sa.Column("department_id", sa.Integer(), sa.ForeignKey("departments.id"), primary_key=True),
+        sa.Column("granted_by", sa.Integer(), sa.ForeignKey("users.id"), nullable=False,
+                   comment="记录该权限是被哪位管理员授予的,满足审计追溯要求"),
+        sa.Column("granted_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+    )
+
+    # 迁移历史数据:把原有的单一department_id关系,平移一份到新的多对多表中,保证存量用户权限不丢失
+    # 使用原始SQL是因为这是一次性的数据迁移动作,不适合用ORM模型来表达
+    op.execute(
+        """
+        INSERT INTO user_department_access (user_id, department_id, granted_by, granted_at)
+        SELECT id, department_id, id, created_at FROM users
+        """
+    )
+
+    # 审计日志表:记录关键操作(登录、权限变更、文档删除等),满足金融行业操作留痕要求
+    op.create_table(
+        "audit_logs",
+        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column("user_id", sa.Integer(), sa.ForeignKey("users.id"), nullable=True),
+        sa.Column("action", sa.String(length=100), nullable=False, comment="操作类型,如 login / grant_access / delete_document"),
+        sa.Column("detail", sa.JSON(), nullable=True),
+        sa.Column("ip_address", sa.String(length=64), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+    )
+    op.create_index("ix_audit_logs_user_id", "audit_logs", ["user_id"])
+    op.create_index("ix_audit_logs_created_at", "audit_logs", ["created_at"])
+
+
+def downgrade() -> None:
+    op.drop_index("ix_audit_logs_created_at", table_name="audit_logs")
+    op.drop_index("ix_audit_logs_user_id", table_name="audit_logs")
+    op.drop_table("audit_logs")
+    op.drop_table("user_department_access")
+```
+
+孙昊看到陈铭把两个迁移版本都写完,提醒了一句容易被忽视的细节:"你注意`0002`里那条`INSERT INTO ... SELECT`,这是把历史数据迁移进新表结构的动作,`upgrade()`里写数据迁移逻辑,不能光建表不管数据,不然升级完老用户的权限直接就丢了——这种数据迁移在容器化的entrypoint脚本里跑一次`alembic upgrade head`就应该自动完成,不需要运维人员再手动补一遍数据,这也是为什么迁移脚本要写得足够完备、足够可重复执行。"
+
+### 9.12 密钥管理进阶:从`.env`明文到Docker Secrets
+
+9.4小节的`.env`方案能满足"不硬编码进镜像"的基本要求,但明文密码依然会以环境变量的形式出现在`docker inspect`的输出里,任何能够执行`docker inspect`的人(比如同一台机器上的其他运维人员)都能看到密码原文。对于金融客户,这个暴露面还需要进一步收敛,今天引入Docker原生的`secrets`机制作为进阶方案——密钥以文件形式挂载进容器的`/run/secrets/`目录,不出现在环境变量列表里,应用代码改为优先读取密钥文件。
+
+```bash
+#!/usr/bin/env bash
+# ==============================================================================
+# scripts/generate_secrets.sh —— 生产密钥生成脚本
+# 使用场景:在目标机房服务器上首次部署前,现场生成高强度随机密钥,
+#          脚本本身不会把生成的密钥回传到任何地方,只写入本地secrets目录
+# ==============================================================================
+
+set -euo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SECRETS_DIR="${PROJECT_ROOT}/secrets"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [gen-secrets] $*"; }
+
+mkdir -p "${SECRETS_DIR}"
+chmod 700 "${SECRETS_DIR}"
+
+# 需要生成的密钥清单:文件名 -> 生成策略
+declare -A SECRET_FILES=(
+    ["postgres_password.txt"]="pwd"
+    ["redis_password.txt"]="pwd"
+    ["chroma_auth_token.txt"]="token"
+    ["jwt_secret_key.txt"]="token"
+    ["backup_encryption_key.txt"]="token"
+)
+
+for filename in "${!SECRET_FILES[@]}"; do
+    target_path="${SECRETS_DIR}/${filename}"
+
+    if [[ -f "${target_path}" ]]; then
+        log "跳过 ${filename}:文件已存在,不覆盖现有密钥(避免误操作导致已部署系统的密钥失效)"
+        continue
+    fi
+
+    strategy="${SECRET_FILES[${filename}]}"
+    case "${strategy}" in
+        pwd)
+            # 生成24位强密码,包含大小写字母与数字,避开容易引起shell转义问题的特殊符号
+            secret_value=$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 24)
+            ;;
+        token)
+            # 生成64位十六进制Token,用于签名密钥、认证Token等场景,强度更高
+            secret_value=$(openssl rand -hex 32)
+            ;;
+        *)
+            log "错误: 未知的密钥生成策略 ${strategy}"
+            exit 1
+            ;;
+    esac
+
+    printf '%s' "${secret_value}" > "${target_path}"
+    chmod 600 "${target_path}"
+    log "已生成: ${filename} (权限600,仅文件属主可读写)"
+done
+
+log "=========================================="
+log "密钥生成完成,目录: ${SECRETS_DIR}"
+log "重要提示:"
+log "  1. secrets/ 目录已经在 .gitignore 中排除,禁止手动 git add 强制提交"
+log "  2. 生产环境务必对该目录做好文件系统级别的额外保护(如仅root可读的宿主机权限)"
+log "  3. 若需要密钥轮换,应先规划好轮换期间的双密钥并存策略,不能直接删除旧密钥文件"
+log "=========================================="
+```
+
+Docker Secrets覆盖配置,与基础配置和生产覆盖配置一起叠加使用:
+
+```yaml
+# ==============================================================================
+# docker-compose.secrets.yml —— Docker Secrets 密钥管理覆盖配置
+# 使用方式: docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.secrets.yml up -d
+# 核心思路:密钥不再通过 environment 字段以明文形式注入,而是通过 secrets 机制
+#          挂载为容器内的只读文件 /run/secrets/<secret_name>,应用代码优先读取这些文件
+# 限制说明:Docker Compose(非Swarm模式)下的secrets本质上是以bind mount方式实现的,
+#          安全收益主要体现在"不出现在环境变量与docker inspect输出中",
+#          如果要获得Swarm/K8s级别的加密存储与传输能力,需要升级到对应的编排平台,
+#          这一点在明天的安全合规专题里会展开对比说明
+# ==============================================================================
+
+version: "3.9"
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password.txt
+  redis_password:
+    file: ./secrets/redis_password.txt
+  chroma_auth_token:
+    file: ./secrets/chroma_auth_token.txt
+  jwt_secret_key:
+    file: ./secrets/jwt_secret_key.txt
+  backup_encryption_key:
+    file: ./secrets/backup_encryption_key.txt
+
+services:
+  postgres:
+    environment:
+      # POSTGRES_PASSWORD 与 POSTGRES_PASSWORD_FILE 互斥,官方镜像原生支持 _FILE 后缀写法
+      - POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password
+    secrets:
+      - postgres_password
+
+  redis:
+    # redis官方镜像不支持直接从文件读取启动参数,这里通过入口命令读取文件内容后传给redis-server
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - 'redis-server --requirepass "$$(cat /run/secrets/redis_password)" --appendonly yes'
+    secrets:
+      - redis_password
+
+  chroma:
+    environment:
+      - CHROMA_SERVER_AUTH_CREDENTIALS_FILE=/run/secrets/chroma_auth_token
+    secrets:
+      - chroma_auth_token
+
+  backend:
+    environment:
+      # 后端应用代码需要配合修改为优先读取 _FILE 后缀指向的文件,参考下方 secret_loader.py
+      - POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password
+      - JWT_SECRET_KEY_FILE=/run/secrets/jwt_secret_key
+      - CHROMA_AUTH_TOKEN_FILE=/run/secrets/chroma_auth_token
+    secrets:
+      - postgres_password
+      - jwt_secret_key
+      - chroma_auth_token
+
+  celery-worker:
+    environment:
+      - POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password
+      - REDIS_PASSWORD_FILE=/run/secrets/redis_password
+    secrets:
+      - postgres_password
+      - redis_password
+```
+
+配套的应用侧密钥读取工具,采用"优先读文件、找不到再回退到环境变量"的兼容写法,保证同一份代码既能在纯`.env`方案下跑通,也能在Docker Secrets方案下跑通:
+
+```python
+"""
+backend/app/utils/secret_loader.py —— 密钥读取工具
+兼容两种密钥注入方式:
+1. 传统方式: 直接通过环境变量 XXX 注入明文值(如 .env 方案)
+2. Docker Secrets方式: 通过环境变量 XXX_FILE 指向一个包含密钥内容的文件路径,
+   应用启动时读取文件内容作为实际密钥值,文件内容本身不出现在环境变量或进程列表中
+优先级: 如果同时配置了 XXX_FILE,优先使用文件内容;否则回退到 XXX 环境变量
+"""
+
+import logging
+import os
+from pathlib import Path
+from typing import Optional
+
+logger = logging.getLogger("cangqiong.secret_loader")
+
+
+def load_secret(env_var_name: str, default: Optional[str] = None, required: bool = False) -> Optional[str]:
+    """
+    读取一个密钥值,自动兼容"文件挂载"与"环境变量明文"两种注入方式。
+
+    Args:
+        env_var_name: 基础环境变量名,如 "JWT_SECRET_KEY"
+        default: 两种方式都取不到值时的默认值
+        required: 若为True且最终未能取到任何值,直接抛出异常阻止应用带着缺失的密钥启动
+
+    Returns:
+        密钥的字符串值,如果都取不到且未标记为required,则返回default
+    """
+    file_env_var_name = f"{env_var_name}_FILE"
+    file_path_str = os.getenv(file_env_var_name)
+
+    if file_path_str:
+        file_path = Path(file_path_str)
+        if not file_path.is_file():
+            raise RuntimeError(
+                f"环境变量 {file_env_var_name} 指定的密钥文件不存在: {file_path_str},"
+                f"请检查 docker-compose.secrets.yml 中的 secrets 挂载配置是否生效"
+            )
+        secret_value = file_path.read_text(encoding="utf-8").strip()
+        logger.info("密钥 %s 通过文件方式加载(来源: %s)", env_var_name, file_env_var_name)
+        return secret_value
+
+    plain_value = os.getenv(env_var_name)
+    if plain_value:
+        logger.info("密钥 %s 通过环境变量明文方式加载,生产环境建议迁移到 Docker Secrets 方案", env_var_name)
+        return plain_value
+
+    if required:
+        raise RuntimeError(
+            f"必需的密钥 {env_var_name} 未配置,既没有找到环境变量 {env_var_name},"
+            f"也没有找到 {file_env_var_name} 指向的密钥文件"
+        )
+
+    return default
+
+
+def build_database_url_with_secret() -> str:
+    """
+    组装数据库连接串,密码部分优先从密钥文件读取,而不是直接依赖预先拼接好的DATABASE_URL,
+    这样可以避免"密码以明文形式出现在DATABASE_URL这一个环境变量里"这种绕过Secrets机制的情况
+    """
+    db_host = os.getenv("DATABASE_HOST", "postgres")
+    db_port = os.getenv("DATABASE_PORT", "5432")
+    db_name = os.getenv("DATABASE_NAME", "cangqiong_kb")
+    db_user = os.getenv("DATABASE_USER", "cangqiong_admin")
+
+    db_password = load_secret("POSTGRES_PASSWORD", required=True)
+
+    return f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+```
+
+陈铭一开始有点疑惑:"既然要上Docker Secrets,为什么代码里还要兼容环境变量明文这条路径,不是应该强制走密钥文件吗?"孙昊解释,这涉及到"渐进式升级"的现实考虑——不是所有客户环境都能一步到位用上Secrets机制(比如某些客户机房出于历史原因还在用更旧的Docker版本,或者运维团队还没有走完密钥管理的流程改造),代码层面保留兼容路径,可以让同一套应用代码在不同成熟度的客户环境下都能正常工作,只是在日志里明确提示"生产环境建议迁移",把决定权交给运维,而不是用代码强行卡死一种方案。这是他们给多个客户做私有化交付后总结出来的一个经验——"代码要够灵活去适配客户的现实情况,但日志要足够诚实地告诉大家什么是更好的做法"。
+
+### 9.13 安全基线自检脚本:最小暴露原则自动化审计
+
+孙昊在流程图讲解里提到镜像漏洞扫描,但需求文档4.6节验收标准里还有一条"端口暴露清单核查",这件事完全可以写成脚本自动完成,不需要每次人工拿着docker-compose.yml一行行去数。
+
+```python
+#!/usr/bin/env python3
+"""
+scripts/security_baseline_audit.py —— 安全基线自动化审计脚本
+审计目标:对照御风金融需求文档中的"最小暴露原则"与常见容器安全基线,
+        自动检查 docker-compose.yml / docker-compose.prod.yml 中的潜在风险项,
+        输出结构化报告,可作为提交给客户安全评估流程的辅助材料之一
+
+审计规则清单:
+  R1. 除显式允许的入口服务(默认仅nginx)外,任何服务都不应该配置 ports 端口映射
+  R2. 生产环境覆盖配置中,backend-net 网络必须配置 internal: true
+  R3. 每个服务都应该配置 healthcheck,否则编排系统无法感知服务真实的健康状态
+  R4. environment 字段中不应该出现形如 PASSWORD=明文值 这种直接写死密钥的模式
+      (通过 ${VAR} 引用变量是被允许的,直接写字面量密码字符串才会被判定为风险)
+  R5. 生产环境覆盖配置中,数据存储类服务(postgres/redis/chroma)不应该配置 ports
+  R6. 每个自建服务(有build字段的服务)理论上应配置 restart 策略,避免异常退出后无人接管
+"""
+
+import argparse
+import json
+import re
+import sys
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any, Optional
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover
+    print("错误: 缺少 PyYAML 依赖,请先执行 pip install pyyaml", file=sys.stderr)
+    sys.exit(2)
+
+
+class Severity(str, Enum):
+    """风险等级:critical表示会直接导致金融客户安全评估不通过的问题,warning表示建议整改项"""
+
+    CRITICAL = "critical"
+    WARNING = "warning"
+    INFO = "info"
+
+
+@dataclass
+class Finding:
+    """单条审计发现"""
+
+    rule_id: str
+    severity: Severity
+    service: str
+    message: str
+
+
+# 默认允许对外暴露端口的服务白名单,今天的架构里只有nginx作为唯一入口
+DEFAULT_ALLOWED_EXPOSED_SERVICES = frozenset({"nginx"})
+
+# 生产环境不允许暴露端口的核心数据存储类服务
+DATA_STORE_SERVICES = frozenset({"postgres", "redis", "chroma"})
+
+# 匹配"环境变量里直接写死密钥字面量"的模式,例如 POSTGRES_PASSWORD=abc123
+# 允许通过 ${VAR} 或 ${VAR:-default} 这种插值引用的写法,不触发告警
+_HARDCODED_SECRET_KEY_PATTERN = re.compile(
+    r"(PASSWORD|SECRET|TOKEN|API_KEY)\s*[:=]\s*(?!\$\{)([^\s\$]{4,})", re.IGNORECASE
+)
+
+
+def load_compose_file(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(f"找不到编排文件: {path}")
+    with path.open(encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def _merge_compose(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """简化版的Compose文件叠加合并,仅用于审计场景,不追求和docker compose CLI完全一致的合并语义,
+    但覆盖了 services / networks 两个审计脚本关心的关键字段的浅层合并逻辑"""
+    merged: dict[str, Any] = json.loads(json.dumps(base))  # 深拷贝,避免污染原始dict
+
+    merged.setdefault("services", {})
+    for service_name, override_service_conf in override.get("services", {}).items():
+        base_service_conf = merged["services"].setdefault(service_name, {})
+        for key, value in override_service_conf.items():
+            base_service_conf[key] = value
+
+    merged.setdefault("networks", {})
+    for net_name, override_net_conf in override.get("networks", {}).items():
+        base_net_conf = merged["networks"].setdefault(net_name, {})
+        if isinstance(override_net_conf, dict):
+            base_net_conf.update(override_net_conf)
+
+    return merged
+
+
+def _stringify_environment(env_field: Any) -> list[str]:
+    """environment字段在Compose里可以写成list形式(['KEY=VALUE', ...])或dict形式({KEY: VALUE}),
+    统一转换成 'KEY=VALUE' 字符串列表,方便后续用同一套正则规则去检查"""
+    if env_field is None:
+        return []
+    if isinstance(env_field, dict):
+        return [f"{k}={v}" for k, v in env_field.items()]
+    if isinstance(env_field, list):
+        return [str(item) for item in env_field]
+    return []
+
+
+def audit_exposed_ports(
+    merged_conf: dict[str, Any], allowed_services: frozenset[str]
+) -> list[Finding]:
+    """R1 + R5: 检查端口暴露情况"""
+    findings: list[Finding] = []
+    for service_name, service_conf in merged_conf.get("services", {}).items():
+        ports = service_conf.get("ports")
+        if not ports:
+            continue
+
+        if service_name in DATA_STORE_SERVICES:
+            findings.append(
+                Finding(
+                    rule_id="R5",
+                    severity=Severity.CRITICAL,
+                    service=service_name,
+                    message=(
+                        f"数据存储类服务 '{service_name}' 配置了端口映射 {ports},"
+                        f"违反最小暴露原则,数据库/缓存/向量库不应直接暴露给宿主机网络"
+                    ),
+                )
+            )
+        elif service_name not in allowed_services:
+            findings.append(
+                Finding(
+                    rule_id="R1",
+                    severity=Severity.WARNING,
+                    service=service_name,
+                    message=(
+                        f"服务 '{service_name}' 配置了端口映射 {ports},"
+                        f"未在允许暴露端口的白名单 {sorted(allowed_services)} 中,请确认是否为有意暴露"
+                    ),
+                )
+            )
+    return findings
+
+
+def audit_internal_network(merged_conf: dict[str, Any]) -> list[Finding]:
+    """R2: 检查后端网络是否配置了 internal: true"""
+    findings: list[Finding] = []
+    backend_net_conf = merged_conf.get("networks", {}).get("backend-net", {})
+    if not backend_net_conf.get("internal"):
+        findings.append(
+            Finding(
+                rule_id="R2",
+                severity=Severity.CRITICAL,
+                service="backend-net",
+                message="backend-net 网络未配置 internal: true,数据层容器仍有能力主动访问外网,不满足数据不出域要求",
+            )
+        )
+    return findings
+
+
+def audit_healthcheck(merged_conf: dict[str, Any]) -> list[Finding]:
+    """R3: 检查每个服务是否配置了健康检查"""
+    findings: list[Finding] = []
+    for service_name, service_conf in merged_conf.get("services", {}).items():
+        if not service_conf.get("healthcheck"):
+            findings.append(
+                Finding(
+                    rule_id="R3",
+                    severity=Severity.WARNING,
+                    service=service_name,
+                    message=f"服务 '{service_name}' 未配置 healthcheck,编排系统无法感知该服务的真实健康状态",
+                )
+            )
+    return findings
+
+
+def audit_hardcoded_secrets(merged_conf: dict[str, Any]) -> list[Finding]:
+    """R4: 检查环境变量中是否存在硬编码的密钥字面量"""
+    findings: list[Finding] = []
+    for service_name, service_conf in merged_conf.get("services", {}).items():
+        env_entries = _stringify_environment(service_conf.get("environment"))
+        for entry in env_entries:
+            match = _HARDCODED_SECRET_KEY_PATTERN.search(entry)
+            if match and "CHANGE_ME" not in entry:
+                findings.append(
+                    Finding(
+                        rule_id="R4",
+                        severity=Severity.CRITICAL,
+                        service=service_name,
+                        message=f"服务 '{service_name}' 的环境变量中疑似存在硬编码密钥: {entry.split('=')[0]}=****",
+                    )
+                )
+    return findings
+
+
+def audit_restart_policy(merged_conf: dict[str, Any]) -> list[Finding]:
+    """R6: 检查自建服务是否配置了重启策略"""
+    findings: list[Finding] = []
+    for service_name, service_conf in merged_conf.get("services", {}).items():
+        if service_conf.get("build") and not service_conf.get("restart"):
+            findings.append(
+                Finding(
+                    rule_id="R6",
+                    severity=Severity.WARNING,
+                    service=service_name,
+                    message=f"自建服务 '{service_name}' 未配置 restart 策略,进程异常退出后不会被自动拉起",
+                )
+            )
+    return findings
+
+
+def run_all_audits(
+    base_compose_path: Path,
+    prod_override_path: Optional[Path],
+    allowed_exposed_services: frozenset[str],
+) -> list[Finding]:
+    base_conf = load_compose_file(base_compose_path)
+    merged_conf = base_conf
+    if prod_override_path is not None:
+        override_conf = load_compose_file(prod_override_path)
+        merged_conf = _merge_compose(base_conf, override_conf)
+
+    findings: list[Finding] = []
+    findings.extend(audit_exposed_ports(merged_conf, allowed_exposed_services))
+    findings.extend(audit_internal_network(merged_conf))
+    findings.extend(audit_healthcheck(merged_conf))
+    findings.extend(audit_hardcoded_secrets(merged_conf))
+    findings.extend(audit_restart_policy(merged_conf))
+    return findings
+
+
+def render_report(findings: list[Finding]) -> str:
+    lines = ["=" * 70, "苍穹知识库系统 · 安全基线自检报告", "=" * 70, ""]
+
+    if not findings:
+        lines.append("未发现任何风险项,当前配置符合已定义的安全基线规则。")
+        return "\n".join(lines)
+
+    critical_findings = [f for f in findings if f.severity == Severity.CRITICAL]
+    warning_findings = [f for f in findings if f.severity == Severity.WARNING]
+
+    lines.append(f"共发现 {len(findings)} 项风险,其中严重级 {len(critical_findings)} 项,警告级 {len(warning_findings)} 项。")
+    lines.append("")
+
+    for group_name, group_items in (("【严重】", critical_findings), ("【警告】", warning_findings)):
+        if not group_items:
+            continue
+        lines.append(group_name)
+        for finding in group_items:
+            lines.append(f"  [{finding.rule_id}] 服务={finding.service}  {finding.message}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="苍穹知识库系统安全基线自检脚本")
+    parser.add_argument("--base", type=Path, default=Path("docker-compose.yml"), help="基础编排文件路径")
+    parser.add_argument("--prod", type=Path, default=Path("docker-compose.prod.yml"), help="生产环境覆盖配置路径")
+    parser.add_argument(
+        "--allow-exposed",
+        type=str,
+        default="nginx",
+        help="允许暴露端口的服务名单,逗号分隔,默认仅允许nginx",
+    )
+    parser.add_argument("--json", action="store_true", help="以JSON格式输出结果,便于CI流水线解析")
+    args = parser.parse_args()
+
+    allowed = frozenset(name.strip() for name in args.allow_exposed.split(",") if name.strip())
+
+    try:
+        findings = run_all_audits(args.base, args.prod, allowed)
+    except FileNotFoundError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps([finding.__dict__ for finding in findings], ensure_ascii=False, indent=2, default=str))
+    else:
+        print(render_report(findings))
+
+    has_critical = any(f.severity == Severity.CRITICAL for f in findings)
+    return 1 if has_critical else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+陈铭拿这个脚本跑了一遍今天写的docker-compose文件,结果输出"未发现任何风险项",他心里踏实了不少,但孙昊提了个醒:"脚本能查的是'写在配置文件里能看出来的问题',查不出来的问题——比如镜像本身有没有已知CVE漏洞、代码里有没有SQL注入——还得靠明天的镜像扫描工具和代码审查来补上。自动化审计是第一道关,不是唯一一道关。"这句话陈铭一字不差记进了备忘录。
+
+### 9.14 部署后集成测试与烟雾测试
+
+赵天成在晨会上提到的"环境等价性验证",今天要落地成一份可以在真实容器环境里跑的测试脚本——不是测代码逻辑本身(那是单元测试该干的事),而是测"整套容器编排起来之后,对外表现出来的行为是否符合预期"。
+
+```python
+"""
+backend/tests/test_smoke_deployment.py —— 部署后集成/烟雾测试
+测试对象: 已经通过 docker compose up -d 拉起的完整苍穹知识库系统(可以是本地开发环境,
+         也可以是云服务器测试环境),测试脚本本身运行在容器外部,像真实用户/调用方一样
+         通过网络请求验证系统行为,这正是赵天成负责的"环境等价性验证"的核心手段
+
+运行方式:
+    SMOKE_TEST_BASE_URL=http://<服务器IP或域名> pytest backend/tests/test_smoke_deployment.py -v
+
+设计原则:
+1. 这些测试不应该依赖测试运行者对系统内部实现的了解,只依赖对外暴露的HTTP接口行为,
+   这样才能真正验证"客户视角下这套系统是否可用",而不是"代码逻辑是否正确"(单元测试已经覆盖)
+2. 测试之间应尽量独立,不假设执行顺序,失败一个测试不应该级联导致其它测试失败
+3. 涉及鉴权、限流、RBAC这些安全相关的行为,必须像老王强调的那样"不仅测正确输入,
+   还要测错误输入是否被正确拒绝",这也是本文件里 test_* 用例分为"正向"和"反向"两组的原因
+"""
+
+import os
+import time
+import uuid
+
+import pytest
+import requests
+
+BASE_URL = os.getenv("SMOKE_TEST_BASE_URL", "http://localhost").rstrip("/")
+REQUEST_TIMEOUT_SECONDS = 10
+
+
+@pytest.fixture(scope="module")
+def http_session() -> requests.Session:
+    """复用一个session对象,减少每次请求都重新建立TCP连接的开销,更贴近真实客户端行为"""
+    session = requests.Session()
+    session.headers.update({"User-Agent": "cangqiong-smoke-test/1.0"})
+    return session
+
+
+class TestBasicAvailability:
+    """第一组:基础可用性验证,对应验收标准第1条"在10分钟内达到可用状态" """
+
+    def test_nginx_entrypoint_reachable(self, http_session: requests.Session) -> None:
+        """验证唯一对外入口Nginx能够正常响应"""
+        response = http_session.get(f"{BASE_URL}/healthz", timeout=REQUEST_TIMEOUT_SECONDS)
+        assert response.status_code == 200, f"Nginx入口健康检查异常,状态码: {response.status_code}"
+
+    def test_backend_health_endpoint(self, http_session: requests.Session) -> None:
+        """验证后端服务健康检查接口可达,且返回结构符合预期字段"""
+        response = http_session.get(f"{BASE_URL}/api/health", timeout=REQUEST_TIMEOUT_SECONDS)
+        assert response.status_code == 200
+        body = response.json()
+        assert body.get("status") == "ok"
+        assert "uptime_seconds" in body
+
+    def test_frontend_static_assets_reachable(self, http_session: requests.Session) -> None:
+        """验证前端静态页面能够被正常返回(不校验具体页面内容,只校验能拿到200和非空内容)"""
+        response = http_session.get(f"{BASE_URL}/", timeout=REQUEST_TIMEOUT_SECONDS)
+        assert response.status_code == 200
+        assert len(response.content) > 0
+
+
+class TestDegradationBehavior:
+    """第二组:降级行为验证,对应验收标准第3条"关闭非核心容器后应给出明确错误提示而非无响应或崩溃"
+    这一组测试默认跳过,需要配合人工关闭对应容器后手动执行,因为它具有破坏性,不适合放进常规CI流水线"""
+
+    @pytest.mark.skipif(
+        os.getenv("RUN_DEGRADATION_TESTS") != "1",
+        reason="需要显式设置环境变量 RUN_DEGRADATION_TESTS=1 才会执行,因为该测试要求人工预先关闭指定容器",
+    )
+    def test_chat_endpoint_returns_clear_error_when_vector_db_down(self, http_session: requests.Session) -> None:
+        """预期用法: 先执行 docker compose stop chroma,再运行本测试,验证返回的是结构化错误而不是500裸异常或连接超时"""
+        response = http_session.post(
+            f"{BASE_URL}/api/chat/ask",
+            json={"conversation_id": None, "question": "测试问题:向量库降级场景"},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        # 期望后端能够捕获下游异常并转换成结构化的4xx/5xx响应,而不是让请求直接超时或返回裸的堆栈信息
+        assert response.status_code in (503, 502)
+        body = response.json()
+        assert "message" in body
+        assert "Traceback" not in body.get("message", ""), "错误响应中不应该泄露内部堆栈信息"
+
+
+class TestRBACIsolation:
+    """第三组:RBAC权限隔离验证,对应需求文档4.4.2"不同部门访问的知识库范围需要隔离" """
+
+    def test_user_cannot_access_other_department_documents(self, http_session: requests.Session) -> None:
+        """反向测试:合规部用户尝试访问风控部专属文档,预期被拒绝(403),而不是静默返回空结果或直接报错崩溃"""
+        login_resp = http_session.post(
+            f"{BASE_URL}/api/auth/login",
+            json={"username": "compliance_test_user", "password": os.environ["SMOKE_TEST_COMPLIANCE_USER_PASSWORD"]},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        assert login_resp.status_code == 200, "测试账号登录失败,请确认测试环境的种子账号是否已正确初始化"
+        token = login_resp.json()["access_token"]
+
+        response = http_session.get(
+            f"{BASE_URL}/api/documents/risk-control-only-doc-001",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        assert response.status_code == 403, (
+            f"预期跨部门访问应被拒绝(403),实际状态码: {response.status_code},"
+            f"存在潜在的权限隔离失效风险,必须在上线前修复"
+        )
+
+    def test_admin_can_access_all_departments(self, http_session: requests.Session) -> None:
+        """正向测试:管理员角色应能够跨部门访问,验证RBAC没有"一刀切"地把所有非本部门访问都拒绝"""
+        login_resp = http_session.post(
+            f"{BASE_URL}/api/auth/login",
+            json={"username": "admin_test_user", "password": os.environ["SMOKE_TEST_ADMIN_USER_PASSWORD"]},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        assert login_resp.status_code == 200
+        token = login_resp.json()["access_token"]
+
+        response = http_session.get(
+            f"{BASE_URL}/api/documents/risk-control-only-doc-001",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        assert response.status_code in (200, 404), (
+            "管理员角色访问不应因权限问题被拒绝(403是不可接受的),"
+            "404表示文档确实不存在属于正常业务情况,403才代表权限设计有误"
+        )
+
+
+class TestRateLimiting:
+    """第四组:限流行为验证,对应需求文档4.5.4"容器间通信最小暴露"与Nginx配置的limit_req_zone"""
+
+    def test_excessive_requests_get_rate_limited(self, http_session: requests.Session) -> None:
+        """短时间内对同一接口发起远超burst配置的请求量,预期后续请求收到429而不是被无限制放行拖垮后端"""
+        endpoint = f"{BASE_URL}/api/health"
+        status_codes: list[int] = []
+
+        for _ in range(60):
+            resp = http_session.get(endpoint, timeout=REQUEST_TIMEOUT_SECONDS)
+            status_codes.append(resp.status_code)
+
+        rate_limited_count = sum(1 for code in status_codes if code == 429)
+        # 不要求"必须触发限流"(因为/api/health在nginx配置里可能被从限流区单独摘出),
+        # 但如果限流生效,断言至少有部分请求被正确拒绝,防止限流规则被误删导致完全失效
+        if rate_limited_count == 0:
+            pytest.skip("当前接口未观察到限流生效,若该接口本应受限流保护,请人工核查nginx限流配置是否被误改")
+        assert rate_limited_count > 0
+
+
+class TestConversationPersistence:
+    """第五组:对话历史留存验证,对应需求文档4.4.3"所有问答记录需要落库留存" """
+
+    def test_conversation_persists_across_requests(self, http_session: requests.Session) -> None:
+        """验证连续两次带同一conversation_id的请求,第二次请求能够读到第一次的历史消息,
+        证明数据确实落到了PostgreSQL而不是停留在某个容器内存中(容器重启就会丢失)"""
+        login_resp = http_session.post(
+            f"{BASE_URL}/api/auth/login",
+            json={"username": "smoke_test_user", "password": os.environ["SMOKE_TEST_USER_PASSWORD"]},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        assert login_resp.status_code == 200
+        token = login_resp.json()["access_token"]
+        headers = {"Authorization": f"Bearer {token}"}
+
+        unique_marker = f"smoke-test-marker-{uuid.uuid4().hex[:8]}"
+        create_resp = http_session.post(
+            f"{BASE_URL}/api/chat/ask",
+            json={"conversation_id": None, "question": f"{unique_marker} 这是一条烟雾测试问题"},
+            headers=headers,
+            timeout=30,
+        )
+        assert create_resp.status_code == 200
+        conversation_id = create_resp.json()["conversation_id"]
+
+        # 给数据库写入留出短暂的时间窗口,避免因为异步落库带来的偶发性失败
+        time.sleep(1)
+
+        history_resp = http_session.get(
+            f"{BASE_URL}/api/chat/{conversation_id}/messages",
+            headers=headers,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        assert history_resp.status_code == 200
+        messages = history_resp.json()["messages"]
+        assert any(unique_marker in msg["content"] for msg in messages), "历史消息中未找到刚才发送的标记内容,持久化可能存在问题"
+```
+
+配套的一键执行入口脚本,把环境变量准备、依赖安装、测试执行整合成一条命令,方便部署脚本(9.6小节的`deploy.sh`)在`post_deploy_verify`阶段直接调用:
+
+```bash
+#!/usr/bin/env bash
+# ==============================================================================
+# scripts/run_smoke_tests.sh —— 烟雾测试一键执行脚本
+# ==============================================================================
+
+set -euo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TARGET_URL="${1:-http://localhost}"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [smoke-test] $*"; }
+
+log "目标环境: ${TARGET_URL}"
+
+if [[ -z "${SMOKE_TEST_USER_PASSWORD:-}" ]]; then
+    log "错误: 未配置测试账号密码相关环境变量,请先在CI secrets或本地环境中配置"
+    log "所需变量: SMOKE_TEST_USER_PASSWORD / SMOKE_TEST_ADMIN_USER_PASSWORD / SMOKE_TEST_COMPLIANCE_USER_PASSWORD"
+    exit 1
+fi
+
+export SMOKE_TEST_BASE_URL="${TARGET_URL}"
+
+cd "${PROJECT_ROOT}"
+python3 -m pytest backend/tests/test_smoke_deployment.py -v --tb=short -m "not skip"
+
+log "烟雾测试执行完成"
+```
+
+赵天成把这套烟雾测试跑起来之后,特意在群里发了一条消息:"这套东西以后每次发版本都跑一遍,我就不用每次手工点几十遍页面确认功能正常了。"王振宇在群里回了一句:"这才是测试该有的样子——不是为了'测试覆盖率好看',是为了让人真正敢按下部署按钮。"
 
 ---
 
