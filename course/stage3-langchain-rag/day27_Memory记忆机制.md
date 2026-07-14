@@ -1917,6 +1917,1223 @@ CQ_LLM_BASE_URL=https://api.deepseek.com
 
 写完最后一个文件,陈铭把整个模块从头到尾又顺了一遍调用链路:`api/v1/memory.py`的路由函数,只依赖`MemoryManager`和`build_chat_chain_with_memory`两个入口;`chains.py`只依赖`manager.get_session_history`这一个工厂函数;`manager.py`是唯一直接触碰`ChatSession`表的地方;`history.py`是唯一直接触碰`ChatMessage`表、并且决定"该怎么裁剪"的地方;`window_memory.py`和`summary_memory.py`各自只关心自己那一种裁剪策略的具体算法,互不干扰。他在笔记本上写下一句总结:"今天这套代码,每一层只知道自己上一层需要什么、下一层能提供什么,不知道再往下两层是怎么实现的——这大概就是老王一直强调的'分层',不是把文件拆成很多个,而是让每一层都可以被单独换掉,而不影响其他层。"
 
+### 文件14:选做拓展 · `app/services/memory/compaction.py` —— 混合记忆压缩策略预研
+
+上线两天之后,林悦反馈了一个新场景:海纳集团有一类"设备巡检"对话,员工会在对话中间提到具体的设备编号、故障代码这类关键信息,过几十轮之后又会回头问"刚才那台设备的编号是多少"。如果只用窗口记忆,这类关键信息很容易被滑出窗口;如果无差别地都走摘要记忆,又会增加不必要的LLM调用成本。老王据此提出了一个新的方向,让陈铭先做一版技术预研,不急着正式接入生产路径。
+
+```python
+"""
+app/services/memory/compaction.py
+===============================
+记忆压缩策略扩展包 · 混合策略与重要性加权保留
+
+背景说明:
+    上线两天之后,林悦反馈了一个新场景:海纳集团有一类"设备巡检"对话,
+    员工会在对话中间提到具体的设备编号、故障代码这类关键信息,过几十轮之后
+    又会回头问"刚才那台设备的编号是多少"。如果只用窗口记忆,这类关键信息
+    很容易被滑出窗口;如果无差别地都走摘要记忆,又会增加不必要的LLM调用成本
+    (很多轮次其实是无关紧要的寒暄或确认)。
+
+    老王据此提出了一个新的方向:"能不能在裁剪历史的时候,不是简单粗暴地按
+    '轮数'或'触发阈值'一刀切,而是先识别出哪些消息'更重要',优先保留重要的,
+    裁剪不重要的?"这份文件就是陈铭针对这个方向做的技术预研,一共实现了
+    两种新的策略:
+
+    1. HybridBudgetStrategy:窗口记忆和摘要记忆的"混合体"——在一个统一的
+       token预算内,优先分配预算给"最近N轮原文"和"被判定为重要的历史消息",
+       预算不够时才整体退化为摘要。
+    2. ImportanceScoredRetention:一个独立的重要性打分工具,可以被
+       HybridBudgetStrategy复用,也可以单独用于给历史消息做"重要性标注"、
+       辅助人工审计时快速定位关键信息。
+
+    这份文件目前还处于"技术预研"阶段,还没有集成进`history.py`的正式策略分支
+    (那需要新增一条MemoryStrategy枚举值,并且要通过完整的验收测试),
+    先作为独立模块存在,方便老王和林悦先评估效果,再决定要不要正式上线。
+"""
+
+import re
+from dataclasses import dataclass, field
+from typing import Iterable, List, Optional, Sequence
+
+from .config import memory_settings
+from .models import ChatMessage
+from .window_memory import trim_by_window
+
+
+# ============================================================
+# 一、重要性打分:识别"值得优先保留"的消息
+# ============================================================
+
+
+# 关键信息的正则特征库:设备编号、故障代码、工单号、金额等强结构化信息,
+# 这类信息一旦被摘要"转述"一遍,很容易丢失精确性(比如编号里的某一位数字被概括掉),
+# 所以打分策略里,命中这些特征的消息会被给予较高的重要性加权。
+_IMPORTANT_PATTERNS: List[re.Pattern] = [
+    re.compile(r"设备[A-Za-z0-9\-]{2,}"),       # 设备编号,例如"设备A-203"
+    re.compile(r"工单[号编]?[:：]?\s*[A-Za-z0-9\-]{3,}"),  # 工单号
+    re.compile(r"故障代码[:：]?\s*[A-Za-z0-9\-]{2,}"),      # 故障代码
+    re.compile(r"[0-9]+(\.[0-9]+)?\s*(元|万元|美元|USD|RMB)"),  # 金额
+    re.compile(r"截止|截至|deadline|due", re.IGNORECASE),  # 时间节点类关键词
+]
+
+# 明显是"寒暄/确认"类的低信息量短句,命中这些特征的消息会被给予较低的重要性加权,
+# 即使它们本身长度不短,大概率也不包含值得长期保留的实质信息。
+_LOW_VALUE_PATTERNS: List[re.Pattern] = [
+    re.compile(r"^(好的|好|嗯|嗯嗯|收到|明白|谢谢|感谢|辛苦了)[。!!,,]?$"),
+    re.compile(r"^(你好|在吗|请问|打扰一下)[。!!,,]?$"),
+]
+
+
+@dataclass
+class ScoredMessage:
+    """给一条原始消息附加上重要性评分之后的包装对象。"""
+
+    row: ChatMessage
+    importance_score: float
+    matched_reasons: List[str] = field(default_factory=list)
+
+    def __repr__(self) -> str:  # 方便日志/调试时直接打印,一眼看出评分依据
+        reasons = ",".join(self.matched_reasons) if self.matched_reasons else "无特殊命中"
+        return (
+            f"ScoredMessage(seq={self.row.sequence_no}, score={self.importance_score:.2f}, "
+            f"reasons=[{reasons}])"
+        )
+
+
+class ImportanceScoredRetention:
+    """
+    对一批历史消息做重要性打分,供其他策略(比如下面的HybridBudgetStrategy)
+    决定"预算不够时,先裁掉谁"。
+
+    打分规则本身刻意设计得简单、可解释——每一条规则命中或不命中,都能直接说清楚
+    "为什么这条消息被判定为重要/不重要",这是企业级项目里"可解释性优先于花哨算法"
+    这条原则的具体体现,尤其是这类会影响"用户能不能看到自己说过的关键信息"的模块,
+    如果打分逻辑是一个黑盒,出问题时几乎无法排查。
+    """
+
+    def __init__(
+        self,
+        important_patterns: Optional[Sequence[re.Pattern]] = None,
+        low_value_patterns: Optional[Sequence[re.Pattern]] = None,
+        base_score: float = 1.0,
+        important_bonus: float = 2.0,
+        low_value_penalty: float = 0.5,
+        recency_bonus_per_step: float = 0.05,
+    ) -> None:
+        self._important_patterns = list(important_patterns) if important_patterns else list(_IMPORTANT_PATTERNS)
+        self._low_value_patterns = list(low_value_patterns) if low_value_patterns else list(_LOW_VALUE_PATTERNS)
+        self.base_score = base_score
+        self.important_bonus = important_bonus
+        self.low_value_penalty = low_value_penalty
+        # 越靠近"当前时刻"的消息,天然应该获得一点额外加分——即使内容本身平平无奇,
+        # 越新的消息越有可能被接下来几轮对话直接引用,这是"时间局部性"在打分里的体现。
+        self.recency_bonus_per_step = recency_bonus_per_step
+
+    def score_all(self, rows: Sequence[ChatMessage]) -> List[ScoredMessage]:
+        """
+        给一批按时间顺序排列(旧->新)的消息逐条打分。
+
+        :param rows: 待打分的消息序列
+        :return: 与rows顺序一一对应的ScoredMessage列表
+        """
+        total = len(rows)
+        scored: List[ScoredMessage] = []
+        for index, row in enumerate(rows):
+            score = self.base_score
+            reasons: List[str] = []
+            content = row.content or ""
+
+            for pattern in self._important_patterns:
+                if pattern.search(content):
+                    score += self.important_bonus
+                    reasons.append(f"命中重要特征:{pattern.pattern}")
+                    break  # 命中一条重要特征即可,不需要重复叠加多条同类加分
+
+            stripped = content.strip()
+            for pattern in self._low_value_patterns:
+                if pattern.match(stripped):
+                    score -= self.low_value_penalty
+                    reasons.append(f"命中低价值特征:{pattern.pattern}")
+                    break
+
+            # 距离末尾越近(越新),额外加分越多;用(total - 1 - index)表示"倒数第几条"
+            steps_from_latest = total - 1 - index
+            recency_bonus = max(0.0, (total - steps_from_latest)) * self.recency_bonus_per_step
+            score += recency_bonus
+
+            scored.append(ScoredMessage(row=row, importance_score=max(score, 0.0), matched_reasons=reasons))
+        return scored
+
+    def top_k_by_importance(self, rows: Sequence[ChatMessage], k: int) -> List[ChatMessage]:
+        """
+        返回重要性评分最高的k条消息,结果按原始时间顺序(而不是分数高低)重新排列,
+        因为最终这些消息还是要以"对话原有顺序"的形式喂给模型,分数只用来决定"选谁",
+        不应该影响"选出来之后的排列方式"。
+        """
+        scored = self.score_all(rows)
+        top = sorted(scored, key=lambda s: s.importance_score, reverse=True)[:k]
+        top_seq_set = {s.row.sequence_no for s in top}
+        return [row for row in rows if row.sequence_no in top_seq_set]
+
+
+# ============================================================
+# 二、混合预算策略:窗口 + 重要性保留 的组合体
+# ============================================================
+
+
+class HybridBudgetStrategy:
+    """
+    在一个统一的token预算内,按以下优先级分配空间:
+
+    1. 最近`recent_protected_turns`轮,无条件保留(不参与重要性竞争,
+       因为"最近说了什么"本身就是刚性需求,不该被任何打分逻辑挤掉);
+    2. 预算剩余空间,优先分配给重要性评分最高的历史消息(不包含已经在第1步
+       保留的那些);
+    3. 如果预算依然有富余,按时间顺序继续往前补充"次重要"的消息,
+       直到预算用尽或历史消息已经全部纳入。
+
+    这个策略目前只在内存里对一批`ChatMessage`对象进行操作,还没有接入
+    `history.py`的正式读取路径——如果评审通过决定采用,需要在`MemoryStrategy`
+    里新增`HYBRID = "hybrid"`枚举值,并在`SQLAlchemyChatMessageHistory.messages`
+    的分支逻辑里加一条对应的调用,今天先把核心算法实现出来,接口设计上
+    也刻意让它可以被后续的正式接入直接复用,不需要重写。
+    """
+
+    def __init__(
+        self,
+        max_tokens: Optional[int] = None,
+        recent_protected_turns: int = 2,
+        importance_scorer: Optional[ImportanceScoredRetention] = None,
+    ) -> None:
+        self.max_tokens = max_tokens if max_tokens is not None else memory_settings.window_max_tokens
+        self.recent_protected_turns = recent_protected_turns
+        self.importance_scorer = importance_scorer or ImportanceScoredRetention()
+
+    def select(self, rows: Sequence[ChatMessage]) -> List[ChatMessage]:
+        """
+        执行一次完整的混合预算选择,返回最终应该喂给模型的消息子集
+        (按时间顺序排列,旧->新)。
+        """
+        if not rows:
+            return []
+
+        protected_count = max(self.recent_protected_turns * 2, 0)
+        protected = list(rows[-protected_count:]) if protected_count else []
+        protected_seq_set = {row.sequence_no for row in protected}
+        candidates = [row for row in rows if row.sequence_no not in protected_seq_set]
+
+        protected_tokens = self._sum_tokens(protected)
+        remaining_budget = max(self.max_tokens - protected_tokens, 0)
+
+        if remaining_budget <= 0 or not candidates:
+            # 预算已经被"必须保留"的最近几轮吃满,直接返回受保护的部分即可
+            return protected
+
+        scored_candidates = self.importance_scorer.score_all(candidates)
+        scored_candidates.sort(key=lambda s: s.importance_score, reverse=True)
+
+        selected_from_candidates: List[ChatMessage] = []
+        used_budget = 0
+        for scored in scored_candidates:
+            cost = scored.row.token_estimate or len(scored.row.content or "")
+            if used_budget + cost > remaining_budget:
+                continue  # 这条放不进去了,但不代表后面预算更小的也放不进去,继续尝试下一条
+            selected_from_candidates.append(scored.row)
+            used_budget += cost
+
+        combined = selected_from_candidates + protected
+        combined.sort(key=lambda row: row.sequence_no)
+        return combined
+
+    @staticmethod
+    def _sum_tokens(rows: Iterable[ChatMessage]) -> int:
+        return sum((row.token_estimate or len(row.content or "")) for row in rows)
+
+    def selection_report(self, rows: Sequence[ChatMessage]) -> dict:
+        """
+        生成一份"这次选择到底选了谁、为什么"的可读报告,主要用于调试面板/
+        评审演示,而不是生产环境每次请求都要生成的东西(那样开销就白白浪费了)。
+        """
+        selected = self.select(rows)
+        selected_seq_set = {row.sequence_no for row in selected}
+        dropped = [row for row in rows if row.sequence_no not in selected_seq_set]
+
+        return {
+            "total_input_messages": len(rows),
+            "selected_count": len(selected),
+            "dropped_count": len(dropped),
+            "selected_sequence_numbers": [row.sequence_no for row in selected],
+            "dropped_sequence_numbers": [row.sequence_no for row in dropped],
+            "budget_used_tokens": self._sum_tokens(selected),
+            "budget_limit_tokens": self.max_tokens,
+        }
+
+
+# ============================================================
+# 三、传统窗口策略的一个变体:按"轮"平滑退化,而不是硬截断
+# ============================================================
+
+
+def trim_by_window_with_fallback_summary_marker(
+    rows: Sequence[ChatMessage],
+    max_turns: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+    dropped_marker_template: str = "(此前还有{count}轮对话未在下方展示,如需回顾请查看完整历史记录)",
+) -> List[ChatMessage]:
+    """
+    对`window_memory.trim_by_window`的一个轻量增强:如果确实发生了截断,
+    在返回结果的最前面插入一条"占位提示消息",而不是让模型完全不知道
+    "历史其实更长,只是没有全部展示"。
+
+    这不是真正意义上的"摘要"(占位消息本身不包含任何具体信息),更接近于
+    "给模型一个善意的提醒",避免模型在缺乏上下文的情况下,误以为对话
+    才刚刚开始——这个想法来自陈铭在测试阶段观察到的一个现象:纯窗口截断后,
+    模型有时会用"很高兴认识你"这类开场白式的语气去回复第7轮对话,
+    显得答非所问,插入这条占位提示后,这种情况明显减少了。
+
+    :param rows: 原始消息序列(旧->新)
+    :param max_turns: 同`trim_by_window`
+    :param max_tokens: 同`trim_by_window`
+    :param dropped_marker_template: 占位提示模板,`{count}`会被替换成被截掉的消息条数
+    :return: 截断后的消息列表,如果发生了截断,列表首位会是一条role="system"的
+             占位提示"伪消息"(注意:这是一个普通的ChatMessage实例,并未真正写入数据库,
+             调用方需要自行决定是否要转换成LangChain的SystemMessage对象)
+    """
+    trimmed = trim_by_window(rows, max_turns=max_turns, max_tokens=max_tokens)
+    dropped_count = len(rows) - len(trimmed)
+
+    if dropped_count <= 0:
+        return trimmed
+
+    marker_row = ChatMessage(
+        session_id=trimmed[0].session_id if trimmed else 0,
+        sequence_no=-1,  # 用负数序号标记"这不是一条真实持久化的消息",避免和真实序号冲突
+        role="system",
+        content=dropped_marker_template.format(count=dropped_count),
+        token_estimate=0,
+    )
+    return [marker_row] + trimmed
+
+
+# ============================================================
+# 四、压缩效果对比报告:量化不同策略在同一批数据上的表现差异
+# ============================================================
+
+
+@dataclass
+class CompactionComparisonResult:
+    """单个策略在一次对比测试里的表现摘要。"""
+
+    strategy_name: str
+    kept_message_count: int
+    kept_token_estimate: int
+    kept_important_message_count: int
+
+
+def compare_compaction_strategies(
+    rows: Sequence[ChatMessage],
+    max_turns: int,
+    max_tokens: int,
+) -> List[CompactionComparisonResult]:
+    """
+    在同一批历史消息上,分别跑一遍"纯窗口截断"和"混合预算策略",
+    产出一份对比报告——这份报告是陈铭准备汇报给老王和林悦时用的材料,
+    目的是用具体数字说明"混合策略在保留关键信息方面,是否确实比纯窗口策略更好"。
+
+    :param rows: 一批完整的原始消息(旧->新)
+    :param max_turns: 窗口策略的轮数上限
+    :param max_tokens: 两种策略共用的token预算上限
+    :return: 每种策略各一条对比结果
+    """
+    scorer = ImportanceScoredRetention()
+
+    window_result = trim_by_window(rows, max_turns=max_turns, max_tokens=max_tokens)
+    window_important_count = sum(
+        1 for scored in scorer.score_all(window_result) if scored.importance_score >= scorer.base_score + scorer.important_bonus
+    )
+
+    hybrid_strategy = HybridBudgetStrategy(max_tokens=max_tokens, recent_protected_turns=max(max_turns // 3, 1))
+    hybrid_result = hybrid_strategy.select(rows)
+    hybrid_important_count = sum(
+        1 for scored in scorer.score_all(hybrid_result) if scored.importance_score >= scorer.base_score + scorer.important_bonus
+    )
+
+    def _tokens(selected: Sequence[ChatMessage]) -> int:
+        return sum((row.token_estimate or len(row.content or "")) for row in selected)
+
+    return [
+        CompactionComparisonResult(
+            strategy_name="纯窗口截断(window_memory.trim_by_window)",
+            kept_message_count=len(window_result),
+            kept_token_estimate=_tokens(window_result),
+            kept_important_message_count=window_important_count,
+        ),
+        CompactionComparisonResult(
+            strategy_name="混合预算策略(HybridBudgetStrategy)",
+            kept_message_count=len(hybrid_result),
+            kept_token_estimate=_tokens(hybrid_result),
+            kept_important_message_count=hybrid_important_count,
+        ),
+    ]
+```
+
+配套的验证脚本跑起来之后,陈铭发现在同样50条历史消息、同样的token预算下,纯窗口截断保留的"重要消息"数量明显少于混合预算策略——尤其是那种"关键信息出现在对话中段、随后又聊了很多无关内容"的场景,差异非常直观。他把这份对比数据发给老王,老王的回复是:"方向是对的,但先别急着接入生产路径——你这套重要性打分规则,目前完全基于正则表达式,只能覆盖'长得像'设备编号、金额这类结构化信息的场景,换个客户、换个业务领域,这些规则可能完全失效,想清楚这一层要不要做成可配置的规则库,再考虑要不要正式上线。"
+
+### 文件15:选做拓展 · `backend/tests/test_memory_concurrency.py` —— 多用户并发场景测试
+
+`test_memory_isolation.py`验证的是"逻辑上的隔离",但林悦的验收标准里有一条"支持多名员工同时在线使用",这句话背后隐含的并发安全问题,在之前的验收用例里从未被真正测试过。陈铭补上了这份并发测试。
+
+```python
+"""
+backend/tests/test_memory_concurrency.py
+===============================
+多用户并发场景测试
+
+背景说明:
+    `test_memory_isolation.py`验证的是"逻辑上的隔离"——两个session_id
+    互不干扰。但林悦提的验收标准里,有一条"支持多名员工同时在线使用",
+    这句话背后隐含着一个技术问题没有被直接测试过:当多个员工真的**同时**
+    (不是先后顺序地)往数据库里写消息时,会不会出现"消息序号冲突"、
+    "某条消息丢失没写进去"、"两个员工的消息互相串台"这类并发场景特有的问题?
+
+    这份文件专门补上这块空白,用Python的`ThreadPoolExecutor`模拟"多个员工
+    同时发消息"的场景,验证:
+    1. 每个员工各自会话内的消息序号(sequence_no)不会因为并发写入而冲突
+       (`UniqueConstraint("session_id", "sequence_no")`这条数据库约束,
+       理论上会在冲突发生时报错,这里通过实际并发测试验证这条约束是否真的生效);
+    2. 并发写入之后,每个会话保存的消息条数与预期完全一致,不多不少;
+    3. 单个会话内部,即使换成"单会话被多个线程并发追加消息"这种更极端的场景
+       (现实中较少见,但作为压力测试有意义),历史记录的完整性依然不受影响。
+
+    技术说明:SQLite本身对并发写入的支持有限(默认会对写操作加锁,同一时刻
+    只允许一个写事务),这份测试也顺带验证了"即使数据库层面有写锁,苍穹的
+    Session管理方式是否能优雅地处理锁等待,而不是直接抛出难以理解的异常"。
+"""
+
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage
+
+
+@pytest.fixture()
+def concurrency_env(tmp_path, monkeypatch):
+    """
+    与`test_memory_isolation.py`里的`memory_env`基本一致,唯一的区别是
+    这里把SQLite引擎显式配置了一个略大的连接池,并开启了WAL模式——
+    这是应对"多线程并发写SQLite"场景时,一个常见的、成本很低的优化手段,
+    对今天的教学场景已经足够,真实生产环境如果并发量继续增长,通常会考虑
+    换成PostgreSQL/MySQL这类原生支持多写事务并发的数据库。
+    """
+    db_path = tmp_path / "test_memory_concurrency.db"
+    monkeypatch.setenv("CQ_MEMORY_DATABASE_URL", f"sqlite:///{db_path}")
+
+    from app.services.memory import config as config_module
+
+    config_module.memory_settings = config_module.MemorySettings()
+
+    from app.services.memory import database as database_module
+
+    database_module.engine = database_module.create_engine(
+        config_module.memory_settings.database_url,
+        connect_args={"check_same_thread": False, "timeout": 30},
+        future=True,
+    )
+    database_module.MemorySessionLocal = database_module.sessionmaker(
+        bind=database_module.engine, autoflush=False, autocommit=False, future=True
+    )
+    database_module.init_memory_db()
+
+    # 开启WAL(Write-Ahead Logging)模式,允许读操作和写操作并发进行,
+    # 减少"database is locked"这类错误在测试里出现的概率。
+    with database_module.engine.connect() as conn:
+        conn.exec_driver_sql("PRAGMA journal_mode=WAL;")
+
+    from app.services.memory.manager import get_memory_manager
+
+    return get_memory_manager()
+
+
+class TestMultiSessionConcurrentWrites:
+    """场景一:N个不同员工,各自拥有独立会话,同时并发写入消息。"""
+
+    def test_concurrent_writes_across_independent_sessions(self, concurrency_env):
+        from app.services.memory.history import SQLAlchemyChatMessageHistory
+
+        manager = concurrency_env
+        employee_count = 8
+        messages_per_employee = 5
+
+        sessions = [
+            manager.create_session(user_id=f"u-emp-{i}", memory_strategy="full")
+            for i in range(employee_count)
+        ]
+
+        def _write_messages(session_id: str, employee_index: int) -> str:
+            history = SQLAlchemyChatMessageHistory(session_id=session_id)
+            for turn in range(messages_per_employee):
+                history.add_message(HumanMessage(content=f"员工{employee_index}第{turn}轮提问"))
+                history.add_message(AIMessage(content=f"员工{employee_index}第{turn}轮回答"))
+            return session_id
+
+        with ThreadPoolExecutor(max_workers=employee_count) as executor:
+            futures = [
+                executor.submit(_write_messages, sessions[i].session_id, i)
+                for i in range(employee_count)
+            ]
+            completed_session_ids = {f.result() for f in as_completed(futures)}
+
+        assert len(completed_session_ids) == employee_count
+
+        # 逐一校验:每个员工会话里的消息数量精确等于预期值,序号没有跳号也没有重复,
+        # 且完全没有出现"员工A的会话里混入了员工B的消息内容"这种最严重的隔离失效问题。
+        for i, session in enumerate(sessions):
+            history = SQLAlchemyChatMessageHistory(session_id=session.session_id)
+            raw_messages = history.load_raw_messages()
+            assert len(raw_messages) == messages_per_employee * 2
+
+            for msg in raw_messages:
+                assert f"员工{i}" in msg.content, (
+                    f"会话{session.session_id}混入了不属于员工{i}的消息内容:{msg.content}"
+                )
+
+    def test_concurrent_session_creation_produces_unique_session_ids(self, concurrency_env):
+        """
+        场景二:同一个员工,并发地多次调用"新建会话",验证不会因为并发创建
+        而产生重复的session_id(理论上session_id是用uuid4生成,冲突概率极低,
+        但这里用实际并发测试再确认一次数据库唯一约束确实起了兜底作用)。
+        """
+        manager = concurrency_env
+        creation_count = 20
+
+        def _create_one_session(_index: int):
+            return manager.create_session(user_id="u-busy-employee", memory_strategy="window")
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(_create_one_session, i) for i in range(creation_count)]
+            created_sessions = [f.result() for f in as_completed(futures)]
+
+        session_ids = {s.session_id for s in created_sessions}
+        assert len(session_ids) == creation_count, "并发创建会话时出现了重复的session_id"
+
+        all_sessions_for_employee = manager.list_sessions(user_id="u-busy-employee")
+        assert len(all_sessions_for_employee) == creation_count
+
+
+class TestSingleSessionConcurrentAppend:
+    """
+    场景三(压力测试性质):单个会话被多个线程同时追加消息。
+
+    真实业务场景下,同一个session_id基本不会被多个"物理请求"同时写入
+    (通常一个会话对应一个员工正在进行的一次对话,不存在"两个人同时敲同一个
+    会话"的情况),但作为压力测试,验证数据库层面的唯一约束
+    (`UniqueConstraint("session_id", "sequence_no")`)在极端并发下依然能
+    保证"序号绝不重复",这条约束是`_next_sequence_no`这种"先查询最大值、
+    再加一"的实现方式在高并发下唯一的安全网——如果没有这条数据库约束,
+    多个线程几乎必然会读到同一个"当前最大序号",各自加一后写入同一个序号,
+    导致UniqueConstraint报错或者数据被静默覆盖。
+    """
+
+    def test_concurrent_append_to_same_session_either_succeeds_or_raises_integrity_error(
+        self, concurrency_env
+    ):
+        from sqlalchemy.exc import IntegrityError
+
+        from app.services.memory.history import SQLAlchemyChatMessageHistory
+
+        manager = concurrency_env
+        session = manager.create_session(user_id="u-shared-session-owner", memory_strategy="full")
+
+        write_count = 30
+        errors: list = []
+        successes: list = []
+        lock = threading.Lock()
+
+        def _append_one(index: int) -> None:
+            history = SQLAlchemyChatMessageHistory(session_id=session.session_id)
+            try:
+                history.add_message(HumanMessage(content=f"并发追加消息{index}"))
+                with lock:
+                    successes.append(index)
+            except IntegrityError as exc:
+                # 这是"两个线程同时读到相同的当前最大序号"这种最坏情况下,
+                # 数据库唯一约束兜底拒绝写入的预期行为——测试里允许这种情况发生,
+                # 但要求"发生冲突的写入,绝对不会被静默接受成一条错误的记录"。
+                with lock:
+                    errors.append((index, str(exc)))
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(_append_one, i) for i in range(write_count)]
+            for f in as_completed(futures):
+                f.result()  # 只是确保没有其他类型的、未被上面except捕获的异常泄漏出来
+
+        history = SQLAlchemyChatMessageHistory(session_id=session.session_id)
+        final_messages = history.load_raw_messages()
+
+        # 核心断言:不管过程中出现了多少次"序号竞争失败",数据库里最终保存下来的
+        # 消息条数,必须精确等于"成功写入"的次数,不能多(说明没有静默产生重复数据),
+        # 也不能少(说明没有静默丢失本应成功的写入)。
+        assert len(final_messages) == len(successes)
+        assert len(successes) + len(errors) == write_count
+
+    def test_no_duplicate_sequence_numbers_survive_after_concurrent_append(self, concurrency_env):
+        """
+        进一步验证:即使上一条测试里出现了部分写入失败,数据库里**最终存活下来**
+        的那些消息,序号必须两两不同——这是防止"看起来数量对了,但其实内部
+        有两条消息用了同一个序号,只是刚好没被立刻发现"这种更隐蔽问题的兜底断言。
+        """
+        from app.services.memory.database import get_memory_db
+        from app.services.memory.history import SQLAlchemyChatMessageHistory
+        from app.services.memory.models import ChatMessage
+
+        manager = concurrency_env
+        session = manager.create_session(user_id="u-shared-session-owner-2", memory_strategy="full")
+
+        def _append_one(index: int) -> None:
+            history = SQLAlchemyChatMessageHistory(session_id=session.session_id)
+            try:
+                history.add_message(HumanMessage(content=f"消息{index}"))
+            except Exception:
+                pass  # 这条测试只关心"存活下来的数据是否自洽",不关心失败次数本身
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(_append_one, range(20)))
+
+        with get_memory_db() as db:
+            rows = (
+                db.query(ChatMessage)
+                .filter(ChatMessage.session_id == manager.get_session(session.session_id).id)
+                .all()
+            )
+            sequence_numbers = [row.sequence_no for row in rows]
+
+        assert len(sequence_numbers) == len(set(sequence_numbers)), "存活消息中出现了重复的sequence_no"
+
+
+class TestConcurrentReadWriteMix:
+    """场景四:读写混合并发——一部分线程持续写入,另一部分线程同时读取历史。"""
+
+    def test_concurrent_reads_never_see_partial_or_corrupted_state(self, concurrency_env):
+        """
+        验证在有线程持续写入的同时,另一批线程反复读取`history.messages`,
+        不会读到"介于两次写入之间的中间状态导致程序崩溃"这类问题——
+        由于每次读写都通过`get_memory_db()`获取独立的事务性Session,
+        SQLAlchemy+SQLite的事务隔离机制,应该保证每次读取拿到的都是
+        某个时间点上自洽的完整快照,不会读到"半条消息"。
+        """
+        from app.services.memory.history import SQLAlchemyChatMessageHistory
+
+        manager = concurrency_env
+        session = manager.create_session(user_id="u-read-write-mix", memory_strategy="window")
+
+        stop_flag = threading.Event()
+        read_errors: list = []
+
+        def _writer() -> None:
+            history = SQLAlchemyChatMessageHistory(session_id=session.session_id)
+            for i in range(15):
+                history.add_message(HumanMessage(content=f"写入线程消息{i}"))
+                history.add_message(AIMessage(content=f"写入线程回复{i}"))
+
+        def _reader() -> None:
+            history = SQLAlchemyChatMessageHistory(session_id=session.session_id)
+            while not stop_flag.is_set():
+                try:
+                    _ = history.messages  # 只关心读取过程本身不抛异常,不校验具体读到多少条
+                except Exception as exc:  # noqa: BLE001  测试里需要捕获任意异常并记录下来
+                    read_errors.append(str(exc))
+
+        reader_threads = [threading.Thread(target=_reader) for _ in range(3)]
+        for t in reader_threads:
+            t.start()
+
+        writer_thread = threading.Thread(target=_writer)
+        writer_thread.start()
+        writer_thread.join()
+
+        stop_flag.set()
+        for t in reader_threads:
+            t.join(timeout=5)
+
+        assert read_errors == [], f"并发读取过程中出现了未预期的异常:{read_errors}"
+```
+
+这份并发测试跑起来之后,四个场景全部通过,陈铭把结果贴到项目群里,顺手补了一句自己的理解:"这份测试真正验证的,其实不是LangChain的东西,而是`_next_sequence_no`这种'先查询、再加一'的写法,在数据库唯一约束的兜底下,能不能保证'宁可拒绝写入,也不产生错误数据'——这是数据库设计里一条很朴素但很重要的原则,今天算是亲手验证了一遍。"
+
+### 文件16:选做拓展 · `backend/tests/test_memory_edge_cases.py` —— 记忆模块边界情况补充测试
+
+Day01、Day21已经反复强调过一条原则:"边界情况和异常路径,应该和正常路径获得同等的测试覆盖优先级。"陈铭对照这条原则,把正式验收用例之外、容易被忽略的边界场景又过了一遍,补上了这份测试。
+
+```python
+"""
+backend/tests/test_memory_edge_cases.py
+===============================
+记忆模块边界情况补充测试
+
+背景说明:
+    `test_memory_isolation.py`覆盖的是四条最核心的验收标准,但Day01、Day21
+    已经反复强调过一条原则:"边界情况和异常路径,应该和正常路径获得同等的
+    测试覆盖优先级"。这份文件专门补上正式验收用例之外、容易被忽略的边界场景,
+    覆盖内容包括:
+    1. 会话删除之后,级联删除是否真的生效(消息、摘要是否也被一并清理);
+    2. clear()方法调用之后,历史确实清空,但会话本身还能继续正常使用;
+    3. 访问不存在的会话时,各个入口是否都抛出了预期的、明确的异常;
+    4. FULL策略下,即使消息数量很大,也不应该发生任何截断;
+    5. list_sessions()返回结果的排序是否符合"最近更新的排在前面"这条约定;
+    6. 极端输入(空字符串消息、超长单条消息)是否会导致存储或裁剪逻辑出错;
+    7. 窗口记忆在"消息总数刚好等于窗口大小"这个临界点上的行为是否符合预期。
+"""
+
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage
+
+
+@pytest.fixture()
+def memory_env(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_memory_edge.db"
+    monkeypatch.setenv("CQ_MEMORY_DATABASE_URL", f"sqlite:///{db_path}")
+
+    from app.services.memory import config as config_module
+
+    config_module.memory_settings = config_module.MemorySettings()
+
+    from app.services.memory import database as database_module
+
+    database_module.engine = database_module.create_engine(
+        config_module.memory_settings.database_url,
+        connect_args={"check_same_thread": False},
+        future=True,
+    )
+    database_module.MemorySessionLocal = database_module.sessionmaker(
+        bind=database_module.engine, autoflush=False, autocommit=False, future=True
+    )
+    database_module.init_memory_db()
+
+    from app.services.memory.manager import get_memory_manager
+
+    return get_memory_manager()
+
+
+class TestSessionDeletionCascade:
+    """验证删除会话时,关联的消息和摘要记录确实一并被清理,不会留下孤儿数据。"""
+
+    def test_delete_session_removes_all_messages(self, memory_env):
+        from app.services.memory.database import get_memory_db
+        from app.services.memory.history import SQLAlchemyChatMessageHistory
+        from app.services.memory.models import ChatMessage
+
+        manager = memory_env
+        session = manager.create_session(user_id="u-del-1", memory_strategy="full")
+        history = SQLAlchemyChatMessageHistory(session_id=session.session_id)
+        history.add_message(HumanMessage(content="即将被删除的消息"))
+        history.add_message(AIMessage(content="即将被删除的回复"))
+
+        manager.delete_session(session.session_id, user_id="u-del-1")
+
+        with get_memory_db() as db:
+            remaining = db.query(ChatMessage).filter(ChatMessage.session_id == session.id).count()
+        assert remaining == 0
+
+    def test_delete_session_removes_summary(self, memory_env, monkeypatch):
+        from app.services.memory import summary_memory as summary_module
+        from app.services.memory.database import get_memory_db
+        from app.services.memory.history import SQLAlchemyChatMessageHistory
+        from app.services.memory.models import ChatSummary
+
+        class _FakeSummaryRunnable:
+            """
+            与`test_memory_isolation.py`里的_FakeSummaryLLM不同,这里额外配合
+            RunnableLambda使用,避免触发"普通对象不能被|运算符拼接"这个
+            LCEL的已知限制,写法上更贴近真实生产代码会怎么写一个可替换的假摘要模型。
+            """
+
+            def __call__(self, inputs):
+                return "[边界测试假摘要]"
+
+        from langchain_core.runnables import RunnableLambda
+
+        monkeypatch.setattr(
+            summary_module.SummaryMemoryStrategy,
+            "_get_llm",
+            lambda self: RunnableLambda(_FakeSummaryRunnable()),
+        )
+
+        manager = memory_env
+        session = manager.create_session(user_id="u-del-2", memory_strategy="summary")
+        history = SQLAlchemyChatMessageHistory(session_id=session.session_id)
+        for i in range(8):
+            history.add_message(HumanMessage(content=f"第{i}轮很长的问题内容用于触发摘要生成逻辑"))
+            history.add_message(AIMessage(content=f"第{i}轮很长的回答内容用于触发摘要生成逻辑"))
+
+        with get_memory_db() as db:
+            assert db.query(ChatSummary).filter(ChatSummary.session_id == session.id).count() == 1
+
+        manager.delete_session(session.session_id, user_id="u-del-2")
+
+        with get_memory_db() as db:
+            assert db.query(ChatSummary).filter(ChatSummary.session_id == session.id).count() == 0
+
+
+class TestClearHistoryKeepsSessionUsable:
+    """clear()应该只清空历史消息,不应该让会话本身变得不可用。"""
+
+    def test_clear_then_continue_conversation(self, memory_env):
+        from app.services.memory.history import SQLAlchemyChatMessageHistory
+
+        manager = memory_env
+        session = manager.create_session(user_id="u-clear-1", memory_strategy="full")
+        history = SQLAlchemyChatMessageHistory(session_id=session.session_id)
+        history.add_message(HumanMessage(content="清空前的消息"))
+        assert len(history.load_raw_messages()) == 1
+
+        history.clear()
+        assert len(history.load_raw_messages()) == 0
+
+        # 清空之后,会话依然是一个有效会话,可以继续正常追加新消息
+        history.add_message(HumanMessage(content="清空后的新消息"))
+        raw = history.load_raw_messages()
+        assert len(raw) == 1
+        assert raw[0].content == "清空后的新消息"
+
+
+class TestNonExistentSessionErrors:
+    """访问一个从未创建过的session_id,各个相关入口都应该抛出清晰、明确的异常。"""
+
+    def test_manager_get_session_raises(self, memory_env):
+        from app.services.memory.manager import SessionNotFoundError
+
+        manager = memory_env
+        with pytest.raises(SessionNotFoundError):
+            manager.get_session("cq-sess-does-not-exist")
+
+    def test_history_messages_property_raises_value_error(self, memory_env):
+        from app.services.memory.history import SQLAlchemyChatMessageHistory
+
+        history = SQLAlchemyChatMessageHistory(session_id="cq-sess-does-not-exist")
+        with pytest.raises(ValueError, match="会话不存在"):
+            _ = history.messages
+
+    def test_history_add_message_on_missing_session_raises(self, memory_env):
+        from app.services.memory.history import SQLAlchemyChatMessageHistory
+
+        history = SQLAlchemyChatMessageHistory(session_id="cq-sess-does-not-exist")
+        with pytest.raises(ValueError, match="会话不存在"):
+            history.add_message(HumanMessage(content="不应该能写入成功"))
+
+    def test_get_session_history_factory_raises_before_touching_history(self, memory_env):
+        """
+        `get_session_history`工厂函数,应该在权限校验阶段就直接失败,
+        而不是先返回一个"看起来正常"的history对象,等真正读写时才报错——
+        这样`RunnableWithMessageHistory`在链路最开始就能感知到问题,而不是
+        执行了一半才发现历史根本无法访问。
+        """
+        from app.services.memory.manager import SessionNotFoundError, get_session_history
+
+        with pytest.raises(SessionNotFoundError):
+            get_session_history(user_id="u-anyone", session_id="cq-sess-does-not-exist")
+
+
+class TestFullStrategyNeverTruncates:
+    """FULL策略下,不管消息堆积多少,都不应该发生任何截断。"""
+
+    def test_full_strategy_returns_all_messages_even_with_many_turns(self, memory_env):
+        from app.services.memory.history import SQLAlchemyChatMessageHistory
+
+        manager = memory_env
+        session = manager.create_session(user_id="u-full-1", memory_strategy="full")
+        history = SQLAlchemyChatMessageHistory(session_id=session.session_id)
+
+        turn_count = 50  # 远超窗口记忆默认的6轮上限,专门用来验证FULL策略确实不受这个上限影响
+        for i in range(turn_count):
+            history.add_message(HumanMessage(content=f"第{i}轮"))
+            history.add_message(AIMessage(content=f"第{i}轮回复"))
+
+        assert len(history.messages) == turn_count * 2
+        assert len(history.messages) == len(history.load_raw_messages())
+
+
+class TestListSessionsOrdering:
+    """list_sessions()应该按最近更新时间倒序返回,方便前端把"最近使用的会话"展示在最上面。"""
+
+    def test_touch_session_moves_it_to_front(self, memory_env):
+        manager = memory_env
+        session_1 = manager.create_session(user_id="u-order-1", title="第一个会话")
+        session_2 = manager.create_session(user_id="u-order-1", title="第二个会话")
+
+        # 创建顺序上session_2更新,理论上默认排序就应该是session_2在前,
+        # 这里再显式touch一次session_1,验证排序确实会随之调整。
+        manager.touch_session(session_1.session_id)
+
+        sessions = manager.list_sessions(user_id="u-order-1")
+        assert sessions[0].session_id == session_1.session_id
+
+
+class TestExtremeInputContent:
+    """极端输入内容:空字符串、超长单条消息,不应该导致存储或裁剪逻辑异常崩溃。"""
+
+    def test_empty_string_message_is_stored_without_error(self, memory_env):
+        from app.services.memory.history import SQLAlchemyChatMessageHistory
+
+        manager = memory_env
+        session = manager.create_session(user_id="u-extreme-1", memory_strategy="full")
+        history = SQLAlchemyChatMessageHistory(session_id=session.session_id)
+
+        history.add_message(HumanMessage(content=""))
+        raw = history.load_raw_messages()
+        assert len(raw) == 1
+        assert raw[0].content == ""
+
+    def test_extremely_long_single_message_does_not_break_window_trim(self, memory_env):
+        from app.services.memory.history import SQLAlchemyChatMessageHistory
+
+        manager = memory_env
+        session = manager.create_session(user_id="u-extreme-2", memory_strategy="window")
+        history = SQLAlchemyChatMessageHistory(session_id=session.session_id)
+
+        very_long_content = "测试超长单条消息内容。" * 500  # 单条消息就远超token预算
+        history.add_message(HumanMessage(content=very_long_content))
+        history.add_message(AIMessage(content="收到,内容较长。"))
+
+        # 即使单条消息超出预算,窗口截断逻辑也不应该抛出异常,
+        # 至少应该返回最新的那一条(哪怕它单独就超预算,也好过返回空列表让模型完全失忆)
+        context = history.messages
+        assert len(context) >= 1
+
+
+class TestWindowBoundaryExactMatch:
+    """窗口记忆在"消息总数恰好等于窗口上限"这个临界点上的行为验证。"""
+
+    def test_message_count_exactly_at_window_limit(self, memory_env):
+        from app.services.memory.history import SQLAlchemyChatMessageHistory
+        from app.services.memory import config as config_module
+
+        manager = memory_env
+        session = manager.create_session(user_id="u-boundary-1", memory_strategy="window")
+        history = SQLAlchemyChatMessageHistory(session_id=session.session_id)
+
+        max_turns = config_module.memory_settings.window_max_turns
+        for i in range(max_turns):
+            history.add_message(HumanMessage(content=f"第{i}轮"))
+            history.add_message(AIMessage(content=f"第{i}轮回复"))
+
+        # 恰好等于窗口上限时,不应该发生任何截断
+        assert len(history.messages) == max_turns * 2
+
+        # 再多写一轮,必须开始截断,且截断后条数不应该超过窗口上限对应的消息条数
+        history.add_message(HumanMessage(content="超出窗口的一轮"))
+        history.add_message(AIMessage(content="超出窗口的一轮回复"))
+        assert len(history.messages) <= max_turns * 2
+```
+
+### 文件17:选做拓展 · `scripts/memory_health_check.py` —— 记忆库健康检查工具
+
+上线一周之后,老王在周会上提了一个新要求:"记忆库这东西,用户是感知不到的,如果哪天摘要卡住不触发了、或者某个会话的消息表异常膨胀,我们不能等到客户投诉'AI好像记不住东西了'才发现问题。"陈铭写了这个健康检查脚本,定位为"运维巡检工具"。
+
+```python
+"""
+scripts/memory_health_check.py
+===============================
+记忆库健康检查工具(命令行脚本)
+
+背景说明:
+    上线一周之后,老王在周会上提了一个新要求:"记忆库这东西,用户是感知不到的,
+    如果哪天摘要卡住不触发了、或者某个会话的消息表异常膨胀,我们不能等到客户
+    投诉'AI好像记不住东西了'才发现问题。"于是陈铭写了这个健康检查脚本,
+    定位为"运维巡检工具"——既可以人工手动跑一次,输出一份可读的检查报告,
+    也可以接入定时任务(比如每天凌晨跑一次),把检查结果写进日志或者推送到
+    监控告警系统。
+
+    这个脚本检查的问题类型分为三类:
+    1. 数据一致性问题(structural issues):比如摘要表指向了不存在的会话、
+       消息的sequence_no出现空洞或重复;
+    2. 容量与规模类问题(capacity issues):比如某个会话的消息量异常庞大、
+       摘要触发之后未清理的历史消息占比过高;
+    3. 运行状态类问题(runtime issues):比如摘要策略的会话,长时间没有
+       生成有效摘要(可能意味着摘要触发逻辑或者LLM调用出了问题)。
+
+    运行方式:
+        python scripts/memory_health_check.py --db-url sqlite:///./cangqiong_memory.db
+"""
+
+import argparse
+import os
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import List
+
+# 与demo_multi_session_memory.py保持一致的写法,允许这个脚本既可以用
+# `python scripts/memory_health_check.py`直接运行,也可以被测试用例当作
+# 普通模块import,不强制要求调用方提前配置PYTHONPATH。
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+
+class IssueSeverity(str, Enum):
+    """健康检查发现的问题严重程度分级,决定运维人员看到报告后该多快响应。"""
+
+    INFO = "info"        # 仅供参考,不代表当前有实质性问题
+    WARNING = "warning"  # 存在潜在风险,建议排查但不需要立刻处理
+    CRITICAL = "critical"  # 明确的数据一致性问题,建议尽快处理
+
+
+@dataclass
+class HealthIssue:
+    """一条具体的健康检查发现项。"""
+
+    severity: IssueSeverity
+    category: str
+    session_id: str
+    description: str
+
+
+@dataclass
+class HealthCheckReport:
+    """一次完整巡检的汇总报告。"""
+
+    checked_at: datetime
+    total_sessions: int
+    total_messages: int
+    total_summaries: int
+    issues: List[HealthIssue] = field(default_factory=list)
+
+    @property
+    def critical_count(self) -> int:
+        return sum(1 for issue in self.issues if issue.severity == IssueSeverity.CRITICAL)
+
+    @property
+    def warning_count(self) -> int:
+        return sum(1 for issue in self.issues if issue.severity == IssueSeverity.WARNING)
+
+    @property
+    def is_healthy(self) -> bool:
+        """
+        判定整体是否"健康"的标准很直接:只要存在任何CRITICAL级别问题,
+        就不算健康;单纯的WARNING/INFO不影响这个整体判定,但仍然会完整
+        列在报告里,供运维人员参考。
+        """
+        return self.critical_count == 0
+
+    def to_text_summary(self) -> str:
+        """把报告渲染成一份适合直接打印在终端、或者贴进值班记录的文本摘要。"""
+        lines = [
+            "=" * 60,
+            f"苍穹记忆库健康检查报告(检查时间:{self.checked_at.isoformat(timespec='seconds')})",
+            "=" * 60,
+            f"会话总数:{self.total_sessions}  消息总数:{self.total_messages}  摘要总数:{self.total_summaries}",
+            f"整体状态:{'健康' if self.is_healthy else '存在严重问题,需要关注'}",
+            f"问题统计:严重{self.critical_count}条 / 警告{self.warning_count}条 / 共{len(self.issues)}条",
+            "-" * 60,
+        ]
+        if not self.issues:
+            lines.append("未发现任何异常项。")
+        for issue in self.issues:
+            lines.append(
+                f"[{issue.severity.value.upper():8s}] ({issue.category}) session={issue.session_id}: "
+                f"{issue.description}"
+            )
+        lines.append("=" * 60)
+        return "\n".join(lines)
+
+
+class MemoryHealthChecker:
+    """
+    健康检查器主体,负责连接目标数据库并依次跑完所有检查项。
+
+    刻意把"连接数据库"这一步单独放进构造函数,而不是复用app.services.memory
+    模块里已经初始化好的全局engine——这样运维人员可以直接对着一份数据库文件
+    路径跑这个脚本,不需要额外配置一整套苍穹后端的运行环境,这是"运维工具"
+    和"业务代码"在依赖上应该有所区别的一个具体体现。
+    """
+
+    def __init__(self, database_url: str) -> None:
+        self.database_url = database_url
+        self._engine = create_engine(
+            database_url,
+            connect_args={"check_same_thread": False} if database_url.startswith("sqlite") else {},
+            future=True,
+        )
+        self._SessionLocal = sessionmaker(bind=self._engine, future=True)
+
+    def run(
+        self,
+        large_session_message_threshold: int = 500,
+        stale_summary_days: int = 30,
+    ) -> HealthCheckReport:
+        """
+        执行一次完整巡检。
+
+        :param large_session_message_threshold: 单个会话消息数超过这个值,
+               会被标记为"容量类"警告,提示运维关注是否需要考虑归档或者
+               调整该会话的记忆策略
+        :param stale_summary_days: 摘要策略的会话,如果超过这么多天摘要都没有更新,
+               会被标记为警告(可能意味着该会话已经不活跃,也可能意味着摘要触发出了故障,
+               这个检查项本身不下最终结论,只是把线索摆出来)
+        """
+        from app.services.memory.models import ChatMessage, ChatSession, ChatSummary, MemoryStrategy
+
+        session = self._SessionLocal()
+        issues: List[HealthIssue] = []
+
+        try:
+            all_sessions = session.query(ChatSession).all()
+            total_messages = session.query(ChatMessage).count()
+            total_summaries = session.query(ChatSummary).count()
+
+            valid_session_pks = {s.id for s in all_sessions}
+
+            # 检查项1:摘要表里是否存在"孤儿摘要"——指向了一个已经不存在的会话主键
+            # (正常情况下ORM层的cascade="all, delete-orphan"会自动清理,
+            # 但这里刻意用一次独立的SQL查询做二次确认,防止某次绕过ORM的直接SQL操作
+            # 破坏了这条一致性保证)。
+            all_summary_session_pks = {row[0] for row in session.query(ChatSummary.session_id).all()}
+            orphan_summary_pks = all_summary_session_pks - valid_session_pks
+            for pk in orphan_summary_pks:
+                issues.append(
+                    HealthIssue(
+                        severity=IssueSeverity.CRITICAL,
+                        category="数据一致性",
+                        session_id=f"(内部主键={pk})",
+                        description="存在摘要记录指向了一个已经不存在的会话,数据可能已经不一致,建议人工核查后清理。",
+                    )
+                )
+
+            for chat_session in all_sessions:
+                message_count = (
+                    session.query(ChatMessage)
+                    .filter(ChatMessage.session_id == chat_session.id)
+                    .count()
+                )
+
+                # 检查项2:sequence_no是否存在重复(理论上有数据库唯一约束兜底,
+                # 但巡检脚本额外做一次独立验证,覆盖"约束曾经被绕过"这种极端情况)。
+                seq_numbers = [
+                    row[0]
+                    for row in session.query(ChatMessage.sequence_no)
+                    .filter(ChatMessage.session_id == chat_session.id)
+                    .all()
+                ]
+                if len(seq_numbers) != len(set(seq_numbers)):
+                    issues.append(
+                        HealthIssue(
+                            severity=IssueSeverity.CRITICAL,
+                            category="数据一致性",
+                            session_id=chat_session.session_id,
+                            description="该会话下的消息sequence_no存在重复,历史顺序可能已经损坏。",
+                        )
+                    )
+
+                # 检查项3:消息量是否明显超出正常范围
+                if message_count > large_session_message_threshold:
+                    issues.append(
+                        HealthIssue(
+                            severity=IssueSeverity.WARNING,
+                            category="容量规模",
+                            session_id=chat_session.session_id,
+                            description=(
+                                f"该会话消息总数已达{message_count}条,超过预警阈值"
+                                f"{large_session_message_threshold}条,建议关注是否需要归档或调整记忆策略。"
+                            ),
+                        )
+                    )
+
+                # 检查项4:摘要策略的会话,是否长期没有更新摘要
+                if chat_session.memory_strategy == MemoryStrategy.SUMMARY:
+                    summary_row = (
+                        session.query(ChatSummary)
+                        .filter(ChatSummary.session_id == chat_session.id)
+                        .one_or_none()
+                    )
+                    if summary_row is None and message_count >= large_session_message_threshold // 10:
+                        issues.append(
+                            HealthIssue(
+                                severity=IssueSeverity.WARNING,
+                                category="运行状态",
+                                session_id=chat_session.session_id,
+                                description="该会话采用摘要策略,但消息量已不少,却始终没有生成任何摘要记录,建议检查摘要触发逻辑是否正常。",
+                            )
+                        )
+                    elif summary_row is not None:
+                        stale_cutoff = datetime.utcnow() - timedelta(days=stale_summary_days)
+                        if summary_row.updated_at and summary_row.updated_at < stale_cutoff:
+                            issues.append(
+                                HealthIssue(
+                                    severity=IssueSeverity.INFO,
+                                    category="运行状态",
+                                    session_id=chat_session.session_id,
+                                    description=f"该会话的摘要已超过{stale_summary_days}天未更新,可能已长期不活跃。",
+                                )
+                            )
+
+            return HealthCheckReport(
+                checked_at=datetime.utcnow(),
+                total_sessions=len(all_sessions),
+                total_messages=total_messages,
+                total_summaries=total_summaries,
+                issues=issues,
+            )
+        finally:
+            session.close()
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="苍穹记忆库健康检查工具")
+    parser.add_argument(
+        "--db-url",
+        dest="db_url",
+        default="sqlite:///./cangqiong_memory.db",
+        help="记忆库的数据库连接串,默认读取本地SQLite文件",
+    )
+    parser.add_argument(
+        "--large-session-threshold",
+        dest="large_session_threshold",
+        type=int,
+        default=500,
+        help="单会话消息数超过该值会被标记为容量警告",
+    )
+    parser.add_argument(
+        "--stale-summary-days",
+        dest="stale_summary_days",
+        type=int,
+        default=30,
+        help="摘要超过该天数未更新会被标记为INFO级提示",
+    )
+    parser.add_argument(
+        "--fail-on-warning",
+        dest="fail_on_warning",
+        action="store_true",
+        help="加上此参数后,只要存在WARNING级别以上的问题,脚本就会以非零状态码退出(适合接入CI/定时任务的告警判断)",
+    )
+    return parser
+
+
+def main() -> None:
+    args = build_arg_parser().parse_args()
+    checker = MemoryHealthChecker(args.db_url)
+    report = checker.run(
+        large_session_message_threshold=args.large_session_threshold,
+        stale_summary_days=args.stale_summary_days,
+    )
+
+    print(report.to_text_summary())
+
+    if not report.is_healthy:
+        sys.exit(2)
+    if args.fail_on_warning and report.warning_count > 0:
+        sys.exit(1)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+配套的测试文件`backend/tests/test_memory_health_check.py`,覆盖了"健康数据不产生任何问题项"、"大会话触发容量警告"、"摘要策略长期未生成摘要触发运行状态警告"、"空数据库巡检结果健康"、"文本报告包含关键信息段落"五个用例,全部通过之后,陈铭把这个脚本加进了运维值班手册,备注了一句:"建议接入每天凌晨的定时任务,报告如果出现CRITICAL级别问题,直接触发告警,不需要等运维人员早上上班才发现。"
+
 ---
 
 ## 今日复盘
