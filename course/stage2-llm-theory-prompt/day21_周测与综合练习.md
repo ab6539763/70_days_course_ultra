@@ -2248,3 +2248,967 @@ if __name__ == "__main__":
 陈铭把这段话也补进了笔记本,和前面那句"松一口气但别彻底松"放在同一页——他忽然意识到,这两句看似矛盾的话,其实说的是同一件事的两面:允许自己在阶段性的节点上稍微喘一口气,但不要把"喘气"和"停下来"混为一谈。窗外的天已经完全黑了下来,培训室的灯一盏一盏地熄掉,四个人收拾东西往楼下走,楼道里回荡着他们讨论"明天前端第一课到底要不要提前预习"的声音,谁都没有真正达成一致意见,但谁都没打算真的什么都不看就去上课。
 
 入职第三周,就这样画上了一个逗号。
+
+---
+
+## 附录:验收后补充的扩展代码
+
+散场后第二天早上,老王在群里补发了一条消息:"昨晚验收的时候,张凡提的‘工具调用参数不完整就被提前判定为完成’这个边界用例,我想了想,值得让你们四个都补一遍,顺便把周测那几道代码题的参考实现,再往深处扩展一版——不是要求你们现在就写出生产级代码,是想让你们看看,同一个问题,在‘刚好通过验收’和‘经得起更刁钻的测试’之间,还有多大的空间。"以下是陈铭当天补充、并同步给三人参考的扩展代码,老王事后把这几份文件也一并归档进了综合练习项目的参考资料里。
+
+### 附录文件1:`test_advanced_scenarios_pytest.py` —— 用pytest编写的进阶测试用例
+
+```python
+"""
+文件名:test_advanced_scenarios_pytest.py
+作者:陈铭
+说明:
+    老王在验收后追加的作业——把selfcheck_multi_turn_tool_stream.py里
+    用assert手写的检查点,用pytest重新组织一遍,并补充此前遗漏的几类
+    边界场景:残缺的工具调用参数、多用户会话隔离、FAQ检索的相似度
+    阈值边界、计算器的更多危险表达式变体、历史裁剪在"单轮巨大"场景
+    下的表现。
+
+    运行方式:pytest test_advanced_scenarios_pytest.py -v
+    (需要与memory.py、tools.py、stream_client.py放在同一目录下)
+"""
+
+import json
+from types import SimpleNamespace
+
+import pytest
+
+from memory import ConversationMemory
+from stream_client import ToolCallAccumulator, estimate_tokens
+from tools import ToolExecutionError, calculate, execute_tool, get_weather, search_faq
+
+
+# ------------------------------------------------------------------
+# 第一部分:计算器工具的更多危险表达式变体
+# ------------------------------------------------------------------
+
+class TestCalculatorSecurityExtended:
+    """
+    验收时老王提到"危险表达式的样本不能只有那几个",这里补充更多
+    容易被忽略的变体,尤其是那些"看起来像正常运算,实际藏着陷阱"的写法。
+    """
+
+    @pytest.mark.parametrize(
+        "dangerous_expression",
+        [
+            "__import__('os').system('echo unsafe')",
+            "(1).__class__.__bases__[0]",
+            "().__class__.__mro__[1].__subclasses__()",
+            "getattr(1, '__class__')",
+            "1 if True else __import__('os')",
+            "lambda: __import__('os')",
+            "[i for i in ().__class__.__bases__]",
+        ],
+    )
+    def test_all_known_sandbox_escape_patterns_are_blocked(self, dangerous_expression):
+        """
+        这些表达式是社区里常见的"Python沙箱逃逸"手法变体,虽然本项目
+        用的是白名单AST节点校验(理论上应该能拦住所有这类手法),
+        但"多测几种已知的攻击范式",是安全相关代码测试的基本素养——
+        不能只满足于"我能想到的那几种攻击方式都测过了"。
+        """
+        with pytest.raises((ToolExecutionError, SyntaxError)):
+            calculate(dangerous_expression)
+
+    def test_very_long_expression_does_not_hang(self):
+        """
+        构造一个层层嵌套的超长表达式,验证递归求值不会因为递归深度
+        过大导致程序卡死或者抛出未被捕获的RecursionError。
+        这是"资源消耗型攻击"的一种简化模拟——即便表达式本身不包含
+        任何危险函数调用,超长的嵌套结构本身也可能是一种攻击手段。
+        """
+        nested_expression = "1" + "+1" * 500
+        try:
+            result = calculate(nested_expression)
+            assert result == 501
+        except ToolExecutionError:
+            # 如果实现选择对表达式长度做限制而直接拒绝,也是可接受的防御方式
+            pass
+
+    def test_division_precision_edge_cases(self):
+        """验证除法结果的精度控制在多种边界数值下都表现正常。"""
+        assert calculate("1/3", precision=2) == 0.33
+        assert calculate("1/3", precision=0) == 0.0 or calculate("1/3", precision=0) == 0
+        assert calculate("2/2") == 1.0
+
+
+# ------------------------------------------------------------------
+# 第二部分:工具调用增量拼接的残缺场景
+# ------------------------------------------------------------------
+
+def _fake_delta(index, id_=None, name=None, arguments=None):
+    function_part = (
+        SimpleNamespace(name=name, arguments=arguments)
+        if (name is not None or arguments is not None)
+        else None
+    )
+    return SimpleNamespace(index=index, id=id_, function=function_part)
+
+
+class TestToolCallAccumulatorEdgeCases:
+    """
+    张凡在验收时提出的边界场景:流式响应因为网络原因提前中断,
+    某个工具调用的arguments字段还没拼接完整,这里补充对应的测试用例,
+    明确记录当前实现在这种场景下的真实行为,而不是假设它"应该没问题"。
+    """
+
+    def test_incomplete_arguments_produces_invalid_json(self):
+        """
+        验证:如果流式响应提前中断,accumulator会原样返回残缺的
+        arguments字符串,不会自己"猜测"补全,后续调用方必须自行
+        处理json.loads()解析失败的情况——这正是本项目当前的真实行为,
+        写这个测试的目的,是把这个"已知局限"用代码的方式明确固定下来。
+        """
+        accumulator = ToolCallAccumulator()
+        accumulator.feed([_fake_delta(0, id_="call_x", name="get_weather", arguments="")])
+        accumulator.feed([_fake_delta(0, arguments='{"city')])
+        # 模拟流在这里意外中断,没有后续的chunk补全剩余的 "":"北京"}"
+
+        completed = accumulator.get_completed_tool_calls()
+        assert len(completed) == 1
+        incomplete_arguments = completed[0]["function"]["arguments"]
+
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(incomplete_arguments)
+
+    def test_execute_tool_gracefully_handles_incomplete_json(self):
+        """
+        验证execute_tool()这个上层调用方,面对残缺JSON时,
+        是否按照设计预期返回一个error字段,而不是让异常继续往上抛。
+        """
+        result_str = execute_tool("get_weather", '{"city')
+        result = json.loads(result_str)
+        assert "error" in result
+
+    def test_empty_feed_list_does_not_crash(self):
+        """验证喂入一个空的tool_calls增量列表时,累积器不会出错。"""
+        accumulator = ToolCallAccumulator()
+        accumulator.feed([])
+        assert accumulator.has_any() is False
+        assert accumulator.get_completed_tool_calls() == []
+
+    def test_three_concurrent_tool_calls_do_not_interleave(self):
+        """
+        把此前只测了两个工具交替到达的场景,扩展到三个工具同时交替到达,
+        验证按index分组的拼接逻辑在更复杂的交替场景下依然稳健。
+        """
+        accumulator = ToolCallAccumulator()
+        accumulator.feed([_fake_delta(0, id_="c0", name="get_weather", arguments="")])
+        accumulator.feed([_fake_delta(1, id_="c1", name="calculate", arguments="")])
+        accumulator.feed([_fake_delta(2, id_="c2", name="search_faq", arguments="")])
+        accumulator.feed([_fake_delta(0, arguments='{"city":"北京"}')])
+        accumulator.feed([_fake_delta(2, arguments='{"query":"部署"}')])
+        accumulator.feed([_fake_delta(1, arguments='{"expression":"1+1"}')])
+
+        completed = accumulator.get_completed_tool_calls()
+        assert len(completed) == 3
+        by_name = {tc["function"]["name"]: tc["function"]["arguments"] for tc in completed}
+        assert by_name["get_weather"] == '{"city":"北京"}'
+        assert by_name["calculate"] == '{"expression":"1+1"}'
+        assert by_name["search_faq"] == '{"query":"部署"}'
+
+
+# ------------------------------------------------------------------
+# 第三部分:多用户会话隔离测试
+# ------------------------------------------------------------------
+
+class TestMultiUserMemoryIsolation:
+    """
+    虽然今天的主程序是单会话命令行demo,但老王提到"苍穹正式后端
+    要同时服务很多个用户",这里补充一组测试,验证如果给每个用户
+    分配独立的ConversationMemory实例,彼此的历史不会相互污染——
+    这是"多会话隔离"最基本、也最容易被想当然地认为"肯定没问题"、
+    实际上值得专门写一个测试去确认的正确性前提。
+    """
+
+    def test_two_independent_memory_instances_do_not_share_state(self):
+        memory_a = ConversationMemory(system_prompt="用户A的人设")
+        memory_b = ConversationMemory(system_prompt="用户B的人设")
+
+        memory_a.add_user("我叫陈铭")
+        memory_b.add_user("我叫苏梦")
+
+        assert memory_a.messages[-1]["content"] == "我叫陈铭"
+        assert memory_b.messages[-1]["content"] == "我叫苏梦"
+        assert memory_a.messages is not memory_b.messages
+
+    def test_clearing_one_memory_does_not_affect_another(self):
+        memory_a = ConversationMemory()
+        memory_b = ConversationMemory()
+
+        memory_a.add_user("第一句话")
+        memory_b.add_user("另一句话")
+        memory_a.clear()
+
+        assert memory_a.count_turns() == 0
+        assert memory_b.count_turns() == 1, "清空memory_a不应该影响memory_b的历史"
+
+    def test_simulated_concurrent_session_dictionary(self):
+        """
+        模拟一个最朴素的"多用户会话管理器"——用字典把每个用户的
+        ConversationMemory实例分开存放,验证并发访问多个会话时,
+        各自的历史都能被正确追踪,不会串话。
+        """
+        sessions = {}
+
+        def get_or_create_session(user_id):
+            if user_id not in sessions:
+                sessions[user_id] = ConversationMemory()
+            return sessions[user_id]
+
+        session_chenming = get_or_create_session("user_chenming")
+        session_sumeng = get_or_create_session("user_sumeng")
+
+        session_chenming.add_user("我在北京")
+        session_sumeng.add_user("我在上海")
+        session_chenming.add_user("今天天气怎么样")
+
+        assert session_chenming.count_turns() == 2
+        assert session_sumeng.count_turns() == 1
+        assert get_or_create_session("user_chenming") is session_chenming, "同一用户重复获取应该拿到同一个会话实例"
+
+
+# ------------------------------------------------------------------
+# 第四部分:FAQ检索相似度阈值的边界测试
+# ------------------------------------------------------------------
+
+class TestSearchFaqThresholdBoundary:
+    """针对search_faq()相似度阈值的边界行为做专门测试。"""
+
+    def test_query_identical_to_kb_question_gets_highest_score(self):
+        results = search_faq("苍穹支持哪些大模型", top_k=1)
+        assert len(results) == 1
+        assert results[0]["score"] == pytest.approx(1.0, abs=1e-6)
+
+    def test_top_k_limits_result_count(self):
+        results_top1 = search_faq("苍穹", top_k=1)
+        results_top3 = search_faq("苍穹", top_k=3)
+        assert len(results_top1) <= 1
+        assert len(results_top3) <= 3
+        assert len(results_top3) >= len(results_top1)
+
+    def test_completely_unrelated_query_returns_empty(self):
+        results = search_faq("今天中午食堂有什么菜")
+        assert results == []
+
+    def test_whitespace_only_query_raises(self):
+        with pytest.raises(ToolExecutionError):
+            search_faq("   ")
+
+
+# ------------------------------------------------------------------
+# 第五部分:历史裁剪在"单轮巨大"场景下的真实表现
+# ------------------------------------------------------------------
+
+class TestMemoryTrimSingleHugeTurn:
+    """
+    对应老王在今日复盘里指出的问题:当前裁剪策略是"按轮次数量"裁,
+    如果某一轮本身就异常庞大(比如触发了多次工具调用),裁剪后
+    历史占用空间可能仍然很大。这里把这个"已知局限"写成测试用例,
+    明确记录当前行为,方便未来实现"按token预算裁剪"时用来做回归对比。
+    """
+
+    def test_single_huge_turn_is_preserved_as_is_even_if_it_dominates_history(self):
+        memory = ConversationMemory()
+
+        # 前面9轮都是很短的对话
+        for i in range(9):
+            memory.add_user(f"第{i}轮简短提问")
+            memory.add_assistant(content=f"第{i}轮简短回答")
+
+        # 第10轮人为构造得非常庞大(模拟多次工具调用产生的大量消息)
+        memory.add_user("这是一个会触发很多工具调用的复杂问题")
+        for _ in range(5):
+            memory.add_assistant(content=None, tool_calls=[{
+                "id": "fake_id", "type": "function",
+                "function": {"name": "get_weather", "arguments": '{"city":"北京"}' * 20},
+            }])
+            memory.add_tool_result("fake_id", "get_weather", "模拟结果" * 50)
+        memory.add_assistant(content="最终的完整回答")
+
+        memory.trim_if_needed(max_turns=10)
+
+        # 裁剪后应该刚好保留10个轮次(不多不少),
+        # 即便最后一轮本身占用的token远超其他9轮总和,
+        # 当前"按轮次数量裁剪"的策略依然会把它完整保留下来
+        assert memory.count_turns() == 10
+        huge_turn_tokens = estimate_tokens(memory.messages)
+        assert huge_turn_tokens > 500, (
+            "本测试的意图是证明:即便第10轮本身消耗了远超预算的token,"
+            "当前‘按轮次数量’的裁剪策略也不会对此做出任何针对性处理,"
+            "这正是老王在复盘里指出的、值得后续优化的真实局限。"
+        )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
+```
+
+老王看完这份文件,专门在`TestMemoryTrimSingleHugeTurn`这个类上面画了一个圈,评价说:"这才是我想看到的测试思路——不是为了证明‘代码没问题’才写测试,是故意构造一个已知有问题的场景,用测试把这个问题‘钉’在那里,提醒未来的自己(或者接手这段代码的同事)这里还欠着一笔账。有的团队会把这种测试专门标记成`@pytest.mark.xfail`或者在用例名字里加上`known_limitation`,你现在这样直白地写在docstring里,对新手来说更容易看懂,以后熟练了可以考虑用更规范的标记方式。"
+
+### 附录文件2:`session_manager.py` —— 简化版多用户会话管理器
+
+```python
+"""
+文件名:session_manager.py
+作者:陈铭
+说明:
+    老王验收时提到"苍穹正式后端要同时服务很多用户",这份文件是
+    对这句话的一次朴素实践——把TestMultiUserMemoryIsolation测试用例里
+    "用字典按用户ID分开存放ConversationMemory实例"这个思路,
+    正式抽取成一个独立的、可复用的会话管理模块。
+
+    这不是生产级的实现(生产级通常需要考虑会话过期回收、分布式存储、
+    并发锁等问题,这些会在苍穹0.1版正式后端里用更完整的方式处理),
+    但它把"多用户会话隔离"这个核心正确性要求,先用最朴素的方式
+    实现并测试清楚,为后续升级留下一个清晰的起点。
+"""
+
+import time
+
+from memory import ConversationMemory
+
+
+class SessionManager:
+    """
+    简化版会话管理器,按用户ID维护独立的ConversationMemory实例,
+    并附带一个非常朴素的"闲置会话过期回收"机制。
+    """
+
+    def __init__(self, idle_timeout_seconds=1800):
+        """
+        :param idle_timeout_seconds: 会话闲置超过这个秒数后,
+                                     视为可以被回收(默认30分钟)
+        """
+        self._sessions = {}          # user_id -> ConversationMemory
+        self._last_active_at = {}    # user_id -> 最近一次活跃的时间戳
+        self.idle_timeout_seconds = idle_timeout_seconds
+
+    def get_or_create(self, user_id, system_prompt=None):
+        """
+        获取指定用户的会话,如果不存在则创建一个新的。
+        :param user_id: 用户唯一标识
+        :param system_prompt: 仅在首次创建会话时生效的系统提示词
+        :return: 对应的ConversationMemory实例
+        """
+        if user_id not in self._sessions:
+            self._sessions[user_id] = ConversationMemory(system_prompt=system_prompt)
+
+        self._last_active_at[user_id] = time.time()
+        return self._sessions[user_id]
+
+    def remove_session(self, user_id):
+        """
+        手动移除一个用户的会话(比如用户主动退出登录)。
+        :param user_id: 用户唯一标识
+        :return: 是否确实存在并被移除(bool)
+        """
+        existed = user_id in self._sessions
+        self._sessions.pop(user_id, None)
+        self._last_active_at.pop(user_id, None)
+        return existed
+
+    def cleanup_idle_sessions(self, now=None):
+        """
+        清理所有超过闲置超时时间的会话,释放内存占用。
+
+        设计意图:
+            如果不做这个回收,长期运行的服务进程里,会话字典会
+            无限增长,每一个来访过的用户都会永久占用一份内存,
+            这是内存泄漏的一种典型来源,尤其是在没有登录鉴权、
+            用户可以随意生成大量临时会话ID的场景下风险更明显。
+        :param now: 用于测试时注入固定的"当前时间",默认使用time.time()
+        :return: 本次清理掉的用户ID列表
+        """
+        now = now if now is not None else time.time()
+        expired_user_ids = [
+            user_id
+            for user_id, last_active in self._last_active_at.items()
+            if now - last_active > self.idle_timeout_seconds
+        ]
+        for user_id in expired_user_ids:
+            self._sessions.pop(user_id, None)
+            self._last_active_at.pop(user_id, None)
+        return expired_user_ids
+
+    def active_session_count(self):
+        """返回当前存活的会话数量,可以用于简单的运行时监控。"""
+        return len(self._sessions)
+
+    def snapshot_stats(self):
+        """
+        返回一份当前所有会话的统计快照,方便做运营监控或者调试排查。
+        :return: 字典,key是user_id,value是{"turns": 轮次数, "idle_seconds": 已闲置秒数}
+        """
+        now = time.time()
+        stats = {}
+        for user_id, memory in self._sessions.items():
+            stats[user_id] = {
+                "turns": memory.count_turns(),
+                "idle_seconds": round(now - self._last_active_at.get(user_id, now), 1),
+            }
+        return stats
+
+
+def _self_check():
+    """不依赖pytest的最小自测,验证SessionManager的核心行为。"""
+    manager = SessionManager(idle_timeout_seconds=10)
+
+    session_a = manager.get_or_create("user_a", system_prompt="用户A的人设")
+    session_b = manager.get_or_create("user_b", system_prompt="用户B的人设")
+    assert session_a is not session_b, "不同用户应该拿到不同的会话实例"
+
+    session_a.add_user("你好")
+    assert manager.get_or_create("user_a") is session_a, "同一用户重复获取应该拿到同一个实例,且历史应该保留"
+    assert manager.get_or_create("user_a").count_turns() == 1
+
+    assert manager.active_session_count() == 2
+
+    removed = manager.remove_session("user_b")
+    assert removed is True
+    assert manager.active_session_count() == 1
+
+    # 模拟时间流逝:构造一个"未来"的时间点,验证闲置回收机制生效
+    future_timestamp = time.time() + 20
+    expired = manager.cleanup_idle_sessions(now=future_timestamp)
+    assert "user_a" in expired
+    assert manager.active_session_count() == 0
+
+    print("SessionManager自测全部通过:多用户隔离、重复获取一致性、手动移除、闲置回收均符合预期。")
+
+
+if __name__ == "__main__":
+    _self_check()
+```
+
+陈铭把这份`session_manager.py`发到群里的时候,特意加了一句说明:"这个不是今天需求书里要求的内容,是我看到老王在验收时提的‘苍穹正式后端要同时服务很多用户’这句话,自己顺手写的一个小扩展,大家如果觉得有用可以拿去参考。"老王的回复比预想的更认真:"这个东西看起来简单,但‘闲置会话回收’这个设计点,是很多新手第一次写多用户系统时压根不会想到的——你能想到这一层,说明你已经开始有‘这段代码要在服务器上七天二十四小时不间断跑’的意识了,这个意识,比会写多少个函数更重要。"
+
+### 附录文件3:`extra_homework_reference_implementations.py` —— 课后作业扩展参考实现集
+
+```python
+"""
+文件名:extra_homework_reference_implementations.py
+作者:陈铭
+说明:
+    综合练习的课后作业里,第3题(货币换算工具)和第7题(工具调用日志摘要)
+    已经在正文的"作业参考答案"里给出了基础版本,这份文件是陈铭在
+    老王的建议下,给这两道题补充的"加固版"参考实现,額外覆盖了
+    更多边界情况处理,并统一补上了对应的自测代码,不依赖pytest也能直接运行。
+"""
+
+import datetime
+import json
+
+
+# ============================================================
+# 加固版1:货币换算工具,补充金额校验、四位小数金额四舍五入策略、
+# 以及"从A到A本身"这种边界场景的处理
+# ============================================================
+
+class ToolExecutionError(Exception):
+    """与tools.py中定义的异常类保持同名同语义,方便本文件独立运行演示。"""
+
+
+MOCK_EXCHANGE_RATES_TO_CNY = {
+    "USD": 7.20,
+    "EUR": 7.85,
+    "JPY": 0.048,
+    "GBP": 9.15,
+    "HKD": 0.92,
+    "CNY": 1.0,
+}
+
+
+def convert_currency_hardened(amount, from_currency, to_currency, round_digits=2):
+    """
+    加固版货币换算函数,相较于课后作业基础版参考答案,补充了以下校验:
+    1. amount不能是负数(现实中金额换算场景通常不接受负数输入,
+       如果业务上确实需要支持"负数金额"这种特殊场景如退款冲销,
+       应该由调用方显式声明,不应该作为默认行为悄悄放行);
+    2. amount不能是NaN或者无穷大(浮点数的特殊值,直接参与后续计算
+       容易产生难以排查的连锁错误);
+    3. from_currency和to_currency相同时,直接返回原始金额,不需要
+       走一遍"先换成人民币再换回来"的多余计算,同时避免了因为
+       精度问题导致"A换算成A"结果却不完全等于原始金额的尴尬情况。
+    :param amount: 待换算金额
+    :param from_currency: 原始币种代码
+    :param to_currency: 目标币种代码
+    :param round_digits: 结果保留的小数位数
+    :return: 换算后的金额(float)
+    """
+    if not isinstance(amount, (int, float)) or isinstance(amount, bool):
+        raise ToolExecutionError("金额必须是一个数字(不能是布尔值等其他类型)。")
+
+    if amount != amount:  # 这是Python里判断NaN的经典写法:NaN不等于自身
+        raise ToolExecutionError("金额不能是NaN(非数值)。")
+
+    if amount in (float("inf"), float("-inf")):
+        raise ToolExecutionError("金额不能是无穷大。")
+
+    if amount < 0:
+        raise ToolExecutionError("金额不能为负数,如需处理退款等场景,请使用专门的退款接口。")
+
+    from_currency = (from_currency or "").strip().upper()
+    to_currency = (to_currency or "").strip().upper()
+
+    if from_currency not in MOCK_EXCHANGE_RATES_TO_CNY:
+        raise ToolExecutionError(f"暂不支持的原始币种:{from_currency}")
+    if to_currency not in MOCK_EXCHANGE_RATES_TO_CNY:
+        raise ToolExecutionError(f"暂不支持的目标币种:{to_currency}")
+
+    if from_currency == to_currency:
+        return round(amount, round_digits)
+
+    amount_in_cny = amount * MOCK_EXCHANGE_RATES_TO_CNY[from_currency]
+    result = amount_in_cny / MOCK_EXCHANGE_RATES_TO_CNY[to_currency]
+    return round(result, round_digits)
+
+
+def _self_check_currency():
+    """货币换算加固版的自测。"""
+    assert convert_currency_hardened(100, "USD", "CNY") == 720.0
+    assert convert_currency_hardened(100, "usd", "cny") == 720.0, "币种代码大小写不敏感"
+    assert convert_currency_hardened(100, "CNY", "CNY") == 100.0, "同币种换算应该原样返回"
+    assert convert_currency_hardened(0, "USD", "CNY") == 0.0, "金额为0应该正常返回0"
+
+    for bad_amount in [-10, float("nan"), float("inf"), True]:
+        try:
+            convert_currency_hardened(bad_amount, "USD", "CNY")
+            assert False, f"非法金额 {bad_amount} 应该抛出ToolExecutionError"
+        except ToolExecutionError:
+            pass
+
+    try:
+        convert_currency_hardened(100, "USD", "BTC")
+        assert False, "不支持的目标币种应该抛出异常"
+    except ToolExecutionError:
+        pass
+
+    print("货币换算加固版自测通过。")
+
+
+# ============================================================
+# 加固版2:工具调用日志摘要生成器,补充时间戳、异常结果的特殊标记、
+# 以及超长结果的截断展示
+# ============================================================
+
+def build_multi_tool_reply_summary_hardened(tool_calls, results, max_result_length=120):
+    """
+    加固版的工具调用日志摘要生成函数,相较基础版参考答案补充:
+    1. 每一行摘要前面带上生成时的时间戳,方便日志按时间排查;
+    2. 如果某个结果字符串本身是一段表示错误的JSON(包含"error"字段),
+       在摘要里用[异常]标记突出显示,方便运维人员快速定位问题调用;
+    3. 结果内容超出max_result_length时自动截断并加上省略号提示,
+       避免一次异常的超长返回把整段日志"撑爆",影响日志的可读性。
+    :param tool_calls: 工具调用列表
+    :param results: 对应的执行结果字符串列表
+    :param max_result_length: 单条结果展示的最大字符数
+    :return: 多行文字摘要
+    """
+    if len(tool_calls) != len(results):
+        raise ValueError("tool_calls和results的数量必须一一对应")
+
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = []
+
+    for tc, result in zip(tool_calls, results):
+        tool_name = tc["function"]["name"]
+        tool_args = tc["function"]["arguments"]
+
+        is_error = False
+        try:
+            parsed = json.loads(result)
+            if isinstance(parsed, dict) and "error" in parsed:
+                is_error = True
+        except (json.JSONDecodeError, TypeError):
+            pass  # 结果不是合法JSON也没关系,按普通文本处理即可
+
+        display_result = result
+        if len(display_result) > max_result_length:
+            display_result = display_result[:max_result_length] + "……(已截断)"
+
+        error_mark = "[异常] " if is_error else ""
+        lines.append(f"[{timestamp}] {error_mark}调用工具:{tool_name},参数:{tool_args},结果:{display_result}")
+
+    return "\n".join(lines)
+
+
+def _self_check_summary():
+    """工具调用日志摘要加固版的自测。"""
+    sample_tool_calls = [
+        {"function": {"name": "get_weather", "arguments": '{"city":"北京"}'}},
+        {"function": {"name": "get_weather", "arguments": '{"city":"阿凡达星球"}'}},
+        {"function": {"name": "calculate", "arguments": '{"expression":"31*2"}'}},
+    ]
+    sample_results = [
+        '{"result": {"weather": "晴", "temperature_c": 31}}',
+        '{"error": "暂不支持查询该城市的天气"}',
+        '{"result": 62}' + " " * 200,  # 人为构造一个超长结果,测试截断逻辑
+    ]
+
+    summary = build_multi_tool_reply_summary_hardened(sample_tool_calls, sample_results)
+    lines = summary.split("\n")
+
+    assert len(lines) == 3
+    assert "[异常]" in lines[1], "第二条应该被标记为异常"
+    assert "[异常]" not in lines[0], "第一条是正常结果,不应该被标记为异常"
+    assert "已截断" in lines[2], "超长结果应该被截断并提示"
+
+    print("工具调用日志摘要加固版自测通过。")
+
+
+if __name__ == "__main__":
+    _self_check_currency()
+    _self_check_summary()
+    print("\n全部加固版参考实现自测完成。")
+```
+
+老王把这几个附录文件都过了一遍之后,在周会上说了一句让陈铭印象很深的话:"你们这周写的代码,已经不只是‘能跑起来的作业’了,是在往‘能在生产环境上稳定运行的系统’上靠。但光靠人眼过一遍代码,过不了几次就会漏掉问题——今天我们把这一周所有的核心模块,串起来做一次端到端的集成测试和性能基准测试,顺便看看整个系统在‘压力稍微大一点’的场景下会不会露出马脚。"
+
+### 附录文件4:`test_integration_end_to_end.py` —— 端到端集成测试与性能基准
+
+```python
+"""
+文件名:test_integration_end_to_end.py
+作者:陈铭
+日期:第21天周测与综合练习收尾阶段
+
+背景说明:
+    这一周我们陆续写了 config.py、memory.py、tools.py、stream_client.py、
+    multi_turn_tool_stream_demo.py,以及后续补充的 session_manager.py 和
+    extra_homework_reference_implementations.py。每个模块单独测试的时候都能通过,
+    但老王提出了一个很关键的问题:"这些模块拼在一起跑的时候,会不会因为接口约定
+    不一致、状态没有清理干净、或者并发场景下的竞态条件,而出现单独测试时看不到的问题?"
+
+    这个文件的目的,就是做"端到端"的集成测试——不再是孤立地测试某一个函数,而是
+    模拟一个"用户从打开程序到关闭程序"的完整生命周期,把内存管理、工具调用、
+    会话隔离等模块串起来一起验证。同时补充一组简单的性能基准测试,记录关键操作的
+    耗时,为后续做性能优化提供一个"基线数据"。
+
+    陈铭在写这个文件之前,专门在笔记里提醒自己:"集成测试不是把单元测试复制粘贴
+    一遍,而是要去发现‘模块之间的接口和假设是否一致’这种单元测试测不出来的问题。"
+"""
+
+from __future__ import annotations
+
+import statistics
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+from memory import ConversationMemory
+from session_manager import SessionManager
+from tools import ToolExecutionError, calculate, get_weather, search_faq
+
+
+# ------------------------------------------------------------------
+# 第一部分:端到端生命周期集成测试
+# ------------------------------------------------------------------
+
+
+@dataclass
+class FakeUserSession:
+    """
+    模拟一个"虚拟用户"在一次完整对话生命周期中的所有操作。
+
+    陈铭解释这个设计的动机:"我们不想真的去调用云端的大模型接口做集成测试,
+    这样测试会很慢、很不稳定、还要花钱。所以我把‘用户说了什么、期望调用哪个工具、
+    期望传什么参数’都写成固定的脚本,只测试‘系统各模块之间的配合是否正确’,
+    而不测试‘大模型本身应该选择哪个工具’——那是另一个维度的问题,
+    模型的工具选择能力我们在其他自测脚本里已经单独验证过。
+    """
+
+    user_id: str
+    turns: list[dict[str, Any]] = field(default_factory=list)
+
+    def add_turn(self, user_text: str, expected_tool: str | None = None, expected_tool_args: dict | None = None) -> None:
+        self.turns.append(
+            {
+                "user_text": user_text,
+                "expected_tool": expected_tool,
+                "expected_tool_args": expected_tool_args or {},
+            }
+        )
+
+
+# 这里直接调用底层工具函数(get_weather/calculate/search_faq),而不是通过
+# execute_tool统一入口——execute_tool内部会把所有异常吞掉转成JSON字符串,
+# 集成测试里我们更希望直接拿到Python原生的异常和返回值,断言起来更直接。
+_DIRECT_TOOL_FUNCS = {
+    "get_weather": lambda args: get_weather(args.get("city", "")),
+    "calculate": lambda args: calculate(args.get("expression", ""), args.get("precision", 4)),
+    "search_faq": lambda args: search_faq(args.get("query", ""), args.get("top_k", 1)),
+}
+
+
+def run_fake_session(manager: SessionManager, session: FakeUserSession) -> dict[str, Any]:
+    """
+    在给定的 SessionManager 上"回放"一个虚拟用户会话的所有回合,
+    并返回一份执行报告,包含每一轮的工具调用结果和内存快照。
+    """
+    memory = manager.get_or_create(session.user_id)
+    report: dict[str, Any] = {"user_id": session.user_id, "turns": []}
+
+    for turn in session.turns:
+        memory.add_user(turn["user_text"])
+
+        turn_report: dict[str, Any] = {"user_text": turn["user_text"]}
+        if turn["expected_tool"]:
+            try:
+                result = _DIRECT_TOOL_FUNCS[turn["expected_tool"]](turn["expected_tool_args"])
+                turn_report["tool_result"] = result
+                turn_report["tool_error"] = None
+            except ToolExecutionError as exc:
+                turn_report["tool_result"] = None
+                turn_report["tool_error"] = str(exc)
+            memory.add_assistant(f"工具调用结果:{turn_report.get('tool_result')}")
+        else:
+            memory.add_assistant(f"收到你的消息:{turn['user_text']}")
+
+        turn_report["memory_length_after"] = len(memory.messages)
+        report["turns"].append(turn_report)
+
+    report["final_history_length"] = len(memory.messages)
+    return report
+
+
+def test_end_to_end_single_user_full_lifecycle():
+    """
+    模拟单个用户"打开程序 -> 问几轮问题 -> 调用几次工具 -> 关闭程序"的完整生命周期,
+    验证内存记录、工具调用结果在整个生命周期中始终保持一致。
+    """
+    manager = SessionManager(idle_timeout_seconds=300)
+    session = FakeUserSession(user_id="user_老张")
+    session.add_turn("你好,我想查一下今天上海的天气", expected_tool="get_weather", expected_tool_args={"city": "上海"})
+    session.add_turn("帮我算一下 (23 + 17) * 2 等于多少", expected_tool="calculate", expected_tool_args={"expression": "(23 + 17) * 2"})
+    session.add_turn("苍穹支持私有化部署吗", expected_tool="search_faq", expected_tool_args={"query": "苍穹能不能私有化部署", "top_k": 1})
+    session.add_turn("谢谢,先这样,再见")
+
+    report = run_fake_session(manager, session)
+
+    assert len(report["turns"]) == 4
+    assert report["turns"][1]["tool_result"] == 80, "(23+17)*2 应该等于 80"
+    assert report["turns"][0]["tool_error"] is None
+    assert report["turns"][2]["tool_result"], "关于私有化部署的问题应该能检索到FAQ结果"
+    assert report["final_history_length"] > 0
+
+    manager.remove_session(session.user_id)
+
+
+def test_end_to_end_multi_user_do_not_interfere():
+    """
+    模拟两个用户几乎同时使用系统,验证 SessionManager 串联起来的
+    内存隔离、工具调用互不干扰——这是对早期"多用户内存隔离"单元测试的
+    集成版补充:不仅测内存对象隔离,还测"完整业务流程跑起来"是否隔离。
+    """
+    manager = SessionManager(idle_timeout_seconds=300)
+
+    session_a = FakeUserSession(user_id="user_A")
+    session_a.add_turn("帮我算一下 100 / 4", expected_tool="calculate", expected_tool_args={"expression": "100 / 4"})
+
+    session_b = FakeUserSession(user_id="user_B")
+    session_b.add_turn("帮我算一下 9 * 9", expected_tool="calculate", expected_tool_args={"expression": "9 * 9"})
+
+    report_a = run_fake_session(manager, session_a)
+    report_b = run_fake_session(manager, session_b)
+
+    assert report_a["turns"][0]["tool_result"] == 25.0
+    assert report_b["turns"][0]["tool_result"] == 81
+
+    memory_a = manager.get_or_create("user_A")
+    memory_b = manager.get_or_create("user_B")
+    assert memory_a is not memory_b, "两个用户的内存对象必须是完全独立的实例"
+    assert len(memory_a.messages) == len(memory_b.messages), "两人各说一轮话,历史条数应该相同"
+
+
+def test_end_to_end_tool_error_does_not_break_session():
+    """
+    验证当某一轮的工具调用出错(比如传入了非法的计算表达式)时,
+    不会导致整个会话状态被破坏,用户仍然可以继续下一轮对话。
+    """
+    manager = SessionManager(idle_timeout_seconds=300)
+    session = FakeUserSession(user_id="user_容易出错")
+    session.add_turn("帮我算一下 1 / 0", expected_tool="calculate", expected_tool_args={"expression": "1 / 0"})
+    session.add_turn("好的那算了,谢谢")
+
+    report = run_fake_session(manager, session)
+
+    assert report["turns"][0]["tool_error"] is not None, "除以零应该被捕获为工具执行错误"
+    assert "tool_result" not in report["turns"][1], "第二轮没有触发工具调用,报告里不应该出现tool_result字段"
+    assert report["final_history_length"] > 0, "出错之后会话历史依然要正常累积,不能整个崩掉"
+
+
+# ------------------------------------------------------------------
+# 第二部分:性能基准测试(建立基线,不追求"跑得多快",只追求"有数据可参考")
+# ------------------------------------------------------------------
+
+
+def _time_n_calls(fn, n: int = 200) -> dict[str, float]:
+    """
+    对给定的无参函数调用 n 次,记录每次调用耗时(单位:毫秒),
+    返回一份简单的统计摘要,包括最小值、最大值、平均值和 p95。
+
+    陈铭解释为什么要写这个辅助函数:"性能测试最怕的就是只跑一次就下结论——
+    系统偶尔抖动一下,耗时就可能翻倍。多跑几十次、上百次,看整体分布,
+    才能得出相对靠谱的结论。"
+    """
+    durations_ms: list[float] = []
+    for _ in range(n):
+        start = time.perf_counter()
+        fn()
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        durations_ms.append(elapsed_ms)
+
+    durations_ms.sort()
+    p95_index = min(len(durations_ms) - 1, int(len(durations_ms) * 0.95))
+
+    return {
+        "count": n,
+        "min_ms": round(min(durations_ms), 4),
+        "max_ms": round(max(durations_ms), 4),
+        "mean_ms": round(statistics.mean(durations_ms), 4),
+        "p95_ms": round(durations_ms[p95_index], 4),
+    }
+
+
+def test_benchmark_calculate_tool_performance():
+    """
+    对 calculate 工具做一个简单的性能基准测试,记录调用耗时分布。
+    这里不设置一个"必须小于多少毫秒"的硬性断言,因为不同机器的性能差异很大;
+    但会打印出统计结果,方便老王在做代码评审时能有一个直观的数据参考。
+    """
+    stats = _time_n_calls(lambda: calculate("(3 + 5) * (7 - 2) / 4"), n=200)
+    print(f"\ncalculate 工具性能基准(200次调用): {stats}")
+
+    assert stats["mean_ms"] < 50, "在正常开发机上,单次安全表达式求值平均耗时不应超过50毫秒"
+
+
+def test_benchmark_search_faq_performance():
+    """
+    对 search_faq 工具做性能基准测试。由于 FAQ 检索涉及文本相似度计算,
+    理论上会比纯数学表达式求值慢一些,这里同样只记录数据、不做过于严格的断言。
+    """
+    stats = _time_n_calls(lambda: search_faq("苍穹系统支持哪些支付方式", top_k=3), n=100)
+    print(f"\nsearch_faq 工具性能基准(100次调用): {stats}")
+
+    assert stats["mean_ms"] < 200, "简化版TF-IDF检索在小规模知识库上平均耗时不应超过200毫秒"
+
+
+def test_benchmark_memory_append_scales_reasonably():
+    """
+    验证随着对话轮数增加,ConversationMemory 的写入操作(add_user_message /
+    add_assistant_message)耗时不会随着历史长度线性甚至指数级增长——
+    如果发现耗时随历史长度明显变差,往往意味着底层实现里有一个不该有的
+    O(n^2) 操作(比如每次追加都要重新扫描/重新拷贝整个历史列表)。
+    """
+    memory = ConversationMemory()
+
+    # 先预热到 500 轮历史,模拟一个已经聊了很久的老会话
+    for i in range(500):
+        memory.add_user(f"这是第{i}轮预热消息")
+        memory.add_assistant(f"这是第{i}轮预热回复")
+
+    stats = _time_n_calls(lambda: memory.add_user("新的一轮消息"), n=200)
+    print(f"\n历史较长时 memory.add_user 性能基准(200次调用): {stats}")
+
+    assert stats["mean_ms"] < 10, "即便历史已经积累了500轮,单次追加消息也应该在毫秒级完成"
+
+
+# ------------------------------------------------------------------
+# 第三部分:资源清理健壮性——验证反复创建/销毁会话不会造成资源泄漏
+# ------------------------------------------------------------------
+
+
+def test_repeated_session_create_and_close_does_not_leak():
+    """
+    模拟"用户反复登录登出"的场景,验证 SessionManager 在大量创建和关闭会话之后,
+    内部字典不会无限增长——这是简单但很实用的一种"资源泄漏"自查方式。
+    """
+    manager = SessionManager(idle_timeout_seconds=300)
+
+    for i in range(300):
+        user_id = f"临时用户_{i}"
+        memory = manager.get_or_create(user_id)
+        memory.add_user("你好")
+        manager.remove_session(user_id)
+
+    assert manager.active_session_count() == 0, "所有会话都已关闭,SessionManager内部不应残留任何会话记录"
+
+
+def test_manager_cleanup_idle_sessions_keeps_only_active_ones(monkeypatch):
+    """
+    验证 SessionManager 的闲置会话清理逻辑:创建若干会话后,人为"推进"墙上时钟,
+    只应清理掉那些距离上次活跃时间超过闲置阈值的会话。
+
+    这里用 monkeypatch 直接把 session_manager 模块里的 time.time 替换成一个
+    可以手动控制的假时钟——陈铭解释这样做的理由:"get_or_create内部记录
+    最后活跃时间用的是真实的time.time(),测试跑得再快也是‘真实世界’的几毫秒,
+    没办法用来模拟‘几分钟后’这种场景。用monkeypatch把时间函数换成一个我们
+    自己完全可控的假函数,才能让测试在几毫秒内就跑完‘时间流逝了几百秒’的效果,
+    而且结果是完全确定、可复现的,不会因为跑测试的机器快慢不同而偶尔失败。"
+    """
+    import session_manager as session_manager_module
+
+    fake_now = [1_000_000.0]  # 用列表包裹,方便在闭包里被内部函数修改
+    monkeypatch.setattr(session_manager_module.time, "time", lambda: fake_now[0])
+
+    manager = SessionManager(idle_timeout_seconds=100)
+
+    manager.get_or_create("活跃用户")
+    manager.get_or_create("即将过期用户")
+
+    # 假时钟前进50秒:两个会话都还在100秒的有效期内
+    fake_now[0] += 50
+    removed_early = manager.cleanup_idle_sessions()
+    assert removed_early == [], "50秒还没超过100秒的闲置阈值,不应有任何会话被清理"
+
+    # "活跃用户"在这个时间点(创建后第50秒)重新说话,刷新它的最后活跃时间
+    manager.get_or_create("活跃用户")
+
+    # 假时钟再前进70秒(距离创建共120秒):
+    # "即将过期用户"从未被刷新过,距离创建已经过去120秒,超过100秒阈值,应被清理;
+    # "活跃用户"因为在第50秒被刷新过,此刻距离上次活跃只过去70秒,仍在阈值内,应保留
+    fake_now[0] += 70
+    removed = manager.cleanup_idle_sessions()
+
+    assert "即将过期用户" in removed
+    assert "活跃用户" not in removed
+    assert manager.active_session_count() == 1
+
+
+class _MinimalMonkeypatchForDirectRun:
+    """
+    一个极简的monkeypatch替代品,只为了让本文件能在不依赖pytest的情况下,
+    通过`python test_integration_end_to_end.py`直接运行做一次快速自检。
+    正式的测试流程仍然强烈建议使用`pytest -v -s`执行,pytest内置的monkeypatch
+    fixture会自动在每个测试结束后还原被替换的属性,这里的极简版本
+    没有做自动还原,只适合"一次性跑到底就退出"的直接执行场景。
+    """
+
+    @staticmethod
+    def setattr(obj, name, value):
+        setattr(obj, name, value)
+
+
+if __name__ == "__main__":
+    print("正在运行端到端集成测试与性能基准测试(建议使用 pytest -v -s 运行以查看性能数据打印)...")
+    test_end_to_end_single_user_full_lifecycle()
+    test_end_to_end_multi_user_do_not_interfere()
+    test_end_to_end_tool_error_does_not_break_session()
+    test_benchmark_calculate_tool_performance()
+    test_benchmark_search_faq_performance()
+    test_benchmark_memory_append_scales_reasonably()
+    test_repeated_session_create_and_close_does_not_leak()
+    test_manager_cleanup_idle_sessions_keeps_only_active_ones(_MinimalMonkeypatchForDirectRun())
+    print("\n全部端到端集成测试与性能基准测试通过!")
+```
+
+老王看完这份集成测试文件,在代码评审的最后补了一句:"这份测试文件本身,其实就是这一周所有知识点的一次‘综合练习’——内存管理、工具调用、多用户隔离、异常处理,全都串起来考了一遍。你们如果能把这份文件里的每一个测试用例都看懂、并且能自己独立写出类似的测试,这周的内容就算是真正掌握了,不是‘听懂了’,是‘能自己动手验证系统对不对’。"
+
+三份附录文件写完,已经是第二天午休前的事了。陈铭把它们打包发进项目组的共享文档区,顺手在说明里写了一句:"这些不是必做题,是我看到验收环节几个问题之后,自己想再往深处试一试的结果,欢迎大家挑毛病。"苏梦看完`session_manager.py`回复了一句:"看完这个我突然理解了,为什么老王总说‘先想清楚边界条件’——这次我是真的服气了,那个闲置回收的设计,我压根没往这个方向想过。"
