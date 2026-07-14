@@ -2269,6 +2269,1113 @@ print("全部8个检查点均已通过,Day2核心知识点与文本清洗工具�
 print("=" * 50)
 ```
 
+老王在Code Review收尾的时候补了一句:"你们今天写的这十个文件,已经是一个五脏俱全的小型练习集了。但既然咱们要往'企业级'这个标准去靠,还差最后一层——真正的项目里,测试不会只覆盖'我想到的场景',还要覆盖'我不愿意去想但客户一定会遇到的场景'。晚自习最后半小时,我们再加几个文件,专门练这个。"他还提到,这批补充文件不要求今晚全部写完,允许大家在明天上午到岗后花十分钟补完,但必须留出足够的边界情况覆盖率,"我看重的不是代码量,是你们有没有养成'先想坏情况,再想好情况'的反射弧"。
+
+### 文件11:`string_methods_advanced_playground.py` —— 字符串方法进阶练习场
+
+```python
+"""
+文件名:string_methods_advanced_playground.py
+作者:陈铭
+说明:
+    老王在Code Review时补充布置的进阶练习,覆盖今天课堂笔记里没有
+    展开讲、但在企业级文本处理中同样常用的一批字符串方法:
+    partition/rpartition、count、zfill、ljust/rjust/center、
+    splitlines、expandtabs、casefold,以及字符串的比较排序规则。
+    每个方法配至少两个业务相关的示例,并标注和课堂已讲方法的区别。
+"""
+
+print("=" * 60)
+print("第一部分:partition / rpartition —— 三段式切分")
+print("=" * 60)
+
+# partition()和split()的区别:partition只切一次,并且会把分隔符本身也保留在结果里,
+# 返回的是一个固定长度为3的元组:(分隔符之前, 分隔符本身, 分隔符之后)
+config_line = "database.host=192.168.1.100"
+before, sep, after = config_line.partition("=")
+print(f"原始配置行: {config_line!r}")
+print(f"partition('=') 结果: 前段={before!r}, 分隔符={sep!r}, 后段={after!r}")
+
+# 如果分隔符不存在,partition会返回(原字符串, '', '')——注意这里不会报错
+no_sep_line = "没有等号的配置行"
+p_before, p_sep, p_after = no_sep_line.partition("=")
+print(f"\n找不到分隔符时: 前段={p_before!r}, 分隔符={p_sep!r}, 后段={p_after!r}")
+print("(说明:分隔符不存在时,整段原文都进入'前段',后两个元素是空字符串,不会报错)")
+
+# rpartition()是从右边开始找第一个分隔符,常用于处理"文件路径"这类右侧信息更关键的场景
+file_path = "/data/documents/customer/海纳制造集团设备手册.pdf"
+r_before, r_sep, r_after = file_path.rpartition("/")
+print(f"\n文件路径: {file_path!r}")
+print(f"rpartition('/') 结果: 目录部分={r_before!r}, 文件名部分={r_after!r}")
+
+# 结合partition取文件扩展名,对比rpartition("."),体会"从左找"和"从右找"的差异
+report_name = "monthly.sales.report.2024.xlsx"
+name_part, dot_sep, ext_part = report_name.rpartition(".")
+print(f"\n文件名: {report_name!r}")
+print(f"rpartition('.') 提取扩展名: 主体={name_part!r}, 扩展名={ext_part!r}")
+print("(这里必须用rpartition而不是partition,因为文件名中间也有多个点号,")
+print(" 用partition会在第一个点号处就切断,得到错误的扩展名)")
+wrong_name_part, wrong_dot, wrong_ext_part = report_name.partition(".")
+print(f"对比:如果误用partition,会得到扩展名={wrong_ext_part!r}(明显是错的)")
+
+print("\n" + "=" * 60)
+print("第二部分:count —— 统计子串出现次数")
+print("=" * 60)
+
+audit_log_line = "user=chenming action=login status=success ip=10.0.0.5 status=success"
+status_count = audit_log_line.count("status=success")
+print(f"日志行: {audit_log_line!r}")
+print(f"'status=success' 出现次数: {status_count}")
+
+# count()也可以配合切片,统计某个区间内的出现次数,而不是整个字符串范围
+partial_range = audit_log_line[:40]
+partial_count = partial_range.count("status")
+print(f"\n只统计前40个字符区间内'status'的出现次数: {partial_count}")
+print(f"(对应区间内容: {partial_range!r})")
+
+# 统计空字符的count结果需要格外小心:count("")的结果是"长度+1",这是一个容易被忽略的边界行为
+weird_text = "苍穹"
+print(f"\n'{weird_text}'.count('') 的结果是: {weird_text.count('')}  (等于长度2再加1,这是Python的既定行为,不是bug)")
+
+print("\n" + "=" * 60)
+print("第三部分:zfill / ljust / rjust / center —— 对齐与补齐")
+print("=" * 60)
+
+order_id_raw = "358"
+order_id_padded = order_id_raw.zfill(8)
+print(f"原始订单号: {order_id_raw!r}")
+print(f"zfill(8) 补零后: {order_id_padded!r}  (常用于统一编号位数,比如生成订单号、发票号)")
+
+# zfill对负数也有特殊处理:负号会被保留在最前面,不会被数字0挤到中间
+negative_number_text = "-42"
+print(f"\n负数场景: {negative_number_text!r}.zfill(6) = {negative_number_text.zfill(6)!r}")
+print("(注意:负号仍然在最前面,不是'-000042'写反成'0000-42'这种错误效果)")
+
+product_names = ["苍穹平台", "对话引擎", "RAG检索引擎", "Agent编排中心"]
+print("\n用ljust模拟简单的表格左对齐输出:")
+for product_name in product_names:
+    print(f"|{product_name.ljust(14)}| 状态:已上线")
+
+print("\n用rjust模拟金额右对齐输出(常见于财务报表):")
+amounts = ["9.90", "128.00", "1999.99", "56.50"]
+for amount in amounts:
+    print(f"金额: {amount.rjust(10)} 元")
+
+print("\n用center模拟居中的标题栏:")
+title_bar = "苍穹平台Day2实训报告".center(30, "=")
+print(title_bar)
+
+print("\n" + "=" * 60)
+print("第四部分:splitlines —— 按行切分,处理多行文本")
+print("=" * 60)
+
+multi_line_text = "第一行日志\n第二行日志\r\n第三行日志\r第四行日志"
+lines_result = multi_line_text.splitlines()
+print(f"原始多行文本(repr展示): {multi_line_text!r}")
+print(f"splitlines() 结果: {lines_result}")
+print(f"共 {len(lines_result)} 行")
+print("(splitlines()能同时识别\\n、\\r\\n、\\r三种换行符,这一点比simple的split('\\n')更稳健,")
+print(" 因为不同操作系统、不同来源的文档,换行符风格可能不一致)")
+
+# 对比:如果只用split("\n"),遇到\r\n或单独的\r风格的换行符,会切分不准确
+naive_split_result = multi_line_text.split("\n")
+print(f"\n对比:naive的split('\\n')结果: {naive_split_result}")
+print(f"（可以看到某些行末尾残留了看不见的\\r字符,行数统计也可能不准确）")
+
+print("\n" + "=" * 60)
+print("第五部分:casefold —— 比lower()更彻底的大小写折叠")
+print("=" * 60)
+
+# casefold()和lower()在绝大多数英文场景下效果一样,但在处理某些特殊语言字符
+# (比如德语的ß)时,casefold()会做更彻底的规范化处理,更适合用于"大小写不敏感的比较"场景
+german_like_text = "straße"
+print(f"原文: {german_like_text!r}")
+print(f"lower()   结果: {german_like_text.lower()!r}")
+print(f"casefold() 结果: {german_like_text.casefold()!r}")
+print("(在这个例子中两者结果相同,但casefold()在涉及多语言、特殊字符的场景下更保险,")
+print(" 团队规范建议:如果只是单纯为了'展示'而转小写,用lower();如果是为了'比较是否相同',优先考虑casefold())")
+
+print("\n" + "=" * 60)
+print("第六部分:字符串的大小比较规则(字典序/编码顺序)")
+print("=" * 60)
+
+comparison_pairs = [
+    ("apple", "banana"),
+    ("Apple", "apple"),
+    ("苍穹", "平台"),
+    ("10", "9"),
+    ("abc", "abd"),
+]
+for left, right in comparison_pairs:
+    print(f"{left!r} < {right!r}  ->  {left < right}")
+
+print("\n特别提醒:字符串比较是逐字符按编码值比较的,不是按'数值大小'比较,")
+print("所以 '10' < '9' 的结果是True(因为字符'1'的编码比字符'9'的编码小),")
+print("这和把它们当成数字比较(10 < 9 应该是False)结果完全不同,")
+print("这是新手在处理'看起来像数字但其实是字符串'的数据时,极容易踩的一个陷阱。")
+
+# 用具体代码验证上面这句话
+numeric_string_a = "10"
+numeric_string_b = "9"
+print(f"\n字符串比较: '{numeric_string_a}' < '{numeric_string_b}' -> {numeric_string_a < numeric_string_b}")
+print(f"转成数字再比较: {int(numeric_string_a)} < {int(numeric_string_b)} -> {int(numeric_string_a) < int(numeric_string_b)}")
+
+print("\n所有字符串进阶方法练习执行完毕。")
+```
+
+### 文件12:`operators_edge_cases_and_number_systems.py` —— 运算符边界情况与数字进制专题
+
+```python
+"""
+文件名:operators_edge_cases_and_number_systems.py
+作者:陈铭
+说明:
+    老王补充布置的运算符"加强练习",专门覆盖两类内容:
+    1. 上午课堂没有深入展开的位运算符(&、|、^、~、<<、>>),
+       以及它们和幂运算符(**)、逻辑运算符容易混淆的地方。
+    2. 数字进制转换(二进制/八进制/十六进制)与内置函数bin/oct/hex/int的配合使用,
+       这部分知识在以后调试底层编码、处理颜色值、处理位标志位配置时会用到。
+    3. 浮点数精度问题的进一步探讨,引入decimal模块作为"知道但暂不深入"的预告。
+"""
+
+print("=" * 60)
+print("第一部分:位运算符入门(区分于逻辑运算符and/or/not)")
+print("=" * 60)
+
+flag_a = 0b1010   # 二进制字面量写法,表示十进制的10
+flag_b = 0b0110   # 二进制字面量写法,表示十进制的6
+
+print(f"flag_a = {flag_a} (二进制: {bin(flag_a)})")
+print(f"flag_b = {flag_b} (二进制: {bin(flag_b)})")
+
+print(f"\nflag_a & flag_b = {flag_a & flag_b}  (按位与:每一位都是1才是1)")
+print(f"flag_a | flag_b = {flag_a | flag_b}  (按位或:任一位是1就是1)")
+print(f"flag_a ^ flag_b = {flag_a ^ flag_b}  (按位异或:两位不同才是1)")
+print(f"~flag_a         = {~flag_a}  (按位取反,结果通常是负数,和补码表示有关)")
+print(f"flag_a << 1     = {flag_a << 1}  (左移1位,相当于乘以2)")
+print(f"flag_a >> 1     = {flag_a >> 1}  (右移1位,相当于整除2)")
+
+print("\n--- 再次强调:位运算符和逻辑运算符不是一回事 ---")
+print("上午课堂提醒过 2 ** 10 不能写成 2 ^ 10,这里再补充几个容易混淆的对比:")
+print(f"and 的逻辑运算: True and False -> {True and False}")
+print(f"& 的按位运算  : True & False -> {True & False}  (布尔值参与位运算时会被当成0和1处理,结果碰巧一致)")
+print(f"但数值参与时差异巨大: 6 and 3 -> {6 and 3}  (逻辑and返回的是其中一个操作数本身,不是'与运算'的结果!)")
+print(f"           对比    : 6 & 3   -> {6 & 3}   (这才是真正的按位与运算结果)")
+print("(这一点极容易被新手误解——and/or作用在非布尔值上时,返回的是操作数本身,而不是'逐位运算'的结果,")
+print(" 这是Python里一个非常隐蔽、值得单独记一笔的知识点)")
+
+print("\n" + "=" * 60)
+print("第二部分:进制转换——bin / oct / hex / int的配合使用")
+print("=" * 60)
+
+decimal_number = 255
+print(f"十进制数字: {decimal_number}")
+print(f"转二进制字符串: {bin(decimal_number)}   (前缀0b表示这是二进制表示)")
+print(f"转八进制字符串: {oct(decimal_number)}   (前缀0o表示这是八进制表示)")
+print(f"转十六进制字符串: {hex(decimal_number)} (前缀0x表示这是十六进制表示,这个在颜色值里很常见)")
+
+# int()函数的第二个参数可以指定"待转换字符串"是按哪种进制来解读的
+binary_text = "11111111"
+octal_text = "377"
+hex_text = "ff"
+print(f"\n把二进制字符串'{binary_text}'按二进制解读为十进制: {int(binary_text, 2)}")
+print(f"把八进制字符串'{octal_text}'按八进制解读为十进制: {int(octal_text, 8)}")
+print(f"把十六进制字符串'{hex_text}'按十六进制解读为十进制: {int(hex_text, 16)}")
+
+# 一个实际业务小例子:解析一个常见的CSS颜色十六进制码
+css_color_hex = "#3A7BD5"
+color_value_without_hash = css_color_hex.lstrip("#")
+red_component = int(color_value_without_hash[0:2], 16)
+green_component = int(color_value_without_hash[2:4], 16)
+blue_component = int(color_value_without_hash[4:6], 16)
+print(f"\nCSS颜色码: {css_color_hex}")
+print(f"解析出的RGB分量: R={red_component}, G={green_component}, B={blue_component}")
+
+print("\n" + "=" * 60)
+print("第三部分:浮点数精度问题进阶——认识decimal模块(仅预告,不深入)")
+print("=" * 60)
+
+# 复习昨天和今天上午提到的浮点数精度陷阱
+float_sum = 0.1 + 0.2
+print(f"0.1 + 0.2 的直接结果: {float_sum}")
+print(f"0.1 + 0.2 == 0.3 的判断结果: {float_sum == 0.3}  (符合预期地为False,这是浮点数存储方式导致的)")
+
+# 正确的浮点数"近似相等"判断写法——用差值和一个很小的容差(epsilon)比较
+epsilon = 1e-9
+is_approximately_equal = abs(float_sum - 0.3) < epsilon
+print(f"用容差判断是否'近似相等': abs(结果 - 0.3) < {epsilon}  ->  {is_approximately_equal}")
+
+# 预告:decimal模块可以提供精确的十进制运算,常用于金融、财务类计算场景
+from decimal import Decimal
+
+decimal_sum = Decimal("0.1") + Decimal("0.2")
+print(f"\n【预告,仅作了解】使用decimal模块计算: Decimal('0.1') + Decimal('0.2') = {decimal_sum}")
+print(f"decimal计算结果 == Decimal('0.3') 的判断: {decimal_sum == Decimal('0.3')}")
+print("(decimal模块的详细用法不在Day2的考察范围内,这里只是让大家知道——")
+print(" 涉及金额等对精度要求极高的计算,业界通常不会直接用浮点数float,而是用Decimal或者整数分为单位来计算,")
+print(" 比如把'元'转换成'分'再做整数运算,这个思路以后在做电商、财务相关模块时会经常用到)")
+
+print("\n" + "=" * 60)
+print("第四部分:比较运算符与逻辑运算符的组合边界情况补充")
+print("=" * 60)
+
+# 补充几个上午课堂笔记之外、Code Review时老王临时追加的边界情况
+
+# 边界情况1:None和任何数字比较,会直接报错(而不是像"32"==32那样安静地返回False)
+# 以下代码保留为注释,避免实际运行崩溃:
+# result_none_compare = None > 5
+# 报错信息大致为:TypeError: '>' not supported between instances of 'NoneType' and 'int'
+print("边界情况1:None不能直接和数字用>、<比较,会抛出TypeError(已在注释中记录,未实际触发)")
+
+# 但None可以用==和!=安全地比较,不会报错
+none_value = None
+print(f"边界情况1补充: None == 5 的结果是 {none_value == 5} (不会报错)")
+print(f"           None == None 的结果是 {none_value == None} (虽然合法,但规范上更推荐用is None判断)")
+print(f"           推荐写法 is None: {none_value is None}")
+
+# 边界情况2:布尔值参与算术运算,会被当成1和0
+bool_arith_result = True + True + False
+print(f"\n边界情况2: True + True + False = {bool_arith_result}  (True当1、False当0参与加法运算)")
+
+# 边界情况3:字符串乘以整数,是"重复拼接",不是报错
+repeat_result = "苍穹" * 3
+print(f"\n边界情况3: '苍穹' * 3 = {repeat_result!r}  (字符串乘整数表示重复拼接,是Python的一个常用技巧)")
+# 但字符串乘以字符串,或者字符串乘以浮点数,会报错,以下保留为注释
+# broken_repeat = "苍穹" * "3"
+# 报错信息大致为:TypeError: can't multiply sequence by non-int of type 'str'
+# broken_repeat_float = "苍穹" * 2.5
+# 报错信息大致为:TypeError: can't multiply sequence by non-int of type 'float'
+print("(注意:字符串乘以字符串,或字符串乘以浮点数,都会报TypeError,已在注释中记录)")
+
+print("\n所有运算符边界情况与进制专题练习执行完毕。")
+```
+
+### 文件13:`text_cleaner_v5_batch_and_stats.py` —— 文本清洗小工具(v5:批量处理与统计增强版)
+
+```python
+"""
+文件名:text_cleaner_v5_batch_and_stats.py
+作者:陈铭
+版本:v5(在v4企业级整合版基础上,进一步扩展"批量处理多篇文档"与"更细粒度统计"能力)
+说明:
+    老王在Code Review后半段提出一个新的假设场景:"如果客户一次性上传了
+    十份文档,而不是一份,你的工具现在的接口设计够不够用?"
+    这个v5版本正是为了回应这个假设场景而写的扩展版,新增内容包括:
+    1. batch_clean_texts():批量清洗一组文本,返回每一篇的报告列表。
+    2. summarize_batch_report():对批量清洗结果做汇总统计
+       (总文本数、空白文本数、平均替换敏感词次数、最长/最短文本长度等)。
+    3. word_frequency_top_n():统计清洗后文本中出现频率最高的前N个"字"
+       (今天还没学中文分词,这里先用最朴素的逐字符统计方式,
+       老王特意说明"这是一种简化处理,真正的分词要等后面的NLP相关内容")。
+    4. 更完整的边界情况覆盖:混合列表(部分正常、部分None、部分空字符串)。
+
+    本文件依赖v4版本中已经写好的核心函数,体现"不重复造轮子,
+    在已有基础上扩展"这一企业级开发中非常重要的习惯。
+"""
+
+from text_cleaner_v4_enterprise import run_cleaning_pipeline, is_blank_text
+
+
+def batch_clean_texts(text_list, config=None):
+    """
+    对一组文本批量执行清洗流水线。
+
+    参数:
+        text_list (list): 一组待清洗的原始文本,可以混合包含None、空字符串、正常文本等各种情况。
+        config (dict): 清洗配置,直接透传给run_cleaning_pipeline()。
+
+    返回值:
+        list: 每一篇文本对应的清洗报告字典组成的列表,顺序与输入列表一致,
+              方便调用者按索引对照"第几篇文档对应第几份报告"。
+
+    设计说明:
+        这里没有对text_list本身做"是否为None"的判断,是因为按照目前团队的约定,
+        "传入一个非列表的东西调用batch_clean_texts",属于调用者的编程错误,
+        不属于本函数需要"温柔处理"的业务边界情况,这两者的区别老王在Code Review时
+        专门强调过:"业务数据的脏,我们要兜底;调用方式本身的错,该报错就报错,
+        不要什么都往'try兜住不报错'这个方向去想,那样反而会隐藏真正的程序bug。"
+    """
+    reports = []
+    for single_text in text_list:
+        report = run_cleaning_pipeline(single_text, config=config)
+        reports.append(report)
+    return reports
+
+
+def summarize_batch_report(reports):
+    """
+    对batch_clean_texts()返回的报告列表做进一步的汇总统计。
+
+    参数:
+        reports (list): batch_clean_texts()的返回值。
+
+    返回值:
+        dict: 汇总统计结果,包含:
+            - "total_count": 总文本数。
+            - "blank_count": 被判定为空白文本的数量。
+            - "non_blank_count": 非空白文本的数量。
+            - "total_sensitive_hits": 全部文本累计替换的敏感词总次数。
+            - "average_sensitive_hits": 非空白文本的平均敏感词替换次数
+              (为避免除以0,如果非空白文本数量为0,该值记为0)。
+            - "longest_cleaned_text": 清洗后最长的文本内容。
+            - "shortest_cleaned_text_non_blank": 非空白文本中,清洗后最短的内容。
+
+    设计说明:
+        这里出现了"平均值计算时除数可能为0"的经典边界情况,
+        用短路求值(and/or组合)提前规避了ZeroDivisionError,
+        这是今天知识范围内能做到的最稳妥写法,明天学完if之后可以写得更直白。
+    """
+    total_count = len(reports)
+    blank_count = 0
+    non_blank_count = 0
+    total_sensitive_hits = 0
+    longest_cleaned_text = ""
+    shortest_cleaned_text_non_blank = None
+
+    for report in reports:
+        if report["is_blank"]:
+            blank_count += 1
+            continue
+
+        non_blank_count += 1
+        total_sensitive_hits += report["sensitive_word_hits"]
+
+        current_cleaned = report["cleaned_text"]
+        if len(current_cleaned) > len(longest_cleaned_text):
+            longest_cleaned_text = current_cleaned
+
+        # 用"shortest_cleaned_text_non_blank是否还是None"来判断这是不是第一次遇到非空白文本,
+        # 这是一种在没有更专业的"哨兵值"概念之前,能想到的最朴素的初始化技巧
+        is_first_non_blank = (shortest_cleaned_text_non_blank is None)
+        is_shorter_than_current_shortest = (
+            shortest_cleaned_text_non_blank is not None
+            and len(current_cleaned) < len(shortest_cleaned_text_non_blank)
+        )
+        if is_first_non_blank or is_shorter_than_current_shortest:
+            shortest_cleaned_text_non_blank = current_cleaned
+
+    # 平均值计算,防止除以0:用and短路,non_blank_count为0时直接给出0,不去执行除法
+    average_sensitive_hits = (
+        non_blank_count and (total_sensitive_hits / non_blank_count)
+    ) or 0
+
+    summary = {
+        "total_count": total_count,
+        "blank_count": blank_count,
+        "non_blank_count": non_blank_count,
+        "total_sensitive_hits": total_sensitive_hits,
+        "average_sensitive_hits": average_sensitive_hits,
+        "longest_cleaned_text": longest_cleaned_text,
+        "shortest_cleaned_text_non_blank": shortest_cleaned_text_non_blank,
+    }
+    return summary
+
+
+def word_frequency_top_n(text, top_n=5):
+    """
+    统计文本中出现频率最高的前N个字符(简化版,按单个字符统计,不做中文分词)。
+
+    参数:
+        text (str): 待统计的文本。
+        top_n (int): 返回频率最高的前多少个字符,默认5。
+
+    返回值:
+        list: 由(字符, 出现次数)组成的元组列表,按出现次数从高到低排序。
+
+    设计说明:
+        这里没有使用collections.Counter(那是更靠后阶段才会介绍的标准库工具),
+        而是用最朴素的"字典累加计数"方式手写实现,目的是让大家先理解
+        "词频统计"背后的基本原理,再在后续课程里学到更简洁的标准库写法时,
+        能够体会到"原来标准库帮我省掉了这么多重复劳动"。
+    """
+    if is_blank_text(text):
+        return []
+
+    # 统计空白字符会干扰"内容词频"的意义,这里先用split()按空白切分再重新拼接,
+    # 相当于把所有连续空白折叠成没有空白的纯内容,再逐字符统计
+    content_only = "".join(text.split())
+
+    frequency_map = {}
+    for character in content_only:
+        # .get(character, 0)是字典的一个常用技巧,表示"如果这个字符还没有记录过,就当作0开始计数"
+        frequency_map[character] = frequency_map.get(character, 0) + 1
+
+    # 把字典转换成(字符, 次数)元组组成的列表,再按次数从高到低排序
+    frequency_items = list(frequency_map.items())
+    # sorted()的key参数指定按元组的第二个元素(次数)排序,reverse=True表示从高到低
+    sorted_items = sorted(frequency_items, key=lambda pair: pair[1], reverse=True)
+
+    return sorted_items[:top_n]
+
+
+# --------------------------------------------------------------------------
+# 手动测试区
+# --------------------------------------------------------------------------
+if __name__ == "__main__":
+    print("=" * 60)
+    print("text_cleaner_v5_batch_and_stats.py —— 批量处理与统计增强测试")
+    print("=" * 60)
+
+    batch_config = {
+        "case_mode": "keep",
+        "sensitive_words": ["内部机密", "Secret", "竞品X公司"],
+        "placeholder": "***",
+    }
+
+    # 混合列表:正常文本、None、空字符串、纯空格、长文本、含敏感词文本,覆盖各种边界情况
+    incoming_documents = [
+        "苍穹平台是一款企业级智能体中台产品。",
+        None,
+        "",
+        "     ",
+        "这是一份内部机密文档,内部机密内容涉及Secret信息,请勿外传给竞品X公司。",
+        "苍穹平台苍穹平台苍穹平台,重复出现的内容用于测试词频统计功能是否正常工作。",
+        "短文本",
+    ]
+
+    print(f"\n本批次共收到 {len(incoming_documents)} 篇文档,开始批量清洗...")
+    batch_reports = batch_clean_texts(incoming_documents, config=batch_config)
+
+    for doc_index, single_report in enumerate(batch_reports, start=1):
+        print(f"\n第{doc_index}篇文档报告:")
+        print(f"  原始内容: {single_report['original_text']!r}")
+        if single_report["is_blank"]:
+            print("  判定结果: 空白文本,已跳过清洗")
+        else:
+            print(f"  清洗结果: {single_report['cleaned_text']!r}")
+            print(f"  敏感词替换次数: {single_report['sensitive_word_hits']}")
+
+    print("\n" + "-" * 60)
+    print("批量汇总统计报告:")
+    batch_summary = summarize_batch_report(batch_reports)
+    print(f"  总文档数: {batch_summary['total_count']}")
+    print(f"  空白文档数: {batch_summary['blank_count']}")
+    print(f"  非空白文档数: {batch_summary['non_blank_count']}")
+    print(f"  累计敏感词替换次数: {batch_summary['total_sensitive_hits']}")
+    print(f"  平均每篇敏感词替换次数: {batch_summary['average_sensitive_hits']:.2f}")
+    print(f"  最长的清洗后文本: {batch_summary['longest_cleaned_text']!r}")
+    print(f"  最短的非空白清洗后文本: {batch_summary['shortest_cleaned_text_non_blank']!r}")
+
+    print("\n" + "-" * 60)
+    print("词频统计测试(简化版,按单字符统计,不做分词):")
+    frequency_sample_text = "苍穹平台苍穹平台苍穹平台,重复出现的内容用于测试词频统计功能是否正常工作。"
+    top_frequencies = word_frequency_top_n(frequency_sample_text, top_n=5)
+    print(f"  样本文本: {frequency_sample_text!r}")
+    print(f"  出现频率最高的5个字符:")
+    for character, count in top_frequencies:
+        print(f"    '{character}' 出现 {count} 次")
+
+    print("\n" + "-" * 60)
+    print("边界情况测试:全部为空白文本的批量输入")
+    all_blank_documents = [None, "", "   ", "\t\n"]
+    all_blank_reports = batch_clean_texts(all_blank_documents, config=batch_config)
+    all_blank_summary = summarize_batch_report(all_blank_reports)
+    print(f"  总文档数: {all_blank_summary['total_count']}")
+    print(f"  空白文档数: {all_blank_summary['blank_count']}")
+    print(f"  平均敏感词替换次数(应安全地为0,而不是报除0错误): {all_blank_summary['average_sensitive_hits']}")
+
+    print("\n所有批量处理与统计增强测试执行完毕。")
+```
+
+### 文件14:`unit_style_tests_day2_extended.py` —— Day2扩展单元测试(仿unittest风格)
+
+```python
+"""
+文件名:unit_style_tests_day2_extended.py
+作者:陈铭
+说明:
+    老王提到,以后正式的项目会用unittest或pytest这类专业测试框架写测试
+    (那部分内容会在项目化阶段系统展开),但今天知识范围内还不方便直接
+    引入这些框架的全部概念。这个文件用一种"手写模拟"的方式,
+    提前搭建出和正式单元测试框架非常相似的组织结构——
+    每个测试函数都以test_开头,内部用assert断言,最后统一收集执行结果、
+    统计通过和失败的数量,并打印一份汇总报告,形式上向未来要学的
+    unittest.TestCase靠近,但完全只用今天学过的语法元素实现。
+"""
+
+from text_cleaner_v4_enterprise import (
+    clean_whitespace,
+    normalize_case,
+    replace_sensitive_words,
+    is_blank_text,
+    run_cleaning_pipeline,
+)
+from text_cleaner_v5_batch_and_stats import (
+    batch_clean_texts,
+    summarize_batch_report,
+    word_frequency_top_n,
+)
+
+
+# --------------------------------------------------------------------------
+# 测试结果收集容器:用一个字典模拟"测试报告"，包含通过数、失败数、失败详情列表
+# --------------------------------------------------------------------------
+test_run_summary = {
+    "passed": 0,
+    "failed": 0,
+    "failure_details": [],
+}
+
+
+def run_single_test(test_name, test_function):
+    """
+    执行单个测试函数,并捕获其执行结果,累加到全局的test_run_summary里。
+
+    参数:
+        test_name (str): 测试用例的名字,用于打印和记录。
+        test_function: 一个不接受参数、内部用assert断言的函数。
+
+    返回值:
+        None,该函数只负责执行并记录结果。
+
+    设计说明:
+        这里用到了try/except(今天知识范围之外的超前用法,Day10才正式讲),
+        老王特别叮嘱过,这里的try/except只是"借用"一下,用来让单个测试用例的
+        失败不会导致整个测试脚本崩溃、后面的用例跑不完,这是测试脚本设计里
+        一个很朴素但很重要的原则——"一个用例挂了,不能拖累其他用例"。
+        今天不需要理解try/except的语法细节,只需要理解这个设计动机。
+    """
+    try:
+        test_function()
+        test_run_summary["passed"] += 1
+        print(f"  [通过] {test_name}")
+    except AssertionError as error:
+        test_run_summary["failed"] += 1
+        test_run_summary["failure_details"].append((test_name, str(error)))
+        print(f"  [失败] {test_name} —— {error}")
+
+
+# --------------------------------------------------------------------------
+# 测试用例组1:clean_whitespace 的正常场景与边界场景
+# --------------------------------------------------------------------------
+def test_clean_whitespace_normal_case():
+    """验证正常带空格文本能被正确去除首尾空白。"""
+    assert clean_whitespace("  苍穹平台  ") == "苍穹平台"
+
+
+def test_clean_whitespace_internal_space_preserved():
+    """验证内部空格不会被误删,只处理首尾。"""
+    assert clean_whitespace("  苍穹 平台  ") == "苍穹 平台"
+
+
+def test_clean_whitespace_tab_and_newline():
+    """验证Tab和换行符也能被正确去除。"""
+    assert clean_whitespace("\t苍穹平台\n") == "苍穹平台"
+
+
+def test_clean_whitespace_already_clean_text():
+    """验证已经干净的文本,清洗后结果应该完全不变。"""
+    assert clean_whitespace("已经很干净的文本") == "已经很干净的文本"
+
+
+def test_clean_whitespace_pure_whitespace_becomes_empty():
+    """验证纯空白文本清洗后应该变成空字符串。"""
+    assert clean_whitespace("     \n\t   ") == ""
+
+
+# --------------------------------------------------------------------------
+# 测试用例组2:normalize_case 的各种模式
+# --------------------------------------------------------------------------
+def test_normalize_case_lower_mode():
+    """验证lower模式能把全部字符转为小写。"""
+    assert normalize_case("Cangqiong PLATFORM", mode="lower") == "cangqiong platform"
+
+
+def test_normalize_case_upper_mode():
+    """验证upper模式能把全部字符转为大写。"""
+    assert normalize_case("Cangqiong Platform", mode="upper") == "CANGQIONG PLATFORM"
+
+
+def test_normalize_case_title_mode():
+    """验证title模式能把每个单词首字母大写。"""
+    assert normalize_case("cangqiong platform", mode="title") == "Cangqiong Platform"
+
+
+def test_normalize_case_keep_mode_no_change():
+    """验证keep模式不应对文本做任何改动。"""
+    original_text = "MixedCASE Text 保持原样"
+    assert normalize_case(original_text, mode="keep") == original_text
+
+
+def test_normalize_case_unknown_mode_falls_back_to_original():
+    """验证传入一个未定义的模式名时,应安全地返回原文,而不是报错或崩溃。"""
+    original_text = "未知模式测试文本"
+    assert normalize_case(original_text, mode="this_mode_does_not_exist") == original_text
+
+
+# --------------------------------------------------------------------------
+# 测试用例组3:replace_sensitive_words 的正常场景与边界场景
+# --------------------------------------------------------------------------
+def test_replace_sensitive_words_single_hit():
+    """验证单个敏感词能被正确替换,且替换计数为1。"""
+    result_text, count = replace_sensitive_words("这是内部机密文档", ["内部机密"])
+    assert result_text == "这是***文档"
+    assert count == 1
+
+
+def test_replace_sensitive_words_multiple_hits_same_word():
+    """验证同一个敏感词出现多次时,全部被替换,且计数累加正确。"""
+    result_text, count = replace_sensitive_words("内部机密内部机密内部机密", ["内部机密"])
+    # 注意:占位符默认是"***"(3个星号),原文替换了3次,所以结果是9个星号,不是6个
+    assert result_text == "*********"
+    assert count == 3
+
+
+def test_replace_sensitive_words_case_variant_upper():
+    """验证敏感词的大写变体也能被替换(v3/v4设计的多形态尝试策略)。"""
+    result_text, count = replace_sensitive_words("This is SECRET data", ["Secret"])
+    assert "SECRET" not in result_text
+    assert count == 1
+
+
+def test_replace_sensitive_words_no_hit_returns_original():
+    """验证文本中不包含任何敏感词时,应原样返回,替换计数为0。"""
+    original_text = "这段文本完全不包含任何敏感词"
+    result_text, count = replace_sensitive_words(original_text, ["内部机密", "Secret"])
+    assert result_text == original_text
+    assert count == 0
+
+
+def test_replace_sensitive_words_empty_word_list():
+    """验证敏感词列表为空时,应原样返回文本,不应抛出异常。"""
+    result_text, count = replace_sensitive_words("苍穹平台文本", [])
+    assert result_text == "苍穹平台文本"
+    assert count == 0
+
+
+def test_replace_sensitive_words_empty_text():
+    """验证文本本身为空字符串时,应安全返回空字符串,不应抛出异常。"""
+    result_text, count = replace_sensitive_words("", ["内部机密"])
+    assert result_text == ""
+    assert count == 0
+
+
+def test_replace_sensitive_words_list_contains_empty_string():
+    """验证敏感词列表里混入了一个空字符串时,应被安全跳过,不产生荒谬的替换结果。"""
+    result_text, count = replace_sensitive_words("正常文本", ["", "内部机密"])
+    assert result_text == "正常文本"
+    assert count == 0
+
+
+def test_replace_sensitive_words_custom_placeholder():
+    """验证自定义占位符参数能生效。"""
+    result_text, count = replace_sensitive_words("内部机密文档", ["内部机密"], placeholder="[已脱敏]")
+    assert result_text == "[已脱敏]文档"
+    assert count == 1
+
+
+# --------------------------------------------------------------------------
+# 测试用例组4:is_blank_text 的各类边界输入
+# --------------------------------------------------------------------------
+def test_is_blank_text_none_input():
+    """验证None应被判定为空白文本。"""
+    assert is_blank_text(None) is True
+
+
+def test_is_blank_text_empty_string():
+    """验证空字符串应被判定为空白文本。"""
+    assert is_blank_text("") is True
+
+
+def test_is_blank_text_pure_whitespace():
+    """验证纯空格、Tab、换行组成的字符串应被判定为空白文本。"""
+    assert is_blank_text("   \t\n  ") is True
+
+
+def test_is_blank_text_normal_text():
+    """验证正常文本不应被判定为空白文本。"""
+    assert is_blank_text("苍穹平台") is False
+
+
+def test_is_blank_text_non_string_type():
+    """验证非字符串类型的输入(比如整数)应被安全地判定为空白文本,而不是抛出异常。"""
+    assert is_blank_text(12345) is True
+
+
+def test_is_blank_text_text_with_only_leading_trailing_space():
+    """验证首尾有空格但中间有实际内容的文本,不应被误判为空白文本。"""
+    assert is_blank_text("   有内容   ") is False
+
+
+# --------------------------------------------------------------------------
+# 测试用例组5:run_cleaning_pipeline 的端到端场景
+# --------------------------------------------------------------------------
+def test_run_cleaning_pipeline_full_flow():
+    """验证完整流水线(去空格+统一大小写+敏感词替换)端到端结果正确。"""
+    config = {"case_mode": "lower", "sensitive_words": ["Secret"], "placeholder": "***"}
+    report = run_cleaning_pipeline("  This is SECRET Content  ", config=config)
+    assert report["cleaned_text"] == "this is *** content"
+    assert report["whitespace_removed"] is True
+    assert report["sensitive_word_hits"] == 1
+
+
+def test_run_cleaning_pipeline_none_input_returns_blank_report():
+    """验证传入None时,应返回一份标记为空白、且不抛异常的报告。"""
+    report = run_cleaning_pipeline(None)
+    assert report["is_blank"] is True
+    assert report["cleaned_text"] == ""
+
+
+def test_run_cleaning_pipeline_default_config_keeps_case():
+    """验证不传config时,默认不改变大小写、不替换敏感词。"""
+    report = run_cleaning_pipeline("  Cangqiong PLATFORM  ")
+    assert report["cleaned_text"] == "Cangqiong PLATFORM"
+    assert report["sensitive_word_hits"] == 0
+
+
+def test_run_cleaning_pipeline_no_whitespace_to_remove():
+    """验证输入本身没有多余空白时,whitespace_removed字段应为False。"""
+    report = run_cleaning_pipeline("已经很干净")
+    assert report["whitespace_removed"] is False
+
+
+# --------------------------------------------------------------------------
+# 测试用例组6:batch_clean_texts 与 summarize_batch_report 的组合场景
+# --------------------------------------------------------------------------
+def test_batch_clean_texts_returns_matching_length():
+    """验证批量清洗返回的报告列表长度,应与输入列表长度一致。"""
+    inputs = ["文本一", None, "", "文本二"]
+    reports = batch_clean_texts(inputs)
+    assert len(reports) == len(inputs)
+
+
+def test_summarize_batch_report_counts_blank_correctly():
+    """验证汇总统计能正确区分空白文本和非空白文本的数量。"""
+    inputs = ["有内容", None, "", "   ", "还有内容"]
+    reports = batch_clean_texts(inputs)
+    summary = summarize_batch_report(reports)
+    assert summary["total_count"] == 5
+    assert summary["blank_count"] == 3
+    assert summary["non_blank_count"] == 2
+
+
+def test_summarize_batch_report_all_blank_average_is_zero():
+    """验证全部为空白文本时,平均敏感词替换次数应安全地为0,而不是报除0错误。"""
+    inputs = [None, "", "   "]
+    reports = batch_clean_texts(inputs)
+    summary = summarize_batch_report(reports)
+    assert summary["average_sensitive_hits"] == 0
+
+
+def test_summarize_batch_report_longest_and_shortest_are_identified():
+    """验证最长文本和最短非空白文本能被正确识别出来。"""
+    inputs = ["短", "中等长度文本内容", None, ""]
+    reports = batch_clean_texts(inputs)
+    summary = summarize_batch_report(reports)
+    assert summary["longest_cleaned_text"] == "中等长度文本内容"
+    assert summary["shortest_cleaned_text_non_blank"] == "短"
+
+
+# --------------------------------------------------------------------------
+# 测试用例组7:word_frequency_top_n 的场景
+# --------------------------------------------------------------------------
+def test_word_frequency_top_n_basic_case():
+    """验证基本的词频统计能正确排序返回最高频的字符。"""
+    result = word_frequency_top_n("aaabbc", top_n=2)
+    assert result[0] == ("a", 3)
+    assert result[1] == ("b", 2)
+
+
+def test_word_frequency_top_n_blank_text_returns_empty_list():
+    """验证空白文本的词频统计应返回空列表,而不是报错。"""
+    assert word_frequency_top_n("", top_n=5) == []
+    assert word_frequency_top_n(None, top_n=5) == []
+
+
+def test_word_frequency_top_n_ignores_whitespace():
+    """验证词频统计不应把空白字符纳入统计范围。"""
+    result = word_frequency_top_n("a a a   b", top_n=5)
+    character_list = [pair[0] for pair in result]
+    assert " " not in character_list
+
+
+# --------------------------------------------------------------------------
+# 主执行流程:依次运行以上全部测试用例,并打印汇总报告
+# --------------------------------------------------------------------------
+if __name__ == "__main__":
+    print("=" * 60)
+    print("Day2扩展单元测试套件(仿unittest风格) —— 开始执行")
+    print("=" * 60)
+
+    all_test_cases = [
+        ("clean_whitespace: 正常场景", test_clean_whitespace_normal_case),
+        ("clean_whitespace: 保留内部空格", test_clean_whitespace_internal_space_preserved),
+        ("clean_whitespace: Tab与换行", test_clean_whitespace_tab_and_newline),
+        ("clean_whitespace: 已干净文本不变", test_clean_whitespace_already_clean_text),
+        ("clean_whitespace: 纯空白变空字符串", test_clean_whitespace_pure_whitespace_becomes_empty),
+        ("normalize_case: lower模式", test_normalize_case_lower_mode),
+        ("normalize_case: upper模式", test_normalize_case_upper_mode),
+        ("normalize_case: title模式", test_normalize_case_title_mode),
+        ("normalize_case: keep模式不变", test_normalize_case_keep_mode_no_change),
+        ("normalize_case: 未知模式回退原文", test_normalize_case_unknown_mode_falls_back_to_original),
+        ("replace_sensitive_words: 单次命中", test_replace_sensitive_words_single_hit),
+        ("replace_sensitive_words: 多次命中同一词", test_replace_sensitive_words_multiple_hits_same_word),
+        ("replace_sensitive_words: 大写变体命中", test_replace_sensitive_words_case_variant_upper),
+        ("replace_sensitive_words: 无命中原样返回", test_replace_sensitive_words_no_hit_returns_original),
+        ("replace_sensitive_words: 空敏感词列表", test_replace_sensitive_words_empty_word_list),
+        ("replace_sensitive_words: 空文本", test_replace_sensitive_words_empty_text),
+        ("replace_sensitive_words: 列表含空字符串", test_replace_sensitive_words_list_contains_empty_string),
+        ("replace_sensitive_words: 自定义占位符", test_replace_sensitive_words_custom_placeholder),
+        ("is_blank_text: None输入", test_is_blank_text_none_input),
+        ("is_blank_text: 空字符串", test_is_blank_text_empty_string),
+        ("is_blank_text: 纯空白字符串", test_is_blank_text_pure_whitespace),
+        ("is_blank_text: 正常文本", test_is_blank_text_normal_text),
+        ("is_blank_text: 非字符串类型", test_is_blank_text_non_string_type),
+        ("is_blank_text: 首尾空格但有内容", test_is_blank_text_text_with_only_leading_trailing_space),
+        ("run_cleaning_pipeline: 完整流程", test_run_cleaning_pipeline_full_flow),
+        ("run_cleaning_pipeline: None输入", test_run_cleaning_pipeline_none_input_returns_blank_report),
+        ("run_cleaning_pipeline: 默认配置保留大小写", test_run_cleaning_pipeline_default_config_keeps_case),
+        ("run_cleaning_pipeline: 无需去空格场景", test_run_cleaning_pipeline_no_whitespace_to_remove),
+        ("batch_clean_texts: 返回长度一致", test_batch_clean_texts_returns_matching_length),
+        ("summarize_batch_report: 空白计数正确", test_summarize_batch_report_counts_blank_correctly),
+        ("summarize_batch_report: 全空白平均值为0", test_summarize_batch_report_all_blank_average_is_zero),
+        ("summarize_batch_report: 最长最短文本识别", test_summarize_batch_report_longest_and_shortest_are_identified),
+        ("word_frequency_top_n: 基础排序场景", test_word_frequency_top_n_basic_case),
+        ("word_frequency_top_n: 空白文本返回空列表", test_word_frequency_top_n_blank_text_returns_empty_list),
+        ("word_frequency_top_n: 忽略空白字符", test_word_frequency_top_n_ignores_whitespace),
+    ]
+
+    for case_name, case_function in all_test_cases:
+        run_single_test(case_name, case_function)
+
+    print("\n" + "=" * 60)
+    print("测试执行汇总")
+    print("=" * 60)
+    print(f"总用例数: {len(all_test_cases)}")
+    print(f"通过数量: {test_run_summary['passed']}")
+    print(f"失败数量: {test_run_summary['failed']}")
+
+    if test_run_summary["failed"] > 0:
+        print("\n失败详情:")
+        for failed_name, failure_reason in test_run_summary["failure_details"]:
+            print(f"  - {failed_name}: {failure_reason}")
+    else:
+        print("\n全部测试用例均已通过,Day2扩展测试套件验证完成。")
+```
+
+老王看完这一批文件的Code Review评价被陈铭记在了笔记里:"你们注意`run_single_test`里我特意提前用了一点点`try/except`——这是我故意破例,不是让你们现在就掌握异常处理的全部细节,而是想让你们提前感受一下,'测试框架为什么需要用异常处理来隔离每一个用例',这个设计动机比语法细节更重要。等到Day10正式学异常处理的时候,你们回头看这个文件,应该会有一种'原来当时埋的这个伏笔是这个意思'的感觉。"
+
+### 文件15:`mini_project_log_and_email_toolkit.py` —— 综合小项目:日志格式化与邮箱解析工具箱
+
+```python
+"""
+文件名:mini_project_log_and_email_toolkit.py
+作者:陈铭
+说明:
+    Code Review的最后,老王临时加了一个"课后自选挑战"——把课后作业第5题
+    (提取邮箱域名)和课堂上讲过的f-string对齐格式化结合起来,
+    做成一个稍微完整一点的小工具,模拟"日志系统里展示用户注册信息"这个场景。
+    这个文件综合运用了本章几乎所有的知识点:运算符、索引切片、字符串方法、f-string,
+    并且延续了严格的边界情况处理与中文注释规范,是Day2所有代码里
+    "综合性最强"的一份练习。
+"""
+
+
+def extract_domain(email):
+    """
+    从邮箱地址中提取域名部分,增强版实现(相比课后作业参考答案,补充了更多边界情况)。
+
+    参数:
+        email: 邮箱地址,理论上应为字符串,但函数会对非字符串类型做防御性处理。
+
+    返回值:
+        str: 提取出的域名部分;如果输入不合法,返回一段描述性的错误提示文本
+             (不会抛出未处理的异常,遵循"业务数据的脏,我们要兜底"的原则)。
+    """
+    if not isinstance(email, str):
+        return "输入类型不是字符串,无法解析"
+
+    trimmed_email = email.strip()
+    if trimmed_email == "":
+        return "输入为空文本,无法解析"
+
+    if "@" not in trimmed_email:
+        return "输入不是合法的邮箱格式(缺少@符号)"
+
+    parts = trimmed_email.split("@")
+    # 合法邮箱理论上只应该有一个@,但这里用len(parts)判断,对"多个@"的异常情况也给出明确提示,
+    # 而不是简单粗暴地取最后一段就当作正确结果返回
+    if len(parts) != 2:
+        return f"输入包含{len(parts) - 1}个@符号,不是合法的邮箱格式"
+
+    username_part, domain_part = parts
+    if username_part == "":
+        return "邮箱用户名部分为空,不是合法的邮箱格式"
+    if domain_part == "":
+        return "邮箱域名部分为空,不是合法的邮箱格式"
+    if "." not in domain_part:
+        return "邮箱域名部分缺少'.',可能不是合法的邮箱格式"
+
+    return domain_part
+
+
+def extract_username(email):
+    """
+    从邮箱地址中提取用户名部分(@符号之前的部分)。
+
+    参数:
+        email (str): 邮箱地址。
+
+    返回值:
+        str: 用户名部分;如果输入不合法,返回空字符串作为安全的默认值。
+
+    设计说明:
+        这里选择返回空字符串而不是像extract_domain()那样返回描述性文本,
+        是因为用户名部分通常会被直接拼接到欢迎语里展示给用户,
+        返回一段很长的错误提示文本拼进欢迎语会很奇怪,所以选择了
+        "安静地返回一个空字符串"这种更适合当前使用场景的兜底策略。
+        这也是老王强调的一个原则:"同样是'处理不合法输入',
+        用什么样的兜底返回值,要看这个返回值接下来会被怎么用,
+        没有放之四海而皆准的标准答案。"
+    """
+    if not isinstance(email, str) or "@" not in email:
+        return ""
+    username_part = email.split("@")[0].strip()
+    return username_part
+
+
+def mask_email_for_display(email):
+    """
+    对邮箱地址做简单的展示脱敏处理,只保留用户名的前2个字符,其余用*代替,
+    域名部分保持不变(域名通常不算敏感信息,用户名前缀才是需要保护的部分)。
+
+    参数:
+        email (str): 邮箱地址。
+
+    返回值:
+        str: 脱敏后的邮箱字符串,例如"chenming@pengyuan-tech.com"会变成
+             "ch******@pengyuan-tech.com"。如果输入不合法,返回原样的错误提示。
+
+    设计说明:
+        这里用到了切片(截取前2个字符)和字符串乘法(用*重复填充剩余长度),
+        是本章切片、运算符、字符串方法三类知识点的一次直接综合应用。
+    """
+    domain_result = extract_domain(email)
+    # 复用extract_domain()的合法性校验结果——如果域名解析失败,说明整个邮箱格式就不合法,
+    # 直接把domain_result(此时是错误提示文本)原样返回,不再继续做脱敏处理
+    known_error_prefixes = ("输入", "邮箱")
+    if domain_result.startswith(known_error_prefixes):
+        return domain_result
+
+    username_part = extract_username(email)
+    visible_length = 2
+    if len(username_part) <= visible_length:
+        # 如果用户名本身长度就很短(比如只有1-2个字符),没有足够的部分可以隐藏,
+        # 这里选择全部保留可见字符,不额外补充星号,避免"脱敏后比原文还长"的怪异效果
+        visible_part = username_part
+        masked_part = ""
+    else:
+        visible_part = username_part[:visible_length]
+        masked_part = "*" * (len(username_part) - visible_length)
+
+    return f"{visible_part}{masked_part}@{domain_result}"
+
+
+def format_registration_log_line(username, email, register_time_text, is_vip):
+    """
+    模拟系统日志里"用户注册成功"这一行记录的格式化输出,综合运用f-string的
+    对齐、填充、条件表达式(三元表达式)等特性。
+
+    参数:
+        username (str): 用户昵称。
+        email (str): 用户邮箱。
+        register_time_text (str): 注册时间的文本表示,比如"2024-05-20 09:30:00"。
+        is_vip (bool): 是否为VIP用户。
+
+    返回值:
+        str: 格式化后的一整行日志文本。
+
+    设计说明:
+        这里第一次用到了"条件表达式"(三元表达式)的雏形写法:
+        `"VIP用户" if is_vip else "普通用户"`,这个语法今天还没有正式讲解
+        (完整的if/else语法明天才系统教),但因为这个写法在f-string里
+        实在太常用、太贴合"日志展示"这种场景,老王特意提前透露了这一个用法,
+        并叮嘱"知道怎么用就行,完整原理明天讲if的时候自然就懂了"。
+    """
+    masked_email = mask_email_for_display(email)
+    user_type_label = "VIP用户" if is_vip else "普通用户"
+
+    log_line = (
+        f"[{register_time_text}] "
+        f"用户 {username.ljust(10)} "
+        f"({user_type_label.ljust(6)}) "
+        f"注册成功,邮箱:{masked_email}"
+    )
+    return log_line
+
+
+# --------------------------------------------------------------------------
+# 手动测试区:模拟一批新用户注册日志的批量生成
+# --------------------------------------------------------------------------
+if __name__ == "__main__":
+    print("=" * 70)
+    print("mini_project_log_and_email_toolkit.py —— 综合小项目测试")
+    print("=" * 70)
+
+    print("\n" + "-" * 70)
+    print("第一部分:extract_domain 增强版测试")
+    print("-" * 70)
+    domain_test_cases = [
+        "chenming@pengyuan-tech.com",
+        "sumeng@cangqiong.ai",
+        "这不是邮箱",
+        "",
+        None,
+        12345,
+        "weird@@double-at.com",
+        "@missing-username.com",
+        "missing-domain@",
+        "no-dot-domain@localhost",
+    ]
+    for case in domain_test_cases:
+        print(f"  输入: {case!r:35}  ->  {extract_domain(case)!r}")
+
+    print("\n" + "-" * 70)
+    print("第二部分:mask_email_for_display 脱敏测试")
+    print("-" * 70)
+    mask_test_cases = [
+        "chenming@pengyuan-tech.com",
+        "su@cangqiong.ai",         # 用户名只有2个字符,测试"不额外补星号"的边界情况
+        "a@cangqiong.ai",          # 用户名只有1个字符
+        "hanlu-frontend-dev@pengyuan-tech.com",
+        "不合法邮箱",
+    ]
+    for case in mask_test_cases:
+        print(f"  输入: {case!r:40}  ->  {mask_email_for_display(case)!r}")
+
+    print("\n" + "-" * 70)
+    print("第三部分:format_registration_log_line 综合日志格式化测试")
+    print("-" * 70)
+    registration_records = [
+        ("陈铭", "chenming@pengyuan-tech.com", "2024-05-20 09:30:00", False),
+        ("苏梦", "sumeng@pengyuan-tech.com", "2024-05-20 09:31:12", True),
+        ("韩露", "hanlu@pengyuan-tech.com", "2024-05-20 09:33:45", False),
+        ("张凡", "zhangfan@pengyuan-tech.com", "2024-05-20 09:35:02", True),
+    ]
+    for name, email_addr, register_time, vip_flag in registration_records:
+        print(f"  {format_registration_log_line(name, email_addr, register_time, vip_flag)}")
+
+    print("\n" + "-" * 70)
+    print("第四部分:边界情况综合测试——异常输入不应导致程序崩溃")
+    print("-" * 70)
+    edge_case_records = [
+        (None, None, "2024-05-20 10:00:00", False),
+        ("", "invalid-email", "2024-05-20 10:01:00", False),
+    ]
+    for name, email_addr, register_time, vip_flag in edge_case_records:
+        try:
+            # 这里同样借用了try/except来保护测试脚本本身不因为单个异常输入而崩溃,
+            # 这是Day10异常处理知识点的又一次"预告式使用"
+            safe_username = name if isinstance(name, str) else "未知用户"
+            print(f"  {format_registration_log_line(safe_username, email_addr, register_time, vip_flag)}")
+        except Exception as unexpected_error:
+            print(f"  处理记录时遇到未预料的问题: {unexpected_error}(已被捕获,不影响后续记录处理)")
+
+    print("\n所有综合小项目测试执行完毕。")
+```
+
+老王最后在群里补了一句总结性的话,给今天的代码实战部分收尾:"从`operators_playground.py`到今天最后这个综合小项目,你们应该能感觉到一条清晰的脉络——先掌握单个知识点,再把知识点组合起来解决一个'看起来像真实需求'的问题,最后再回头去补测试、补边界情况。这个节奏,以后你们做苍穹平台里任何一个模块,基本都是同一套打法,只是规模会越来越大、涉及的知识点会越来越多。今天这十五个文件,你们随便挑一份拿出去给同行看,应该都不会丢人——这才是我想要的'新人训练营'水准。"
+
 ---
 
 ## 今日复盘
