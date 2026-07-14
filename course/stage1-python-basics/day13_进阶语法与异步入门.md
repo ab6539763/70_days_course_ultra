@@ -2647,6 +2647,1956 @@ if __name__ == "__main__":
 
 四人在晚自习收尾前,都各自跑通了一遍`python -m tests.test_retry_decorator`,苏梦跑出来的结果里,`test_retry_succeeds_after_failures`那条打印的重试等待时间,和张凡的不完全一样——这是`jitter`随机抖动生效的正常现象,两人一开始都以为是bug,后来对照代码里的`0.5 + random.random()`才想明白,老王笑着说:"这条'不一样'恰好证明了抖动逻辑是有效的,如果两人跑出来的等待时间分毫不差,那才是真出问题了。"
 
+苏梦在晚自习快结束前翻着自己的笔记本,忽然问了一句:"今天讲的这些装饰器、生成器、typing、asyncio,咱们练习项目里目前都只写了'能跑起来的最小版本',真要放进企业项目里,是不是还差着一截?"老王点点头,没有直接否定:"你说得对,今天课堂上写的这些,都是'教学版',够帮你们理解原理,但离'能放心交给别人维护'还有距离——比如retry装饰器目前只有一份基础自检,timer、repeat、CountCalls这三个更早的装饰器,反而一次都没被正式测试过;生成器管道那块,咱们只写了单个生成器的独立例子,没有把'多级生成器串起来处理数据流'这种更贴近真实ETL场景的用法跑通;typing那部分,Protocol、Generic泛型、overload这几个进阶特性,今天笔记只是提了一下概念,没有落地成能跑的代码。"苏梦干脆把这几点记成了一份延伸练习清单,趁着还有印象,晚自习最后这段时间里,把它们一并补完,作为今天知识点在"代码实战"部分的正式延伸。
+
+### 13. `tests/test_decorators_extended.py` —— timer/repeat/CountCalls与retry边界情况的补充自检
+
+```python
+"""
+tests/test_decorators_extended.py
+
+补充说明:
+    tests/test_retry_decorator.py只覆盖了retry装饰器本身,但decorators.py
+    里还有timer、repeat、CountCalls三个装饰器,从来没有被正式测试过——
+    过去只是靠decorators.py文件末尾那段if __name__ == "__main__"里的
+    手动调用、肉眼观察打印内容来"验证"的,这不是一种可以在CI里反复
+    自动运行、可以在重构时提供保护的验证方式。
+
+    这份补充测试:
+    1. 针对timer装饰器,验证它不改变原函数的返回值,且不吞掉原函数抛出的异常。
+    2. 针对repeat装饰器,验证它确实重复执行了指定次数,且返回的是最后一次执行的结果。
+    3. 针对CountCalls类装饰器,验证调用计数的准确性,以及它作为类装饰器
+       是否正确保留了被装饰函数的元信息(__name__等)。
+    4. 针对retry装饰器补充了tests/test_retry_decorator.py没有覆盖到的
+       几个边界情况:等待时间是否真的符合指数退避的量级、jitter关闭时
+       等待时间是否精确、max_delay是否真的对等待时间设置了上限、
+       多种异常类型混合在retryable_exceptions元组里时的分发是否正确。
+
+    运行方式: python -m tests.test_decorators_extended (需要在项目根目录下执行)
+"""
+
+from __future__ import annotations
+
+import sys
+import time
+from pathlib import Path
+from typing import List
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from decorators import CountCalls, repeat, retry, timer  # noqa: E402
+from exceptions import (  # noqa: E402
+    APITimeoutError,
+    AuthenticationError,
+    RateLimitError,
+    ServiceUnavailableError,
+)
+
+
+# ============================================================
+# 第一部分: timer装饰器的补充测试
+# ============================================================
+
+def test_timer_preserves_return_value() -> None:
+    """验证timer装饰器不会改变被装饰函数的返回值。"""
+
+    @timer
+    def compute_square(n: int) -> int:
+        return n * n
+
+    result = compute_square(7)
+    assert result == 49, f"预期返回49,实际返回{result}"
+    print("[通过] test_timer_preserves_return_value")
+
+
+def test_timer_preserves_function_metadata() -> None:
+    """
+    验证timer内部正确使用了functools.wraps,被装饰后的函数依然保留原函数的
+    __name__和__doc__,而不是被wrapper这个内部函数名覆盖掉——这对调试、
+    日志打印、自动生成文档都很重要,如果忘记用functools.wraps,
+    被装饰函数的__name__会变成'wrapper',排查问题时会非常困惑。
+    """
+
+    @timer
+    def calculate_average(numbers: List[float]) -> float:
+        """计算一组数字的平均值。"""
+        return sum(numbers) / len(numbers)
+
+    assert calculate_average.__name__ == "calculate_average", (
+        f"预期__name__保持为'calculate_average',实际是'{calculate_average.__name__}'"
+        "——如果这个断言失败,说明装饰器忘记使用functools.wraps"
+    )
+    assert calculate_average.__doc__ == "计算一组数字的平均值。"
+    print("[通过] test_timer_preserves_function_metadata")
+
+
+def test_timer_does_not_swallow_exceptions() -> None:
+    """
+    验证timer装饰器只是"顺便计时",不会吞掉原函数抛出的异常——
+    这是一个很容易被忽略、但在真实工程代码里很重要的细节:任何"旁路式"
+    (不改变主逻辑,只是附加一些额外行为)的装饰器,都不应该悄悄地
+    改变原函数的异常传播行为,否则调用方原本写好的except逻辑会失效。
+    """
+
+    @timer
+    def always_raise() -> None:
+        raise ValueError("这个异常应该原样传播出去")
+
+    try:
+        always_raise()
+        raise AssertionError("预期应该抛出ValueError,但没有抛出任何异常")
+    except ValueError as exc:
+        assert str(exc) == "这个异常应该原样传播出去"
+    print("[通过] test_timer_does_not_swallow_exceptions")
+
+
+# ============================================================
+# 第二部分: repeat装饰器的补充测试
+# ============================================================
+
+def test_repeat_executes_exact_number_of_times() -> None:
+    """验证repeat(times=N)确实让函数体被执行了恰好N次。"""
+    call_log: List[int] = []
+
+    @repeat(times=4)
+    def record_call() -> int:
+        call_log.append(1)
+        return len(call_log)
+
+    record_call()
+    assert len(call_log) == 4, f"预期函数体被执行4次,实际执行了{len(call_log)}次"
+    print("[通过] test_repeat_executes_exact_number_of_times")
+
+
+def test_repeat_returns_result_of_last_execution() -> None:
+    """验证repeat装饰器返回的是"最后一次"执行的结果,不是第一次或者一个列表。"""
+    counter = {"value": 0}
+
+    @repeat(times=3)
+    def increment_and_return() -> int:
+        counter["value"] += 1
+        return counter["value"]
+
+    result = increment_and_return()
+    assert result == 3, f"预期返回最后一次执行的结果3,实际返回{result}"
+    print("[通过] test_repeat_returns_result_of_last_execution")
+
+
+def test_repeat_with_times_equal_to_one_behaves_like_no_repeat() -> None:
+    """边界情况: repeat(times=1)应该等价于"只执行一次",行为上和不加装饰器一致。"""
+    call_log: List[int] = []
+
+    @repeat(times=1)
+    def single_call() -> str:
+        call_log.append(1)
+        return "只执行一次"
+
+    result = single_call()
+    assert len(call_log) == 1
+    assert result == "只执行一次"
+    print("[通过] test_repeat_with_times_equal_to_one_behaves_like_no_repeat")
+
+
+def test_repeat_propagates_arguments_correctly() -> None:
+    """验证repeat装饰器正确地把*args和**kwargs原样传递给了每一次执行。"""
+    received_args: List[tuple] = []
+
+    @repeat(times=2)
+    def record_args(a: int, b: int, *, label: str = "默认标签") -> str:
+        received_args.append((a, b, label))
+        return label
+
+    record_args(1, 2, label="自定义标签")
+    assert received_args == [(1, 2, "自定义标签"), (1, 2, "自定义标签")], (
+        f"每一次重复执行都应该收到同样的参数,实际记录到: {received_args}"
+    )
+    print("[通过] test_repeat_propagates_arguments_correctly")
+
+
+# ============================================================
+# 第三部分: CountCalls类装饰器的补充测试
+# ============================================================
+
+def test_count_calls_tracks_call_count_accurately() -> None:
+    """验证CountCalls的call_count属性,准确反映了被装饰函数被调用的总次数。"""
+
+    @CountCalls
+    def do_something() -> str:
+        return "已执行"
+
+    assert do_something.call_count == 0, "刚创建、尚未被调用过时,call_count应该是0"
+
+    do_something()
+    do_something()
+    do_something()
+
+    assert do_something.call_count == 3, f"预期call_count是3,实际是{do_something.call_count}"
+    print("[通过] test_count_calls_tracks_call_count_accurately")
+
+
+def test_count_calls_preserves_function_metadata_via_update_wrapper() -> None:
+    """
+    验证CountCalls内部调用functools.update_wrapper(self, func)之后,
+    实例本身的__name__、__doc__等元信息,和被装饰的原函数保持一致——
+    这是"类装饰器"场景下,达到与functools.wraps类似效果的正确写法。
+    """
+
+    @CountCalls
+    def fetch_user_profile(user_id: int) -> str:
+        """根据用户ID获取用户档案信息(此处仅为演示,不涉及真实数据源)。"""
+        return f"用户{user_id}的档案"
+
+    assert fetch_user_profile.__name__ == "fetch_user_profile"
+    assert fetch_user_profile.__doc__ == "根据用户ID获取用户档案信息(此处仅为演示,不涉及真实数据源)。"
+    print("[通过] test_count_calls_preserves_function_metadata_via_update_wrapper")
+
+
+def test_count_calls_returns_original_function_result() -> None:
+    """验证CountCalls装饰器不会篡改原函数的返回值,只是"顺便"统计次数。"""
+
+    @CountCalls
+    def multiply(a: int, b: int) -> int:
+        return a * b
+
+    result = multiply(6, 7)
+    assert result == 42, f"预期返回42,实际返回{result}"
+    print("[通过] test_count_calls_returns_original_function_result")
+
+
+def test_count_calls_instances_have_independent_counters() -> None:
+    """
+    验证两个不同的、各自被@CountCalls装饰的函数,各自的call_count是完全独立的,
+    不会因为都用了同一个CountCalls类而互相干扰计数——这是"每次@CountCalls都会
+    创建一个全新实例"这个事实的直接体现。
+    """
+
+    @CountCalls
+    def task_one() -> None:
+        pass
+
+    @CountCalls
+    def task_two() -> None:
+        pass
+
+    task_one()
+    task_one()
+    task_two()
+
+    assert task_one.call_count == 2
+    assert task_two.call_count == 1
+    print("[通过] test_count_calls_instances_have_independent_counters")
+
+
+# ============================================================
+# 第四部分: retry装饰器的补充边界情况测试
+# ============================================================
+
+def test_retry_wait_time_without_jitter_follows_exponential_backoff() -> None:
+    """
+    验证jitter=False时,重试等待时间严格按照base_delay * 2^(attempt-1)的
+    公式计算,不会有任何随机波动——这是验证"退避算法本身对不对"最直接的方式,
+    通过monkeypatch替换time.sleep,记录每一次被要求等待的秒数,而不真的等待。
+    """
+    recorded_waits: List[float] = []
+    original_sleep = time.sleep
+    time.sleep = lambda seconds: recorded_waits.append(seconds)  # type: ignore[assignment]
+
+    try:
+        attempt_count = {"value": 0}
+
+        @retry(max_attempts=4, base_delay=1.0, jitter=False, retryable_exceptions=(RateLimitError,))
+        def always_rate_limited() -> None:
+            attempt_count["value"] += 1
+            raise RateLimitError("持续限流,用于验证退避公式")
+
+        try:
+            always_rate_limited()
+            raise AssertionError("预期应该在耗尽重试次数后抛出RateLimitError")
+        except RateLimitError:
+            pass
+
+        assert recorded_waits == [1.0, 2.0, 4.0], (
+            f"关闭jitter之后,等待秒数序列应该严格是[1.0, 2.0, 4.0](指数退避),"
+            f"实际记录到: {recorded_waits}"
+        )
+    finally:
+        time.sleep = original_sleep  # 无论测试成功与否,都必须还原真实的time.sleep
+
+    print("[通过] test_retry_wait_time_without_jitter_follows_exponential_backoff")
+
+
+def test_retry_wait_time_respects_max_delay_cap() -> None:
+    """
+    验证即使指数退避理论上算出来的等待时间已经远超max_delay,
+    实际的等待时间也会被max_delay这个上限"封顶",不会无限增长。
+    """
+    recorded_waits: List[float] = []
+    original_sleep = time.sleep
+    time.sleep = lambda seconds: recorded_waits.append(seconds)  # type: ignore[assignment]
+
+    try:
+        @retry(
+            max_attempts=6,
+            base_delay=1.0,
+            max_delay=5.0,
+            jitter=False,
+            retryable_exceptions=(APITimeoutError,),
+        )
+        def always_timeout() -> None:
+            raise APITimeoutError("持续超时,用于验证max_delay封顶效果")
+
+        try:
+            always_timeout()
+            raise AssertionError("预期应该在耗尽重试次数后抛出APITimeoutError")
+        except APITimeoutError:
+            pass
+
+        # 理论上不封顶的话,等待序列应该是[1, 2, 4, 8, 16],但max_delay=5.0会把
+        # 后面几次都压制在5.0
+        assert recorded_waits == [1.0, 2.0, 4.0, 5.0, 5.0], (
+            f"设置max_delay=5.0之后,等待秒数序列应该是[1.0, 2.0, 4.0, 5.0, 5.0],"
+            f"实际记录到: {recorded_waits}"
+        )
+    finally:
+        time.sleep = original_sleep
+
+    print("[通过] test_retry_wait_time_respects_max_delay_cap")
+
+
+def test_retry_with_jitter_stays_within_expected_range() -> None:
+    """
+    验证jitter=True时,每次等待时间落在[0.5倍, 1.5倍]理论值的区间内
+    (对应decorators.py里注释写明的"0.5 + random.random()"这个抖动公式)。
+    因为jitter引入了随机性,不能断言精确数值,只能断言范围。
+    """
+    recorded_waits: List[float] = []
+    original_sleep = time.sleep
+    time.sleep = lambda seconds: recorded_waits.append(seconds)  # type: ignore[assignment]
+
+    try:
+        @retry(
+            max_attempts=3,
+            base_delay=2.0,
+            jitter=True,
+            retryable_exceptions=(ServiceUnavailableError,),
+        )
+        def always_unavailable() -> None:
+            raise ServiceUnavailableError("持续不可用,用于验证抖动范围")
+
+        try:
+            always_unavailable()
+            raise AssertionError("预期应该在耗尽重试次数后抛出ServiceUnavailableError")
+        except ServiceUnavailableError:
+            pass
+
+        # 第一次理论等待值是2.0*(2**0)=2.0, 第二次是2.0*(2**1)=4.0
+        expected_theoretical = [2.0, 4.0]
+        assert len(recorded_waits) == len(expected_theoretical)
+        for actual_wait, theoretical in zip(recorded_waits, expected_theoretical):
+            lower_bound = theoretical * 0.5
+            upper_bound = theoretical * 1.5
+            assert lower_bound <= actual_wait <= upper_bound, (
+                f"实际等待{actual_wait:.2f}秒超出了理论值{theoretical}秒对应的抖动范围"
+                f"[{lower_bound:.2f}, {upper_bound:.2f}]"
+            )
+    finally:
+        time.sleep = original_sleep
+
+    print("[通过] test_retry_with_jitter_stays_within_expected_range")
+
+
+def test_retry_dispatches_correctly_among_multiple_retryable_types() -> None:
+    """
+    验证当retryable_exceptions元组里包含多种异常类型时,不管func这次抛出的
+    是元组里的哪一种,都应该被正确识别为"可重试",而不是只对元组第一个类型生效。
+    """
+    exceptions_to_raise_in_order = [
+        RateLimitError("第一次: 限流"),
+        APITimeoutError("第二次: 超时"),
+        ServiceUnavailableError("第三次: 服务不可用"),
+    ]
+    call_index = {"value": 0}
+
+    @retry(
+        max_attempts=5,
+        base_delay=0.001,
+        jitter=False,
+        retryable_exceptions=(RateLimitError, APITimeoutError, ServiceUnavailableError),
+    )
+    def rotate_through_different_errors() -> str:
+        index = call_index["value"]
+        call_index["value"] += 1
+        if index < len(exceptions_to_raise_in_order):
+            raise exceptions_to_raise_in_order[index]
+        return "终于成功了"
+
+    result = rotate_through_different_errors()
+    assert result == "终于成功了"
+    assert call_index["value"] == 4, f"预期总共调用4次(3次失败+1次成功),实际调用了{call_index['value']}次"
+    print("[通过] test_retry_dispatches_correctly_among_multiple_retryable_types")
+
+
+def test_retry_treats_exception_outside_tuple_as_non_retryable_even_if_related() -> None:
+    """
+    验证即使某个异常和retryable_exceptions里的类型"看起来相关"(比如都是
+    CangqiongAPIError的子类),只要它自己没有被明确列入retryable_exceptions元组,
+    就应该被视为不可重试——这是在验证"重试白名单是精确匹配继承关系的,
+    不会想当然地把兄弟异常类型也算进去"这个设计细节。
+    """
+    call_count = {"value": 0}
+
+    @retry(max_attempts=3, base_delay=0.001, retryable_exceptions=(RateLimitError,))
+    def raise_auth_error_not_in_whitelist() -> None:
+        call_count["value"] += 1
+        raise AuthenticationError("鉴权失败, 不在白名单里, 不应该被重试")
+
+    try:
+        raise_auth_error_not_in_whitelist()
+        raise AssertionError("预期应该立即抛出AuthenticationError")
+    except AuthenticationError:
+        pass
+
+    assert call_count["value"] == 1, (
+        f"AuthenticationError不在retryable_exceptions白名单里,应该只调用1次就立即失败,"
+        f"实际调用了{call_count['value']}次"
+    )
+    print("[通过] test_retry_treats_exception_outside_tuple_as_non_retryable_even_if_related")
+
+
+def run_all_tests() -> None:
+    """依次运行本文件全部测试用例。"""
+    test_timer_preserves_return_value()
+    test_timer_preserves_function_metadata()
+    test_timer_does_not_swallow_exceptions()
+
+    test_repeat_executes_exact_number_of_times()
+    test_repeat_returns_result_of_last_execution()
+    test_repeat_with_times_equal_to_one_behaves_like_no_repeat()
+    test_repeat_propagates_arguments_correctly()
+
+    test_count_calls_tracks_call_count_accurately()
+    test_count_calls_preserves_function_metadata_via_update_wrapper()
+    test_count_calls_returns_original_function_result()
+    test_count_calls_instances_have_independent_counters()
+
+    test_retry_wait_time_without_jitter_follows_exponential_backoff()
+    test_retry_wait_time_respects_max_delay_cap()
+    test_retry_with_jitter_stays_within_expected_range()
+    test_retry_dispatches_correctly_among_multiple_retryable_types()
+    test_retry_treats_exception_outside_tuple_as_non_retryable_even_if_related()
+
+    print("\n全部装饰器扩展测试通过!")
+
+
+if __name__ == "__main__":
+    run_all_tests()
+```
+
+### 14. `generators_pipeline_demo.py` —— 生成器管道、send()双向通信与令牌桶节流器
+
+```python
+"""
+generators_pipeline_demo.py
+
+补充说明:
+    generators_demo.py里的三个例子(分批读文件、打字机效果、内存对比)
+    各自都是"单个生成器"的独立演示,老王在下午收尾前留了一个延伸问题:
+    "如果我想把几个生成器串起来,前一个的输出是后一个的输入,像流水线一样
+    逐级加工数据,该怎么写?"这份文件就是对这个问题的正式回答——
+    "生成器管道"(generator pipeline)是生成器最有威力的用法之一,
+    在处理大规模数据流(日志分析、ETL数据清洗)时非常常见。
+
+    本文件包含:
+    1. 一条完整的三级生成器管道: 读取原始行 -> 清洗/过滤 -> 转换成结构化数据,
+       每一级都是一个独立的生成器函数,任意时刻内存中只保留"正在流动的
+       这一条数据",不会因为数据量增大而线性增长内存占用。
+    2. send()方法的演示——生成器不仅可以"被动产出数据"(yield),
+       还可以"被动接收外部传入的值"，这是生成器协议里经常被忽略、
+       但在实现"可暂停、可恢复的累加器/协程式任务"时很有用的特性。
+    3. 一个基于生成器实现的简易令牌桶(token bucket)节流器,
+       用于控制"消费某个生成器产出的数据"的节奏——为Day16真正对接
+       流式输出时"控制展示节奏、避免刷屏过快"埋一个概念上的伏笔。
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Iterator, List, Optional
+
+
+# ============================================================
+# 第一部分: 三级生成器管道
+# ============================================================
+
+def generate_raw_lines(raw_records: List[str]) -> Iterator[str]:
+    """
+    管道第一级: 模拟"从数据源逐行读取原始数据"。
+
+    这里用一个内存中的列表模拟数据源(避免依赖真实文件,方便直接运行和测试),
+    但函数本身的写法和"从文件里一行一行读"是完全一致的写法——
+    如果换成真实文件,只需要把这个函数体换成对文件对象的for循环,
+    调用方(下一级管道)完全不需要改动任何代码,这正是生成器管道
+    "各级之间只通过yield的值耦合,不关心彼此内部实现"这个优点的体现。
+    """
+    for record in raw_records:
+        yield record
+
+
+def clean_and_filter_lines(lines: Iterator[str]) -> Iterator[str]:
+    """
+    管道第二级: 对上一级产出的每一行做清洗(去除首尾空白)和过滤
+    (丢弃空行、丢弃被#标记为注释的行)。
+
+    注意这个函数的参数lines本身就是一个生成器(或者任何可迭代对象),
+    这个函数自己也是一个生成器函数——这就是"管道"的本质:
+    每一级都是"消费上一级的生成器,产出给下一级消费的新生成器"。
+    """
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            continue
+        yield stripped
+
+
+def parse_key_value_lines(lines: Iterator[str]) -> Iterator[dict]:
+    """
+    管道第三级: 把清洗过的每一行(约定格式为"key=value")解析成字典。
+
+    对于不符合"key=value"格式的行,不会让整条管道崩溃,而是产出一个
+    带有错误标记的字典,把"解析失败"也作为一种正常的数据形态传递下去,
+    交给管道的消费方自行决定如何处理——这是一种在数据处理管道里
+    很常见的容错设计思路:管道本身应该尽量"流动不中断",把"是否终止"
+    的决定权交给最终的消费者,而不是在管道内部某一级就直接抛出异常。
+    """
+    for line in lines:
+        if "=" not in line:
+            yield {"_parse_error": True, "raw": line}
+            continue
+        key, _, value = line.partition("=")
+        yield {"_parse_error": False, "key": key.strip(), "value": value.strip()}
+
+
+def run_full_pipeline(raw_records: List[str]) -> Iterator[dict]:
+    """
+    把三级管道串联起来,对外只暴露一个统一的生成器接口。
+
+    调用方完全不需要知道内部分成了三级、每一级具体做了什么,
+    只需要对run_full_pipeline的返回值做for循环,就能拿到最终加工好的数据——
+    这正是"函数式流水线"思路在生成器上的自然体现。
+    """
+    raw_lines = generate_raw_lines(raw_records)
+    cleaned_lines = clean_and_filter_lines(raw_lines)
+    parsed_records = parse_key_value_lines(cleaned_lines)
+    return parsed_records
+
+
+def demo_generator_pipeline() -> None:
+    """演示完整的三级生成器管道,包含正常数据、空行、注释行、格式错误行混合的场景。"""
+    print("=" * 70)
+    print("演示1: 三级生成器管道 —— 读取 -> 清洗过滤 -> 解析结构化")
+    print("=" * 70)
+
+    raw_records = [
+        "model=deepseek-chat",
+        "",
+        "# 这是一行注释,应该被过滤掉",
+        "  temperature=0.7  ",
+        "这一行没有等号,格式不对",
+        "max_tokens=1024",
+        "   ",
+    ]
+
+    for record in run_full_pipeline(raw_records):
+        if record["_parse_error"]:
+            print(f"  [解析失败] 原始内容: {record['raw']!r}")
+        else:
+            print(f"  [解析成功] {record['key']} = {record['value']}")
+    print()
+
+
+# ============================================================
+# 第二部分: send()方法 —— 生成器的双向通信
+# ============================================================
+
+def running_average_accumulator() -> Iterator[Optional[float]]:
+    """
+    一个用send()接收外部数据、并"记住"内部累计状态的生成器,
+    每次通过send(数字)传入一个新数字,生成器会yield回当前为止的运行平均值。
+
+    这是生成器协议里比单纯的yield更进一步的用法——生成器不仅能向外
+    "产出"数据,还能从外部"接收"数据,并利用这份"接收到的数据"更新
+    自己内部维护的状态,效果上类似一个"可以被逐步喂数据的累加器"。
+
+    注意: 第一次调用时必须先用next()驱动生成器执行到第一个yield处
+    (这一步不会传入任何有意义的数据,只是为了"启动"生成器),
+    之后才能开始用send()真正传值。这是生成器send()协议里一个
+    经常让新手困惑、但必须记住的固定套路。
+    """
+    total = 0.0
+    count = 0
+    current_average: Optional[float] = None
+    while True:
+        received_value = yield current_average
+        if received_value is not None:
+            total += received_value
+            count += 1
+            current_average = total / count
+
+
+def demo_send_based_accumulator() -> None:
+    """演示running_average_accumulator的send()用法。"""
+    print("=" * 70)
+    print("演示2: send()方法 —— 生成器的双向通信(运行平均值累加器)")
+    print("=" * 70)
+
+    accumulator = running_average_accumulator()
+    # 第一次必须用next()"启动"生成器,让它执行到第一个yield语句处等待
+    next(accumulator)
+
+    scores_stream = [88, 92, 79, 95, 84]
+    for score in scores_stream:
+        current_average = accumulator.send(score)
+        print(f"送入分数{score}, 当前累计的运行平均值: {current_average:.2f}")
+
+    accumulator.close()
+    print("[提示] 已调用close(), 生成器不能再被继续send()")
+    print()
+
+
+# ============================================================
+# 第三部分: 基于生成器的简易令牌桶节流器
+# ============================================================
+
+class TokenBucketThrottle:
+    """
+    一个用于控制"消费某个数据流的节奏"的简易令牌桶节流器。
+
+    设计动机:
+        Day16会真正对接大模型的流式输出(stream=True),模型会一个token
+        一个token地把生成结果吐给客户端。如果客户端拿到数据后不加节制地
+        立即全部打印出来,视觉上反而会像"一次性刷屏",体验上还不如非流式
+        的一次性展示。真实的产品(比如各类AI聊天助手的网页界面)在展示
+        流式输出时,往往会做一些"节奏控制",让文字看起来是"逐字蹦出来"的,
+        而不是"哗啦一下全出来"。这个类提供的throttle()方法,就是用生成器
+        实现的一个简化版节奏控制工具,包裹在任意一个"产出数据很快"的
+        生成器外面,强制按照设定的速率"匀速"地把数据吐出去。
+    """
+
+    def __init__(self, tokens_per_second: float) -> None:
+        if tokens_per_second <= 0:
+            raise ValueError(f"tokens_per_second必须是正数,收到的是{tokens_per_second}")
+        self._interval = 1.0 / tokens_per_second
+
+    def throttle(self, fast_source: Iterator[str]) -> Iterator[str]:
+        """
+        包裹一个"产出很快"的生成器fast_source,按照self._interval的间隔,
+        匀速地把每一项数据yield出去(通过time.sleep人为拖慢消费节奏)。
+        :param fast_source: 待节流的原始生成器
+        """
+        for item in fast_source:
+            yield item
+            time.sleep(self._interval)
+
+
+def demo_token_bucket_throttle() -> None:
+    """演示TokenBucketThrottle如何把一个"瞬间产出全部数据"的生成器,变成匀速吐出。"""
+    print("=" * 70)
+    print("演示3: 基于生成器的简易令牌桶节流器")
+    print("=" * 70)
+
+    def fast_character_source(text: str) -> Iterator[str]:
+        """一个"瞬间"就能产出全部字符的快速生成器,没有任何节流控制。"""
+        for character in text:
+            yield character
+
+    throttle = TokenBucketThrottle(tokens_per_second=20)
+    text_to_display = "苍穹平台正在生成回复"
+
+    start = time.perf_counter()
+    displayed = []
+    for character in throttle.throttle(fast_character_source(text_to_display)):
+        displayed.append(character)
+        print(character, end="", flush=True)
+    elapsed = time.perf_counter() - start
+    print(f"\n\n共展示{len(displayed)}个字符, 总耗时约{elapsed:.2f}秒"
+          f"(理论上限速20字符/秒, 预期耗时约{len(text_to_display) / 20:.2f}秒)")
+    print()
+
+
+def main() -> None:
+    demo_generator_pipeline()
+    demo_send_based_accumulator()
+    demo_token_bucket_throttle()
+    print("=" * 70)
+    print("generators_pipeline_demo.py 全部演示运行完毕。")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 15. `tests/test_generators_pipeline_demo.py` —— 生成器管道扩展功能的自检脚本
+
+```python
+"""
+tests/test_generators_pipeline_demo.py
+
+针对generators_pipeline_demo.py里三级管道、send()累加器、令牌桶节流器的
+自检测试。为了让测试运行得快,凡是涉及TokenBucketThrottle真实sleep的测试,
+都会临时替换time.sleep为不真正阻塞的假函数,避免整个测试套件因为
+真实的节流演示而变慢。
+
+运行方式: python -m tests.test_generators_pipeline_demo (需要在项目根目录下执行)
+"""
+
+from __future__ import annotations
+
+import sys
+import time
+from pathlib import Path
+from typing import Iterator, List
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from generators_pipeline_demo import (  # noqa: E402
+    TokenBucketThrottle,
+    clean_and_filter_lines,
+    generate_raw_lines,
+    parse_key_value_lines,
+    run_full_pipeline,
+    running_average_accumulator,
+)
+
+
+# ============================================================
+# 第一部分: 三级管道的测试
+# ============================================================
+
+def test_generate_raw_lines_yields_items_in_order() -> None:
+    """验证管道第一级严格按输入顺序逐一产出,不改变顺序、不丢失数据。"""
+    source = ["a", "b", "c"]
+    result = list(generate_raw_lines(source))
+    assert result == ["a", "b", "c"], f"预期顺序不变,实际得到{result}"
+    print("[通过] test_generate_raw_lines_yields_items_in_order")
+
+
+def test_clean_and_filter_lines_removes_blank_and_comment_lines() -> None:
+    """验证管道第二级正确过滤掉空行与以#开头的注释行,并去除首尾空白。"""
+    raw = ["  hello  ", "", "# 注释", "world", "   ", "# 另一条注释"]
+    result = list(clean_and_filter_lines(iter(raw)))
+    assert result == ["hello", "world"], f"预期过滤后只剩['hello', 'world'],实际得到{result}"
+    print("[通过] test_clean_and_filter_lines_removes_blank_and_comment_lines")
+
+
+def test_clean_and_filter_lines_is_itself_lazy_generator() -> None:
+    """
+    验证clean_and_filter_lines返回的确实是一个生成器对象(而不是一次性算好的list),
+    这对判断"整条管道是否真的具备懒加载/流式处理的内存优势"是一个关键验证点。
+    """
+    result = clean_and_filter_lines(iter(["a"]))
+    assert hasattr(result, "__next__"), "clean_and_filter_lines应该返回一个生成器对象,而不是list"
+    print("[通过] test_clean_and_filter_lines_is_itself_lazy_generator")
+
+
+def test_parse_key_value_lines_parses_valid_format_correctly() -> None:
+    """验证管道第三级能正确解析"key=value"格式的行。"""
+    lines = ["model=deepseek-chat", "temperature=0.7"]
+    result = list(parse_key_value_lines(iter(lines)))
+
+    assert result[0] == {"_parse_error": False, "key": "model", "value": "deepseek-chat"}
+    assert result[1] == {"_parse_error": False, "key": "temperature", "value": "0.7"}
+    print("[通过] test_parse_key_value_lines_parses_valid_format_correctly")
+
+
+def test_parse_key_value_lines_marks_malformed_lines_without_crashing() -> None:
+    """
+    验证遇到不符合"key=value"格式的行,管道不会崩溃(不抛出异常中断整个流程),
+    而是产出一个带有_parse_error=True标记的字典,把错误信息传递下去。
+    """
+    lines = ["这一行没有等号"]
+    result = list(parse_key_value_lines(iter(lines)))
+
+    assert len(result) == 1
+    assert result[0]["_parse_error"] is True
+    assert result[0]["raw"] == "这一行没有等号"
+    print("[通过] test_parse_key_value_lines_marks_malformed_lines_without_crashing")
+
+
+def test_parse_key_value_lines_strips_whitespace_around_key_and_value() -> None:
+    """验证解析结果里key和value都被正确去除了首尾空白。"""
+    lines = ["  max_tokens  =  1024  "]
+    result = list(parse_key_value_lines(iter(lines)))
+    assert result[0]["key"] == "max_tokens"
+    assert result[0]["value"] == "1024"
+    print("[通过] test_parse_key_value_lines_strips_whitespace_around_key_and_value")
+
+
+def test_full_pipeline_end_to_end_mixed_input() -> None:
+    """
+    端到端测试: 验证三级管道串联起来之后,面对"正常行/空行/注释行/格式错误行"
+    混合输入时,最终产出的结果符合预期,且顺序保持一致。
+    """
+    raw_records = [
+        "model=deepseek-chat",
+        "",
+        "# 注释行",
+        "格式错误的行",
+        "max_tokens=1024",
+    ]
+    results: List[dict] = list(run_full_pipeline(raw_records))
+
+    assert len(results) == 3, f"空行和注释行应该被过滤掉,剩下3条,实际得到{len(results)}条"
+    assert results[0] == {"_parse_error": False, "key": "model", "value": "deepseek-chat"}
+    assert results[1]["_parse_error"] is True
+    assert results[1]["raw"] == "格式错误的行"
+    assert results[2] == {"_parse_error": False, "key": "max_tokens", "value": "1024"}
+    print("[通过] test_full_pipeline_end_to_end_mixed_input")
+
+
+def test_full_pipeline_returns_generator_not_list() -> None:
+    """验证run_full_pipeline的返回值本身也是一个生成器,保持"整条管道都是懒加载"的设计承诺。"""
+    result = run_full_pipeline(["a=1"])
+    assert hasattr(result, "__next__"), "run_full_pipeline应该返回一个生成器,而不是提前算好的list"
+    print("[通过] test_full_pipeline_returns_generator_not_list")
+
+
+def test_full_pipeline_with_empty_input_produces_no_results() -> None:
+    """边界情况: 空输入列表,应该得到空结果,而不是抛出异常。"""
+    results = list(run_full_pipeline([]))
+    assert results == []
+    print("[通过] test_full_pipeline_with_empty_input_produces_no_results")
+
+
+# ============================================================
+# 第二部分: send()累加器的测试
+# ============================================================
+
+def test_running_average_accumulator_computes_correct_averages() -> None:
+    """验证running_average_accumulator通过send()逐步送入数据后,每一步的运行平均值都精确正确。"""
+    accumulator = running_average_accumulator()
+    next(accumulator)  # 启动生成器
+
+    first_average = accumulator.send(10)
+    assert first_average == 10.0, f"送入第一个数字10后,平均值应该是10.0,实际是{first_average}"
+
+    second_average = accumulator.send(20)
+    assert second_average == 15.0, f"送入[10, 20]后,平均值应该是15.0,实际是{second_average}"
+
+    third_average = accumulator.send(30)
+    assert third_average == 20.0, f"送入[10, 20, 30]后,平均值应该是20.0,实际是{third_average}"
+
+    print("[通过] test_running_average_accumulator_computes_correct_averages")
+
+
+def test_running_average_accumulator_initial_yield_is_none() -> None:
+    """验证生成器第一次被next()驱动到yield处时,还没有送入任何数据,产出的应该是None。"""
+    accumulator = running_average_accumulator()
+    initial_value = next(accumulator)
+    assert initial_value is None, f"还没送入任何数据时,应该yield出None,实际是{initial_value}"
+    print("[通过] test_running_average_accumulator_initial_yield_is_none")
+
+
+def test_running_average_accumulator_close_prevents_further_send() -> None:
+    """验证调用close()之后,生成器不能再被send()驱动,应该抛出StopIteration。"""
+    accumulator = running_average_accumulator()
+    next(accumulator)
+    accumulator.send(5)
+    accumulator.close()
+
+    try:
+        accumulator.send(10)
+        raise AssertionError("预期close()之后再send()应该抛出StopIteration,但没有抛出")
+    except StopIteration:
+        pass
+
+    print("[通过] test_running_average_accumulator_close_prevents_further_send")
+
+
+# ============================================================
+# 第三部分: TokenBucketThrottle的测试
+# ============================================================
+
+def test_token_bucket_throttle_rejects_non_positive_rate() -> None:
+    """验证tokens_per_second为0或负数时,应该在创建阶段就被拒绝,而不是等到真正使用时才出错。"""
+    for invalid_rate in (0, -1, -0.5):
+        try:
+            TokenBucketThrottle(tokens_per_second=invalid_rate)
+            raise AssertionError(f"tokens_per_second={invalid_rate}应该抛出ValueError,但没有抛出")
+        except ValueError:
+            pass
+    print("[通过] test_token_bucket_throttle_rejects_non_positive_rate")
+
+
+def test_token_bucket_throttle_preserves_all_items_and_order() -> None:
+    """
+    验证节流器只是"拖慢节奏",不会丢失任何数据、也不会打乱数据的顺序——
+    为了让测试运行得快,这里monkeypatch掉time.sleep,只验证数据完整性和顺序,
+    不验证真实的耗时(真实耗时的验证放在下一个测试里单独做)。
+    """
+    original_sleep = time.sleep
+    time.sleep = lambda seconds: None  # type: ignore[assignment]
+
+    try:
+        throttle = TokenBucketThrottle(tokens_per_second=1000)
+        source_items = ["a", "b", "c", "d", "e"]
+
+        def fast_source() -> Iterator[str]:
+            for item in source_items:
+                yield item
+
+        result = list(throttle.throttle(fast_source()))
+        assert result == source_items, f"节流后的数据应该和原始数据完全一致(只是节奏变慢), 实际得到{result}"
+    finally:
+        time.sleep = original_sleep
+
+    print("[通过] test_token_bucket_throttle_preserves_all_items_and_order")
+
+
+def test_token_bucket_throttle_calls_sleep_between_each_item() -> None:
+    """
+    验证节流器确实在每一次产出数据之间调用了time.sleep,且调用次数与数据条数一致——
+    这是验证"节流确实生效了"而不是"只是原样转发数据"的关键断言。
+    """
+    sleep_call_count = {"value": 0}
+    original_sleep = time.sleep
+
+    def counting_sleep(seconds: float) -> None:
+        sleep_call_count["value"] += 1
+
+    time.sleep = counting_sleep  # type: ignore[assignment]
+
+    try:
+        throttle = TokenBucketThrottle(tokens_per_second=100)
+
+        def fast_source() -> Iterator[str]:
+            for item in ["x", "y", "z"]:
+                yield item
+
+        list(throttle.throttle(fast_source()))
+        assert sleep_call_count["value"] == 3, (
+            f"3个数据项,应该恰好调用3次time.sleep,实际调用了{sleep_call_count['value']}次"
+        )
+    finally:
+        time.sleep = original_sleep
+
+    print("[通过] test_token_bucket_throttle_calls_sleep_between_each_item")
+
+
+def test_token_bucket_throttle_with_empty_source_never_calls_sleep() -> None:
+    """边界情况: 如果被包裹的源生成器根本不产出任何数据,节流器不应该调用任何一次sleep。"""
+    sleep_call_count = {"value": 0}
+    original_sleep = time.sleep
+    time.sleep = lambda seconds: sleep_call_count.__setitem__(  # type: ignore[assignment]
+        "value", sleep_call_count["value"] + 1
+    )
+
+    try:
+        throttle = TokenBucketThrottle(tokens_per_second=50)
+
+        def empty_source() -> Iterator[str]:
+            return
+            yield  # pragma: no cover - 这一行永远不会被执行,只是为了让函数被识别为生成器函数
+
+        result = list(throttle.throttle(empty_source()))
+        assert result == []
+        assert sleep_call_count["value"] == 0, "空数据源不应该触发任何一次sleep调用"
+    finally:
+        time.sleep = original_sleep
+
+    print("[通过] test_token_bucket_throttle_with_empty_source_never_calls_sleep")
+
+
+def run_all_tests() -> None:
+    """依次运行本文件全部测试用例。"""
+    test_generate_raw_lines_yields_items_in_order()
+    test_clean_and_filter_lines_removes_blank_and_comment_lines()
+    test_clean_and_filter_lines_is_itself_lazy_generator()
+    test_parse_key_value_lines_parses_valid_format_correctly()
+    test_parse_key_value_lines_marks_malformed_lines_without_crashing()
+    test_parse_key_value_lines_strips_whitespace_around_key_and_value()
+    test_full_pipeline_end_to_end_mixed_input()
+    test_full_pipeline_returns_generator_not_list()
+    test_full_pipeline_with_empty_input_produces_no_results()
+
+    test_running_average_accumulator_computes_correct_averages()
+    test_running_average_accumulator_initial_yield_is_none()
+    test_running_average_accumulator_close_prevents_further_send()
+
+    test_token_bucket_throttle_rejects_non_positive_rate()
+    test_token_bucket_throttle_preserves_all_items_and_order()
+    test_token_bucket_throttle_calls_sleep_between_each_item()
+    test_token_bucket_throttle_with_empty_source_never_calls_sleep()
+
+    print("\n全部生成器管道扩展测试通过!")
+
+
+if __name__ == "__main__":
+    run_all_tests()
+```
+
+### 16. `typing_advanced_demo.py` —— Protocol结构化类型、Generic泛型容器与overload进阶用法
+
+```python
+"""
+typing_advanced_demo.py
+
+补充说明:
+    typing_demo.py覆盖了基础类型注解、容器类型、Optional/Union、Callable、
+    TypedDict、Literal这几个"够用"的核心用法。老王在下午收尾前补充了一句:
+    "typing模块能做的事情远不止这些,但今天先掌握这些高频用法就够用了,
+    剩下的等你们以后真正需要用到某个特性的时候再去查文档"。
+
+    这份文件是陈铭周末自己探索出来的延伸练习,补充了三个在真实企业级
+    代码里也会遇到、但今天课堂笔记没有展开的typing特性:
+    1. Protocol —— "结构化类型"(structural typing),描述"只要具备
+       某些方法/属性,就认为符合这个类型",不要求显式继承某个基类,
+       这是Python里最接近"接口"概念的typing工具。
+    2. Generic与TypeVar的进阶用法 —— 编写一个"泛型容器类",
+       让同一个类在不同场景下能"记住"它装的到底是什么类型的数据。
+    3. overload —— 为同一个函数名,针对不同的参数组合,声明多个不同的
+       类型签名,让类型检查器(以及IDE的自动补全)能精确理解
+       "传不同的参数会得到什么类型的返回值"这件事。
+
+    需要说明: 这些类型注解本身在运行时几乎不会影响程序的实际行为
+    (Python是动态类型语言,类型注解默认不会被强制校验),它们的价值
+    主要体现在IDE自动补全、mypy等静态类型检查工具、以及帮助阅读代码的人
+    更快理解"这个函数期望接收什么、会返回什么"这几个方面。
+"""
+
+from __future__ import annotations
+
+from typing import Generic, Iterable, List, Optional, Protocol, TypeVar, overload, runtime_checkable
+
+
+# ============================================================
+# 第一部分: Protocol —— 结构化类型
+# ============================================================
+
+@runtime_checkable
+class SupportsChatCall(Protocol):
+    """
+    一个结构化类型协议: 只要一个对象具备"以字符串或消息列表为参数、
+    返回字符串"的__call__方法,就认为它"符合SupportsChatCall这个协议",
+    不要求这个对象必须显式继承自某个特定的基类。
+
+    这正是Day9 model_hierarchy.py里BaseModel子类的共同特征——
+    OpenAIModel、QwenModel都实现了__call__方法,如果用Protocol来描述,
+    可以写成"任何实现了__call__(self, prompt) -> str的对象,都符合
+    SupportsChatCall协议",而不需要强制它们必须继承自某个具体基类。
+
+    @runtime_checkable装饰器让这个协议可以配合isinstance()在运行时
+    做检查(默认Protocol只用于静态类型检查,不支持isinstance())。
+    """
+
+    def __call__(self, prompt: str) -> str:
+        ...
+
+
+class SimpleEchoModel:
+    """一个完全独立、没有继承任何基类的"模型",纯粹因为具备匹配的方法签名,就符合SupportsChatCall协议。"""
+
+    def __call__(self, prompt: str) -> str:
+        return f"[Echo] {prompt}"
+
+
+class NotAModel:
+    """一个不具备__call__方法的普通类,用于对比"不符合协议"的情况。"""
+
+    def greet(self) -> str:
+        return "你好"
+
+
+def dispatch_to_any_chat_capable_object(model: SupportsChatCall, prompt: str) -> str:
+    """
+    这个函数的参数类型注解是SupportsChatCall,而不是某个具体的基类——
+    意味着"任何具备匹配调用签名的对象"都可以传进来,不要求继承关系,
+    这是"面向接口编程"思想在Python里的一种轻量级体现方式。
+    """
+    return model(prompt)
+
+
+def demo_protocol_structural_typing() -> None:
+    """演示Protocol的结构化类型检查效果。"""
+    print("=" * 70)
+    print("演示1: Protocol —— 结构化类型(不要求显式继承)")
+    print("=" * 70)
+
+    echo_model = SimpleEchoModel()
+    result = dispatch_to_any_chat_capable_object(echo_model, "你好呀")
+    print(f"SimpleEchoModel的调用结果: {result}")
+
+    print(f"\nisinstance(echo_model, SupportsChatCall) = {isinstance(echo_model, SupportsChatCall)}")
+
+    not_a_model = NotAModel()
+    print(f"isinstance(not_a_model, SupportsChatCall) = {isinstance(not_a_model, SupportsChatCall)}")
+    print("(NotAModel没有实现__call__方法, 因此不符合SupportsChatCall协议)")
+
+    # 用lambda函数验证:即使不是"类的实例",只要签名匹配,也符合协议
+    echo_lambda = lambda prompt: f"[Lambda Echo] {prompt}"  # noqa: E731  这里特意用lambda演示协议的宽松性
+    print(f"isinstance(echo_lambda, SupportsChatCall) = {isinstance(echo_lambda, SupportsChatCall)}")
+    print()
+
+
+# ============================================================
+# 第二部分: Generic与TypeVar的进阶用法 —— 泛型容器类
+# ============================================================
+
+T = TypeVar("T")
+
+
+class BoundedStack(Generic[T]):
+    """
+    一个有容量上限的通用栈结构,能装任意类型的数据(由使用时指定的T决定)。
+
+    用Generic[T]声明这个类是"泛型的",意味着:
+        BoundedStack[str](max_size=10)  —— 这个实例被期望只装字符串
+        BoundedStack[int](max_size=10)  —— 这个实例被期望只装整数
+    在类型检查工具(如mypy)看来,这两种用法会被区分开,如果你往
+    一个声明为BoundedStack[str]的实例里push一个整数,类型检查器
+    会给出警告——但同样要强调:这只是"类型检查阶段"的约束,
+    Python运行时本身并不会真的阻止你这么做。
+    """
+
+    def __init__(self, max_size: int) -> None:
+        if max_size <= 0:
+            raise ValueError(f"max_size必须是正整数,收到的是{max_size}")
+        self._max_size = max_size
+        self._items: List[T] = []
+
+    def push(self, item: T) -> None:
+        """入栈: 如果已达到容量上限,拒绝入栈并抛出异常。"""
+        if len(self._items) >= self._max_size:
+            raise OverflowError(f"栈已满(容量上限{self._max_size}),无法继续push")
+        self._items.append(item)
+
+    def pop(self) -> T:
+        """出栈: 如果栈为空,抛出异常而不是返回None(避免调用方误判"拿到了合法数据")。"""
+        if not self._items:
+            raise IndexError("栈为空,无法pop")
+        return self._items.pop()
+
+    def peek(self) -> Optional[T]:
+        """查看栈顶元素但不移除,栈为空时返回None(这个方法明确约定了"空栈返回None"是合法结果)。"""
+        if not self._items:
+            return None
+        return self._items[-1]
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def is_full(self) -> bool:
+        return len(self._items) >= self._max_size
+
+    @classmethod
+    def from_iterable(cls, items: Iterable[T], max_size: int) -> "BoundedStack[T]":
+        """类方法: 从一个可迭代对象批量构造出一个BoundedStack实例。"""
+        stack: "BoundedStack[T]" = cls(max_size=max_size)
+        for item in items:
+            stack.push(item)
+        return stack
+
+
+def demo_generic_bounded_stack() -> None:
+    """演示BoundedStack这个泛型容器类装载不同类型数据时的行为。"""
+    print("=" * 70)
+    print("演示2: Generic与TypeVar —— 泛型容器类BoundedStack")
+    print("=" * 70)
+
+    string_stack: BoundedStack[str] = BoundedStack(max_size=3)
+    string_stack.push("第一条")
+    string_stack.push("第二条")
+    print(f"字符串栈当前长度: {len(string_stack)}, 栈顶元素: {string_stack.peek()}")
+
+    int_stack: BoundedStack[int] = BoundedStack.from_iterable([1, 2, 3], max_size=3)
+    print(f"整数栈(从迭代对象批量构造)当前长度: {len(int_stack)}, 是否已满: {int_stack.is_full()}")
+
+    try:
+        int_stack.push(4)
+    except OverflowError as exc:
+        print(f"栈已满时继续push被正确拦截: {exc}")
+
+    popped = int_stack.pop()
+    print(f"pop()取出的元素: {popped}, pop之后栈的长度: {len(int_stack)}")
+
+    empty_stack: BoundedStack[float] = BoundedStack(max_size=1)
+    print(f"空栈的peek()结果: {empty_stack.peek()}(应该是None)")
+    print()
+
+
+# ============================================================
+# 第三部分: overload —— 为同一个函数声明多个类型签名
+# ============================================================
+
+@overload
+def parse_model_config(raw: str) -> dict:
+    ...
+
+
+@overload
+def parse_model_config(raw: dict) -> dict:
+    ...
+
+
+def parse_model_config(raw):
+    """
+    根据传入的raw参数类型不同,内部走不同的解析逻辑,但对外统一暴露成
+    同一个函数名parse_model_config——这正是overload要解决的问题:
+    让类型检查器和IDE知道"传字符串会怎样、传字典又会怎样",而不是
+    简单地把参数类型标注成一个笼统的Union[str, dict]导致返回值类型
+    的对应关系变得模糊(尽管这个例子里两种情况返回值类型恰好都是dict,
+    更常见的实际场景是"不同输入类型对应不同的返回值类型",这里为了
+    保持例子简单聚焦在overload本身的语法结构上)。
+
+    注意: @overload装饰的函数体只是占位(用...表示,不会被真正调用),
+    真正的实现是最后这个没有装饰器的、同名的函数,Python在运行时
+    只认最后这份真实实现,前面的@overload声明只在类型检查阶段起作用。
+    """
+    if isinstance(raw, str):
+        # 简化处理: 假设字符串是形如"key1=value1;key2=value2"的格式
+        result = {}
+        for pair in raw.split(";"):
+            if "=" in pair:
+                key, _, value = pair.partition("=")
+                result[key.strip()] = value.strip()
+        return result
+    if isinstance(raw, dict):
+        return dict(raw)
+    raise TypeError(f"raw必须是str或dict,收到的是{type(raw).__name__}")
+
+
+def demo_overload_parse_model_config() -> None:
+    """演示parse_model_config接收字符串和字典两种不同输入时的表现。"""
+    print("=" * 70)
+    print("演示3: overload —— 同一函数名, 不同参数类型的显式类型签名")
+    print("=" * 70)
+
+    from_string = parse_model_config("model=deepseek-chat;temperature=0.7")
+    print(f"传入字符串, 解析结果: {from_string}")
+
+    from_dict = parse_model_config({"model": "qwen-plus", "temperature": "0.5"})
+    print(f"传入字典, 解析结果: {from_dict}")
+
+    try:
+        parse_model_config(12345)  # type: ignore[arg-type]  # 故意传入一个不支持的类型
+    except TypeError as exc:
+        print(f"传入不支持的类型(int)被正确拦截: {exc}")
+    print()
+
+
+def main() -> None:
+    demo_protocol_structural_typing()
+    demo_generic_bounded_stack()
+    demo_overload_parse_model_config()
+    print("=" * 70)
+    print("typing_advanced_demo.py 全部演示运行完毕。")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 17. `tests/test_typing_advanced_demo.py` —— typing进阶特性的自检脚本
+
+```python
+"""
+tests/test_typing_advanced_demo.py
+
+针对typing_advanced_demo.py里Protocol、Generic泛型容器、overload三部分内容的
+自检测试。虽然typing注解本身在运行时大多不会被强制校验,但这份文件里
+Protocol配合@runtime_checkable、以及BoundedStack、parse_model_config的
+具体业务逻辑,都是可以在运行时被真实验证的行为,这份测试聚焦在这些
+"确实会影响运行结果"的部分,而不是去测试类型注解本身。
+
+运行方式: python -m tests.test_typing_advanced_demo (需要在项目根目录下执行)
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from typing_advanced_demo import (  # noqa: E402
+    BoundedStack,
+    NotAModel,
+    SimpleEchoModel,
+    SupportsChatCall,
+    dispatch_to_any_chat_capable_object,
+    parse_model_config,
+)
+
+
+# ============================================================
+# 第一部分: Protocol的测试
+# ============================================================
+
+def test_class_with_matching_call_signature_satisfies_protocol() -> None:
+    """验证任何实现了匹配__call__方法的类实例,都被isinstance()判定为符合SupportsChatCall协议。"""
+    model = SimpleEchoModel()
+    assert isinstance(model, SupportsChatCall), "SimpleEchoModel实现了__call__方法,应该符合协议"
+    print("[通过] test_class_with_matching_call_signature_satisfies_protocol")
+
+
+def test_class_without_call_method_does_not_satisfy_protocol() -> None:
+    """验证没有实现__call__方法的类,不符合SupportsChatCall协议。"""
+    not_a_model = NotAModel()
+    assert not isinstance(not_a_model, SupportsChatCall), "NotAModel没有__call__方法,不应该符合协议"
+    print("[通过] test_class_without_call_method_does_not_satisfy_protocol")
+
+
+def test_lambda_with_matching_signature_also_satisfies_protocol() -> None:
+    """
+    验证Protocol的"结构化类型"特性——不要求显式继承,任何具备匹配方法的对象
+    (包括lambda函数)都能满足协议,这是Protocol和传统的抽象基类(ABC)最大的差异点。
+    """
+    echo_lambda = lambda prompt: f"echo: {prompt}"  # noqa: E731
+    assert isinstance(echo_lambda, SupportsChatCall)
+    print("[通过] test_lambda_with_matching_signature_also_satisfies_protocol")
+
+
+def test_dispatch_function_works_with_any_protocol_conforming_object() -> None:
+    """验证dispatch_to_any_chat_capable_object能正确处理任意符合协议的对象,不要求它们有共同的基类。"""
+    model = SimpleEchoModel()
+    result = dispatch_to_any_chat_capable_object(model, "测试消息")
+    assert result == "[Echo] 测试消息"
+
+    lambda_model = lambda prompt: f"[LambdaModel] {prompt}"  # noqa: E731
+    result_from_lambda = dispatch_to_any_chat_capable_object(lambda_model, "另一条消息")
+    assert result_from_lambda == "[LambdaModel] 另一条消息"
+
+    print("[通过] test_dispatch_function_works_with_any_protocol_conforming_object")
+
+
+# ============================================================
+# 第二部分: BoundedStack泛型容器类的测试
+# ============================================================
+
+def test_bounded_stack_push_and_pop_basic_behavior() -> None:
+    """验证push/pop的基本行为符合"后进先出"(LIFO)的栈语义。"""
+    stack: BoundedStack[str] = BoundedStack(max_size=5)
+    stack.push("第一个")
+    stack.push("第二个")
+    stack.push("第三个")
+
+    assert stack.pop() == "第三个", "栈应该是后进先出,最后push的应该最先被pop出来"
+    assert stack.pop() == "第二个"
+    assert len(stack) == 1
+    print("[通过] test_bounded_stack_push_and_pop_basic_behavior")
+
+
+def test_bounded_stack_rejects_push_when_full() -> None:
+    """验证栈已满时push会抛出OverflowError,而不是静默丢弃或者悄悄扩容。"""
+    stack: BoundedStack[int] = BoundedStack(max_size=2)
+    stack.push(1)
+    stack.push(2)
+
+    try:
+        stack.push(3)
+        raise AssertionError("栈已满时继续push应该抛出OverflowError,但没有抛出")
+    except OverflowError:
+        pass
+
+    assert len(stack) == 2, "push失败后,栈的长度不应该发生变化"
+    print("[通过] test_bounded_stack_rejects_push_when_full")
+
+
+def test_bounded_stack_pop_from_empty_raises_index_error() -> None:
+    """验证对空栈调用pop()会抛出IndexError,而不是返回None(避免调用方误判)。"""
+    stack: BoundedStack[str] = BoundedStack(max_size=3)
+    try:
+        stack.pop()
+        raise AssertionError("对空栈pop()应该抛出IndexError,但没有抛出")
+    except IndexError:
+        pass
+    print("[通过] test_bounded_stack_pop_from_empty_raises_index_error")
+
+
+def test_bounded_stack_peek_does_not_remove_top_element() -> None:
+    """验证peek()只是"查看"栈顶元素,不会真正移除它。"""
+    stack: BoundedStack[int] = BoundedStack(max_size=3)
+    stack.push(100)
+
+    first_peek = stack.peek()
+    second_peek = stack.peek()
+
+    assert first_peek == 100
+    assert second_peek == 100, "连续调用两次peek()应该得到相同的结果,证明peek没有移除元素"
+    assert len(stack) == 1, "peek()之后栈的长度应该保持不变"
+    print("[通过] test_bounded_stack_peek_does_not_remove_top_element")
+
+
+def test_bounded_stack_peek_on_empty_stack_returns_none() -> None:
+    """验证空栈调用peek()返回None,而不是抛出异常(这是peek和pop在"空栈"语义上的刻意差异)。"""
+    stack: BoundedStack[float] = BoundedStack(max_size=1)
+    assert stack.peek() is None
+    print("[通过] test_bounded_stack_peek_on_empty_stack_returns_none")
+
+
+def test_bounded_stack_from_iterable_constructs_correctly() -> None:
+    """验证from_iterable类方法能正确地从一个可迭代对象批量构造出栈,且元素顺序保持一致。"""
+    stack = BoundedStack.from_iterable([1, 2, 3], max_size=5)
+    assert len(stack) == 3
+    assert stack.pop() == 3, "最后一个被push进去的元素(来自可迭代对象的最后一项)应该最先被pop出来"
+    print("[通过] test_bounded_stack_from_iterable_constructs_correctly")
+
+
+def test_bounded_stack_from_iterable_raises_when_source_exceeds_max_size() -> None:
+    """验证如果传入的可迭代对象元素数量超过max_size,from_iterable应该在中途抛出OverflowError。"""
+    try:
+        BoundedStack.from_iterable([1, 2, 3, 4], max_size=2)
+        raise AssertionError("元素数量超过max_size时应该抛出OverflowError,但没有抛出")
+    except OverflowError:
+        pass
+    print("[通过] test_bounded_stack_from_iterable_raises_when_source_exceeds_max_size")
+
+
+def test_bounded_stack_rejects_non_positive_max_size() -> None:
+    """验证创建BoundedStack时,max_size为0或负数应该被拒绝。"""
+    for invalid_size in (0, -1, -5):
+        try:
+            BoundedStack(max_size=invalid_size)
+            raise AssertionError(f"max_size={invalid_size}应该抛出ValueError,但没有抛出")
+        except ValueError:
+            pass
+    print("[通过] test_bounded_stack_rejects_non_positive_max_size")
+
+
+def test_bounded_stack_is_full_reflects_current_capacity_state() -> None:
+    """验证is_full()准确反映栈的当前容量状态,随着push/pop正确地在True和False之间切换。"""
+    stack: BoundedStack[str] = BoundedStack(max_size=2)
+    assert not stack.is_full()
+
+    stack.push("a")
+    assert not stack.is_full()
+
+    stack.push("b")
+    assert stack.is_full()
+
+    stack.pop()
+    assert not stack.is_full(), "pop之后不应该再判定为已满"
+    print("[通过] test_bounded_stack_is_full_reflects_current_capacity_state")
+
+
+# ============================================================
+# 第三部分: parse_model_config(overload)的测试
+# ============================================================
+
+def test_parse_model_config_handles_string_input() -> None:
+    """验证传入分号分隔的key=value字符串时,能被正确解析成字典。"""
+    result = parse_model_config("model=deepseek-chat;temperature=0.7")
+    assert result == {"model": "deepseek-chat", "temperature": "0.7"}
+    print("[通过] test_parse_model_config_handles_string_input")
+
+
+def test_parse_model_config_handles_dict_input() -> None:
+    """验证传入字典时,直接返回一份浅拷贝(而不是原对象的引用)。"""
+    original = {"model": "qwen-plus"}
+    result = parse_model_config(original)
+
+    assert result == original
+    assert result is not original, "应该返回一份拷贝,而不是原字典对象本身的引用"
+    print("[通过] test_parse_model_config_handles_dict_input")
+
+
+def test_parse_model_config_rejects_unsupported_type() -> None:
+    """验证传入既不是字符串也不是字典的类型时,应该抛出TypeError。"""
+    for invalid_input in (123, 3.14, ["a", "list"], None):
+        try:
+            parse_model_config(invalid_input)  # type: ignore[arg-type]
+            raise AssertionError(f"传入{invalid_input!r}应该抛出TypeError,但没有抛出")
+        except TypeError:
+            pass
+    print("[通过] test_parse_model_config_rejects_unsupported_type")
+
+
+def test_parse_model_config_string_input_ignores_malformed_segments() -> None:
+    """
+    验证字符串输入中,如果某一段不包含等号(格式不对),这一段应该被安全跳过,
+    而不会导致整体解析失败或者抛出异常。
+    """
+    result = parse_model_config("model=deepseek-chat;这一段没有等号;temperature=0.5")
+    assert result == {"model": "deepseek-chat", "temperature": "0.5"}
+    print("[通过] test_parse_model_config_string_input_ignores_malformed_segments")
+
+
+def test_parse_model_config_empty_string_returns_empty_dict() -> None:
+    """边界情况: 空字符串输入,应该返回空字典,而不是抛出异常。"""
+    result = parse_model_config("")
+    assert result == {}
+    print("[通过] test_parse_model_config_empty_string_returns_empty_dict")
+
+
+def run_all_tests() -> None:
+    """依次运行本文件全部测试用例。"""
+    test_class_with_matching_call_signature_satisfies_protocol()
+    test_class_without_call_method_does_not_satisfy_protocol()
+    test_lambda_with_matching_signature_also_satisfies_protocol()
+    test_dispatch_function_works_with_any_protocol_conforming_object()
+
+    test_bounded_stack_push_and_pop_basic_behavior()
+    test_bounded_stack_rejects_push_when_full()
+    test_bounded_stack_pop_from_empty_raises_index_error()
+    test_bounded_stack_peek_does_not_remove_top_element()
+    test_bounded_stack_peek_on_empty_stack_returns_none()
+    test_bounded_stack_from_iterable_constructs_correctly()
+    test_bounded_stack_from_iterable_raises_when_source_exceeds_max_size()
+    test_bounded_stack_rejects_non_positive_max_size()
+    test_bounded_stack_is_full_reflects_current_capacity_state()
+
+    test_parse_model_config_handles_string_input()
+    test_parse_model_config_handles_dict_input()
+    test_parse_model_config_rejects_unsupported_type()
+    test_parse_model_config_string_input_ignores_malformed_segments()
+    test_parse_model_config_empty_string_returns_empty_dict()
+
+    print("\n全部typing进阶特性测试通过!")
+
+
+if __name__ == "__main__":
+    run_all_tests()
+```
+
+### 18. `async_retry_helper.py` —— asyncio版重试装饰器与并发数限制器
+
+```python
+"""
+async_retry_helper.py
+
+补充说明:
+    今天下午学的asyncio.gather、下午收尾的async_multi_model_call.py,都是
+    "假设请求一定会成功"的理想版本——真实场景里,异步请求同样会遇到限流、
+    超时、服务临时不可用这些问题,今天课堂笔记里的retry装饰器又是同步版本,
+    不能直接套用在async def协程函数上(用同步版的time.sleep去"等待重试"，
+    会直接把整个事件循环阻塞住，等于白白浪费了asyncio带来的并发优势)。
+
+    这份文件补充两个async场景下常用的辅助工具:
+    1. async_retry —— retry装饰器的asyncio版本，内部用await asyncio.sleep
+       代替time.sleep，避免阻塞事件循环，让"重试等待"这段时间里，
+       其他协程依然可以继续运行。
+    2. AsyncConcurrencyLimiter —— 基于asyncio.Semaphore实现的并发数限制器，
+       用于控制"同时发起的异步请求数量上限"，避免asyncio.gather一次性
+       发起成百上千个请求，瞬间打爆下游服务或者触发更严格的限流。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import functools
+import random
+from typing import Callable, Tuple, Type, TypeVar
+
+F = TypeVar("F", bound=Callable)
+
+
+def async_retry(
+    max_attempts: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 30.0,
+    jitter: bool = True,
+    retryable_exceptions: Tuple[Type[Exception], ...] = (Exception,),
+):
+    """
+    retry装饰器的asyncio版本，只能用于装饰async def定义的协程函数。
+
+    与同步版retry装饰器的唯一本质差异：等待重试的那一步，必须用
+    await asyncio.sleep(wait)，而不能用time.sleep(wait)——后者会
+    真正地把整个线程(以及运行在同一个事件循环里的其他所有协程)都
+    阻塞住，这是asyncio编程里一个非常容易在"从同步改异步"时踩到的坑。
+    """
+    if max_attempts < 1:
+        raise ValueError("max_attempts必须是正整数")
+
+    def decorator(func: F) -> F:
+        if not asyncio.iscoroutinefunction(func):
+            raise TypeError(
+                f"async_retry只能装饰协程函数(async def),但{func.__name__}不是协程函数"
+            )
+
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            last_exception: Exception | None = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return await func(*args, **kwargs)
+                except retryable_exceptions as exc:
+                    last_exception = exc
+                    if attempt >= max_attempts:
+                        raise
+                    wait = min(base_delay * (2 ** (attempt - 1)), max_delay)
+                    if jitter:
+                        wait = wait * (0.5 + random.random())
+                    await asyncio.sleep(wait)
+                except Exception:
+                    # 不在retryable_exceptions范围内的异常，视为不可重试，立即抛出
+                    raise
+            if last_exception is not None:
+                raise last_exception
+            raise RuntimeError("async_retry逻辑异常终止，未能获取任何结果")
+
+        return wrapper  # type: ignore[return-value]
+
+    return decorator
+
+
+class AsyncConcurrencyLimiter:
+    """
+    基于asyncio.Semaphore的并发数限制器。
+
+    典型用法:
+        limiter = AsyncConcurrencyLimiter(max_concurrent=5)
+        results = await asyncio.gather(
+            *(limiter.run(fetch_one, url) for url in url_list)
+        )
+    即便url_list里有100个地址，实际同时在飞行中的请求也不会超过5个，
+    这在批量调用外部API、避免瞬间并发过高触发限流时非常实用。
+    """
+
+    def __init__(self, max_concurrent: int) -> None:
+        if max_concurrent <= 0:
+            raise ValueError(f"max_concurrent必须是正整数，收到的是{max_concurrent}")
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self.max_concurrent = max_concurrent
+        self._peak_in_flight = 0
+        self._current_in_flight = 0
+
+    async def run(self, coro_func: Callable, *args, **kwargs):
+        """
+        在并发限制下执行一个协程函数调用，自动记录"同时在飞行中的请求数"的
+        历史峰值，方便调用方事后校验限流是否真的生效。
+        """
+        async with self._semaphore:
+            self._current_in_flight += 1
+            self._peak_in_flight = max(self._peak_in_flight, self._current_in_flight)
+            try:
+                return await coro_func(*args, **kwargs)
+            finally:
+                self._current_in_flight -= 1
+
+    @property
+    def peak_in_flight(self) -> int:
+        """返回从创建以来，"同时在飞行中的请求数"曾经达到过的最大值。"""
+        return self._peak_in_flight
+
+
+async def demo_async_retry() -> None:
+    """演示async_retry在协程函数上重试的效果。"""
+    print("=" * 70)
+    print("演示1: async_retry —— 不阻塞事件循环的异步重试装饰器")
+    print("=" * 70)
+
+    attempt_log = {"count": 0}
+
+    @async_retry(max_attempts=3, base_delay=0.01, retryable_exceptions=(ConnectionError,))
+    async def flaky_async_call() -> str:
+        attempt_log["count"] += 1
+        if attempt_log["count"] < 3:
+            raise ConnectionError(f"第{attempt_log['count']}次调用模拟连接失败")
+        return "第3次调用终于成功"
+
+    result = await flaky_async_call()
+    print(f"最终结果: {result}, 总共尝试了{attempt_log['count']}次\n")
+
+
+async def demo_concurrency_limiter() -> None:
+    """演示AsyncConcurrencyLimiter如何把并发数真正限制在设定值以内。"""
+    print("=" * 70)
+    print("演示2: AsyncConcurrencyLimiter —— 控制同时在飞行的请求数量")
+    print("=" * 70)
+
+    limiter = AsyncConcurrencyLimiter(max_concurrent=3)
+
+    async def fake_request(task_id: int) -> str:
+        await asyncio.sleep(0.05)
+        return f"任务{task_id}完成"
+
+    task_ids = list(range(10))
+    results = await asyncio.gather(*(limiter.run(fake_request, tid) for tid in task_ids))
+    print(f"全部{len(results)}个任务完成, 历史峰值并发数: {limiter.peak_in_flight}"
+          f"(设定上限是{limiter.max_concurrent})\n")
+
+
+async def main() -> None:
+    await demo_async_retry()
+    await demo_concurrency_limiter()
+    print("=" * 70)
+    print("async_retry_helper.py 全部演示运行完毕。")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### 19. `tests/test_async_retry_helper.py` —— 异步重试与并发限流的自检脚本
+
+```python
+"""
+tests/test_async_retry_helper.py
+
+针对async_retry_helper.py里async_retry装饰器和AsyncConcurrencyLimiter的
+自检测试。由于被测代码本身是asyncio协程，测试函数也必须写成协程函数，
+并通过asyncio.run()驱动执行——这是"给异步代码写单元测试"最基础的固定套路。
+
+运行方式: python -m tests.test_async_retry_helper (需要在项目根目录下执行)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+import time
+from pathlib import Path
+from typing import List
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from async_retry_helper import AsyncConcurrencyLimiter, async_retry  # noqa: E402
+
+
+# ============================================================
+# 第一部分: async_retry的测试
+# ============================================================
+
+async def test_async_retry_succeeds_after_transient_failures() -> None:
+    """验证async_retry能在协程函数多次失败后，最终在耗尽次数前成功返回结果。"""
+    attempt_count = {"value": 0}
+
+    @async_retry(max_attempts=4, base_delay=0.001, retryable_exceptions=(ConnectionError,))
+    async def flaky_call() -> str:
+        attempt_count["value"] += 1
+        if attempt_count["value"] < 3:
+            raise ConnectionError("模拟的临时连接失败")
+        return "成功"
+
+    result = await flaky_call()
+    assert result == "成功"
+    assert attempt_count["value"] == 3, f"预期第3次才成功，实际尝试了{attempt_count['value']}次"
+    print("[通过] test_async_retry_succeeds_after_transient_failures")
+
+
+async def test_async_retry_raises_after_exhausting_attempts() -> None:
+    """验证重试次数耗尽后，async_retry会重新抛出最后一次遇到的异常。"""
+    attempt_count = {"value": 0}
+
+    @async_retry(max_attempts=3, base_delay=0.001, retryable_exceptions=(TimeoutError,))
+    async def always_timeout() -> None:
+        attempt_count["value"] += 1
+        raise TimeoutError("持续超时")
+
+    try:
+        await always_timeout()
+        raise AssertionError("预期应该在耗尽重试次数后抛出TimeoutError")
+    except TimeoutError:
+        pass
+
+    assert attempt_count["value"] == 3, f"预期总共尝试3次，实际尝试了{attempt_count['value']}次"
+    print("[通过] test_async_retry_raises_after_exhausting_attempts")
+
+
+async def test_async_retry_does_not_retry_non_whitelisted_exceptions() -> None:
+    """验证不在retryable_exceptions白名单里的异常，会立即抛出，不进行任何重试。"""
+    attempt_count = {"value": 0}
+
+    @async_retry(max_attempts=5, base_delay=0.001, retryable_exceptions=(ConnectionError,))
+    async def raise_value_error() -> None:
+        attempt_count["value"] += 1
+        raise ValueError("不在白名单里的异常")
+
+    try:
+        await raise_value_error()
+        raise AssertionError("预期应该立即抛出ValueError")
+    except ValueError:
+        pass
+
+    assert attempt_count["value"] == 1, f"不可重试的异常应该只尝试1次，实际尝试了{attempt_count['value']}次"
+    print("[通过] test_async_retry_does_not_retry_non_whitelisted_exceptions")
+
+
+async def test_async_retry_wait_does_not_block_other_coroutines() -> None:
+    """
+    验证async_retry内部等待重试时用的是await asyncio.sleep而不是time.sleep——
+    验证方式: 让一个"持续失败、正在重试等待"的协程和另一个"独立的、不断计数"的协程
+    同时用asyncio.gather跑起来,如果重试等待真的没有阻塞事件循环,
+    独立协程的计数器应该能在等待期间持续正常递增。
+    """
+    counter = {"value": 0}
+
+    async def independent_counter_task() -> None:
+        for _ in range(5):
+            counter["value"] += 1
+            await asyncio.sleep(0.01)
+
+    @async_retry(max_attempts=2, base_delay=0.05, jitter=False, retryable_exceptions=(RuntimeError,))
+    async def failing_once() -> str:
+        if counter["value"] == 0:
+            raise RuntimeError("第一次调用时故意失败一次，制造重试等待")
+        return "成功"
+
+    async def failing_task() -> str:
+        try:
+            return await failing_once()
+        except RuntimeError:
+            return "彻底失败"
+
+    results = await asyncio.gather(independent_counter_task(), failing_once())
+    assert results[1] == "成功" or isinstance(results[1], str)
+    assert counter["value"] > 0, "独立协程的计数器应该在重试等待期间持续正常递增，证明事件循环没有被阻塞"
+    print("[通过] test_async_retry_wait_does_not_block_other_coroutines")
+
+
+def test_async_retry_rejects_non_coroutine_function() -> None:
+    """验证async_retry如果被用来装饰一个普通的同步函数(而非协程函数)，应该在装饰阶段就报错。"""
+    try:
+        @async_retry(max_attempts=2)
+        def sync_function() -> None:
+            pass
+
+        raise AssertionError("预期装饰一个普通同步函数应该抛出TypeError，但没有抛出")
+    except TypeError:
+        pass
+    print("[通过] test_async_retry_rejects_non_coroutine_function")
+
+
+def test_async_retry_rejects_non_positive_max_attempts() -> None:
+    """验证max_attempts为0或负数时，应该在创建装饰器阶段就被拒绝。"""
+    for invalid_attempts in (0, -1, -3):
+        try:
+            async_retry(max_attempts=invalid_attempts)
+            raise AssertionError(f"max_attempts={invalid_attempts}应该抛出ValueError，但没有抛出")
+        except ValueError:
+            pass
+    print("[通过] test_async_retry_rejects_non_positive_max_attempts")
+
+
+# ============================================================
+# 第二部分: AsyncConcurrencyLimiter的测试
+# ============================================================
+
+async def test_concurrency_limiter_never_exceeds_max_concurrent() -> None:
+    """验证即使同时提交远超上限数量的任务，实际同时在飞行中的请求数也不会超过设定上限。"""
+    limiter = AsyncConcurrencyLimiter(max_concurrent=3)
+
+    async def slow_task(task_id: int) -> int:
+        await asyncio.sleep(0.03)
+        return task_id
+
+    task_ids = list(range(12))
+    results = await asyncio.gather(*(limiter.run(slow_task, tid) for tid in task_ids))
+
+    assert sorted(results) == task_ids, "所有任务都应该正常完成并返回各自的task_id"
+    assert limiter.peak_in_flight <= 3, (
+        f"设定的并发上限是3, 但观测到的历史峰值并发数是{limiter.peak_in_flight}, 说明限流失效了"
+    )
+    print("[通过] test_concurrency_limiter_never_exceeds_max_concurrent")
+
+
+async def test_concurrency_limiter_actually_utilizes_available_slots() -> None:
+    """
+    验证限流器不会"过度保守"——如果任务数量足够多、且并发上限设置得比较宽松，
+    历史峰值并发数应该确实能够达到(或接近)设定的上限，而不是每次都串行执行。
+    """
+    limiter = AsyncConcurrencyLimiter(max_concurrent=4)
+
+    async def slow_task(task_id: int) -> int:
+        await asyncio.sleep(0.05)
+        return task_id
+
+    await asyncio.gather(*(limiter.run(slow_task, tid) for tid in range(8)))
+    assert limiter.peak_in_flight == 4, (
+        f"任务数量足够多、上限设置为4时，历史峰值并发数应该恰好达到4，实际是{limiter.peak_in_flight}"
+    )
+    print("[通过] test_concurrency_limiter_actually_utilizes_available_slots")
+
+
+def test_concurrency_limiter_rejects_non_positive_max_concurrent() -> None:
+    """验证max_concurrent为0或负数时，应该在创建阶段就被拒绝。"""
+    for invalid_value in (0, -1, -10):
+        try:
+            AsyncConcurrencyLimiter(max_concurrent=invalid_value)
+            raise AssertionError(f"max_concurrent={invalid_value}应该抛出ValueError，但没有抛出")
+        except ValueError:
+            pass
+    print("[通过] test_concurrency_limiter_rejects_non_positive_max_concurrent")
+
+
+async def test_concurrency_limiter_propagates_exceptions_from_wrapped_coroutine() -> None:
+    """验证limiter.run()不会吞掉被包裹协程抛出的异常，异常应该原样传播给调用方。"""
+    limiter = AsyncConcurrencyLimiter(max_concurrent=2)
+
+    async def always_fail() -> None:
+        raise KeyError("被包裹的协程内部抛出的异常")
+
+    try:
+        await limiter.run(always_fail)
+        raise AssertionError("预期应该抛出KeyError")
+    except KeyError:
+        pass
+    print("[通过] test_concurrency_limiter_propagates_exceptions_from_wrapped_coroutine")
+
+
+async def test_concurrency_limiter_releases_slot_even_when_task_fails() -> None:
+    """
+    验证即使某个任务执行失败(抛出异常)，限流器占用的"槽位"也会被正确释放，
+    不会因为一次失败就永久占用一个并发名额，导致后续任务被无限阻塞。
+    """
+    limiter = AsyncConcurrencyLimiter(max_concurrent=2)
+
+    async def sometimes_fail(task_id: int) -> int:
+        if task_id == 0:
+            raise ValueError("第0号任务故意失败")
+        await asyncio.sleep(0.01)
+        return task_id
+
+    results = await asyncio.gather(
+        *(limiter.run(sometimes_fail, tid) for tid in range(4)), return_exceptions=True
+    )
+
+    success_count = sum(1 for r in results if isinstance(r, int))
+    failure_count = sum(1 for r in results if isinstance(r, Exception))
+    assert success_count == 3, f"预期3个任务成功，实际成功{success_count}个"
+    assert failure_count == 1, f"预期1个任务失败，实际失败{failure_count}个"
+    print("[通过] test_concurrency_limiter_releases_slot_even_when_task_fails")
+
+
+async def run_all_async_tests() -> None:
+    """依次运行本文件全部需要事件循环驱动的协程测试用例。"""
+    await test_async_retry_succeeds_after_transient_failures()
+    await test_async_retry_raises_after_exhausting_attempts()
+    await test_async_retry_does_not_retry_non_whitelisted_exceptions()
+    await test_async_retry_wait_does_not_block_other_coroutines()
+
+    await test_concurrency_limiter_never_exceeds_max_concurrent()
+    await test_concurrency_limiter_actually_utilizes_available_slots()
+    await test_concurrency_limiter_propagates_exceptions_from_wrapped_coroutine()
+    await test_concurrency_limiter_releases_slot_even_when_task_fails()
+
+
+def run_all_tests() -> None:
+    """
+    依次运行本文件全部测试用例，包括不需要事件循环的同步测试
+    (校验装饰器创建阶段的参数检查逻辑)和需要事件循环驱动的协程测试。
+    """
+    test_async_retry_rejects_non_coroutine_function()
+    test_async_retry_rejects_non_positive_max_attempts()
+    test_concurrency_limiter_rejects_non_positive_max_concurrent()
+
+    asyncio.run(run_all_async_tests())
+
+    print("\n全部异步重试与并发限流扩展测试通过!")
+
+
+if __name__ == "__main__":
+    start = time.perf_counter()
+    run_all_tests()
+    elapsed = time.perf_counter() - start
+    print(f"(测试总耗时约{elapsed:.2f}秒)")
+```
+
 ### 晚自习FAQ:关于重试与超时设计的几个延伸问题
 
 收尾前的十来分钟,老王留了一段自由提问时间,四人陆续抛出了几个问题,老王当场作答,陈铭把这几段问答也一并记进了笔记本,作为今天知识点的补充边角料。
