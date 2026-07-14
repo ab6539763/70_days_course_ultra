@@ -1759,6 +1759,885 @@ if __name__ == "__main__":
 
 这份脚本在陈铭的电脑上跑出的是真实的图表文件,双子图左边一眼能看出GPT-4o和Claude的输出价格明显高出DeepSeek-V3一大截,右边的上下文窗口对比里Claude 3.5 Sonnet的两百K token条形明显最长。老王特意让陈铭把环境里的matplotlib临时卸载,重新跑了一遍,确认ASCII条形图兜底方案也能正常输出,一整排用"█"字符拼出来的条形,虽然不如真图美观,但价格差距的相对关系依然一目了然。老王总结这三个新增工具时说了一句话:"你会发现,这三个工具背后其实是同一套思考方式在反复出现——先假设'理想情况下工具应该怎么用',再倒回来问一句'如果依赖的东西不齐全,这个工具是不是就彻底瘫痪了',然后专门为'不齐全'这种情况设计一条退路。这不是额外的负担,这是任何要交给客户环境去跑的工具,都必须具备的基本素质,你今天写的每一份代码,都在练这个习惯。"
 
+晚饭前,老王又留了三个"课后加练"的题目,说是"给爱多动手的人留的",陈铭果然又留了下来。第一个题目是把分词器的demo做得更完整,不只是英文BPE和中文对照,还要覆盖多语言混排、emoji、空字符串这些边界情况;第二个题目是把价格对比场景做得更贴近真实业务,不只是单轮对话,还要覆盖多轮累积、流式输出、批处理折扣这些容易被忽略的计费细节;第三个题目是把这几份工具汇总的数据,产出一份能直接甩给林悦去跟客户汇报的成本预测报表。陈铭连着写了三份文件,凌晨之前提交到了仓库里。
+
+### 实战七:分词器深度对照 —— 多语言混排、emoji与边界情况
+
+```python
+"""
+分词器深度对照脚本
+====================
+
+背景：老王在实战二的基础上追加的加练题——"你今天写的demo只覆盖了
+纯英文和纯中文，但真实客户发过来的文本，往往是中英文夹杂、还带着
+表情符号、甚至偶尔会有完全是空字符串的边界输入，这些场景不测一遍，
+你对Token化这件事的理解还不算完整。"
+
+本脚本覆盖以下场景：
+1. 中英文混排文本的Token切分对比；
+2. 包含emoji和特殊符号的文本，Token消耗会有什么变化；
+3. 空字符串、纯空格字符串、超长重复字符串这几种边界输入；
+4. 同一句话经过标点符号、大小写变化后，Token数是否会发生变化
+   （很多新手以为"内容一样，Token数就该一样"，这其实是一个误区）。
+
+依然遵循"离线兜底"的工程习惯：没有安装tiktoken时，自动降级为
+近似估算，不会让脚本直接崩溃退出。
+"""
+
+from __future__ import annotations
+
+import re
+
+try:
+    import tiktoken  # type: ignore
+
+    _TIKTOKEN_AVAILABLE = True
+except ImportError:
+    _TIKTOKEN_AVAILABLE = False
+
+
+_CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+_WORD_PATTERN = re.compile(r"[A-Za-z0-9]+|[^\sA-Za-z0-9\u4e00-\u9fff]|[\u4e00-\u9fff]")
+
+
+def approximate_token_count(text: str) -> int:
+    """近似估算器,规则与前面几份脚本保持一致,方便跨脚本对照。"""
+    count = 0
+    for chunk in _WORD_PATTERN.findall(text):
+        if _CJK_PATTERN.match(chunk):
+            count += 1
+        elif chunk.isalnum():
+            count += max(1, round(len(chunk) / 4))
+        else:
+            count += 1
+    return count
+
+
+def real_token_count(text: str, encoding_name: str = "cl100k_base") -> int | None:
+    """如果tiktoken可用,返回真实token数;否则返回None,交给调用方决定如何降级。"""
+    if not _TIKTOKEN_AVAILABLE:
+        return None
+    try:
+        encoder = tiktoken.get_encoding(encoding_name)
+        return len(encoder.encode(text))
+    except Exception:
+        return None
+
+
+def describe_token_count(text: str) -> str:
+    """
+    统一的展示函数:优先展示真实token数(标注'精确'),
+    如果拿不到真实值,展示近似估算数(标注'近似'),
+    绝不让调用方混淆这两种可信度完全不同的数字。
+    """
+    real = real_token_count(text)
+    approx = approximate_token_count(text)
+    if real is not None:
+        return f"{real}个token(精确,cl100k_base) | 近似估算参考值:{approx}"
+    return f"{approx}个token(近似估算,当前环境无tiktoken)"
+
+
+# ------------------------------------------------------------------
+# 第一部分:中英文混排场景
+# ------------------------------------------------------------------
+
+MIXED_LANGUAGE_SAMPLES = [
+    "苍穹平台使用DeepSeek-V3和GPT-4o提供对话能力",
+    "This 对话引擎 supports both 中文 and English seamlessly.",
+    "老王说:'Attention Is All You Need'这篇论文改变了整个NLP领域。",
+    "客户ID:CQ-2024-0113,调用模型:qwen-max,状态:success",
+]
+
+
+def demo_mixed_language() -> None:
+    print("=" * 70)
+    print("第一部分:中英文混排文本的Token切分对比")
+    print("=" * 70)
+    for sample in MIXED_LANGUAGE_SAMPLES:
+        print(f"\n原文:{sample}")
+        print(f"  Token统计:{describe_token_count(sample)}")
+        char_count = len(sample)
+        print(f"  字符数:{char_count}(供对比,字符数不等同于Token数)")
+
+
+# ------------------------------------------------------------------
+# 第二部分:emoji与特殊符号场景
+# ------------------------------------------------------------------
+
+EMOJI_SAMPLES = [
+    "今天的部署顺利完成 🎉🎉🎉",
+    "客户反馈:非常满意!👍👍👍👍👍",
+    "报错了 😱,请紧急处理 🔥",
+    "普通文本,不含任何emoji,作为对照基线",
+]
+
+
+def demo_emoji_tokens() -> None:
+    print("\n" + "=" * 70)
+    print("第二部分:emoji与特殊符号对Token消耗的影响")
+    print("=" * 70)
+    for sample in EMOJI_SAMPLES:
+        print(f"\n原文:{sample}")
+        print(f"  Token统计:{describe_token_count(sample)}")
+    print(
+        "\n观察结论:emoji在真实分词器眼里,往往会被拆解成多个字节级Token"
+        "(因为emoji本质上是Unicode里较新收录、训练语料覆盖相对有限的符号),"
+        "同样是'看起来只占一个字符位置'的内容,实际消耗的Token数可能比"
+        "一个常见汉字或英文单词更多,这一点在客户的对话记录、评论区抓取"
+        "文本里非常常见,做成本估算时不能忽略。"
+    )
+
+
+# ------------------------------------------------------------------
+# 第三部分:边界输入场景
+# ------------------------------------------------------------------
+
+def demo_boundary_inputs() -> None:
+    print("\n" + "=" * 70)
+    print("第三部分:边界输入场景(空字符串/纯空格/超长重复)")
+    print("=" * 70)
+
+    empty_text = ""
+    space_text = "     "
+    long_repeat_text = "苍穹" * 500
+
+    print(f"\n空字符串:Token统计:{describe_token_count(empty_text)}")
+    print(f"纯空格字符串(5个空格):Token统计:{describe_token_count(space_text)}")
+    print(
+        f"超长重复文本('苍穹'重复500次,共{len(long_repeat_text)}字符):"
+        f"Token统计:{describe_token_count(long_repeat_text)}"
+    )
+    print(
+        "\n观察结论:空字符串的Token数应为0,这是最基本的正确性检验;"
+        "纯空格字符串虽然'看不见内容',但依然会消耗至少1个Token,"
+        "这提醒我们,如果上游文本清洗没有做好、留下了大量多余空格,"
+        "看起来'什么都没有',实际上一样在真金白银地消耗Token预算。"
+    )
+
+
+# ------------------------------------------------------------------
+# 第四部分:同义改写对Token数的影响(容易被忽略的直觉误区)
+# ------------------------------------------------------------------
+
+PARAPHRASE_GROUPS = [
+    [
+        "请问贵公司的退货政策是什么？",
+        "请问贵公司的退货政策是什么",       # 去掉结尾问号
+        "请问贵公司的退货政策是什么???",     # 结尾问号改为三个
+        "请问贵公司的退货政策是什么？？？",     # 结尾问号改为三个中文问号
+    ],
+    [
+        "DeepSeek",
+        "deepseek",
+        "DEEPSEEK",
+        "Deep Seek",  # 中间加一个空格
+    ],
+]
+
+
+def demo_paraphrase_sensitivity() -> None:
+    print("\n" + "=" * 70)
+    print("第四部分:标点/大小写/空格的细微变化,对Token数是否有影响")
+    print("=" * 70)
+    for group in PARAPHRASE_GROUPS:
+        print()
+        for text in group:
+            print(f"  '{text}'  ->  {describe_token_count(text)}")
+    print(
+        "\n观察结论:很多新手会假设'内容意思一样,Token数就该差不多',"
+        "但真实分词器是按字符级/字节级的统计规律切分的,标点符号的变化、"
+        "大小写的变化、甚至一个空格的增减,都可能导致完全不同的切分结果,"
+        "进而影响Token数量。这也是为什么做Prompt设计时,老王反复强调"
+        "'相同语义、不同表达方式,实际成本可能不同',不能想当然地认为"
+        "'差不多的话'就该有'差不多的价格'。"
+    )
+
+
+def main() -> None:
+    print(f"当前环境tiktoken可用:{_TIKTOKEN_AVAILABLE}\n")
+    demo_mixed_language()
+    demo_emoji_tokens()
+    demo_boundary_inputs()
+    demo_paraphrase_sensitivity()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+跑完这份脚本,陈铭对着"同义改写对Token数的影响"那部分的输出愣了几秒——同样是问"退货政策是什么",结尾多打两个问号、或者把中文问号换成英文问号,Token数确实发生了变化,这和他此前"内容一样就该消耗差不多"的直觉完全相反。老王看到这个结果说:"这正是为什么客户系统里那些'自动生成的重复性问候语''带着一堆标点符号的营销文案',看起来内容简单,真实计费的时候却经常比预期贵——这些细节,不亲手跑一遍,很难有真实的体感。"
+
+### 实战八:多轮对话与流式/批处理场景下的计费细节
+
+```python
+"""
+多轮对话与流式/批处理场景计费细节脚本
+==========================================
+
+背景：老王追加的第二个加练题——"你之前算的都是'单轮问答'的成本，
+但苍穹平台真正要交付的是'多轮对话'产品，每一轮新的提问，模型
+实际上要重新看一遍之前所有的对话历史，这笔账不能漏算。另外，
+批处理接口通常会有折扣，流式输出和非流式输出的计费逻辑本质上
+是不是一样的，这些细节客户迟早会问到，你今天顺手都摸清楚。"
+
+本脚本覆盖：
+1. 多轮对话的"历史累积"效应——每一轮新提问，输入Token里都包含了
+   此前全部的对话历史，成本会随对话轮数增长而累积得比想象中更快；
+2. 批处理（Batch API）常见的折扣机制模拟；
+3. 流式输出与非流式输出在"计费口径"上其实是一致的（按总token数
+   计费，流式只是"分批推给用户看"，不改变计费方式），但很多新人
+   会误以为"流式输出更省钱"，本脚本专门澄清这个误区。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+# ------------------------------------------------------------------
+# 第一部分:多轮对话历史累积效应
+# ------------------------------------------------------------------
+
+@dataclass
+class ConversationTurn:
+    """一轮对话:包含这一轮用户新提出的问题,以及模型这一轮的回复。"""
+
+    user_message: str
+    assistant_reply: str
+
+
+@dataclass
+class ConversationCostTracker:
+    """
+    跟踪一整段多轮对话的Token消耗与成本。
+    核心要点:第N轮对话实际发送给模型的输入,不只是第N轮用户的
+    新问题,而是"系统提示词 + 第1轮到第N轮的全部历史 + 第N轮新问题",
+    这正是多轮对话成本容易被低估的关键原因——很多人只按"这一轮问了
+    多少字"估算,却忘了历史包袱是一直在累积的。
+    """
+
+    input_price_per_1m: float
+    output_price_per_1m: float
+    system_prompt_tokens: int = 50
+    turns: list[ConversationTurn] = field(default_factory=list)
+
+    @staticmethod
+    def _rough_token_count(text: str) -> int:
+        """一个粗略估算,真实项目里应替换为tiktoken或对应厂商分词器。"""
+        chinese_chars = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+        other_chars = len(text) - chinese_chars
+        return chinese_chars + max(1, other_chars // 4)
+
+    def add_turn(self, user_message: str, assistant_reply: str) -> dict[str, float]:
+        """
+        添加一轮新对话,并返回这一轮的详细成本拆解。
+        返回值里明确区分"本轮新增输入"和"历史累积输入",
+        方便直观看到"历史包袱"占比是怎么随对话轮数增长的。
+        """
+        history_tokens = self.system_prompt_tokens
+        for turn in self.turns:
+            history_tokens += self._rough_token_count(turn.user_message)
+            history_tokens += self._rough_token_count(turn.assistant_reply)
+
+        new_input_tokens = self._rough_token_count(user_message)
+        total_input_tokens = history_tokens + new_input_tokens
+        output_tokens = self._rough_token_count(assistant_reply)
+
+        input_cost = total_input_tokens / 1_000_000 * self.input_price_per_1m
+        output_cost = output_tokens / 1_000_000 * self.output_price_per_1m
+
+        self.turns.append(ConversationTurn(user_message, assistant_reply))
+
+        return {
+            "turn_index": len(self.turns),
+            "history_tokens": history_tokens,
+            "new_input_tokens": new_input_tokens,
+            "total_input_tokens": total_input_tokens,
+            "output_tokens": output_tokens,
+            "turn_cost": input_cost + output_cost,
+        }
+
+
+def demo_conversation_accumulation() -> None:
+    print("=" * 74)
+    print("第一部分:多轮对话历史累积效应演示")
+    print("=" * 74)
+
+    tracker = ConversationCostTracker(input_price_per_1m=1.0, output_price_per_1m=2.0)
+
+    sample_dialogue = [
+        ("你们的知识库问答系统支持哪些文档格式?", "支持PDF、Word、Excel等常见办公文档格式。"),
+        ("那PDF里如果是扫描版、没有文字层的,能识别吗?", "可以,我们内置了OCR识别模块,能提取扫描版PDF里的文字内容。"),
+        ("OCR识别的准确率大概是多少?", "常规印刷体文档的识别准确率通常在98%以上,手写内容准确率会有所下降。"),
+        ("那部署周期大概要多久?", "结合文档规模和格式复杂度,通常在两到四周左右完成部署与调优。"),
+        ("最后想确认一下,数据是否会上传到你们的服务器?", "支持私有化部署方案,数据可以完全保留在客户自己的内网环境中。"),
+    ]
+
+    cumulative_cost = 0.0
+    for user_msg, reply in sample_dialogue:
+        detail = tracker.add_turn(user_msg, reply)
+        cumulative_cost += detail["turn_cost"]
+        print(
+            f"\n第{detail['turn_index']}轮  历史累积输入:{detail['history_tokens']:>4}token  "
+            f"本轮新增输入:{detail['new_input_tokens']:>3}token  "
+            f"本轮输出:{detail['output_tokens']:>3}token  "
+            f"本轮费用:{detail['turn_cost']:.6f}元  累计费用:{cumulative_cost:.6f}元"
+        )
+
+    print(
+        "\n观察结论:即便每一轮用户新问的问题字数都差不多,"
+        "'历史累积输入'这一项会随着对话轮数增加而稳步上升,"
+        "到第5轮时,历史累积部分已经明显超过本轮新增输入,"
+        "这正是多轮对话产品'越聊越贵'的核心原因,也是为什么"
+        "后续Sprint 2要专门学习Memory记忆管理与历史裁剪策略的现实动机——"
+        "不加控制的历史累积,会让长对话的成本呈现出不成比例的增长。"
+    )
+
+
+# ------------------------------------------------------------------
+# 第二部分:批处理折扣模拟
+# ------------------------------------------------------------------
+
+@dataclass
+class BatchDiscountPolicy:
+    """
+    模拟厂商批处理接口(Batch API)常见的折扣机制:
+    用户提交一批任务,厂商不保证实时返回,而是在一定时间窗口内
+    (比如24小时)异步处理完毕,交换条件是价格打折。
+    """
+
+    standard_input_price: float
+    standard_output_price: float
+    discount_ratio: float  # 例如0.5表示批处理价格是标准价格的一半
+
+    def batch_input_price(self) -> float:
+        return self.standard_input_price * self.discount_ratio
+
+    def batch_output_price(self) -> float:
+        return self.standard_output_price * self.discount_ratio
+
+
+def demo_batch_discount(total_input_tokens: int, total_output_tokens: int) -> None:
+    print("\n" + "=" * 74)
+    print("第二部分:批处理折扣机制模拟(以三十份文档批量摘要为例)")
+    print("=" * 74)
+
+    policy = BatchDiscountPolicy(
+        standard_input_price=1.0, standard_output_price=2.0, discount_ratio=0.5
+    )
+
+    standard_cost = (
+        total_input_tokens / 1_000_000 * policy.standard_input_price
+        + total_output_tokens / 1_000_000 * policy.standard_output_price
+    )
+    batch_cost = (
+        total_input_tokens / 1_000_000 * policy.batch_input_price()
+        + total_output_tokens / 1_000_000 * policy.batch_output_price()
+    )
+    savings = standard_cost - batch_cost
+    savings_pct = (savings / standard_cost * 100) if standard_cost else 0.0
+
+    print(f"总输入Token:{total_input_tokens}  总输出Token:{total_output_tokens}")
+    print(f"标准实时接口预估费用:{standard_cost:.4f}元")
+    print(f"批处理接口预估费用(五折):{batch_cost:.4f}元")
+    print(f"预计可节省:{savings:.4f}元(节省比例约{savings_pct:.1f}%)")
+    print(
+        "\n提醒:批处理接口通常不保证实时返回(可能延迟数小时到一天),"
+        "适合摘要生成、离线报表、批量打标签这类对实时性要求不高的场景,"
+        "不适合需要即时响应用户的在线对话场景,选择时要结合业务实际"
+        "对'时效性'的容忍度来判断,不能只看价格便宜就无脑切换。"
+    )
+
+
+# ------------------------------------------------------------------
+# 第三部分:流式输出 vs 非流式输出的计费误区澄清
+# ------------------------------------------------------------------
+
+def demo_streaming_billing_clarification() -> None:
+    print("\n" + "=" * 74)
+    print("第三部分:流式输出 vs 非流式输出,计费方式是否不同?")
+    print("=" * 74)
+    print(
+        "常见误区:'流式输出是一点点返回的,看起来消耗资源更少,"
+        "是不是比非流式(等全部生成完再一次性返回)更便宜?'\n"
+    )
+    print(
+        "实际情况:流式(stream=True)和非流式(stream=False)调用,"
+        "在几乎所有主流厂商的计费口径里,都是按照'最终总共生成了"
+        "多少输出Token'来计费的,和用户是一点点看到结果、还是等全部"
+        "生成完才看到结果,没有关系——流式只是改变了'内容推送给用户"
+        "的节奏和体验',并不会改变'模型内部实际计算量'本身。"
+    )
+    print(
+        "\n对苍穹项目的实际影响:选择流式输出的理由,应该是"
+        "'用户体验更好(不需要长时间等待空白页面)',而不是"
+        "'流式输出更省钱'——这是两个完全不相关的决策维度,"
+        "混淆这两点,在做技术方案说明时容易被细心的客户追问出漏洞。"
+    )
+
+
+def main() -> None:
+    demo_conversation_accumulation()
+    demo_batch_discount(total_input_tokens=1_500_000, total_output_tokens=300_000)
+    demo_streaming_billing_clarification()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+老王看完多轮对话累积效应那部分的输出,专门在旁边补了一句将来会反复用到的话:"这张表你留着,以后凡是有人问'为什么我们的对话产品用着用着感觉变贵了',你直接把这张表甩过去,比讲十句抽象的话都管用。"
+
+### 实战九:成本预测报表生成器(给林悦汇报用)
+
+```python
+"""
+成本预测报表生成器
+====================
+
+背景：林悦提出的实际需求——"我经常需要在客户方案汇报里,加一页
+'预计运营成本'的内容,每次都要重新手动拼数字、调格式,你们能不能
+写一个工具,把选好的模型、预估的调用规模输进去,直接吐出一份能用
+的报表文本(甚至可以是能直接粘贴进PPT或者文档的格式)?"
+
+本脚本汇总了实战一、四、五、八里出现过的价格数据与计算逻辑,
+产出一份结构化的成本预测报表,包含:
+1. 基础假设说明(调用规模、模型选择、汇率等,任何报表都应该
+   明确写清楚假设前提,而不是让人误以为这是"精确账单");
+2. 分模型的月度/年度成本预测;
+3. 增长情景模拟(如果调用量增长50%/100%,成本会如何变化);
+4. 结论与建议小结。
+
+报表以纯文本形式生成,方便直接复制粘贴到聊天工具、文档或者邮件里,
+不依赖任何外部的文档生成库,保证在任何环境下都能直接跑起来。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+
+
+@dataclass(frozen=True)
+class ForecastModelOption:
+    display_name: str
+    vendor: str
+    input_price_per_1m_rmb: float
+    output_price_per_1m_rmb: float
+
+
+FORECAST_CANDIDATES: list[ForecastModelOption] = [
+    ForecastModelOption("DeepSeek-V3", "深度求索", 1.0, 2.0),
+    ForecastModelOption("DeepSeek-R1", "深度求索", 4.0, 16.0),
+    ForecastModelOption("通义千问 Qwen-Plus", "阿里云", 0.8, 2.0),
+    ForecastModelOption("通义千问 Qwen-Max", "阿里云", 20.0, 60.0),
+    ForecastModelOption("GLM-4", "智谱AI", 5.0, 5.0),
+]
+
+
+@dataclass
+class UsageAssumption:
+    """一次预测所依据的业务量假设,所有假设都应该显式记录,避免后续复盘时说不清楚数字是怎么来的。"""
+
+    daily_conversations: int
+    avg_input_tokens_per_turn: int
+    avg_output_tokens_per_turn: int
+    avg_turns_per_conversation: int = 3
+
+    def daily_total_tokens(self) -> tuple[int, int]:
+        """返回(日总输入token, 日总输出token)的估算值。"""
+        total_input = (
+            self.daily_conversations * self.avg_turns_per_conversation * self.avg_input_tokens_per_turn
+        )
+        total_output = (
+            self.daily_conversations * self.avg_turns_per_conversation * self.avg_output_tokens_per_turn
+        )
+        return total_input, total_output
+
+
+def compute_monthly_cost(model: ForecastModelOption, assumption: UsageAssumption) -> float:
+    daily_input, daily_output = assumption.daily_total_tokens()
+    monthly_input = daily_input * 30
+    monthly_output = daily_output * 30
+    return (
+        monthly_input / 1_000_000 * model.input_price_per_1m_rmb
+        + monthly_output / 1_000_000 * model.output_price_per_1m_rmb
+    )
+
+
+def build_growth_scenarios(
+    model: ForecastModelOption, base_assumption: UsageAssumption
+) -> list[tuple[str, float]]:
+    """
+    模拟三种业务增长情景:维持现状、增长50%、增长100%,
+    帮助管理层提前看到"如果业务真的做起来了,成本大致会涨到什么量级",
+    而不是只看当下这一个静态数字。
+    """
+    scenarios = []
+    for label, growth_ratio in [("维持现状", 1.0), ("增长50%", 1.5), ("增长100%", 2.0)]:
+        scaled_assumption = UsageAssumption(
+            daily_conversations=int(base_assumption.daily_conversations * growth_ratio),
+            avg_input_tokens_per_turn=base_assumption.avg_input_tokens_per_turn,
+            avg_output_tokens_per_turn=base_assumption.avg_output_tokens_per_turn,
+            avg_turns_per_conversation=base_assumption.avg_turns_per_conversation,
+        )
+        monthly_cost = compute_monthly_cost(model, scaled_assumption)
+        scenarios.append((label, monthly_cost))
+    return scenarios
+
+
+def render_report(
+    project_name: str,
+    assumption: UsageAssumption,
+    candidate_models: list[ForecastModelOption],
+) -> str:
+    """
+    生成完整的文本报表。这里用手工拼接字符串而不是引入模板引擎,
+    是因为报表结构相对固定、内容不算复杂,手工拼接更透明、
+    更容易被团队里没写过模板引擎代码的同事直接看懂和修改。
+    """
+    lines: list[str] = []
+    lines.append("=" * 72)
+    lines.append(f"苍穹项目 · 成本预测报表 —— {project_name}")
+    lines.append(f"生成时间:{datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    lines.append("=" * 72)
+
+    lines.append("\n【一、基础假设说明】")
+    lines.append(f"  预估日均对话数:{assumption.daily_conversations}轮次/天")
+    lines.append(f"  平均每次对话轮数:{assumption.avg_turns_per_conversation}轮")
+    lines.append(f"  平均每轮输入Token:{assumption.avg_input_tokens_per_turn}")
+    lines.append(f"  平均每轮输出Token:{assumption.avg_output_tokens_per_turn}")
+    lines.append("  说明:以上数字均为项目启动前的估算假设,实际数据以上线后的真实调用统计为准。")
+
+    lines.append("\n【二、各候选模型月度成本预测】")
+    monthly_costs: list[tuple[ForecastModelOption, float]] = []
+    for model in candidate_models:
+        monthly_cost = compute_monthly_cost(model, assumption)
+        monthly_costs.append((model, monthly_cost))
+        lines.append(
+            f"  {model.display_name:<22}({model.vendor:<8})  "
+            f"预估月成本:{monthly_cost:>10.2f}元  "
+            f"预估年成本:{monthly_cost * 12:>12.2f}元"
+        )
+
+    cheapest_model, cheapest_cost = min(monthly_costs, key=lambda pair: pair[1])
+    most_expensive_model, most_expensive_cost = max(monthly_costs, key=lambda pair: pair[1])
+    lines.append(
+        f"\n  当前候选中,最经济的选项是「{cheapest_model.display_name}」"
+        f"(约{cheapest_cost:.2f}元/月),"
+        f"最昂贵的选项是「{most_expensive_model.display_name}」"
+        f"(约{most_expensive_cost:.2f}元/月),"
+        f"价格差距约{(most_expensive_cost / cheapest_cost if cheapest_cost else 0):.1f}倍。"
+    )
+
+    lines.append("\n【三、业务增长情景模拟(以最经济的候选模型为例)】")
+    for label, monthly_cost in build_growth_scenarios(cheapest_model, assumption):
+        lines.append(f"  {label:<10}预估月成本:{monthly_cost:>10.2f}元")
+
+    lines.append("\n【四、结论与建议】")
+    lines.append(
+        "  1. 建议优先选择价格与能力匹配业务场景的模型,而非盲目追求"
+        "参数规模或者品牌知名度。"
+    )
+    lines.append(
+        "  2. 建议在项目上线后,接入实时的Token使用监控工具"
+        "(参见token_usage_monitor.py),持续校准本报表中的估算假设,"
+        "避免长期依赖启动前的静态预测。"
+    )
+    lines.append(
+        "  3. 如果业务量存在快速增长的可能性,建议提前评估批处理接口、"
+        "私有化部署等长期更具成本优势的方案,而不是等成本压力出现"
+        "之后才被动应对。"
+    )
+    lines.append("=" * 72)
+
+    return "\n".join(lines)
+
+
+def main() -> None:
+    assumption = UsageAssumption(
+        daily_conversations=800,
+        avg_input_tokens_per_turn=350,
+        avg_output_tokens_per_turn=450,
+        avg_turns_per_conversation=4,
+    )
+    report_text = render_report(
+        project_name="某制造业客户知识库问答项目(示例)",
+        assumption=assumption,
+        candidate_models=FORECAST_CANDIDATES,
+    )
+    print(report_text)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+陈铭把这份脚本生成的报表原样贴进了群里,林悦看完回复了一句:"这个格式我直接能用,以后每次给新客户做方案,让这个脚本先跑一遍垫个底,我再往上加一点业务侧的措辞就能用了,比我自己从头拼数字省事太多。"老王补充了一句更偏工程视角的评价:"这份报表的价值,不只在于'省事',更在于'假设透明'——报表第一部分明明白白写清楚了所有的假设前提,以后如果客户质疑数字,你能立刻拿出'这是基于什么假设算出来的',而不是含糊地说'差不多是这个数'。透明的假设,是专业度的一部分。"
+
+### 实战十:单元测试 —— 用pytest验证成本估算工具的正确性
+
+老王在陈铭提交前最后检查了一遍,补了一句:"你写了这么多计算逻辑,有没有想过,这些函数本身对不对,谁来验证?靠肉眼看输出结果是否'看起来合理',迟早会漏掉边界情况的bug。今天顺手把关键的计算函数补一份单元测试,这是Day18会系统讲的内容,你今天先practice一下手感。"
+
+```python
+"""
+成本估算工具单元测试
+======================
+
+使用pytest对本课件里几个核心计算函数做单元测试,覆盖:
+1. approximate_token_count的基本正确性与边界情况;
+2. ConversationCostTracker的历史累积逻辑是否正确;
+3. compute_monthly_cost、build_growth_scenarios的数值计算正确性;
+4. BudgetAlert三档预警逻辑的边界值测试。
+
+运行方式:在安装了pytest的环境下,执行 `pytest test_day15_cost_tools.py -v`
+如果本地没有安装pytest,文件末尾也保留了一个不依赖pytest、
+直接用assert编写的最小化自测函数,可以直接用python运行验证。
+"""
+
+from __future__ import annotations
+
+import re
+
+
+# ------------------------------------------------------------------
+# 第一部分:重新实现(简化版)待测函数,保持测试文件自包含、可独立运行
+# 真实项目里,这些函数应该从对应的业务模块里import,这里为了让本文件
+# 不依赖其他课件文件也能独立跑通,选择内联一份简化实现。
+# ------------------------------------------------------------------
+
+_CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+_WORD_PATTERN = re.compile(r"[A-Za-z0-9]+|[^\sA-Za-z0-9\u4e00-\u9fff]|[\u4e00-\u9fff]")
+
+
+def approximate_token_count(text: str) -> int:
+    count = 0
+    for chunk in _WORD_PATTERN.findall(text):
+        if _CJK_PATTERN.match(chunk):
+            count += 1
+        elif chunk.isalnum():
+            count += max(1, round(len(chunk) / 4))
+        else:
+            count += 1
+    return count
+
+
+def compute_monthly_cost(
+    daily_conversations: int,
+    avg_turns: int,
+    avg_input_tokens: int,
+    avg_output_tokens: int,
+    input_price_per_1m: float,
+    output_price_per_1m: float,
+) -> float:
+    daily_input = daily_conversations * avg_turns * avg_input_tokens
+    daily_output = daily_conversations * avg_turns * avg_output_tokens
+    monthly_input = daily_input * 30
+    monthly_output = daily_output * 30
+    return (
+        monthly_input / 1_000_000 * input_price_per_1m
+        + monthly_output / 1_000_000 * output_price_per_1m
+    )
+
+
+def budget_alert_level(cost: float, budget_ceiling: float) -> str:
+    """
+    返回预警级别:'超支'/'临近上限'/'正常'。
+    这是实战四BudgetAlert逻辑的简化版本,专门抽出来方便测试三档边界值。
+    """
+    if budget_ceiling <= 0:
+        return "超支"
+    ratio = cost / budget_ceiling
+    if ratio > 1.0:
+        return "超支"
+    if ratio >= 0.8:
+        return "临近上限"
+    return "正常"
+
+
+# ------------------------------------------------------------------
+# 第二部分:pytest测试用例
+# ------------------------------------------------------------------
+
+class TestApproximateTokenCount:
+    """针对近似token计数函数的测试。"""
+
+    def test_empty_string_returns_zero(self):
+        assert approximate_token_count("") == 0
+
+    def test_pure_chinese_text(self):
+        # "苍穹科技"共4个汉字,每个汉字近似记为1个token
+        assert approximate_token_count("苍穹科技") == 4
+
+    def test_pure_english_word(self):
+        # "DeepSeek"共8个字符,按每4字符切一次的近似规则,应该是2个token
+        assert approximate_token_count("DeepSeek") == 2
+
+    def test_mixed_chinese_and_english(self):
+        text = "使用DeepSeek模型"
+        result = approximate_token_count(text)
+        # 4个汉字("使用"+"模型") + "DeepSeek"按近似规则算出的token数,结果应该大于4
+        assert result > 4
+
+    def test_whitespace_only_string(self):
+        # 纯空格字符串会被_WORD_PATTERN过滤掉(因为模式里排除了\s),
+        # 因此近似估算结果应为0,这个边界行为要写进测试里明确记录下来,
+        # 避免以后有人改动正则表达式时,不小心破坏了这个既有行为。
+        assert approximate_token_count("     ") == 0
+
+    def test_long_repeated_text_scales_linearly(self):
+        base = approximate_token_count("苍穹")
+        repeated = approximate_token_count("苍穹" * 100)
+        assert repeated == base * 100
+
+
+class TestMonthlyCostComputation:
+    """针对月度成本计算函数的测试。"""
+
+    def test_zero_conversations_means_zero_cost(self):
+        cost = compute_monthly_cost(
+            daily_conversations=0,
+            avg_turns=3,
+            avg_input_tokens=300,
+            avg_output_tokens=300,
+            input_price_per_1m=1.0,
+            output_price_per_1m=2.0,
+        )
+        assert cost == 0.0
+
+    def test_basic_cost_calculation(self):
+        cost = compute_monthly_cost(
+            daily_conversations=100,
+            avg_turns=1,
+            avg_input_tokens=1_000_000,   # 特意用整百万,方便手算验证
+            avg_output_tokens=0,
+            input_price_per_1m=1.0,
+            output_price_per_1m=2.0,
+        )
+        # 100次对话 * 1轮 * 100万token * 30天 / 100万 * 1元 = 3000元
+        assert cost == 3000.0
+
+    def test_doubling_price_doubles_cost(self):
+        base_cost = compute_monthly_cost(500, 3, 300, 400, 1.0, 2.0)
+        doubled_price_cost = compute_monthly_cost(500, 3, 300, 400, 2.0, 4.0)
+        assert doubled_price_cost == base_cost * 2
+
+    def test_negative_conversations_raises_or_handled_gracefully(self):
+        # 这不是一个"应该发生"的正常输入,但工程上应该明确它的行为,
+        # 这里验证当前实现对负数输入的处理方式(得到负成本,而不是崩溃),
+        # 提醒后续如果要在生产环境使用,应该在函数入口补上参数校验。
+        cost = compute_monthly_cost(-10, 3, 300, 400, 1.0, 2.0)
+        assert cost < 0, "当前实现对负数输入不会抛异常,只会得到负成本,这是已知的待改进点"
+
+
+class TestBudgetAlertLevel:
+    """针对预算预警三档判断逻辑的边界值测试,边界值测试是单元测试里最容易漏、也最容易出bug的部分。"""
+
+    def test_normal_when_far_below_budget(self):
+        assert budget_alert_level(cost=10.0, budget_ceiling=100.0) == "正常"
+
+    def test_near_upper_boundary_of_normal(self):
+        # 恰好79.9%,应该还算"正常"
+        assert budget_alert_level(cost=79.9, budget_ceiling=100.0) == "正常"
+
+    def test_exactly_at_80_percent_is_near_ceiling(self):
+        # 恰好80%,应该进入"临近上限"档,这是一个典型的边界值测试点
+        assert budget_alert_level(cost=80.0, budget_ceiling=100.0) == "临近上限"
+
+    def test_exactly_at_100_percent_is_still_normal_range_not_over(self):
+        # 恰好100%,按当前实现的判断条件(ratio > 1.0才算超支),
+        # 应该仍属于"临近上限"而不是"超支",这个边界行为容易被误判,
+        # 必须用测试明确锁定,避免未来改代码时不小心改变了这个语义。
+        assert budget_alert_level(cost=100.0, budget_ceiling=100.0) == "临近上限"
+
+    def test_just_over_100_percent_is_over_budget(self):
+        assert budget_alert_level(cost=100.01, budget_ceiling=100.0) == "超支"
+
+    def test_zero_budget_ceiling_is_always_over(self):
+        # 预算上限为0是一种异常配置(可能是配置疏漏),
+        # 无论实际成本是多少,都应该判定为超支,避免"零预算却显示正常"这种误导性结果
+        assert budget_alert_level(cost=0.0, budget_ceiling=0.0) == "超支"
+        assert budget_alert_level(cost=5.0, budget_ceiling=0.0) == "超支"
+
+
+# ------------------------------------------------------------------
+# 第三部分:不依赖pytest的最小化自测(方便没装pytest的环境直接验证)
+# ------------------------------------------------------------------
+
+def run_minimal_self_check() -> None:
+    """
+    用最朴素的assert语句,把上面几个核心测试点重新跑一遍,
+    保证即便当前环境没有安装pytest,也能通过直接运行本文件来验证
+    这几个核心函数的正确性,不会因为"没装测试框架"就完全没法自测。
+    """
+    assert approximate_token_count("") == 0
+    assert approximate_token_count("苍穹科技") == 4
+    assert compute_monthly_cost(0, 3, 300, 300, 1.0, 2.0) == 0.0
+    assert budget_alert_level(80.0, 100.0) == "临近上限"
+    assert budget_alert_level(100.01, 100.0) == "超支"
+    print("最小化自测全部通过(不依赖pytest的兜底验证)。")
+
+
+# ------------------------------------------------------------------
+# 第四部分:参数化测试演示(pytest.mark.parametrize),减少重复代码
+# ------------------------------------------------------------------
+
+try:
+    import pytest
+
+    @pytest.mark.parametrize(
+        "cost,ceiling,expected",
+        [
+            (0.0, 100.0, "正常"),
+            (50.0, 100.0, "正常"),
+            (79.99, 100.0, "正常"),
+            (80.0, 100.0, "临近上限"),
+            (95.0, 100.0, "临近上限"),
+            (100.0, 100.0, "临近上限"),
+            (100.01, 100.0, "超支"),
+            (200.0, 100.0, "超支"),
+            (0.0, 0.0, "超支"),
+        ],
+    )
+    def test_budget_alert_level_parametrized(cost, ceiling, expected):
+        """
+        用参数化测试,把预算预警的九种边界组合放进同一个测试函数里,
+        避免像前面TestBudgetAlertLevel那样,每一个边界值都要单独写
+        一个测试方法——当边界值场景较多时,参数化测试能显著减少
+        重复代码,同时保持每一组输入输出的对应关系一目了然。
+        """
+        assert budget_alert_level(cost, ceiling) == expected
+
+    @pytest.mark.parametrize(
+        "text,expected_min_tokens",
+        [
+            ("", 0),
+            ("a", 1),
+            ("苍穹", 2),
+            ("苍穹科技有限公司", 8),
+            ("DeepSeek-V3", 2),
+        ],
+    )
+    def test_approximate_token_count_lower_bound(text, expected_min_tokens):
+        """
+        对近似估算函数做一次"下界"检查:不追求和真实分词器完全一致,
+        只验证结果不会低于一个合理的下界,这种"宽松但有意义"的断言方式,
+        在为近似算法写测试时很常用,比追求逐字节完全匹配更现实。
+        """
+        assert approximate_token_count(text) >= expected_min_tokens
+
+    _PYTEST_PARAMETRIZE_AVAILABLE = True
+except ImportError:  # pragma: no cover - 当前环境未安装pytest时,跳过参数化测试定义
+    _PYTEST_PARAMETRIZE_AVAILABLE = False
+
+
+if __name__ == "__main__":
+    run_minimal_self_check()
+    print(f"pytest参数化测试是否已定义(取决于pytest是否安装):{_PYTEST_PARAMETRIZE_AVAILABLE}")
+```
+
+陈铭本地装了pytest之后跑了一遍,`pytest test_day15_cost_tools.py -v`的输出里,16个测试用例全部显示`PASSED`,唯独`test_negative_conversations_raises_or_handled_gracefully`这个用例名字看起来有点长,他问老王要不要精简。老王说:"测试用例的名字,宁可长一点、说清楚'在测什么场景、期望什么行为',也不要为了短而含糊。三个月后你自己回头看这份测试文件,靠的就是这些名字,不是靠你现在的记忆力。"
+
 ---
 
 ## 今日复盘
