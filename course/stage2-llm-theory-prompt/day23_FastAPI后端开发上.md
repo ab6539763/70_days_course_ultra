@@ -423,17 +423,16 @@ sequenceDiagram
     deactivate V
     alt 任一字段校验失败
         P-->>F: 汇总所有失败字段,抛出ValidationError
-        deactivate P
         F->>H: 转换为RequestValidationError并抛出
         H->>H: 遍历errors(),按字段分组、翻译成中文提示
         H-->>C: 返回422 + {code, message, errors:[{field, reason}]}
     else 全部字段校验通过
         P-->>F: 返回一个类型安全的ChatRequest实例
-        deactivate P
         F->>B: 把ChatRequest实例作为参数注入路由函数
         B->>B: 执行业务逻辑(调用模型客户端等)
         B-->>C: 最终返回200 + ChatResponse
     end
+    deactivate P
 ```
 
 这张图想表达的核心观念是:Pydantic校验不是"一次性通过或失败"的单一判断,而是"逐字段独立校验、失败原因逐字段收集"的过程——哪怕请求体里同时有三个字段都不合法(比如`message`是空字符串,`temperature`是3.5超出范围,`history`有45条超过40条上限),Pydantic也不会校验完第一个字段就提前退出,而是会把三个字段的错误都收集起来,一次性通过422响应全部告诉客户端。这一点对前端开发者(明天要联调的周晓)非常友好——她不需要"改一个字段、提交一次、看一个错误"这样反复试错,而是能一次性看到所有问题,批量修正。

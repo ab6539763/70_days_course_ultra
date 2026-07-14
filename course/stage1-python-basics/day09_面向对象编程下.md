@@ -182,29 +182,29 @@ classDiagram
 
 ```mermaid
 flowchart TD
-    Start(["调用方代码: reply = model(\"你好\")"]) --> CallMagic["Python自动识别model(...)这种写法\n转而调用 model.__call__(\"你好\")"]
-    CallMagic --> WhereCall{"__call__这个方法,\n实际定义在哪一层?"}
-    WhereCall -- "OpenAIModel/QwenModel都没有重写__call__\n只有BaseModel定义了它" --> UseBaseCall["直接执行 BaseModel.__call__()\n(子类自动继承,不需要各自重复实现)"]
+    Start(["调用方代码: reply = model(「你好」)"]) --> CallMagic["Python自动识别model(...)这种写法<br/>转而调用 model.__call__(「你好」)"]
+    CallMagic --> WhereCall{"__call__这个方法,<br/>实际定义在哪一层?"}
+    WhereCall -- "OpenAIModel/QwenModel都没有重写__call__<br/>只有BaseModel定义了它" --> UseBaseCall["直接执行 BaseModel.__call__()<br/>(子类自动继承,不需要各自重复实现)"]
 
-    UseBaseCall --> Normalize["_normalize_input():\n把字符串或messages列表统一成标准格式"]
+    UseBaseCall --> Normalize["_normalize_input():<br/>把字符串或messages列表统一成标准格式"]
     Normalize --> InvokeChat["在__call__内部调用 self.chat(messages)"]
 
-    InvokeChat --> LookupChat{"从 type(self) 开始,\n沿着MRO(方法解析顺序)查找chat()"}
+    InvokeChat --> LookupChat{"从 type(self) 开始,<br/>沿着MRO(方法解析顺序)查找chat()"}
 
-    LookupChat -- "self实际类型是OpenAIModel" --> CheckOpenAI{"OpenAIModel类自己\n有没有定义chat()?"}
-    CheckOpenAI -- "有,已重写" --> RunOpenAI["执行OpenAIModel.chat()\n组装OpenAI兼容请求体\n→_mock_send_request()\n→_parse_response()"]
+    LookupChat -- "self实际类型是OpenAIModel" --> CheckOpenAI{"OpenAIModel类自己<br/>有没有定义chat()?"}
+    CheckOpenAI -- "有,已重写" --> RunOpenAI["执行OpenAIModel.chat()<br/>组装OpenAI兼容请求体<br/>→_mock_send_request()<br/>→_parse_response()"]
     RunOpenAI --> ReturnOpenAI["返回带DeepSeek/OpenAI风格标记的回复文本"]
 
-    LookupChat -- "self实际类型是QwenModel" --> CheckQwen{"QwenModel类自己\n有没有定义chat()?"}
-    CheckQwen -- "有,已重写" --> RunQwen["执行QwenModel.chat()\n组装DashScope兼容请求体\n(含enable_search等千问专属参数)\n→_mock_send_request()\n→_parse_response()"]
+    LookupChat -- "self实际类型是QwenModel" --> CheckQwen{"QwenModel类自己<br/>有没有定义chat()?"}
+    CheckQwen -- "有,已重写" --> RunQwen["执行QwenModel.chat()<br/>组装DashScope兼容请求体<br/>(含enable_search等千问专属参数)<br/>→_mock_send_request()<br/>→_parse_response()"]
     RunQwen --> ReturnQwen["返回带通义千问风格标记的回复文本"]
 
-    LookupChat -- "假设self是BaseModel自己的实例\n(正常业务流程不该出现这种情况)" --> CheckBase{"沿MRO往上找到BaseModel自己的chat()"}
-    CheckBase -- "找到,但内部只有raise语句" --> RunBase["抛出NotImplementedError\n提示必须由具体子类实现"]
+    LookupChat -- "假设self是BaseModel自己的实例<br/>(正常业务流程不该出现这种情况)" --> CheckBase{"沿MRO往上找到BaseModel自己的chat()"}
+    CheckBase -- "找到,但内部只有raise语句" --> RunBase["抛出NotImplementedError<br/>提示必须由具体子类实现"]
 
-    ReturnOpenAI --> End(["调用方拿到最终的reply字符串,\n调用方代码本身完全不知道\n背后走的是哪一条分支"])
+    ReturnOpenAI --> End(["调用方拿到最终的reply字符串,<br/>调用方代码本身完全不知道<br/>背后走的是哪一条分支"])
     ReturnQwen --> End
-    RunBase --> ErrorEnd(["程序在这里报错终止,\n提醒开发者:BaseModel不该被直接实例化使用"])
+    RunBase --> ErrorEnd(["程序在这里报错终止,<br/>提醒开发者:BaseModel不该被直接实例化使用"])
 ```
 
 这张图解释的,正是老王上午反复强调的"多态"这个词具体是怎么发生的。他讲解时特别提了一个容易被忽略的细节:"注意`__call__`这个方法本身,`OpenAIModel`和`QwenModel`都没有重写,它俩用的是从`BaseModel`原样继承下来的那一份——多态不需要每个子类都重写每一个方法,只需要重写那些'确实因厂商而不同'的方法(这里是`chat()`),剩下相同的部分,继承机制会自动帮你复用。"
@@ -217,28 +217,28 @@ flowchart TD
 
 ```mermaid
 graph TD
-    subgraph SCENE1["场景一:直接展示给"人"看"]
+    subgraph SCENE1["场景一:直接展示给「人」看"]
         A1["print(model)"] --> A2["Python自动调用 __str__()"]
-        A3["f\"当前使用的模型是:{model}\""] --> A2
+        A3["f字符串: 当前使用的模型是:{model}"] --> A2
     end
 
-    subgraph SCENE2["场景二:开发者调试/查看对象的"真实身份""]
+    subgraph SCENE2["场景二:开发者调试/查看对象的「真实身份」"]
         B1["交互式环境里直接输入 model 回车"] --> B2["Python自动调用 __repr__()"]
-        B3["print([model1, model2])\n(容器打印内部元素默认用repr)"] --> B2
+        B3["print([model1, model2])<br/>(容器打印内部元素默认用repr)"] --> B2
         B4["显式调用 repr(model)"] --> B2
     end
 
-    subgraph SCENE3["场景三:把对象当函数一样"使用""]
-        C1["reply = model(\"你好\")"] --> C2["Python自动调用 __call__()"]
+    subgraph SCENE3["场景三:把对象当函数一样「使用」"]
+        C1["reply = model(「你好」)"] --> C2["Python自动调用 __call__()"]
     end
 
     subgraph SCENE4["场景四:读写被@property装饰的属性"]
-        D1["model.temperature = 1.8"] --> D2["Python自动调用 temperature的setter\n先校验,校验通过才真正赋值"]
+        D1["model.temperature = 1.8"] --> D2["Python自动调用 temperature的setter<br/>先校验,校验通过才真正赋值"]
         D3["print(model.temperature)"] --> D4["Python自动调用 temperature的getter"]
     end
 
-    A2 -. "如果没有重写,继承自object的默认__str__" .-> A5["效果和默认__repr__基本一致,\n看不出任何有意义的信息"]
-    B2 -. "如果没有重写,继承自object的默认__repr__" .-> B5["形如:<__main__.OpenAIModel object at 0x7f8a1c0a3d90>\n只能看出类名和内存地址,毫无业务价值"]
+    A2 -. "如果没有重写,继承自object的默认__str__" .-> A5["效果和默认__repr__基本一致,<br/>看不出任何有意义的信息"]
+    B2 -. "如果没有重写,继承自object的默认__repr__" .-> B5["形如:&lt;__main__.OpenAIModel object at 0x7f8a1c0a3d90&gt;<br/>只能看出类名和内存地址,毫无业务价值"]
 ```
 
 老王讲这张示意图时,特意提到这四个场景不是凭空编的,而是他从业十年里真实见过、真实踩过坑的四类场景:"场景一和场景二,决定了你未来在日志里、在调试输出里,能不能一眼看懂当前发生了什么;场景三,是今天最有'魔法感'的一个知识点,决定了你的对象能不能被当成一个更自然的接口来使用;场景四,是`@property`存在的全部意义——它让'给属性赋值'这个看起来最普通的动作,背地里悄悄多做了一层校验,调用方完全感觉不到多写了什么代码,但安全性直接上了一个台阶。"
