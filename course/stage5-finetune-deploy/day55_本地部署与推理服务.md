@@ -2355,6 +2355,1152 @@ models:
 
 陈铭写完这份代码后,先在本地跑了一遍测试,全部通过,然后拿着代码去找孙昊和老王review。孙昊看完的第一反应是问了一句:"降级链那里,如果`fengyu-risk-7b`降级到`qwen-max`,风控合规问答场景下,通义千问没有经过微调,回答质量会不会跟专业要求差一大截?这个降级策略在业务上真的合理吗?"这个问题把陈铭问住了,他说确实没想那么细,只是从"保证系统不宕机"的角度设计的。老王介入说这是一个很好的讨论,他给出了自己的看法:"技术上这套降级机制是对的,系统可用性优先于单次回答的完美度,尤其是风控场景,'系统没有响应'比'响应质量打了折扣但至少给了提示'更糟糕。但从业务角度看,降级发生的时候,一定要在最终返回给用户的结果里带上明确的提示,比如'当前回答由通用模型生成,具体条款请以内部合规文档为准',这一点陈铭代码里`degraded_reason`字段已经埋了钩子,后续在Agent层拿到这个标记之后,要在最终话术里加上免责说明,这是产品设计层面要补的一环,记下来放进待办。"陈铭把这一点记进了自己的笔记本,并当场在待办清单里加了一条:"跟产品和Agent团队同步degraded标记的下游处理方案",提醒自己这不是今天写完代码就算结束的事情,还需要跨团队推动落地,否则这个字段只是埋在数据结构里的一个"死信息",不会真正发挥作用。
 
+晚上七点多,孙昊在收尾前又翻了一遍今天写的东西,突然想起一件事:"config/vllm_service_config.yaml里那个`health_check`小节和`sla`小节,写是写进去了,但今天从头到尾,好像没有一行代码真正去读过它们——巡检靠的是我那份手写的bash脚本,SLA达标与否,靠的是我们下午盯着压测报告表格里的数字肉眼判断。这两块配置现在其实是'摆设',这个问题不能留到明天,不然Day56接监控系统的时候,会发现这些配置压根就没有被真正的代码消费过,那还不如干脆别写。"老王认可这个判断,补充说:"这是一种很典型的'配置腐化'——配置文件写得挺规范,但落地执行的代码一直没跟上,时间一长,没人知道这些配置到底是不是还准。今天必须把这个口子补上,哪怕只是最小可用的版本。"于是三人又留下来,补齐了健康巡检的Python生产实现、Prometheus指标导出、压测报告SLA自动校验与历史回归检测,以及把这几块串起来的运维daemon脚本,并配上了单元测试。
+
+### 7.5 健康巡检服务化:HealthInspector与SLA达标监控(Python实现)
+
+孙昊写的`check_vllm_health.sh`是运维手动巡检用的临时脚本,他当时就说过"这个脚本会在Day56接入监控系统之前,先作为运维手动巡检的工具使用"。今天晚上的这段代码,是它的生产级Python实现,补上了bash脚本做不到的几件事:结构化的连续失败计数与故障恢复判定、基于滚动时间窗口的可用性统计并与SLA目标对比、结构化的JSON报告输出,以及既能一次性巡检、也能长期运行成daemon的双模式支持。
+
+```python
+"""
+文件名: services/llm/health_inspector.py
+用途: vLLM/Ollama等本地推理服务的健康巡检与SLA达标监控
+说明:
+    孙昊在7.2节写的check_vllm_health.sh是运维手动巡检用的临时脚本,
+    孙昊当时明确说过"这个脚本会在Day56接入监控系统之前,先作为运维
+    手动巡检的工具使用"。本模块是它的生产级Python实现,补上bash脚本
+    做不到的几件事:
+        1. 结构化的连续失败计数与故障恢复判定(failure_threshold),
+           而不是每次巡检各自独立、互不关联。
+        2. 基于滚动时间窗口的可用性(availability)统计,与
+           config/vllm_service_config.yaml里sla.min_availability
+           对比,给出"SLA是否达标"的明确结论,而不只是"这次巡检成功/失败"。
+        3. 结构化的JSON报告输出,方便后续接入监控系统或人工复盘。
+        4. 可以作为长期运行的巡检daemon,也可以作为一次性巡检脚本
+           (供cron定时调用),两种模式共用同一套核心逻辑。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Deque, Dict, Optional, Tuple
+
+import yaml
+
+logger = logging.getLogger("qiongxiong.health_inspector")
+
+
+@dataclass
+class HealthCheckConfig:
+    """从config/vllm_service_config.yaml的health_check小节解析出的巡检配置。"""
+
+    path: str = "/health"
+    interval_seconds: float = 15.0
+    timeout_seconds: float = 5.0
+    failure_threshold: int = 3
+
+
+@dataclass
+class SLAConfig:
+    """从config/vllm_service_config.yaml的sla小节解析出的服务等级目标。"""
+
+    target_qps_at_50_concurrency: float = 8.0
+    target_token_throughput: float = 800.0
+    p95_ttft_seconds: float = 1.5
+    p95_total_latency_seconds: float = 6.0
+    min_availability: float = 0.995
+
+
+def load_health_and_sla_config(config_path: str) -> Tuple[HealthCheckConfig, SLAConfig]:
+    """
+    从vLLM服务集中化配置文件中解析出健康检查与SLA目标两部分配置。
+
+    这两部分配置在7.2节部署那份`config/vllm_service_config.yaml`里
+    已经写好了(`health_check`与`sla`两个顶层小节),但直到今晚之前,
+    一直只是"写在配置里但没有代码真正读取和执行"的状态——这是
+    企业级项目里很容易发生的一种"配置腐化"现象:配置写得挺规范,
+    但落地执行的代码一直没跟上,本节的代码就是要把这个缺口补上。
+    """
+    with open(config_path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+
+    health_raw = raw.get("health_check", {})
+    sla_raw = raw.get("sla", {})
+
+    health_config = HealthCheckConfig(
+        path=health_raw.get("path", "/health"),
+        interval_seconds=float(health_raw.get("interval_seconds", 15.0)),
+        timeout_seconds=float(health_raw.get("timeout_seconds", 5.0)),
+        failure_threshold=int(health_raw.get("failure_threshold", 3)),
+    )
+    sla_config = SLAConfig(
+        target_qps_at_50_concurrency=float(sla_raw.get("target_qps_at_50_concurrency", 8.0)),
+        target_token_throughput=float(sla_raw.get("target_token_throughput", 800.0)),
+        p95_ttft_seconds=float(sla_raw.get("p95_ttft_seconds", 1.5)),
+        p95_total_latency_seconds=float(sla_raw.get("p95_total_latency_seconds", 6.0)),
+        min_availability=float(sla_raw.get("min_availability", 0.995)),
+    )
+    return health_config, sla_config
+
+
+@dataclass
+class _ModelHealthState:
+    """单个模型在巡检过程中持续累积的健康状态。"""
+
+    consecutive_failures: int = 0
+    is_marked_unhealthy: bool = False
+    check_history: Deque[Tuple[float, bool]] = field(default_factory=lambda: deque(maxlen=8640))
+    # maxlen=8640: 按15秒一次巡检、覆盖最近24小时估算,8640条留出了充足冗余
+    # (24小时按15秒一次理论上是5760条,多留一些空间应对巡检间隔临时调小的场景)。
+
+
+class HealthInspector:
+    """
+    对ModelRouter管理的全部模型实例,做周期性健康巡检与SLA可用性统计。
+
+    典型用法(一次性巡检,适合cron调用):
+        inspector = HealthInspector(router, config_path="config/vllm_service_config.yaml")
+        report = inspector.run_once()
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+
+    典型用法(长期运行daemon):
+        inspector = HealthInspector(router, config_path="...")
+        inspector.run_forever()  # 阻塞运行,通常放在独立进程/线程里
+    """
+
+    def __init__(self, router, config_path: str,
+                 alert_callback: Optional[Callable[[str, str], None]] = None,
+                 report_output_path: Optional[str] = None,
+                 availability_window_seconds: float = 24 * 3600.0):
+        self._router = router
+        self._health_config, self._sla_config = load_health_and_sla_config(config_path)
+        self._alert_callback = alert_callback
+        self._report_output_path = report_output_path
+        self._availability_window_seconds = availability_window_seconds
+        self._states: Dict[str, _ModelHealthState] = {}
+        self._stop_event = threading.Event()
+
+    def _get_state(self, model_key: str) -> _ModelHealthState:
+        if model_key not in self._states:
+            self._states[model_key] = _ModelHealthState()
+        return self._states[model_key]
+
+    def _prune_old_records(self, state: _ModelHealthState) -> None:
+        """清理超出滚动统计窗口之外的历史巡检记录。"""
+        cutoff = time.time() - self._availability_window_seconds
+        while state.check_history and state.check_history[0][0] < cutoff:
+            state.check_history.popleft()
+
+    def _compute_availability(self, state: _ModelHealthState) -> Optional[float]:
+        """计算滚动窗口内的可用性比例,窗口内没有任何记录时返回None。"""
+        self._prune_old_records(state)
+        if not state.check_history:
+            return None
+        healthy_count = sum(1 for _, ok in state.check_history if ok)
+        return healthy_count / len(state.check_history)
+
+    def run_once(self) -> dict:
+        """
+        执行一轮全量巡检(对router管理的每个模型各做一次health_check),
+        更新内部状态,并返回结构化的巡检报告。
+        """
+        raw_results = self._router.health_check_all()
+        model_reports = {}
+
+        for model_key, is_healthy in raw_results.items():
+            state = self._get_state(model_key)
+            state.check_history.append((time.time(), is_healthy))
+
+            if is_healthy:
+                if state.consecutive_failures > 0:
+                    logger.info(
+                        "模型(%s)健康检查恢复正常,此前连续失败%d次",
+                        model_key, state.consecutive_failures,
+                    )
+                state.consecutive_failures = 0
+                if state.is_marked_unhealthy:
+                    state.is_marked_unhealthy = False
+                    self._fire_alert(
+                        "模型健康状态恢复",
+                        f"模型({model_key})已恢复健康,不再处于故障标记状态。",
+                    )
+            else:
+                state.consecutive_failures += 1
+                logger.warning(
+                    "模型(%s)健康检查失败,连续失败次数=%d(阈值=%d)",
+                    model_key, state.consecutive_failures, self._health_config.failure_threshold,
+                )
+                if (state.consecutive_failures >= self._health_config.failure_threshold
+                        and not state.is_marked_unhealthy):
+                    state.is_marked_unhealthy = True
+                    self._fire_alert(
+                        "模型健康检查连续失败",
+                        f"模型({model_key})连续{state.consecutive_failures}次健康检查失败,"
+                        f"已达到阈值({self._health_config.failure_threshold}),标记为不健康状态。",
+                    )
+
+            availability = self._compute_availability(state)
+            sla_met = availability is None or availability >= self._sla_config.min_availability
+            if availability is not None and not sla_met:
+                self._fire_alert(
+                    "SLA可用性未达标",
+                    f"模型({model_key})最近{self._availability_window_seconds / 3600:.0f}小时"
+                    f"可用性为{availability:.4%},低于SLA目标{self._sla_config.min_availability:.4%}。",
+                )
+
+            model_reports[model_key] = {
+                "is_healthy_now": is_healthy,
+                "consecutive_failures": state.consecutive_failures,
+                "is_marked_unhealthy": state.is_marked_unhealthy,
+                "rolling_availability": round(availability, 6) if availability is not None else None,
+                "sla_availability_target": self._sla_config.min_availability,
+                "sla_met": sla_met,
+            }
+
+        report = {
+            "inspected_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "models": model_reports,
+        }
+        self._maybe_write_report(report)
+        return report
+
+    def _fire_alert(self, title: str, detail: str) -> None:
+        logger.error("健康巡检告警: %s —— %s", title, detail)
+        if self._alert_callback is not None:
+            try:
+                self._alert_callback(title, detail)
+            except Exception:  # noqa: BLE001
+                logger.exception("健康巡检告警回调执行失败,不影响巡检主流程")
+
+    def _maybe_write_report(self, report: dict) -> None:
+        if not self._report_output_path:
+            return
+        try:
+            Path(self._report_output_path).write_text(
+                json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8",
+            )
+        except OSError:
+            logger.exception("写入健康巡检报告文件失败: path=%s", self._report_output_path)
+
+    def run_forever(self) -> None:
+        """
+        以health_check.interval_seconds为周期持续巡检,直到调用stop()。
+        通常应当放在独立线程或独立进程里运行,不要阻塞主业务流程。
+        """
+        logger.info(
+            "健康巡检daemon已启动,巡检周期=%.1f秒,连续失败阈值=%d",
+            self._health_config.interval_seconds, self._health_config.failure_threshold,
+        )
+        while not self._stop_event.is_set():
+            try:
+                self.run_once()
+            except Exception:  # noqa: BLE001
+                logger.exception("健康巡检执行过程中发生未预期的异常,本轮跳过")
+            self._stop_event.wait(self._health_config.interval_seconds)
+
+    def stop(self) -> None:
+        """通知run_forever的巡检循环停止,通常在服务优雅关闭时调用。"""
+        self._stop_event.set()
+
+    def get_status_snapshot(self) -> dict:
+        """返回当前全部模型的健康状态快照,不触发新的健康检查,仅读取已有状态。"""
+        snapshot = {}
+        for model_key, state in self._states.items():
+            availability = self._compute_availability(state)
+            snapshot[model_key] = {
+                "consecutive_failures": state.consecutive_failures,
+                "is_marked_unhealthy": state.is_marked_unhealthy,
+                "rolling_availability": round(availability, 6) if availability is not None else None,
+            }
+        return snapshot
+
+
+def _default_alert_callback(title: str, detail: str) -> None:
+    """默认告警回调:仅打印到标准输出,方便本地调试;生产环境应替换为
+    真实的告警通道(企业微信机器人/短信/电话告警等)。"""
+    print(f"[ALERT] {title}: {detail}")
+
+
+def main() -> None:
+    """
+    命令行入口,支持两种运行模式:
+        --once   : 执行一次巡检并打印JSON报告后退出(适合cron调用)
+        (默认)   : 以daemon模式持续巡检,直到收到Ctrl+C
+    """
+    import argparse
+
+    from services.llm.router import ModelRouter
+
+    parser = argparse.ArgumentParser(description="苍穹中台推理服务健康巡检工具")
+    parser.add_argument("--router-config", default="config/model_config.yaml")
+    parser.add_argument("--service-config", default="config/vllm_service_config.yaml")
+    parser.add_argument("--report-output", default="health_report.json")
+    parser.add_argument("--once", action="store_true", help="仅执行一次巡检后退出")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+
+    router = ModelRouter(args.router_config)
+    inspector = HealthInspector(
+        router, config_path=args.service_config,
+        alert_callback=_default_alert_callback,
+        report_output_path=args.report_output,
+    )
+
+    if args.once:
+        report = inspector.run_once()
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+
+    try:
+        inspector.run_forever()
+    except KeyboardInterrupt:
+        inspector.stop()
+        logger.info("健康巡检daemon已收到停止信号,正常退出")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+孙昊看完这份代码,特别肯定了`_ModelHealthState.check_history`那个`deque(maxlen=8640)`的设计,他说:"用maxlen限制历史记录的长度,而不是无限往一个list里塞数据,这是运维代码里最基本、但最容易被新手忽略的一条底线——任何'长期运行的daemon里持续累积的数据结构',都必须有明确的容量上限,不然今天看起来很小的一个内存占用,跑上几个月之后可能就变成一次OOM事故。"
+
+### 7.6 Prometheus指标导出:让路由层调用数据可被监控系统采集
+
+今天的重心是把推理服务本身跑起来、跑稳、跑快,监控系统的正式接入是Day56之后的工作,但孙昊要求"数据源要今天就想清楚、埋好点,不能等到明天要接监控系统了,才发现router层压根没有对外暴露任何可采集的指标"。这段代码就是提前埋好的这个数据源,把7.4节`ModelRouter.get_call_stats()`已经在维护的统计数据,转换成Prometheus能直接抓取的文本格式。
+
+```python
+"""
+文件名: services/llm/metrics_exporter.py
+用途: 将ModelRouter的调用统计与HealthInspector的健康状态,以Prometheus
+      文本格式对外暴露,供监控系统采集(为Day56接入正式监控告警体系
+      做好数据源准备)。
+说明:
+    今天(Day55)的重心是把推理服务本身跑起来、跑稳、跑快,监控系统
+    的正式接入是Day56之后的工作,但孙昊要求"数据源要今天就想清楚、
+    埋好点,不能等到明天要接监控系统了,才发现router层压根没有对外
+    暴露任何可采集的指标"。本模块就是提前埋好的这个数据源。
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Optional
+
+logger = logging.getLogger("qiongxiong.metrics_exporter")
+
+_METRIC_NAMESPACE = "qiongxiong_llm"
+
+
+def render_prometheus_text(router, health_inspector: Optional[object] = None) -> str:
+    """
+    生成符合Prometheus文本暴露格式(exposition format)的指标文本。
+
+    暴露的核心指标(字段名与7.4节ModelRouter.get_call_stats()的返回值
+    严格对应,避免出现"指标名字很好看但内容对不上router实际记录的数据"
+    这种两套口径互相脱节的问题):
+        qiongxiong_llm_calls_total{model_key="..."}                调用总次数
+        qiongxiong_llm_completion_tokens_total{model_key="..."}    累计输出token
+        qiongxiong_llm_call_latency_seconds_avg{model_key="..."}   平均调用延迟
+        qiongxiong_llm_degraded_rate{model_key="..."}              降级(走fallback)比例
+        qiongxiong_llm_rolling_availability{model_key="..."}       滚动可用性(需提供health_inspector)
+    """
+    lines: list[str] = []
+
+    model_keys = list(getattr(router, "_models", {}).keys())
+    all_stats = {model_key: router.get_call_stats(model_key) for model_key in model_keys}
+
+    lines.append(f"# HELP {_METRIC_NAMESPACE}_calls_total 模型调用总次数")
+    lines.append(f"# TYPE {_METRIC_NAMESPACE}_calls_total counter")
+    for model_key, stats in all_stats.items():
+        lines.append(
+            f'{_METRIC_NAMESPACE}_calls_total{{model_key="{model_key}"}} {stats.get("count", 0)}'
+        )
+
+    lines.append(f"# HELP {_METRIC_NAMESPACE}_completion_tokens_total 累计输出token数")
+    lines.append(f"# TYPE {_METRIC_NAMESPACE}_completion_tokens_total counter")
+    for model_key, stats in all_stats.items():
+        lines.append(
+            f'{_METRIC_NAMESPACE}_completion_tokens_total{{model_key="{model_key}"}} '
+            f'{stats.get("total_completion_tokens", 0)}'
+        )
+
+    lines.append(f"# HELP {_METRIC_NAMESPACE}_call_latency_seconds_avg 平均单次调用延迟(秒)")
+    lines.append(f"# TYPE {_METRIC_NAMESPACE}_call_latency_seconds_avg gauge")
+    for model_key, stats in all_stats.items():
+        lines.append(
+            f'{_METRIC_NAMESPACE}_call_latency_seconds_avg{{model_key="{model_key}"}} '
+            f'{stats.get("avg_latency_seconds", 0.0)}'
+        )
+
+    lines.append(f"# HELP {_METRIC_NAMESPACE}_degraded_rate 调用降级(走fallback模型)比例(0~1)")
+    lines.append(f"# TYPE {_METRIC_NAMESPACE}_degraded_rate gauge")
+    for model_key, stats in all_stats.items():
+        lines.append(
+            f'{_METRIC_NAMESPACE}_degraded_rate{{model_key="{model_key}"}} '
+            f'{stats.get("degraded_rate", 0.0)}'
+        )
+
+    if health_inspector is not None:
+        lines.append(f"# HELP {_METRIC_NAMESPACE}_rolling_availability 滚动窗口可用性(0~1)")
+        lines.append(f"# TYPE {_METRIC_NAMESPACE}_rolling_availability gauge")
+        snapshot = health_inspector.get_status_snapshot()
+        for model_key, status in snapshot.items():
+            availability = status.get("rolling_availability")
+            if availability is not None:
+                lines.append(
+                    f'{_METRIC_NAMESPACE}_rolling_availability{{model_key="{model_key}"}} {availability}'
+                )
+
+    return "\n".join(lines) + "\n"
+
+
+def _build_metrics_handler(router, health_inspector):
+    """构造一个绑定了router/health_inspector的HTTP请求处理类。"""
+
+    class MetricsHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - 遵循BaseHTTPRequestHandler的命名约定
+            if self.path != "/metrics":
+                self.send_response(404)
+                self.end_headers()
+                return
+            try:
+                body = render_prometheus_text(router, health_inspector).encode("utf-8")
+            except Exception:  # noqa: BLE001
+                logger.exception("生成Prometheus指标文本失败")
+                self.send_response(500)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args) -> None:  # noqa: A002
+            # 覆盖父类默认的访问日志行为,改为走统一的logger,
+            # 避免每次抓取指标都在stdout刷一行BaseHTTPRequestHandler自带的access log。
+            logger.debug("MetricsHandler: " + format, *args)
+
+    return MetricsHandler
+
+
+class MetricsServer:
+    """
+    以独立线程运行的最小化Prometheus指标HTTP服务器。
+
+    典型用法:
+        server = MetricsServer(router=router, health_inspector=inspector, port=9105)
+        server.start()
+        ...
+        server.stop()
+    """
+
+    def __init__(self, router, health_inspector: Optional[object] = None,
+                 host: str = "0.0.0.0", port: int = 9105):
+        handler_cls = _build_metrics_handler(router, health_inspector)
+        self._httpd = HTTPServer((host, port), handler_cls)
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread.start()
+        logger.info(
+            "Prometheus指标服务已启动: http://%s:%d/metrics",
+            self._httpd.server_address[0], self._httpd.server_address[1],
+        )
+
+    def stop(self) -> None:
+        self._httpd.shutdown()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        logger.info("Prometheus指标服务已停止")
+
+
+def main() -> None:
+    """独立运行指标导出服务的命令行入口,方便先脱离完整daemon单独调试。"""
+    import argparse
+
+    from services.llm.health_inspector import HealthInspector
+    from services.llm.router import ModelRouter
+
+    parser = argparse.ArgumentParser(description="苍穹中台推理服务Prometheus指标导出")
+    parser.add_argument("--router-config", default="config/model_config.yaml")
+    parser.add_argument("--service-config", default="config/vllm_service_config.yaml")
+    parser.add_argument("--port", type=int, default=9105)
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+
+    router = ModelRouter(args.router_config)
+    inspector = HealthInspector(router, config_path=args.service_config)
+    server = MetricsServer(router=router, health_inspector=inspector, port=args.port)
+    server.start()
+
+    stop_event = threading.Event()
+    signal.signal(signal.SIGINT, lambda *_: stop_event.set())
+    signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
+
+    logger.info("指标导出服务运行中,按Ctrl+C退出")
+    while not stop_event.is_set():
+        inspector.run_once()
+        stop_event.wait(timeout=inspector._health_config.interval_seconds)
+
+    server.stop()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 7.7 压测报告SLA达标校验与历史回归检测
+
+孙昊补这段代码时说了一句陈铭记进笔记的话:"今天这份压测报告,只是给你们自己看的一次性数据,但御风金融要的不是'今天测出来达标'这一次性结论,而是'以后模型换版本、代码换版本,还能不能持续达标'——所以从今天起,达标校验要变成一个可以重复跑的脚本,不能靠人肉盯着报告表格里的数字去做判断。"这段脚本做两件事:第一,把7.3节压测报告和`config/vllm_service_config.yaml`里的`sla`目标做自动比对;第二,如果提供了历史基线报告,还会做一次趋势回归检测,任何一项不达标都会让脚本以非零退出码结束,这正是留给Day56 CI/CD流水线做"部署前性能闸门"的接口。
+
+```python
+"""
+文件名: scripts/benchmark_regression.py
+用途: 对压测报告(7.3节ThroughputBenchmark产出的JSON)做两件事:
+      1. 与config/vllm_service_config.yaml里的sla目标做达标校验;
+      2. (可选)与历史基线报告做趋势对比,发现性能回归时以非零退出码
+         结束,方便未来接入CI/CD流水线做自动化的部署前性能闸门
+         (这一点会在Day56的CI/CD专题里正式串起来)。
+说明:
+    孙昊晚上补充这个脚本时说了一句话:"今天这份压测报告,只是给
+    你们自己看的一次性数据,但御风金融要的不是'今天测出来达标'
+    这一次性结论,而是'以后模型换版本、代码换版本,还能不能持续
+    达标'——所以从今天起,达标校验要变成一个可以重复跑的脚本,
+    不能靠人肉盯着报告表格里的数字去做判断。"
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import dataclass
+from typing import List, Optional
+
+import yaml
+
+
+@dataclass
+class SLATargets:
+    target_qps_at_50_concurrency: float
+    target_token_throughput: float
+    p95_ttft_seconds: float
+    p95_total_latency_seconds: float
+    min_availability: float
+
+
+def load_sla_targets(service_config_path: str) -> SLATargets:
+    """从vLLM服务集中化配置文件的sla小节加载达标目标。"""
+    with open(service_config_path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+    sla_raw = raw.get("sla", {})
+    return SLATargets(
+        target_qps_at_50_concurrency=float(sla_raw.get("target_qps_at_50_concurrency", 8.0)),
+        target_token_throughput=float(sla_raw.get("target_token_throughput", 800.0)),
+        p95_ttft_seconds=float(sla_raw.get("p95_ttft_seconds", 1.5)),
+        p95_total_latency_seconds=float(sla_raw.get("p95_total_latency_seconds", 6.0)),
+        min_availability=float(sla_raw.get("min_availability", 0.995)),
+    )
+
+
+def _find_level_result(report: dict, concurrency: int) -> Optional[dict]:
+    """从压测报告的results列表中,找到指定并发档位对应的那一条记录。"""
+    for item in report.get("results", []):
+        if item.get("concurrency") == concurrency:
+            return item
+    return None
+
+
+@dataclass
+class SLAViolation:
+    metric_name: str
+    actual_value: float
+    target_value: float
+    comparison: str  # ">=" 或 "<="
+
+    def __str__(self) -> str:
+        return (
+            f"{self.metric_name}: 实际值={self.actual_value},"
+            f"目标要求{self.comparison}{self.target_value},未达标"
+        )
+
+
+def check_sla_compliance(report: dict, targets: SLATargets,
+                           reference_concurrency: int = 50) -> List[SLAViolation]:
+    """
+    校验压测报告在指定并发档位下,是否满足全部SLA目标。
+
+    参数:
+        report: 7.3节压测脚本产出的JSON报告(已用json.load解析为字典)。
+        targets: 通过load_sla_targets加载的达标目标。
+        reference_concurrency: SLA目标定义时参照的并发档位,默认50
+            (与target_qps_at_50_concurrency这个字段名里的"50"保持一致,
+            如果压测时没有跑到这个并发档位,会在返回结果里额外提示)。
+
+    返回:
+        未达标项列表,为空列表表示全部达标。
+    """
+    level_result = _find_level_result(report, reference_concurrency)
+    if level_result is None:
+        return [SLAViolation(
+            metric_name=f"并发档位{reference_concurrency}的压测数据",
+            actual_value=0.0, target_value=0.0, comparison="存在(但未找到对应数据)",
+        )]
+
+    violations: List[SLAViolation] = []
+
+    if level_result.get("qps", 0.0) < targets.target_qps_at_50_concurrency:
+        violations.append(SLAViolation(
+            "QPS", level_result.get("qps", 0.0), targets.target_qps_at_50_concurrency, ">=",
+        ))
+    if level_result.get("token_throughput_per_sec", 0.0) < targets.target_token_throughput:
+        violations.append(SLAViolation(
+            "Token吞吐量(token/s)", level_result.get("token_throughput_per_sec", 0.0),
+            targets.target_token_throughput, ">=",
+        ))
+
+    ttft_p95 = level_result.get("ttft_p95")
+    if ttft_p95 is not None and ttft_p95 > targets.p95_ttft_seconds:
+        violations.append(SLAViolation("首Token延迟P95(秒)", ttft_p95, targets.p95_ttft_seconds, "<="))
+
+    latency_p95 = level_result.get("latency_p95")
+    if latency_p95 is not None and latency_p95 > targets.p95_total_latency_seconds:
+        violations.append(SLAViolation(
+            "总延迟P95(秒)", latency_p95, targets.p95_total_latency_seconds, "<=",
+        ))
+
+    total_requests = level_result.get("total_requests", 0)
+    failure_count = level_result.get("failure_count", 0)
+    if total_requests > 0:
+        observed_availability = 1.0 - failure_count / total_requests
+        if observed_availability < targets.min_availability:
+            violations.append(SLAViolation(
+                "本次压测请求成功率(近似可用性)", round(observed_availability, 6),
+                targets.min_availability, ">=",
+            ))
+
+    return violations
+
+
+@dataclass
+class RegressionFinding:
+    metric_name: str
+    baseline_value: float
+    current_value: float
+    change_ratio: float
+
+    def __str__(self) -> str:
+        direction = "下降" if self.change_ratio < 0 else "上升"
+        return (
+            f"{self.metric_name}: 基线={self.baseline_value}, 当前={self.current_value}, "
+            f"{direction}{abs(self.change_ratio):.1%}"
+        )
+
+
+def detect_regression(baseline_report: dict, current_report: dict,
+                        reference_concurrency: int = 50,
+                        regression_threshold_ratio: float = 0.10) -> List[RegressionFinding]:
+    """
+    对比当前压测报告与历史基线报告,识别是否发生明显的性能回归。
+
+    "回归"的判定标准是相对变化幅度超过regression_threshold_ratio
+    (默认10%),而不是任何微小波动都判定为回归——压测本身存在正常的
+    测量噪声,阈值太敏感会导致"狼来了"式的误报,反而让团队对回归
+    检测失去信任。
+
+    参数:
+        baseline_report / current_report: 两份压测报告字典。
+        reference_concurrency: 用于对比的并发档位。
+        regression_threshold_ratio: 判定为回归的相对变化阈值。
+
+    返回:
+        发生回归的指标列表(只包含性能变差方向的指标:QPS/吞吐下降、
+        延迟上升),为空表示未发现明显回归。
+    """
+    baseline_level = _find_level_result(baseline_report, reference_concurrency)
+    current_level = _find_level_result(current_report, reference_concurrency)
+    if baseline_level is None or current_level is None:
+        return []
+
+    findings: List[RegressionFinding] = []
+
+    def _relative_change(old_value: float, new_value: float) -> float:
+        if old_value == 0:
+            return 0.0
+        return (new_value - old_value) / old_value
+
+    qps_change = _relative_change(baseline_level.get("qps", 0.0), current_level.get("qps", 0.0))
+    if qps_change < -regression_threshold_ratio:
+        findings.append(RegressionFinding(
+            "QPS", baseline_level.get("qps", 0.0), current_level.get("qps", 0.0), qps_change,
+        ))
+
+    throughput_change = _relative_change(
+        baseline_level.get("token_throughput_per_sec", 0.0),
+        current_level.get("token_throughput_per_sec", 0.0),
+    )
+    if throughput_change < -regression_threshold_ratio:
+        findings.append(RegressionFinding(
+            "Token吞吐量", baseline_level.get("token_throughput_per_sec", 0.0),
+            current_level.get("token_throughput_per_sec", 0.0), throughput_change,
+        ))
+
+    baseline_latency = baseline_level.get("latency_p95")
+    current_latency = current_level.get("latency_p95")
+    if baseline_latency and current_latency:
+        latency_change = _relative_change(baseline_latency, current_latency)
+        if latency_change > regression_threshold_ratio:
+            findings.append(RegressionFinding(
+                "总延迟P95", baseline_latency, current_latency, latency_change,
+            ))
+
+    return findings
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="压测报告SLA达标校验与历史回归检测")
+    parser.add_argument("--report", required=True, help="本次压测报告JSON文件路径")
+    parser.add_argument("--service-config", default="config/vllm_service_config.yaml",
+                         help="vLLM服务集中化配置文件路径,用于读取sla目标")
+    parser.add_argument("--baseline-report", default=None, help="历史基线报告JSON文件路径(可选)")
+    parser.add_argument("--reference-concurrency", type=int, default=50)
+    parser.add_argument("--regression-threshold", type=float, default=0.10)
+    args = parser.parse_args()
+
+    with open(args.report, "r", encoding="utf-8") as f:
+        current_report = json.load(f)
+
+    targets = load_sla_targets(args.service_config)
+    violations = check_sla_compliance(current_report, targets, args.reference_concurrency)
+
+    print("=" * 60)
+    print(f"SLA达标校验(参照并发档位={args.reference_concurrency})")
+    print("=" * 60)
+    if not violations:
+        print("全部SLA指标达标。")
+    else:
+        print(f"发现{len(violations)}项未达标指标:")
+        for v in violations:
+            print(f"  - {v}")
+
+    exit_code = 0
+    if violations:
+        exit_code = 1
+
+    if args.baseline_report:
+        with open(args.baseline_report, "r", encoding="utf-8") as f:
+            baseline_report = json.load(f)
+        findings = detect_regression(
+            baseline_report, current_report, args.reference_concurrency, args.regression_threshold,
+        )
+        print("\n" + "=" * 60)
+        print(f"历史回归检测(基线={args.baseline_report}, 阈值={args.regression_threshold:.0%})")
+        print("=" * 60)
+        if not findings:
+            print("未发现明显性能回归。")
+        else:
+            print(f"发现{len(findings)}项性能回归:")
+            for finding in findings:
+                print(f"  - {finding}")
+            exit_code = 1
+
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+### 7.8 运维一体化Daemon:把路由、巡检、指标导出串成一个可长期运行的进程
+
+三段代码分别写完之后,老王提出最后一个要求:"这三块东西——路由层、健康巡检、指标导出——如果部署的时候要分别手动启动三个进程,运维同事迟早会漏启动一个。今天写一个最小化的一体化daemon,把它们串起来,作为将来Day56容器化时`CMD`要执行的那个入口脚本的雏形。"
+
+```python
+"""
+文件名: scripts/run_inference_ops_daemon.py
+用途: 苍穹中台推理服务运维一体化daemon
+说明:
+    把ModelRouter(7.4节)、HealthInspector(7.5节)、MetricsServer(7.6节)
+    三者组装进一个进程里长期运行,作为Day56容器化部署时容器启动命令的
+    雏形。今天先在裸机上跑通这个脚本,明天只需要把它包进Dockerfile的
+    CMD里,核心逻辑不需要任何改动——这也是老王反复强调的"先想清楚
+    运行时的进程结构,再谈容器化,容器只是换了个'壳'"的具体体现。
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import signal
+import threading
+import time
+
+from services.llm.health_inspector import HealthInspector
+from services.llm.metrics_exporter import MetricsServer
+from services.llm.router import ModelRouter
+
+logger = logging.getLogger("qiongxiong.ops_daemon")
+
+
+class InferenceOpsDaemon:
+    """
+    推理服务运维一体化daemon:统一管理路由层实例的生命周期,
+    并在后台线程里持续运行健康巡检与指标导出服务。
+    """
+
+    def __init__(self, router_config: str, service_config: str,
+                 metrics_port: int = 9105, health_report_path: str = "health_report.json"):
+        self._router = ModelRouter(router_config)
+        self._inspector = HealthInspector(
+            self._router, config_path=service_config,
+            alert_callback=self._on_alert,
+            report_output_path=health_report_path,
+        )
+        self._metrics_server = MetricsServer(
+            router=self._router, health_inspector=self._inspector, port=metrics_port,
+        )
+        self._inspector_thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+
+    def _on_alert(self, title: str, detail: str) -> None:
+        """
+        默认告警处理逻辑,今天先记录到日志里;这个回调的签名与Day46
+        写的WeComAlertNotifier.send完全兼容,未来接入企业微信告警时,
+        只需要把这里换成对应的调用即可,不需要改动HealthInspector本身。
+        """
+        logger.critical("[运维daemon告警] %s: %s", title, detail)
+
+    def start(self) -> None:
+        """启动指标服务与后台巡检线程。"""
+        logger.info("推理服务运维daemon启动中……")
+        self._metrics_server.start()
+        self._inspector_thread = threading.Thread(target=self._inspector.run_forever, daemon=True)
+        self._inspector_thread.start()
+        logger.info("推理服务运维daemon已启动,路由层与健康巡检均已就绪")
+
+    def stop(self) -> None:
+        """优雅停止:先停巡检循环,再停指标服务,顺序不能颠倒。"""
+        logger.info("推理服务运维daemon收到停止信号,开始优雅关闭……")
+        self._inspector.stop()
+        if self._inspector_thread is not None:
+            self._inspector_thread.join(timeout=10)
+        self._metrics_server.stop()
+        logger.info("推理服务运维daemon已完全停止")
+
+    def wait_forever(self) -> None:
+        """阻塞主线程,直到外部通过stop()或信号触发停止。"""
+        while not self._stop_event.is_set():
+            time.sleep(1)
+
+    def request_stop(self) -> None:
+        self._stop_event.set()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="苍穹中台推理服务运维一体化daemon")
+    parser.add_argument("--router-config", default="config/model_config.yaml")
+    parser.add_argument("--service-config", default="config/vllm_service_config.yaml")
+    parser.add_argument("--metrics-port", type=int, default=9105)
+    parser.add_argument("--health-report", default="health_report.json")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    )
+
+    daemon = InferenceOpsDaemon(
+        router_config=args.router_config,
+        service_config=args.service_config,
+        metrics_port=args.metrics_port,
+        health_report_path=args.health_report,
+    )
+
+    def _handle_signal(signum, frame):  # noqa: ANN001 - 标准signal回调签名
+        logger.info("收到信号%s,准备退出", signum)
+        daemon.request_stop()
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+
+    daemon.start()
+    try:
+        daemon.wait_forever()
+    finally:
+        daemon.stop()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+配套的Prometheus告警规则,直接对应7.6节导出的几个指标,方便Day56接入正式监控体系时不需要从零设计告警条件:
+
+```yaml
+# 文件名: ops/prometheus_alerts.yml
+# 用途: 苍穹中台推理服务的Prometheus告警规则,对应metrics_exporter.py导出的指标
+
+groups:
+  - name: qiongxiong-inference-alerts
+    rules:
+      - alert: ModelRollingAvailabilityBelowSLA
+        expr: qiongxiong_llm_rolling_availability < 0.995
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "模型 {{ $labels.model_key }} 滚动可用性低于SLA目标"
+          description: "当前可用性为 {{ $value | humanizePercentage }},低于0.995的SLA目标,已持续5分钟以上。"
+
+      - alert: ModelDegradedRateHigh
+        expr: qiongxiong_llm_degraded_rate > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "模型 {{ $labels.model_key }} 降级(走fallback)比例过高"
+          description: "过去一段时间内,超过5%的请求走了降级链路,可能意味着主模型持续不稳定,建议排查。"
+
+      - alert: ModelCallLatencyHigh
+        expr: qiongxiong_llm_call_latency_seconds_avg > 6.0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "模型 {{ $labels.model_key }} 平均调用延迟过高"
+          description: "平均调用延迟为 {{ $value }}s,超过SLA目标里p95_total_latency_seconds=6.0s对应的合理范围,建议检查GPU负载与并发情况。"
+```
+
+老王看完这份告警规则,补充了一句提醒:"这三条规则里,第一条`for: 5m`是故意设置的,不是随手写的默认值——如果一次巡检失败就立刻告警,平时网络抖动一下都会炸一次告警,这就是Day46讲过的'告警本身不能变成新的刷屏源'那个道理的延伸;但如果容忍时间设得太长,真的出了故障又发现得太慢。5分钟是我们结合今天巡检周期(15秒一次)倒推出来的一个折中值——5分钟内至少有20次巡检数据支撑这个判断,不会是单次抽样的噪声。"
+
+### 7.9 单元测试:健康巡检、指标导出与SLA校验
+
+```python
+"""
+文件名: tests/test_health_and_metrics.py
+用途: HealthInspector / metrics_exporter / benchmark_regression 三个模块的单元测试
+说明: 全部使用假的Router与健康检查结果,不依赖真实vLLM服务运行
+作者: 陈铭
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock
+
+import pytest
+
+from services.llm.health_inspector import HealthInspector, load_health_and_sla_config
+from services.llm.metrics_exporter import render_prometheus_text
+from scripts.benchmark_regression import (
+    SLATargets,
+    check_sla_compliance,
+    detect_regression,
+)
+
+
+SERVICE_CONFIG_YAML = """
+service:
+  name: test-service
+model:
+  path: /data/models/test
+  served_name: test-model
+runtime:
+  host: 0.0.0.0
+  port: 8000
+security:
+  api_key_env: TEST_KEY
+sla:
+  target_qps_at_50_concurrency: 8
+  target_token_throughput: 800
+  p95_ttft_seconds: 1.5
+  p95_total_latency_seconds: 6.0
+  min_availability: 0.995
+health_check:
+  path: /health
+  interval_seconds: 15
+  timeout_seconds: 5
+  failure_threshold: 3
+logging:
+  dir: /tmp
+"""
+
+
+@pytest.fixture
+def service_config_file(tmp_path):
+    config_path = tmp_path / "vllm_service_config.yaml"
+    config_path.write_text(SERVICE_CONFIG_YAML, encoding="utf-8")
+    return str(config_path)
+
+
+class TestHealthInspector:
+    """校验健康巡检的连续失败判定、恢复判定与告警触发逻辑。"""
+
+    def _build_router(self, health_sequence):
+        """构造一个假Router,health_check_all()按顺序返回health_sequence里的值。"""
+        router = MagicMock()
+        router.health_check_all.side_effect = health_sequence
+        return router
+
+    def test_healthy_model_reports_zero_failures(self, service_config_file):
+        router = self._build_router([{"fengyu-risk-7b": True}])
+        inspector = HealthInspector(router, config_path=service_config_file)
+        report = inspector.run_once()
+        assert report["models"]["fengyu-risk-7b"]["consecutive_failures"] == 0
+        assert report["models"]["fengyu-risk-7b"]["is_marked_unhealthy"] is False
+
+    def test_consecutive_failures_trigger_unhealthy_flag(self, service_config_file):
+        sequence = [{"fengyu-risk-7b": False}] * 3
+        router = self._build_router(sequence)
+        inspector = HealthInspector(router, config_path=service_config_file)
+
+        report = None
+        for _ in range(3):
+            report = inspector.run_once()
+
+        assert report["models"]["fengyu-risk-7b"]["consecutive_failures"] == 3
+        assert report["models"]["fengyu-risk-7b"]["is_marked_unhealthy"] is True
+
+    def test_recovery_clears_unhealthy_flag(self, service_config_file):
+        sequence = [{"fengyu-risk-7b": False}] * 3 + [{"fengyu-risk-7b": True}]
+        router = self._build_router(sequence)
+        inspector = HealthInspector(router, config_path=service_config_file)
+
+        report = None
+        for _ in range(4):
+            report = inspector.run_once()
+
+        assert report["models"]["fengyu-risk-7b"]["consecutive_failures"] == 0
+        assert report["models"]["fengyu-risk-7b"]["is_marked_unhealthy"] is False
+
+    def test_alert_callback_invoked_on_threshold_breach(self, service_config_file):
+        alert_calls = []
+
+        def _alert(title, detail):
+            alert_calls.append((title, detail))
+
+        sequence = [{"fengyu-risk-7b": False}] * 3
+        router = self._build_router(sequence)
+        inspector = HealthInspector(
+            router, config_path=service_config_file, alert_callback=_alert,
+        )
+        for _ in range(3):
+            inspector.run_once()
+
+        assert any("连续失败" in title for title, _ in alert_calls)
+
+    def test_load_config_parses_expected_fields(self, service_config_file):
+        health_config, sla_config = load_health_and_sla_config(service_config_file)
+        assert health_config.failure_threshold == 3
+        assert sla_config.min_availability == pytest.approx(0.995)
+
+
+class TestMetricsExporter:
+    """校验Prometheus指标文本渲染逻辑。"""
+
+    def test_render_includes_call_counts(self):
+        router = MagicMock()
+        router._models = {"fengyu-risk-7b": MagicMock()}
+        router.get_call_stats.return_value = {
+            "count": 42, "total_completion_tokens": 5000,
+            "avg_latency_seconds": 1.2, "degraded_count": 2, "degraded_rate": 0.0476,
+        }
+        text = render_prometheus_text(router)
+        assert "qiongxiong_llm_calls_total" in text
+        assert 'model_key="fengyu-risk-7b"' in text
+        assert "42" in text
+
+    def test_render_includes_availability_when_inspector_provided(self):
+        router = MagicMock()
+        router._models = {"fengyu-risk-7b": MagicMock()}
+        router.get_call_stats.return_value = {"count": 0}
+        inspector = MagicMock()
+        inspector.get_status_snapshot.return_value = {
+            "fengyu-risk-7b": {"rolling_availability": 0.999},
+        }
+        text = render_prometheus_text(router, inspector)
+        assert "qiongxiong_llm_rolling_availability" in text
+        assert "0.999" in text
+
+    def test_render_without_models_produces_empty_but_valid_text(self):
+        router = MagicMock()
+        router._models = {}
+        text = render_prometheus_text(router)
+        assert "qiongxiong_llm_calls_total" in text  # HELP/TYPE元信息行始终存在
+
+
+class TestBenchmarkRegression:
+    """校验SLA达标校验与历史回归检测逻辑。"""
+
+    def _make_report(self, qps, throughput, ttft_p95, latency_p95, failure_count=0, total_requests=50):
+        return {
+            "results": [
+                {
+                    "concurrency": 50, "total_requests": total_requests, "failure_count": failure_count,
+                    "qps": qps, "token_throughput_per_sec": throughput,
+                    "ttft_p95": ttft_p95, "latency_p95": latency_p95,
+                }
+            ]
+        }
+
+    def test_sla_compliant_report_has_no_violations(self):
+        report = self._make_report(qps=10.0, throughput=900.0, ttft_p95=1.0, latency_p95=5.0)
+        targets = SLATargets(8.0, 800.0, 1.5, 6.0, 0.995)
+        violations = check_sla_compliance(report, targets)
+        assert violations == []
+
+    def test_low_qps_is_flagged_as_violation(self):
+        report = self._make_report(qps=5.0, throughput=900.0, ttft_p95=1.0, latency_p95=5.0)
+        targets = SLATargets(8.0, 800.0, 1.5, 6.0, 0.995)
+        violations = check_sla_compliance(report, targets)
+        assert any(v.metric_name == "QPS" for v in violations)
+
+    def test_high_latency_is_flagged_as_violation(self):
+        report = self._make_report(qps=10.0, throughput=900.0, ttft_p95=1.0, latency_p95=9.0)
+        targets = SLATargets(8.0, 800.0, 1.5, 6.0, 0.995)
+        violations = check_sla_compliance(report, targets)
+        assert any("总延迟" in v.metric_name for v in violations)
+
+    def test_missing_reference_concurrency_reports_data_missing(self):
+        report = {"results": [{"concurrency": 10, "qps": 10.0}]}
+        targets = SLATargets(8.0, 800.0, 1.5, 6.0, 0.995)
+        violations = check_sla_compliance(report, targets, reference_concurrency=50)
+        assert len(violations) == 1
+        assert "未找到" in str(violations[0])
+
+    def test_regression_detected_when_throughput_drops(self):
+        baseline = self._make_report(qps=10.0, throughput=900.0, ttft_p95=1.0, latency_p95=5.0)
+        current = self._make_report(qps=10.0, throughput=700.0, ttft_p95=1.0, latency_p95=5.0)
+        findings = detect_regression(baseline, current, regression_threshold_ratio=0.10)
+        assert any(f.metric_name == "Token吞吐量" for f in findings)
+
+    def test_no_regression_within_noise_threshold(self):
+        baseline = self._make_report(qps=10.0, throughput=900.0, ttft_p95=1.0, latency_p95=5.0)
+        current = self._make_report(qps=10.0, throughput=880.0, ttft_p95=1.0, latency_p95=5.1)
+        findings = detect_regression(baseline, current, regression_threshold_ratio=0.10)
+        assert findings == []
+
+    def test_latency_regression_detected_when_p95_rises(self):
+        baseline = self._make_report(qps=10.0, throughput=900.0, ttft_p95=1.0, latency_p95=5.0)
+        current = self._make_report(qps=10.0, throughput=900.0, ttft_p95=1.0, latency_p95=8.0)
+        findings = detect_regression(baseline, current, regression_threshold_ratio=0.10)
+        assert any(f.metric_name == "总延迟P95" for f in findings)
+```
+
+晚上九点半,陈铭把这一整套东西又跑了一遍完整的流程:先用`run_inference_ops_daemon.py`把路由层、健康巡检、指标导出同时拉起来,再用`curl http://127.0.0.1:9105/metrics`确认指标能正常抓取,最后跑`benchmark_regression.py`拿今天下午的压测报告去校验SLA,终端打印出"全部SLA指标达标"。孙昊看完最后一次确认,说了句今天的收尾语:"config里写的东西,今天开始每一行都有代码在真正执行它、检验它,这才是配置文件该有的样子。明天开始容器化,这几个脚本我们会原样搬进镜像里,你会发现改动量很小——这也从另一个角度说明,今天这些代码的抽象层次是对的。"
+
 ---
 
 ## 八、今日复盘
