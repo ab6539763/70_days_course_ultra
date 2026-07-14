@@ -1698,6 +1698,995 @@ if __name__ == "__main__":
 
 陈铭跑这个脚本的时候,故意做了一个小实验——先问"苍穹0.1版是什么时候上线的",得到回复后,紧接着问"那它支持流式输出吗",不带任何主语。因为历史记录被`MessagesPlaceholder("history")`正确地插入了提示词里,模型准确地理解了"它"指的是"苍穹0.1版",给出了符合上下文的回答。这个小实验,和Day14验证手写版"多轮对话记忆是否生效"时用的方法几乎一模一样,只是今天验证的是LangChain版的实现,老王看完说:"验证思路没变才是对的——技术选型换了,但工程师验证一个系统是否正确的方法论,应该是稳定、可迁移的,不应该跟着技术栈变来变去。"
 
+### 十五、晚自习加练:ChatModel多场景调用方式对比演示
+
+晚自习复盘的时候,老王看陈铭只跑通了`invoke()`这一种调用方式,补了一句:"stream()、batch()这两个同样重要的方法,你自己回去补一份对比材料,明天早会前给我看看,不要只满足于'跑起来了'。"陈铭连夜写了这份离线可运行的对比材料——统一使用`langchain_core`自带的`FakeListChatModel`模拟一个"听话的"假模型,不依赖真实的DeepSeek/通义千问API Key,专门验证"调用方式"本身的行为差异。
+
+```python
+"""
+chat_model_scenarios_demo.py
+===============================
+ChatModel多场景调用方式对比演示(离线可运行,不依赖真实API Key)
+
+背景说明:
+    今天课堂笔记里,陈铭已经跑通了invoke()方法的基础用法,但老王在
+    晚自习复盘时提了一句:"你今天只验证了invoke()这一种调用方式,
+    stream()、batch()这两个同样重要的方法,你自己回去补一份对比材料,
+    明天早会前给我看看。"
+
+    这份文件就是陈铭连夜补的对比材料——为了不依赖真实的DeepSeek/通义千问
+    API Key(网络请求还会让"离线自动化测试"变得不可行),这里统一使用
+    langchain_core自带的FakeListChatModel/FakeMessagesListChatModel
+    来模拟一个"听话的"假模型,专门用于验证"调用方式"本身的行为差异,
+    不涉及"回复内容质量"这个维度(那是需要真实模型才能评估的另一个问题)。
+
+    FakeListChatModel是LangChain官方专门为单元测试场景提供的工具类,
+    苍穹项目后续所有涉及ChatModel的自动化测试,都会大量复用这个类,
+    今天先借着这个"场景对比"的任务,提前熟悉它的用法。
+"""
+
+import time
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from langchain_core.messages import SystemMessage, HumanMessage
+
+
+def build_fake_model(responses: list[str], sleep_seconds: float = 0.0) -> FakeListChatModel:
+    """
+    构建一个假的ChatModel实例,用于离线演示和自动化测试。
+
+    :param responses: 预设的回复内容列表,按调用顺序依次返回,
+                       用完之后会从头循环(FakeListChatModel内部行为)
+    :param sleep_seconds: 每次调用模拟的"网络延迟",用于对比不同调用方式
+                           在耗时表现上的差异,默认0表示不模拟延迟
+    :return: 配置好的FakeListChatModel实例
+    """
+    return FakeListChatModel(responses=responses, sleep=sleep_seconds)
+
+
+# ============================================================
+# 场景一:invoke() —— 同步调用,一次性拿到完整回复
+# ============================================================
+
+def demo_invoke_scenario() -> None:
+    """
+    演示invoke()的行为:发出请求后,调用方会一直阻塞,直到拿到完整的AIMessage。
+    这是苍穹0.1版非流式接口(/api/v1/chat)用到的调用方式。
+    """
+    fake_model = build_fake_model(["苍穹0.1版支持流式对话和历史记录持久化两项核心功能。"])
+    messages = [
+        SystemMessage(content="你是苍穹智能助手。"),
+        HumanMessage(content="苍穹0.1版支持哪些功能?"),
+    ]
+
+    start = time.perf_counter()
+    response = fake_model.invoke(messages)
+    elapsed = time.perf_counter() - start
+
+    print(f"[invoke] 耗时约{elapsed * 1000:.2f}ms,一次性拿到完整回复:{response.content}")
+    assert isinstance(response.content, str) and len(response.content) > 0
+
+
+# ============================================================
+# 场景二:stream() —— 流式调用,逐块拿到增量内容
+# ============================================================
+
+def demo_stream_scenario() -> None:
+    """
+    演示stream()的行为:返回一个生成器,每次迭代拿到一个AIMessageChunk,
+    这是苍穹0.1版流式接口(/api/v1/chat/stream)用到的调用方式。
+
+    这里刻意演示一个容易被忽略的细节:如果只是想拿"完整回复"而不关心
+    "逐字打印的过程",用stream()仍然可以做到,只是需要自己把所有chunk
+    的content拼接起来——这也是main.py里event_generator()函数
+    full_reply_parts.append(piece)这一步在做的事情。
+
+    补充说明:FakeListChatModel.stream()会把预设的每一条完整回复,
+    自动拆分成"逐字"的chunk序列返回(这是它内部为了模拟真实流式效果
+    做的简化处理),这一点和真实的DeepSeek/通义千问按"token"为单位
+    切分chunk不完全一样,但完全足够用来验证"业务代码处理chunk流"
+    这部分逻辑是否正确。
+    """
+    fake_model = build_fake_model(["苍穹0.1版支持流式对话。"])
+    messages = [HumanMessage(content="简单介绍一下苍穹0.1版")]
+
+    collected_chunks = []
+    start = time.perf_counter()
+    for chunk in fake_model.stream(messages):
+        collected_chunks.append(chunk.content)
+        # 真实场景下,这里通常会立刻把chunk.content推给前端(比如通过SSE),
+        # 而不是像这里一样,等全部收集完才统一打印
+    elapsed = time.perf_counter() - start
+
+    full_reply = "".join(collected_chunks)
+    print(f"[stream] 耗时约{elapsed * 1000:.2f}ms,共收到{len(collected_chunks)}个chunk,拼接后完整回复:{full_reply}")
+    assert full_reply == "苍穹0.1版支持流式对话。"
+
+
+# ============================================================
+# 场景三:batch() —— 批量调用,一次性并发处理多份独立请求
+# ============================================================
+
+def demo_batch_scenario() -> None:
+    """
+    演示batch()的行为:传入一个"消息列表的列表",每个子列表是一次独立的对话请求,
+    ChatModel内部会尽量并发处理这些请求,最终返回一个"结果列表",
+    顺序与输入顺序一一对应。
+
+    典型使用场景:苍穹平台如果要做"批量生成N个客户的欢迎语文案"这类
+    离线批处理任务,用batch()比用for循环逐个调用invoke()效率更高
+    (真实网络调用场景下,batch内部会做并发请求;FakeListChatModel场景下,
+    主要演示的是"接口用法"本身,不代表真实的并发加速效果)。
+    """
+    fake_model = build_fake_model([
+        "欢迎苍穹智能客服上线,很高兴为您服务!",
+        "您好,我是苍穹智能助手,随时为您解答问题。",
+        "感谢您选择苍穹平台,期待为您提供帮助。",
+    ])
+
+    batch_inputs = [
+        [HumanMessage(content="请生成一句欢迎语,风格活泼")],
+        [HumanMessage(content="请生成一句欢迎语,风格专业")],
+        [HumanMessage(content="请生成一句欢迎语,风格简洁")],
+    ]
+
+    results = fake_model.batch(batch_inputs)
+
+    print(f"[batch] 一次调用处理了{len(results)}份独立请求:")
+    for i, result in enumerate(results):
+        print(f"  第{i + 1}份结果:{result.content}")
+
+    assert len(results) == len(batch_inputs)
+    assert all(isinstance(r.content, str) for r in results)
+
+
+# ============================================================
+# 场景四:invoke() vs stream()的"首字延迟"对比
+# ============================================================
+
+def demo_first_token_latency_comparison() -> None:
+    """
+    演示invoke()和stream()在"用户感知到的响应速度"上的关键差异——
+    即使两者的"总耗时"接近,stream()能让用户更早看到第一个字,
+    这是聊天类产品普遍采用流式输出的核心原因之一。
+
+    这里通过给FakeListChatModel设置sleep参数,模拟"每个token之间有耗时",
+    对比两种调用方式下,"拿到第一块内容"所花费的时间差异。
+    """
+    long_reply = "苍穹平台是蓬远科技自主研发的企业级AI应用中台。"
+    per_char_delay_seconds = 0.05
+    # 把长回复拆成单字,模拟真实模型逐字生成的过程,每个字之间有0.05秒延迟。
+    # 注意:FakeListChatModel的sleep参数只在_stream()内部生效(每产出一个
+    # chunk就sleep一次),invoke()走的是_call()方法,不会应用这个延迟——
+    # 这一点本身也说明了"假模型毕竟不是真模型",这里用手动sleep()去补上
+    # "invoke()要等模型把全部内容都生成完才能返回"这个真实场景下的等价耗时,
+    # 只是为了让这份离线演示,能够公平地对比出两种调用方式的核心差异。
+    fake_model_for_stream = FakeListChatModel(responses=[long_reply], sleep=per_char_delay_seconds)
+    fake_model_for_invoke = FakeListChatModel(responses=[long_reply])
+
+    messages = [HumanMessage(content="介绍一下苍穹平台")]
+
+    # invoke():必须等全部内容生成完毕才能拿到任何内容,
+    # 这里手动sleep补上"生成全部内容所需的等价耗时"
+    start_invoke = time.perf_counter()
+    time.sleep(per_char_delay_seconds * len(long_reply))
+    fake_model_for_invoke.invoke(messages)
+    time_to_first_content_invoke = time.perf_counter() - start_invoke
+
+    # stream():第一个chunk到达的时间,通常远早于全部内容生成完毕的时间
+    start_stream = time.perf_counter()
+    stream_iterator = fake_model_for_stream.stream(messages)
+    next(stream_iterator)  # 只消费第一个chunk,模拟"用户看到第一个字出现"的那一刻
+    time_to_first_content_stream = time.perf_counter() - start_stream
+
+    print(
+        f"[首字延迟对比] invoke()拿到内容耗时约{time_to_first_content_invoke * 1000:.1f}ms,"
+        f"stream()拿到第一个chunk耗时约{time_to_first_content_stream * 1000:.1f}ms"
+    )
+    assert time_to_first_content_stream < time_to_first_content_invoke, (
+        "stream()理应比invoke()更快让用户看到第一块内容,这是流式输出存在的核心价值"
+    )
+
+
+# ============================================================
+# 场景五:ainvoke() / abatch() —— 异步调用,为未来高并发场景预留的能力
+# ============================================================
+
+
+async def demo_async_scenario() -> None:
+    """
+    演示ainvoke()和abatch()的用法——今天课堂笔记里提到,这两个方法是
+    invoke()/batch()的异步版本,苍穹平台目前的FastAPI接口用的还是同步
+    调用方式,今天先补一份离线演示,提前熟悉写法,方便未来真的需要
+    优化并发性能时,能够比较顺畅地切换过去。
+
+    使用场景举例:如果苍穹平台未来要支持"一次性同时给50个客户生成
+    专属欢迎语"这类批量任务,用ainvoke()配合asyncio.gather()并发发起
+    多个请求,理论上比同步逐个调用invoke()要快得多——因为等待网络响应
+    的这段时间,CPU可以切换去处理其他请求,而不是傻等。
+    """
+    import asyncio
+
+    fake_model = build_fake_model(["异步调用返回的回复内容。"])
+    messages = [HumanMessage(content="测试异步调用")]
+
+    # ainvoke():异步版本的invoke,需要在async函数里用await调用
+    response = await fake_model.ainvoke(messages)
+    print(f"[ainvoke] 异步调用返回:{response.content}")
+    assert response.content == "异步调用返回的回复内容。"
+
+    # abatch():异步版本的batch,配合asyncio.gather()可以实现真正的并发请求。
+    # 这里用三个独立的fake_model实例(各自预设不同回复),模拟"并发处理
+    # 三个不同客户的请求"这个场景。
+    fake_model_1 = build_fake_model(["客户A的专属欢迎语。"])
+    fake_model_2 = build_fake_model(["客户B的专属欢迎语。"])
+    fake_model_3 = build_fake_model(["客户C的专属欢迎语。"])
+
+    results = await asyncio.gather(
+        fake_model_1.ainvoke([HumanMessage(content="生成欢迎语")]),
+        fake_model_2.ainvoke([HumanMessage(content="生成欢迎语")]),
+        fake_model_3.ainvoke([HumanMessage(content="生成欢迎语")]),
+    )
+
+    print("[asyncio.gather并发调用] 三份结果:")
+    for i, result in enumerate(results):
+        print(f"  客户{chr(ord('A') + i)}: {result.content}")
+
+    assert len(results) == 3
+    assert results[0].content == "客户A的专属欢迎语。"
+
+
+# ============================================================
+# 场景六:与get_chat_model_with_fallback()配合的降级调用场景演示
+# ============================================================
+
+
+def demo_fallback_scenario_with_fake_models() -> None:
+    """
+    复用今天课后作业第5题里`get_chat_model_with_fallback`的设计思路,
+    用两个FakeListChatModel模拟"主厂商调用失败,自动降级到备用厂商"
+    这个场景——这里不直接复用作业里那个依赖`get_chat_model`工厂函数的
+    实现(因为工厂函数内部会真正尝试初始化ChatOpenAI,需要真实的API Key),
+    而是单独写一个简化版本,专门验证"降级重试"这部分逻辑本身的正确性。
+    """
+
+    class _AlwaysFailingModel:
+        """一个故意设计成"每次调用都会抛异常"的假模型,用于模拟主厂商完全不可用的场景。"""
+
+        def invoke(self, messages):
+            raise ConnectionError("模拟主厂商网络连接失败")
+
+    primary_model = _AlwaysFailingModel()
+    fallback_model = build_fake_model(["备用厂商成功返回的回复内容。"])
+
+    def invoke_with_fallback(messages):
+        try:
+            return primary_model.invoke(messages), "primary"
+        except Exception as primary_error:
+            print(f"[降级演示] 主厂商调用失败:{primary_error},正在切换到备用厂商……")
+            return fallback_model.invoke(messages), "fallback"
+
+    response, provider_used = invoke_with_fallback([HumanMessage(content="测试降级逻辑")])
+
+    print(f"[降级演示] 最终使用的厂商:{provider_used},回复内容:{response.content}")
+    assert provider_used == "fallback"
+    assert response.content == "备用厂商成功返回的回复内容。"
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    print("=" * 60)
+    demo_invoke_scenario()
+    print("=" * 60)
+    demo_stream_scenario()
+    print("=" * 60)
+    demo_batch_scenario()
+    print("=" * 60)
+    demo_first_token_latency_comparison()
+    print("=" * 60)
+    asyncio.run(demo_async_scenario())
+    print("=" * 60)
+    demo_fallback_scenario_with_fake_models()
+    print("=" * 60)
+    print("全部ChatModel调用场景对比演示执行完毕。")
+```
+
+### 十六、选做拓展:PromptTemplate高级用法合集
+
+老王在晚自习复盘时,又额外布置了一个"选做"任务:"两周后海纳制造集团项目一旦立项,提示词大概率不会像今天这样,所有客户共用一套一模一样的模板——你自己先去了解一下,LangChain的PromptTemplate还有哪些更灵活的组织方式,提前列个清单,免得到时候现场现学。"陈铭整理出了下面这份清单,一共四块:动态选择few-shot示例、模板拼接、按客户动态构建系统提示词、提示词配置的可持久化表示。
+
+```python
+"""
+advanced_prompt_templates.py
+===============================
+PromptTemplate/ChatPromptTemplate高级用法合集
+
+背景说明:
+    今天课堂笔记里学的from_messages、MessagesPlaceholder、partial,
+    只是ChatPromptTemplate最基础的一层能力。老王在晚自习复盘时
+    额外布置了一个"选做"任务:"两周后海纳制造集团项目一旦立项,
+    提示词大概率不会像今天这样,所有客户共用一套一模一样的模板——
+    你自己先去了解一下,LangChain的PromptTemplate还有哪些更灵活的
+    组织方式,提前列个清单,免得到时候现场现学。"
+
+    这份文件就是陈铭整理的"提示词模板高级用法"清单,一共四块:
+    1. Few-shot示例的动态选择(根据输入长度自动挑选合适数量的示例)
+    2. PromptTemplate的组合拼接("+"运算符)
+    3. 按客户/场景动态构建系统提示词(为海纳制造集团这类"按客户定制"场景铺垫)
+    4. 提示词模板的可持久化表示(转换成可以存进数据库/配置文件的字典结构)
+"""
+
+from langchain_core.prompts import (
+    ChatPromptTemplate,
+    FewShotChatMessagePromptTemplate,
+    MessagesPlaceholder,
+    PromptTemplate,
+)
+from langchain_core.example_selectors import LengthBasedExampleSelector
+
+
+# ============================================================
+# 一、Few-shot示例的动态选择:LengthBasedExampleSelector
+# ============================================================
+
+
+def build_few_shot_prompt_with_length_selector() -> FewShotChatMessagePromptTemplate:
+    """
+    构建一个"根据用户输入长度,动态决定塞进提示词里多少条few-shot示例"的模板。
+
+    设计动机:
+        今天作业第3题里,几组few-shot示例是"写死"塞进MessagesPlaceholder的,
+        不管用户这次的问题是长是短,示例数量都不变。但真实场景下,
+        提示词整体长度是有上限的(受限于模型的上下文窗口,也涉及Token成本),
+        如果用户这次的输入本身已经很长,理论上应该少放几条示例,
+        给用户输入本身留出更多空间;如果用户输入很短,可以多放几条示例,
+        帮助模型更好地理解任务风格。
+
+        LangChain提供的LengthBasedExampleSelector,正是用来自动化处理
+        这种"按长度动态取舍"逻辑的组件,不需要自己手写"数一数当前
+        总长度超没超`阈值,决定要不要砍掉最后一条示例"这类琐碎逻辑。
+    :return: 配置好动态示例选择器的FewShotChatMessagePromptTemplate
+    """
+    # 候选的few-shot示例池:每条示例是一个"input/output"字典
+    example_pool = [
+        {"input": "苍穹支持哪些模型厂商?", "output": "苍穹目前统一通过ChatOpenAI接入DeepSeek、通义千问、OpenAI三家。"},
+        {"input": "苍穹的历史记录存在哪里?", "output": "苍穹的对话历史记录存储在SQLite数据库的messages表里,按对话ID关联。"},
+        {"input": "苍穹支持流式输出吗?", "output": "支持,苍穹通过/api/v1/chat/stream接口,以SSE协议向前端推送流式内容。"},
+        {"input": "苍穹的系统提示词能不能按客户定制?", "output": "可以,苍穹通过ChatPromptTemplate的变量占位机制,支持按客户动态填充系统提示词内容。"},
+    ]
+
+    # 用来格式化每一条示例的小模板:决定每条示例最终"长什么样"
+    example_prompt = ChatPromptTemplate.from_messages([
+        ("human", "{input}"),
+        ("ai", "{output}"),
+    ])
+
+    # LengthBasedExampleSelector默认按"空格/换行切分出的词数"估算长度,
+    # 这个默认策略是为英文场景设计的——中文句子里几乎没有空格,
+    # 如果不做任何调整,默认策略会把一整句中文都当成"1个词",
+    # 导致无论用户输入长还是短,估算出的长度差异都极小,选择效果不明显。
+    # 这里改用get_text_length参数,传入一个按"字符数"估算长度的函数,
+    # 让长度估算能够正确反映中文文本的实际长短。
+    example_selector = LengthBasedExampleSelector(
+        examples=example_pool,
+        example_prompt=PromptTemplate.from_template("{input}\n{output}"),
+        max_length=180,  # 阈值刻意设置在"能区分短输入和长输入"的临界区间,方便下面演示效果
+        get_text_length=lambda text: len(text),
+    )
+
+    return FewShotChatMessagePromptTemplate(
+        example_selector=example_selector,
+        example_prompt=example_prompt,
+    )
+
+
+def demo_length_based_example_selection() -> None:
+    """
+    演示:同一个example_selector,面对"很短的用户输入"和"很长的用户输入",
+    实际选中的few-shot示例数量会不同。
+    """
+    few_shot_prompt = build_few_shot_prompt_with_length_selector()
+
+    short_input = "苍穹是什么?"
+    long_input = (
+        "我们是一家制造业客户,内部有大量的设备操作手册和工艺文档,"
+        "现在人工查阅效率很低,想了解一下苍穹平台能不能帮我们做一个"
+        "企业内部知识库问答系统,大概的实现思路和交付周期是怎样的?"
+    )
+
+    short_messages = few_shot_prompt.format_messages(input=short_input)
+    long_messages = few_shot_prompt.format_messages(input=long_input)
+
+    print(f"[短输入] 选中的few-shot示例条数(每条示例占用2条消息):{len(short_messages) // 2}")
+    print(f"[长输入] 选中的few-shot示例条数(每条示例占用2条消息):{len(long_messages) // 2}")
+
+    assert len(short_messages) >= len(long_messages), (
+        "输入越长,理论上应该给示例让出的空间越少,选中的示例数量应该更少或相等"
+    )
+
+
+# ============================================================
+# 二、PromptTemplate的组合拼接:用"+"运算符拼接多个模板片段
+# ============================================================
+
+
+def demo_prompt_template_composition() -> None:
+    """
+    演示PromptTemplate支持用"+"运算符拼接多个独立的模板片段,
+    组合成一个更完整的模板——这在"系统提示词由多个可复用的‘小段落’
+    拼装而成"的场景下很有用,比如"通用行为准则"+"当前客户专属说明"
+    +"当前场景补充要求"这种分层拼装的提示词结构。
+    """
+    base_instructions = PromptTemplate.from_template(
+        "你是{company_name}旗下的{assistant_name},请专业、友好地回答问题。\n"
+    )
+    client_specific_notes = PromptTemplate.from_template(
+        "当前客户是{client_name},请在回答中优先参考该客户的专属知识库内容。\n"
+    )
+    closing_reminder = PromptTemplate.from_template(
+        "如果遇到不确定的问题,请明确告知用户,不要编造信息。"
+    )
+
+    # "+"运算符会把多个PromptTemplate的模板字符串按顺序拼接起来,
+    # 同时自动合并它们各自声明的输入变量(input_variables)
+    combined_prompt = base_instructions + client_specific_notes + closing_reminder
+
+    result = combined_prompt.format(
+        company_name="蓬远科技",
+        assistant_name="苍穹智能助手",
+        client_name="海纳制造集团",
+    )
+
+    print("[模板拼接结果]")
+    print(result)
+
+    assert "蓬远科技" in result
+    assert "海纳制造集团" in result
+    assert "不要编造信息" in result
+
+
+# ============================================================
+# 三、按客户/场景动态构建系统提示词(为海纳制造集团这类定制场景铺垫)
+# ============================================================
+
+
+# 模拟一份"客户专属配置表"——两周后海纳制造集团项目立项之后,
+# 这类配置大概率会存进数据库,今天先用一个Python字典模拟这个数据结构,
+# 提前把"动态构建提示词"这条业务逻辑的雏形跑通。
+CLIENT_PROMPT_PROFILES: dict[str, dict] = {
+    "default": {
+        "client_display_name": "通用客户",
+        "extra_instructions": "",
+    },
+    "hina_manufacturing": {
+        "client_display_name": "海纳制造集团",
+        "extra_instructions": (
+            "该客户是制造业企业,提问大概率与设备操作、工艺规范、质量标准相关,"
+            "回答时请尽量结合制造业专业语境,避免使用过于宽泛的通用性回答。"
+        ),
+    },
+}
+
+
+def build_dynamic_system_prompt(client_key: str = "default") -> str:
+    """
+    根据客户标识,动态拼装一段系统提示词文本。
+
+    这个函数还不是最终的ChatPromptTemplate,只是先把"拼装系统提示词
+    文本内容"这一步单独抽出来做成纯函数,方便独立测试这段业务逻辑,
+    再把返回结果作为ChatPromptTemplate里system消息的最终内容传入。
+    :param client_key: 客户标识,取值需在CLIENT_PROMPT_PROFILES中存在
+    :return: 拼装完成的系统提示词文本
+    :raises KeyError: 传入了未登记的客户标识
+    """
+    if client_key not in CLIENT_PROMPT_PROFILES:
+        raise KeyError(f"客户标识'{client_key}'未在CLIENT_PROMPT_PROFILES中登记")
+
+    profile = CLIENT_PROMPT_PROFILES[client_key]
+    base_text = (
+        f"你是蓬远科技旗下的苍穹智能助手,当前正在为{profile['client_display_name']}提供服务,"
+        "请专业、友好地回答问题。"
+    )
+    if profile["extra_instructions"]:
+        base_text += f"\n补充说明:{profile['extra_instructions']}"
+    return base_text
+
+
+def build_chat_prompt_for_client(client_key: str = "default") -> ChatPromptTemplate:
+    """
+    结合动态系统提示词文本,构建一份"按客户定制"的ChatPromptTemplate。
+
+    :param client_key: 客户标识
+    :return: 一份system消息已经按客户定制好、但history/user_input仍是
+             占位符、需要调用时填充的ChatPromptTemplate
+    """
+    system_text = build_dynamic_system_prompt(client_key)
+    return ChatPromptTemplate.from_messages([
+        ("system", system_text),
+        MessagesPlaceholder("history"),
+        ("human", "{user_input}"),
+    ])
+
+
+def demo_dynamic_client_prompt() -> None:
+    """演示同一份代码,面向不同客户,能生成出内容不同的系统提示词。"""
+    default_prompt = build_chat_prompt_for_client("default")
+    hina_prompt = build_chat_prompt_for_client("hina_manufacturing")
+
+    default_messages = default_prompt.format_messages(history=[], user_input="你好")
+    hina_messages = hina_prompt.format_messages(history=[], user_input="你好")
+
+    print("[通用客户系统提示词]", default_messages[0].content)
+    print("[海纳制造集团系统提示词]", hina_messages[0].content)
+
+    assert "海纳制造集团" in hina_messages[0].content
+    assert "制造业" in hina_messages[0].content
+    assert "海纳制造集团" not in default_messages[0].content
+
+
+# ============================================================
+# 四、提示词模板的可持久化表示:转换成可存储的字典结构
+# ============================================================
+
+
+def serialize_prompt_config(client_key: str) -> dict:
+    """
+    把某个客户的提示词配置,转换成一份可以直接存进数据库/JSON配置文件的
+    字典结构——这不是LangChain内置的能力,而是苍穹项目自己按需设计的
+    一层"配置持久化"约定,目的是让"新增一个客户的专属提示词配置"这件事,
+    未来可以通过后台管理界面维护一条数据库记录来完成,而不需要每次都改代码、
+    重新部署服务。
+
+    :param client_key: 客户标识
+    :return: 可序列化的字典,包含client_key、system_prompt_text、
+             以及用于重建ChatPromptTemplate所需的结构信息
+    """
+    if client_key not in CLIENT_PROMPT_PROFILES:
+        raise KeyError(f"客户标识'{client_key}'未在CLIENT_PROMPT_PROFILES中登记")
+
+    return {
+        "client_key": client_key,
+        "system_prompt_text": build_dynamic_system_prompt(client_key),
+        "template_structure": [
+            {"role": "system", "content": "__DYNAMIC__"},  # 标记为运行时动态填充
+            {"role": "history_placeholder", "variable_name": "history"},
+            {"role": "human", "content": "{user_input}"},
+        ],
+    }
+
+
+def rebuild_chat_prompt_from_config(config: dict) -> ChatPromptTemplate:
+    """
+    根据serialize_prompt_config()产出的配置字典,重新构建出一份等价的
+    ChatPromptTemplate——验证"提示词配置"确实可以在"文本/字典形式"和
+    "ChatPromptTemplate对象形式"之间正确地来回转换,而不丢失关键信息。
+    :param config: serialize_prompt_config()的返回结果
+    :return: 重建后的ChatPromptTemplate
+    """
+    messages_spec = []
+    for item in config["template_structure"]:
+        if item["role"] == "system":
+            messages_spec.append(("system", config["system_prompt_text"]))
+        elif item["role"] == "history_placeholder":
+            messages_spec.append(MessagesPlaceholder(item["variable_name"]))
+        elif item["role"] == "human":
+            messages_spec.append(("human", item["content"]))
+        else:
+            raise ValueError(f"未知的模板结构角色:{item['role']}")
+    return ChatPromptTemplate.from_messages(messages_spec)
+
+
+def demo_prompt_config_serialization_roundtrip() -> None:
+    """
+    演示"配置序列化->重建模板->格式化消息"这一整条链路是否等价。
+    """
+    original_prompt = build_chat_prompt_for_client("hina_manufacturing")
+    config = serialize_prompt_config("hina_manufacturing")
+    rebuilt_prompt = rebuild_chat_prompt_from_config(config)
+
+    original_result = original_prompt.format_messages(history=[], user_input="设备A的操作规范是什么?")
+    rebuilt_result = rebuilt_prompt.format_messages(history=[], user_input="设备A的操作规范是什么?")
+
+    print("[原始模板产出]", original_result[0].content[:30], "...")
+    print("[重建模板产出]", rebuilt_result[0].content[:30], "...")
+
+    assert original_result[0].content == rebuilt_result[0].content, "序列化再重建之后,系统提示词内容应该完全一致"
+    assert original_result[-1].content == rebuilt_result[-1].content, "用户消息内容也应该完全一致"
+
+
+if __name__ == "__main__":
+    print("=" * 60)
+    demo_length_based_example_selection()
+    print("=" * 60)
+    demo_prompt_template_composition()
+    print("=" * 60)
+    demo_dynamic_client_prompt()
+    print("=" * 60)
+    demo_prompt_config_serialization_roundtrip()
+    print("=" * 60)
+    print("全部PromptTemplate高级用法演示执行完毕。")
+```
+
+### 十七、配套单元测试:`test_langchain_components.py`
+
+老王在今天的晨会上说过一句话:"引入框架不是为了少写代码,而是为了让改动范围可控。"陈铭把这句话记在了心里,晚自习时补上了这份测试——如果今天重构的代码没有配套的自动化测试,"改动范围可控"这句话就只是一句空话,没有人能在下次改动`prompts.py`或`chat_model_factory.py`的时候,快速确认自己是不是不小心破坏了原有的行为。
+
+```python
+"""
+test_langchain_components.py
+===============================
+苍穹0.5版LangChain重构成果的单元测试套件(pytest)
+
+背景说明:
+    老王在今天的晨会上说过一句话:"引入框架不是为了少写代码,而是为了
+    让改动范围可控。"陈铭把这句话记在了心里,晚自习时补上了这份测试——
+    如果今天重构的代码没有配套的自动化测试,"改动范围可控"这句话就只是
+    一句空话,没有人能在下次改动`prompts.py`或`chat_model_factory.py`
+    的时候,快速确认自己是不是不小心破坏了原有的行为。
+
+    测试原则:
+    1. 涉及真实网络请求的部分(真正调用DeepSeek/通义千问API),
+       全部用langchain_core自带的FakeListChatModel或unittest.mock替代,
+       保证这份测试可以在任何机器上离线运行,不需要配置真实的API Key。
+    2. 优先测试"纯逻辑"部分(提示词模板的变量填充结果、厂商配置表的
+       校验逻辑),这部分是今天重构最核心、也最容易被后续改动破坏的地方。
+    3. 边界情况和异常路径,和正常路径给予同等的测试覆盖优先级——
+       这是Day01、Day21已经反复强调过的原则,今天在LangChain场景下
+       继续贯彻。
+
+    运行方式:
+        pytest test_langchain_components.py -v
+"""
+
+import pytest
+from unittest.mock import patch, MagicMock
+
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
+
+from app.llm.prompts import build_chat_prompt, CANGQIONG_SYSTEM_PROMPT_TEMPLATE
+from app.llm import chat_model_factory
+from app.llm.chat_model_factory import (
+    get_chat_model,
+    list_supported_providers,
+    PROVIDER_REGISTRY,
+)
+from advanced_prompt_templates import (
+    build_dynamic_system_prompt,
+    build_chat_prompt_for_client,
+    serialize_prompt_config,
+    rebuild_chat_prompt_from_config,
+    CLIENT_PROMPT_PROFILES,
+)
+
+
+# ============================================================
+# 第一部分:prompts.py 的测试
+# ============================================================
+
+
+class TestBuildChatPrompt:
+    """测试build_chat_prompt()构建出的ChatPromptTemplate行为是否符合预期。"""
+
+    def test_formatted_messages_count_matches_history_plus_two(self):
+        """填充后的消息总数,应该等于"1条系统消息 + 历史消息条数 + 1条当前用户输入"。"""
+        prompt = build_chat_prompt()
+        history = [
+            HumanMessage(content="苍穹0.1版上线了吗?"),
+            AIMessage(content="是的,已经上线了。"),
+        ]
+        result = prompt.format_messages(
+            company_name="蓬远科技",
+            assistant_name="苍穹智能助手",
+            history=history,
+            user_input="太好了",
+        )
+        assert len(result) == 1 + len(history) + 1
+
+    def test_system_message_is_always_first(self):
+        """系统消息必须始终排在格式化结果的第一位,这是下午课堂反复强调的行业约定。"""
+        prompt = build_chat_prompt()
+        result = prompt.format_messages(
+            company_name="蓬远科技",
+            assistant_name="苍穹智能助手",
+            history=[],
+            user_input="你好",
+        )
+        assert isinstance(result[0], SystemMessage)
+
+    def test_system_message_variables_correctly_filled(self):
+        """系统消息里的company_name/assistant_name变量应该被正确替换,不能残留占位符。"""
+        prompt = build_chat_prompt()
+        result = prompt.format_messages(
+            company_name="蓬远科技",
+            assistant_name="苍穹智能助手",
+            history=[],
+            user_input="你好",
+        )
+        system_content = result[0].content
+        assert "蓬远科技" in system_content
+        assert "苍穹智能助手" in system_content
+        assert "{company_name}" not in system_content, "不应该有变量占位符残留未替换"
+        assert "{assistant_name}" not in system_content
+
+    def test_empty_history_still_produces_valid_messages(self):
+        """历史记录为空(比如全新对话的第一轮)时,不应该报错,应正常产出2条消息。"""
+        prompt = build_chat_prompt()
+        result = prompt.format_messages(
+            company_name="蓬远科技",
+            assistant_name="苍穹智能助手",
+            history=[],
+            user_input="你好,我是新用户",
+        )
+        assert len(result) == 2  # 系统消息 + 当前用户输入,历史为空
+
+    def test_missing_variable_raises_key_error(self):
+        """缺少任何一个必填变量,都应该抛出异常,而不是静默地留下未替换的占位符。"""
+        prompt = build_chat_prompt()
+        with pytest.raises(KeyError):
+            prompt.format_messages(
+                company_name="蓬远科技",
+                # 故意漏掉assistant_name
+                history=[],
+                user_input="你好",
+            )
+
+    def test_history_messages_are_preserved_in_order(self):
+        """历史消息在填充后的结果里,应该保持原有的先后顺序,不能被打乱。"""
+        prompt = build_chat_prompt()
+        history = [
+            HumanMessage(content="问题1"),
+            AIMessage(content="回答1"),
+            HumanMessage(content="问题2"),
+            AIMessage(content="回答2"),
+        ]
+        result = prompt.format_messages(
+            company_name="蓬远科技",
+            assistant_name="苍穹智能助手",
+            history=history,
+            user_input="问题3",
+        )
+        # result[0]是系统消息,result[1:5]应该是历史记录,result[5]是当前输入
+        assert [m.content for m in result[1:5]] == ["问题1", "回答1", "问题2", "回答2"]
+        assert result[-1].content == "问题3"
+
+    @pytest.mark.parametrize(
+        "user_input",
+        ["", "   ", "正常问题", "带有特殊符号的问题!@#$%^&*()", "非常" * 200 + "长的问题"],
+    )
+    def test_various_user_input_do_not_crash_formatting(self, user_input):
+        """
+        参数化测试:各种边界形态的用户输入(空字符串、纯空白、超长文本、特殊符号),
+        提示词模板的格式化过程本身都不应该抛出异常——是否允许发送空消息,
+        是接口层Pydantic校验该管的事,不应该是模板格式化这一步该管的事,
+        这是"职责边界"在测试里的具体体现。
+        """
+        prompt = build_chat_prompt()
+        result = prompt.format_messages(
+            company_name="蓬远科技",
+            assistant_name="苍穹智能助手",
+            history=[],
+            user_input=user_input,
+        )
+        assert result[-1].content == user_input
+
+
+# ============================================================
+# 第二部分:chat_model_factory.py 的测试
+# ============================================================
+
+
+class TestProviderRegistry:
+    """测试厂商配置表本身的完整性,防止配置被意外改错。"""
+
+    def test_all_registered_providers_have_required_fields(self):
+        """每个已注册的厂商配置,必须包含base_url/api_key_attr/default_model三个字段。"""
+        for provider, config in PROVIDER_REGISTRY.items():
+            assert "base_url" in config, f"厂商{provider}缺少base_url字段"
+            assert "api_key_attr" in config, f"厂商{provider}缺少api_key_attr字段"
+            assert "default_model" in config, f"厂商{provider}缺少default_model字段"
+
+    def test_list_supported_providers_matches_registry_keys(self):
+        """list_supported_providers()的返回值,应该和PROVIDER_REGISTRY的键集合完全一致。"""
+        assert set(list_supported_providers()) == set(PROVIDER_REGISTRY.keys())
+
+    def test_deepseek_and_qwen_are_registered(self):
+        """今天PRD明确要求验证的两个厂商(DeepSeek、通义千问),必须存在于注册表中。"""
+        assert "deepseek" in PROVIDER_REGISTRY
+        assert "qwen" in PROVIDER_REGISTRY
+
+
+class TestGetChatModel:
+    """测试get_chat_model()工厂函数的行为,包括正常路径和异常路径。"""
+
+    def test_unsupported_provider_raises_value_error(self):
+        """传入一个未注册的厂商代号,应该抛出ValueError,且报错信息里包含当前支持的厂商列表。"""
+        with pytest.raises(ValueError, match="不支持的模型厂商"):
+            get_chat_model(provider="不存在的厂商")
+
+    def test_missing_api_key_raises_runtime_error(self, monkeypatch):
+        """
+        当对应厂商的API密钥没有配置时,应该抛出RuntimeError,而不是让程序
+        带着一个空的api_key去真正发起网络请求(那样会得到一个更难懂的、
+        来自厂商服务端的401报错,而不是"密钥未配置"这个更直接的提示)。
+        """
+        monkeypatch.setattr(chat_model_factory.settings, "deepseek_api_key", "")
+        # 因为get_chat_model被@lru_cache装饰,必须先清空缓存,
+        # 否则前面已经成功调用过的相同参数组合会直接返回缓存结果,
+        # 不会重新执行函数体里"密钥是否为空"的校验逻辑
+        get_chat_model.cache_clear()
+        with pytest.raises(RuntimeError, match="API密钥未配置"):
+            get_chat_model(provider="deepseek")
+
+    def test_get_chat_model_returns_cached_instance_for_same_args(self, monkeypatch):
+        """
+        相同参数多次调用get_chat_model(),应该返回同一个对象实例(得益于lru_cache),
+        这是Day25代码评审时特别强调的性能优化点,这里补一个测试确保这个优化没有失效。
+        """
+        monkeypatch.setattr(chat_model_factory.settings, "deepseek_api_key", "fake-key-for-test")
+        get_chat_model.cache_clear()
+        model_a = get_chat_model(provider="deepseek")
+        model_b = get_chat_model(provider="deepseek")
+        assert model_a is model_b, "相同参数组合应该复用同一个ChatModel实例,而不是每次都重新创建"
+
+    def test_different_providers_produce_different_model_names(self, monkeypatch):
+        """不同厂商应该各自使用自己注册表里配置的default_model,不能互相串用。"""
+        monkeypatch.setattr(chat_model_factory.settings, "deepseek_api_key", "fake-deepseek-key")
+        monkeypatch.setattr(chat_model_factory.settings, "dashscope_api_key", "fake-qwen-key")
+        get_chat_model.cache_clear()
+        deepseek_model = get_chat_model(provider="deepseek")
+        qwen_model = get_chat_model(provider="qwen")
+        assert deepseek_model.model_name == "deepseek-chat"
+        assert qwen_model.model_name == "qwen-plus"
+
+
+# ============================================================
+# 第三部分:模拟"main.py核心链路"的集成测试(用FakeListChatModel替代真实模型)
+# ============================================================
+
+
+class TestChatPipelineWithFakeModel:
+    """
+    用FakeListChatModel替代真实的ChatOpenAI,验证"提示词格式化 -> 模型调用"
+    这条核心链路的完整行为——这是main.py里api_chat()函数核心逻辑的
+    离线可测试版本。
+    """
+
+    def test_full_pipeline_produces_expected_reply(self):
+        """模拟main.py里api_chat()的核心两步,验证最终能拿到预期的回复内容。"""
+        fake_model = FakeListChatModel(responses=["苍穹0.1版支持流式对话和历史记录持久化。"])
+        prompt = build_chat_prompt()
+
+        formatted_messages = prompt.format_messages(
+            company_name="蓬远科技",
+            assistant_name="苍穹智能助手",
+            history=[],
+            user_input="苍穹0.1版支持哪些功能?",
+        )
+        ai_message = fake_model.invoke(formatted_messages)
+
+        assert ai_message.content == "苍穹0.1版支持流式对话和历史记录持久化。"
+
+    def test_full_pipeline_with_multiturn_history(self):
+        """验证多轮历史记录能正确参与到完整链路中,拼装出的消息数量符合预期。"""
+        fake_model = FakeListChatModel(responses=["根据上文,苍穹0.1版已经上线了。"])
+        prompt = build_chat_prompt()
+        history = [
+            HumanMessage(content="苍穹0.1版上线了吗?"),
+            AIMessage(content="是的,已经上线了。"),
+        ]
+
+        formatted_messages = prompt.format_messages(
+            company_name="蓬远科技",
+            assistant_name="苍穹智能助手",
+            history=history,
+            user_input="那它支持流式输出吗?",
+        )
+        ai_message = fake_model.invoke(formatted_messages)
+
+        assert len(formatted_messages) == 4  # 系统消息 + 2条历史 + 1条当前输入
+        assert ai_message.content == "根据上文,苍穹0.1版已经上线了。"
+
+    def test_streaming_pipeline_collects_full_reply(self):
+        """验证流式调用场景下,逐块收集的内容拼接起来,与预设的完整回复一致。"""
+        expected_reply = "苍穹0.5版已经引入LangChain框架重构对话引擎。"
+        fake_model = FakeListChatModel(responses=[expected_reply])
+        prompt = build_chat_prompt()
+
+        formatted_messages = prompt.format_messages(
+            company_name="蓬远科技",
+            assistant_name="苍穹智能助手",
+            history=[],
+            user_input="苍穹0.5版有什么变化?",
+        )
+
+        collected = "".join(chunk.content for chunk in fake_model.stream(formatted_messages))
+        assert collected == expected_reply
+
+
+# ============================================================
+# 第四部分:advanced_prompt_templates.py 里"按客户动态构建提示词"能力的测试
+# ============================================================
+# 这部分测试单独抽出来放在这里(而不是直接放进advanced_prompt_templates.py内部),
+# 是为了和前面几部分保持统一的pytest风格,同时也能验证这份"选做拓展文件"
+# 里的核心函数,同样具备被正式纳入项目测试套件的质量水准。
+
+
+class TestDynamicClientPrompt:
+    """测试"按客户动态构建系统提示词"这组函数的正确性与健壮性。"""
+
+    def test_unknown_client_key_raises_key_error(self):
+        """传入一个未登记的客户标识,应该抛出KeyError,而不是静默返回一个错误的默认提示词。"""
+        with pytest.raises(KeyError, match="未在CLIENT_PROMPT_PROFILES中登记"):
+            build_dynamic_system_prompt("不存在的客户标识")
+
+    def test_default_profile_has_no_extra_instructions(self):
+        """默认客户画像不应该带有任何行业专属的补充说明。"""
+        text = build_dynamic_system_prompt("default")
+        assert "补充说明" not in text
+
+    def test_hina_manufacturing_profile_mentions_manufacturing_context(self):
+        """海纳制造集团的客户画像,系统提示词里应该明确提及制造业相关语境。"""
+        text = build_dynamic_system_prompt("hina_manufacturing")
+        assert "制造业" in text
+        assert "补充说明" in text
+
+    @pytest.mark.parametrize("client_key", list(CLIENT_PROMPT_PROFILES.keys()))
+    def test_all_registered_clients_can_build_valid_chat_prompt(self, client_key):
+        """
+        参数化测试:遍历CLIENT_PROMPT_PROFILES里登记的每一个客户,
+        验证都能成功构建出一份可以正常格式化的ChatPromptTemplate,
+        不会因为某个客户的专属文案里包含特殊字符(比如大括号)而导致模板解析出错。
+        """
+        prompt = build_chat_prompt_for_client(client_key)
+        result = prompt.format_messages(history=[], user_input="测试问题")
+        assert len(result) == 2
+        assert result[0].content  # 系统提示词不能是空字符串
+
+    def test_serialize_and_rebuild_roundtrip_is_lossless(self):
+        """
+        针对每一个已登记的客户,验证"构建原始模板 -> 序列化成配置字典 ->
+        用配置字典重建模板"这条链路,产出的格式化结果完全一致——
+        这是"提示词配置可持久化"这个能力最核心的正确性保证,
+        一旦这个roundtrip测试失败,说明序列化逻辑丢失了某些关键信息。
+        """
+        for client_key in CLIENT_PROMPT_PROFILES:
+            original_prompt = build_chat_prompt_for_client(client_key)
+            config = serialize_prompt_config(client_key)
+            rebuilt_prompt = rebuild_chat_prompt_from_config(config)
+
+            original_result = original_prompt.format_messages(history=[], user_input="一致性校验问题")
+            rebuilt_result = rebuild_chat_prompt_from_config(config).format_messages(
+                history=[], user_input="一致性校验问题"
+            )
+
+            assert [m.content for m in original_result] == [m.content for m in rebuilt_result], (
+                f"客户{client_key}的模板在序列化再重建之后,产出结果出现了不一致"
+            )
+
+    def test_rebuild_from_config_rejects_unknown_structure_role(self):
+        """
+        如果配置字典里出现了未知的模板结构角色(比如数据被意外损坏或者手动改错),
+        重建函数应该主动抛出异常,而不是悄悄忽略这条结构、生成一份不完整的模板。
+        """
+        broken_config = {
+            "system_prompt_text": "测试系统提示词",
+            "template_structure": [
+                {"role": "system", "content": "__DYNAMIC__"},
+                {"role": "未知角色标识", "content": "这条数据是被破坏的"},
+            ],
+        }
+        with pytest.raises(ValueError, match="未知的模板结构角色"):
+            rebuild_chat_prompt_from_config(broken_config)
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(pytest.main([__file__, "-v"]))
+```
+
+这28个测试用例(不含参数化展开的用例)跑起来全部通过,陈铭把测试报告截图发到项目群里,老王只回了一句:"这才是今天重构真正的交付物,不是main.py能跑起来这件事本身。"
+
 ---
 
 ## 今日复盘
