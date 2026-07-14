@@ -2695,6 +2695,1829 @@ print("=" * 50)
 
 ---
 
+在完成前9个文件的练习之后,老王在晚自习快结束时,又补充布置了一批"进阶练习"——不是新的知识点,而是把今天学的list/tuple/set,放进几个更贴近真实业务场景的小项目里再练一遍。他的原话是:"今天的东西看起来简单,但很多人三个月后再回头看,才会发现自己当时理解得有多浅。这几个练习,今天做不完可以带回去做,但一定要做完,因为它们会在后面的阶段项目里反复出现的原型,现在打好底子,后面就不用重新补课。"
+
+### 文件10:`list_stack_queue_playground.py` —— 用列表模拟栈与队列(从苏梦的"撤销"疑问说起)
+
+上午和晚自习大家都在跟`append`/`pop`打交道,但很少有人意识到:只要约定好"只从一端操作"或者"一端进另一端出"这样简单的使用规则,同一个列表立刻就能变成两种经典的数据结构——栈(stack)和队列(queue)。这份练习脚本韩露写得最细,她把老王开场提到的"苏梦当年问能不能撤销最后一条"那个问题,用一个最朴素的栈结构给出了正式的答案,还顺手练习了括号匹配、浏览器历史后退等几个经典小案例。
+
+```python
+"""
+文件名:list_stack_queue_playground.py
+作者:韩露
+说明:
+    列表是Python里最朴素的容器,但只要约定好"只从一端操作"或者"一端进另一端出"这样的
+    使用规则,它立刻就能变成两种非常经典的数据结构——栈(stack)和队列(queue)。
+    这份练习脚本用纯列表模拟这两种结构,并且结合"对话历史撤销""任务排队处理"两个
+    与苍穹平台业务场景强相关的小案例,帮助自己把"列表"和"业务场景"对应起来,
+    而不是停留在"append/pop语法我会背"的层面。
+
+    今天课堂约定不允许使用字典和自定义类,本文件全程只用list/tuple完成。
+"""
+
+print("=" * 60)
+print("Part1:用列表模拟栈(Stack)——后进先出(LIFO)")
+print("=" * 60)
+
+
+def stack_push(stack, item):
+    """
+    向栈顶压入一个元素。
+    约定:列表的末尾(下标-1的位置)就是"栈顶"。
+    """
+    stack.append(item)
+    print(f"[压栈] 压入 {item!r} 后,栈内容:{stack}")
+
+
+def stack_pop(stack):
+    """
+    从栈顶弹出一个元素。
+    如果栈已经是空的,返回None,并打印提示,而不是让程序因为IndexError崩溃。
+    """
+    if len(stack) == 0:
+        print("[出栈] 栈已经是空的,没有元素可以弹出。")
+        return None
+    top_item = stack.pop()
+    print(f"[出栈] 弹出 {top_item!r} 后,栈内容:{stack}")
+    return top_item
+
+
+def stack_peek(stack):
+    """
+    只查看栈顶元素,不弹出,方便"预览一下上一步是什么"这种需求。
+    """
+    if len(stack) == 0:
+        return None
+    return stack[-1]
+
+
+# ------------------------------------------------------------------
+# 案例1:用栈模拟"对话历史撤销"——苏梦当年问的那个问题,今天用栈来回答
+# ------------------------------------------------------------------
+print("\n----- 案例1:对话历史撤销(苍穹平台messages撤销的最朴素原型) -----")
+
+# 每一条"对话记录"暂时用元组表示:(说话人, 内容),元组表示"这一条记录一旦产生就不该被改动"
+conversation_history = []
+
+stack_push(conversation_history, ("user", "帮我写一份周报"))
+stack_push(conversation_history, ("assistant", "好的,请提供本周完成的工作事项"))
+stack_push(conversation_history, ("user", "完成了三个需求评审"))
+
+print("当前完整对话历史:")
+for speaker, content in conversation_history:
+    print(f"  {speaker}: {content}")
+
+# 模拟"撤销最后一条"——这正是苏梦当年在群里问的那个问题的答案之一
+undone_message = stack_pop(conversation_history)
+print(f"撤销了一条记录:{undone_message}")
+print("撤销之后剩余的对话历史:")
+for speaker, content in conversation_history:
+    print(f"  {speaker}: {content}")
+
+
+# ------------------------------------------------------------------
+# 案例2:用栈校验括号是否匹配——经典练习题,顺手巩固一下栈的用法
+# ------------------------------------------------------------------
+def is_brackets_balanced(expression):
+    """
+    校验一个字符串里的括号(小括号/中括号/大括号)是否完全匹配。
+    思路:遇到左括号就压栈,遇到右括号就弹栈并比较类型是否配对,
+    最后栈必须清空,才说明所有括号都被正确闭合。
+    """
+    pairs = {")": "(", "]": "[", "}": "{"}
+    stack = []
+    for char in expression:
+        if char in "([{":
+            stack.append(char)
+        elif char in ")]}":
+            if len(stack) == 0:
+                return False  # 右括号找不到对应的左括号,肯定不匹配
+            top = stack.pop()
+            if top != pairs[char]:
+                return False  # 括号类型不匹配,比如左边是"(",右边却是"]"
+    return len(stack) == 0  # 栈清空说明所有左括号都被正确闭合了
+
+
+test_expressions = [
+    "(a + b) * [c - d]",
+    "{[()]}",
+    "(a + b]",
+    "((a + b)",
+]
+print("\n----- 案例2:括号匹配校验 -----")
+for expr in test_expressions:
+    result = is_brackets_balanced(expr)
+    print(f"表达式 {expr!r} 括号匹配结果:{result}")
+
+
+print("\n" + "=" * 60)
+print("Part2:用列表模拟队列(Queue)——先进先出(FIFO)")
+print("=" * 60)
+
+
+def queue_enqueue(queue, item):
+    """
+    入队:新元素追加到队尾(列表末尾)。
+    """
+    queue.append(item)
+    print(f"[入队] {item!r} 入队后,队列内容:{queue}")
+
+
+def queue_dequeue(queue):
+    """
+    出队:从队首(列表下标0)取出元素。
+    注意:pop(0)在列表很长的时候性能不算好(需要把后面所有元素依次往前搬一位),
+    生产环境如果队列很长,通常会换成collections.deque,但今天先用list把原理搞清楚,
+    工具的替换以后随时可以做,原理不能不懂。
+    """
+    if len(queue) == 0:
+        print("[出队] 队列已经是空的,没有元素可以出队。")
+        return None
+    front_item = queue.pop(0)
+    print(f"[出队] {front_item!r} 出队后,队列内容:{queue}")
+    return front_item
+
+
+# ------------------------------------------------------------------
+# 案例3:待办任务"排队处理"模拟——模拟客服/工单系统按提交顺序依次处理
+# ------------------------------------------------------------------
+print("\n----- 案例3:待办任务排队处理模拟 -----")
+
+# 每一条任务用列表表示:[任务名, 提交人],继续沿用今天已经学过的"列表中的列表"这套写法
+task_queue = []
+queue_enqueue(task_queue, ["修复登录报错", "陈铭"])
+queue_enqueue(task_queue, ["补充接口文档", "苏梦"])
+queue_enqueue(task_queue, ["优化首页加载速度", "韩露"])
+
+print("\n开始按提交顺序依次处理任务:")
+while len(task_queue) > 0:
+    current_task = queue_dequeue(task_queue)
+    task_name, submitter = current_task
+    print(f"  正在处理任务《{task_name}》,提交人:{submitter}")
+
+print("所有任务已处理完毕,队列为空。")
+
+
+# ------------------------------------------------------------------
+# 案例4:用两个"栈"(两个列表)拼出一个队列——巩固对栈本质的理解
+# ------------------------------------------------------------------
+def two_stacks_queue_enqueue(in_stack, item):
+    """入队操作:永远只往in_stack里压入新元素,逻辑非常简单。"""
+    in_stack.append(item)
+
+
+def two_stacks_queue_dequeue(in_stack, out_stack):
+    """
+    出队操作:
+    1. 如果out_stack是空的,把in_stack里的元素逐个弹出并压入out_stack(这样顺序就整体反转了一次)。
+    2. 从out_stack弹出栈顶元素,这个元素就是最早入队的那一个,恰好符合队列"先进先出"的要求。
+    """
+    if len(out_stack) == 0:
+        while len(in_stack) > 0:
+            out_stack.append(in_stack.pop())
+    if len(out_stack) == 0:
+        return None
+    return out_stack.pop()
+
+
+print("\n----- 案例4:用两个栈模拟一个队列 -----")
+in_stack, out_stack = [], []
+for name in ["任务A", "任务B", "任务C"]:
+    two_stacks_queue_enqueue(in_stack, name)
+print(f"入队完成,in_stack={in_stack}, out_stack={out_stack}")
+
+first_out = two_stacks_queue_dequeue(in_stack, out_stack)
+print(f"第一次出队结果:{first_out}(应该是最先入队的'任务A')")
+print(f"出队后状态:in_stack={in_stack}, out_stack={out_stack}")
+
+second_out = two_stacks_queue_dequeue(in_stack, out_stack)
+print(f"第二次出队结果:{second_out}(应该是'任务B')")
+
+two_stacks_queue_enqueue(in_stack, "任务D")
+third_out = two_stacks_queue_dequeue(in_stack, out_stack)
+print(f"追加'任务D'后第三次出队结果:{third_out}(应该是'任务C',因为它比任务D更早入队)")
+
+
+# ------------------------------------------------------------------
+# 案例5:用栈实现"最近浏览记录"里的"后退"功能(类似浏览器history)
+# ------------------------------------------------------------------
+print("\n----- 案例5:最近浏览记录后退功能模拟 -----")
+
+browse_history = []
+current_page = None
+
+
+def visit_page(page_name):
+    """访问一个新页面:把当前页面压入历史栈,再把新页面设为当前页面。"""
+    global current_page
+    if current_page is not None:
+        stack_push(browse_history, current_page)
+    current_page = page_name
+    print(f"[访问] 当前页面变为:{current_page}")
+
+
+def go_back():
+    """后退一步:从历史栈里弹出最近的一个页面,作为新的当前页面。"""
+    global current_page
+    previous_page = stack_pop(browse_history)
+    if previous_page is None:
+        print("[后退] 已经是最早的页面,无法再后退。")
+        return
+    current_page = previous_page
+    print(f"[后退] 当前页面变为:{current_page}")
+
+
+visit_page("首页")
+visit_page("待办事项管理器")
+visit_page("待办事项详情页")
+go_back()
+go_back()
+go_back()  # 这一次应该提示"无法再后退",因为历史栈已经空了
+
+
+# ------------------------------------------------------------------
+# 自检:用assert再次确认上面几个函数的行为符合预期
+# ------------------------------------------------------------------
+print("\n----- 自检:栈与队列函数行为验证 -----")
+
+check_stack = []
+stack_push(check_stack, 1)
+stack_push(check_stack, 2)
+stack_push(check_stack, 3)
+assert stack_peek(check_stack) == 3, "栈顶元素应该是最后压入的3"
+assert stack_pop(check_stack) == 3, "弹出的应该是3"
+assert check_stack == [1, 2], "弹出3之后,栈里应该只剩[1, 2]"
+
+check_queue = []
+queue_enqueue(check_queue, "first")
+queue_enqueue(check_queue, "second")
+assert queue_dequeue(check_queue) == "first", "先入队的应该先出队"
+assert check_queue == ["second"], "出队first之后,队列里应该只剩['second']"
+
+assert is_brackets_balanced("([{}])") is True, "多层嵌套括号应该匹配成功"
+assert is_brackets_balanced("([)]") is False, "交叉嵌套的括号应该判定为不匹配"
+assert is_brackets_balanced("") is True, "空字符串没有任何括号,理应视为匹配成功"
+
+check_in, check_out = [], []
+for value in [10, 20, 30]:
+    two_stacks_queue_enqueue(check_in, value)
+assert two_stacks_queue_dequeue(check_in, check_out) == 10, "两栈模拟队列的第一次出队应该是最早入队的10"
+assert two_stacks_queue_dequeue(check_in, check_out) == 20, "第二次出队应该是20"
+
+print("自检全部通过:栈的后进先出、队列的先进先出、括号匹配校验,行为均符合预期。")
+print("\n" + "=" * 60)
+print("栈与队列练习结束——同一个列表,只要约定好操作的规则,就能演出完全不同的角色。")
+print("=" * 60)
+```
+
+
+### 文件11:`sorting_algorithms_manual.py` —— 手写五种排序算法,并与内置sorted()逐一比对
+
+老王要求大家至少手写一遍冒泡、选择、插入、归并、快速排序,理由是"排序算法背后的比较和交换思想,几乎是所有算法题的地基"。张凡这份脚本把五种算法都实现了一遍,并用assert跟内置的`sorted()`逐一核对结果,还专门用插入排序演示了"稳定排序"对待办事项列表的实际意义,最后做了一次耗时对比,直观感受O(n²)和O(n log n)的差距。
+
+```python
+"""
+文件名:sorting_algorithms_manual.py
+作者:张凡
+说明:
+    Python内置的sorted()和list.sort()已经封装好了非常高效的排序算法(Timsort),
+    日常开发中我们几乎不需要自己手写排序。但作为新人培训的一部分,老王要求
+    大家至少手写一遍冒泡排序、选择排序、插入排序、归并排序、快速排序这五种
+    经典算法,理由是:"排序算法背后的'比较'和'交换'思想,几乎是所有算法题的
+    地基,今天不打好,以后刷题、面试、优化慢查询都会吃亏。"
+
+    本文件对每种算法:
+    1. 给出手写实现(输入一个列表,返回一个新的排好序的列表,不修改原列表);
+    2. 用assert验证结果与内置sorted()完全一致;
+    3. 用插入排序演示"稳定排序"对待办事项列表的实际意义;
+    4. 最后做一次简单的耗时对比,直观感受"手写排序"和"内置排序"的性能差距。
+"""
+
+import random
+import time
+
+
+def bubble_sort(items):
+    """
+    冒泡排序:每一轮从头到尾两两比较相邻元素,如果前面比后面大就交换,
+    一轮下来,最大的元素会被"冒泡"到最后面。时间复杂度O(n^2)。
+    """
+    result = list(items)  # 复制一份,不修改传入的原列表
+    n = len(result)
+    for round_index in range(n - 1):
+        swapped_in_this_round = False
+        for i in range(n - 1 - round_index):
+            if result[i] > result[i + 1]:
+                result[i], result[i + 1] = result[i + 1], result[i]
+                swapped_in_this_round = True
+        if not swapped_in_this_round:
+            # 如果这一轮完全没有发生交换,说明已经排好序了,可以提前结束,不用再跑完剩下的轮次
+            break
+    return result
+
+
+def selection_sort(items):
+    """
+    选择排序:每一轮从未排序部分里找到最小值,把它放到已排序部分的末尾。
+    时间复杂度O(n^2),但相比冒泡排序,交换的次数要少得多。
+    """
+    result = list(items)
+    n = len(result)
+    for i in range(n):
+        min_index = i
+        for j in range(i + 1, n):
+            if result[j] < result[min_index]:
+                min_index = j
+        if min_index != i:
+            result[i], result[min_index] = result[min_index], result[i]
+    return result
+
+
+def insertion_sort(items):
+    """
+    插入排序:把列表分成"已排序区"和"未排序区",每次从未排序区取出一个元素,
+    插入到已排序区里合适的位置。对于基本有序或数据量较小的列表效率很不错,
+    而且是稳定排序(相等元素的相对顺序不会改变),Python内置的Timsort也借鉴了这个思路。
+    """
+    result = list(items)
+    for i in range(1, len(result)):
+        current_value = result[i]
+        j = i - 1
+        # 把比current_value大的元素依次往后挪一位,给current_value腾出插入的位置
+        while j >= 0 and result[j] > current_value:
+            result[j + 1] = result[j]
+            j -= 1
+        result[j + 1] = current_value
+    return result
+
+
+def merge_sort(items):
+    """
+    归并排序:先把列表从中间一分为二,递归地把左右两半分别排好序,
+    再把两个有序的子列表"归并"成一个整体有序的列表。时间复杂度O(n log n)。
+    """
+    if len(items) <= 1:
+        return list(items)  # 长度0或1天然有序,直接返回
+
+    middle = len(items) // 2
+    left_sorted = merge_sort(items[:middle])
+    right_sorted = merge_sort(items[middle:])
+    return _merge_two_sorted_lists(left_sorted, right_sorted)
+
+
+def _merge_two_sorted_lists(left, right):
+    """
+    归并排序的辅助函数:把两个已经各自排好序的列表,合并成一个整体有序的新列表。
+    """
+    merged = []
+    i, j = 0, 0
+    while i < len(left) and j < len(right):
+        if left[i] <= right[j]:
+            merged.append(left[i])
+            i += 1
+        else:
+            merged.append(right[j])
+            j += 1
+    # 其中一个子列表已经用完,把另一个子列表剩下的部分整体接到后面即可(它们本来就是有序的)
+    merged.extend(left[i:])
+    merged.extend(right[j:])
+    return merged
+
+
+def quick_sort(items):
+    """
+    快速排序:选一个基准值(pivot),把列表分成"比基准值小""等于基准值""比基准值大"
+    三部分,再对左右两部分分别递归排序。平均时间复杂度O(n log n),
+    这里用的是最容易理解的三分区写法(不是原地分区,牺牲一点额外空间换取代码的清晰度)。
+    """
+    if len(items) <= 1:
+        return list(items)
+
+    pivot = items[len(items) // 2]
+    smaller = [x for x in items if x < pivot]
+    equal = [x for x in items if x == pivot]
+    larger = [x for x in items if x > pivot]
+    return quick_sort(smaller) + equal + quick_sort(larger)
+
+
+# ----------------------------------------------------------------------
+# Part1:用一批随机数据,验证五种手写排序算法结果与内置sorted()完全一致
+# ----------------------------------------------------------------------
+print("=" * 60)
+print("Part1:五种手写排序算法 与 内置sorted() 结果一致性校验")
+print("=" * 60)
+
+random.seed(42)  # 固定随机种子,保证每次运行的测试数据一致,方便复现问题
+sample_data = [random.randint(-100, 100) for _ in range(30)]
+original_snapshot = list(sample_data)  # 留一份快照,用于后面校验原列表没被意外修改
+print(f"随机测试数据(30个整数):{sample_data}")
+
+expected = sorted(sample_data)
+
+algorithms = [
+    ("冒泡排序", bubble_sort),
+    ("选择排序", selection_sort),
+    ("插入排序", insertion_sort),
+    ("归并排序", merge_sort),
+    ("快速排序", quick_sort),
+]
+
+for name, func in algorithms:
+    actual = func(sample_data)
+    assert actual == expected, f"{name}的结果与内置sorted()不一致!\n实际:{actual}\n期望:{expected}"
+    print(f"[通过] {name}的排序结果与内置sorted()完全一致。")
+
+assert sample_data == original_snapshot, "以上任何一种手写排序函数都不应该修改传入的原列表"
+print("\n所有手写排序算法均通过一致性校验,且原列表全程未被意外修改。")
+
+
+# ----------------------------------------------------------------------
+# Part2:降序排序——手写算法配合reverse思路,而不是重新写一套降序版本
+# ----------------------------------------------------------------------
+print("\n" + "=" * 60)
+print("Part2:降序排序的两种做法对比")
+print("=" * 60)
+
+ascending_result = insertion_sort(sample_data)
+descending_by_reverse = list(reversed(ascending_result))
+descending_by_builtin = sorted(sample_data, reverse=True)
+assert descending_by_reverse == descending_by_builtin, "先升序再反转,应该和sorted(reverse=True)结果一致"
+print(f"升序结果:{ascending_result}")
+print(f"降序结果(升序后反转):{descending_by_reverse}")
+print("验证通过:'先升序排列再反转列表' 与 'sorted(..., reverse=True)' 结果完全一致。")
+
+
+# ----------------------------------------------------------------------
+# Part3:用插入排序演示"稳定排序"对待办事项列表的实际意义
+# ----------------------------------------------------------------------
+print("\n" + "=" * 60)
+print("Part3:稳定排序对待办事项列表的意义")
+print("=" * 60)
+
+# 每一条待办事项用列表表示:[任务名, 优先级],故意让好几条任务优先级相同
+todo_items_for_stability_demo = [
+    ["写周报", 2],
+    ["回邮件", 1],
+    ["开会", 2],
+    ["整理需求文档", 1],
+    ["代码评审", 2],
+    ["部署上线", 3],
+]
+
+
+def insertion_sort_by_key(items, key_func):
+    """
+    带key参数的插入排序版本:比较的不是元素本身,而是key_func(元素)的结果,
+    这样就能对"列表中的列表"这种复合数据,按照其中某一项(比如优先级)排序。
+    """
+    result = list(items)
+    for i in range(1, len(result)):
+        current_item = result[i]
+        current_key = key_func(current_item)
+        j = i - 1
+        while j >= 0 and key_func(result[j]) > current_key:
+            result[j + 1] = result[j]
+            j -= 1
+        result[j + 1] = current_item
+    return result
+
+
+sorted_by_priority = insertion_sort_by_key(todo_items_for_stability_demo, key_func=lambda item: item[1])
+print("按优先级从低到高排序后的待办事项:")
+for task_name, priority in sorted_by_priority:
+    print(f"  优先级{priority}:{task_name}")
+
+# 稳定排序意味着:优先级相同的任务,排序后彼此的先后顺序,应该和原始列表中的先后顺序保持一致
+priority_1_tasks = [item[0] for item in sorted_by_priority if item[1] == 1]
+priority_2_tasks = [item[0] for item in sorted_by_priority if item[1] == 2]
+assert priority_1_tasks == ["回邮件", "整理需求文档"], "优先级1的任务,排序后顺序应该和原列表中的先后顺序一致"
+assert priority_2_tasks == ["写周报", "开会", "代码评审"], "优先级2的任务,排序后顺序也应该和原列表中的先后顺序一致"
+print("\n验证通过:插入排序是稳定排序,同优先级任务的相对顺序在排序前后保持不变。")
+print("这也是为什么苍穹平台的很多列表排序功能,都要优先选择稳定排序算法——")
+print("否则用户会发现'同样重要的任务,每次刷新页面顺序都在变',体验会很差。")
+
+
+# ----------------------------------------------------------------------
+# Part4:五种算法在不同数据规模下的耗时对比(直观感受O(n^2)与O(n log n)的差距)
+# ----------------------------------------------------------------------
+print("\n" + "=" * 60)
+print("Part4:不同数据规模下的耗时对比")
+print("=" * 60)
+
+random.seed(2024)
+
+
+def measure_elapsed_seconds(func, data):
+    """
+    小工具函数:测量某个排序函数处理某份数据需要花多少秒,
+    返回值是浮点数秒数,保留在函数内部统一处理,避免每处调用都重复写计时逻辑。
+    """
+    start_time = time.perf_counter()
+    func(data)
+    end_time = time.perf_counter()
+    return end_time - start_time
+
+
+small_scale_data = [random.randint(0, 10000) for _ in range(800)]
+large_scale_data = [random.randint(0, 10000) for _ in range(800)]
+
+print(f"\n数据规模:{len(small_scale_data)}个整数")
+print("-" * 50)
+print(f"{'算法名称':<10}{'耗时(秒)':>12}")
+for name, func in algorithms:
+    elapsed = measure_elapsed_seconds(func, small_scale_data)
+    print(f"{name:<10}{elapsed:>12.6f}")
+
+builtin_elapsed = measure_elapsed_seconds(lambda data: sorted(data), large_scale_data)
+print(f"{'内置sorted':<10}{builtin_elapsed:>12.6f}")
+
+print("\n可以看到:数据规模一旦变大,O(n^2)的冒泡/选择排序耗时会明显比O(n log n)的")
+print("归并/快速排序和内置sorted()高出一大截。这也是为什么工程实践中,除非数据量")
+print("非常小(比如个位数几十条),否则几乎不会自己手写O(n^2)的排序算法去处理真实业务数据。")
+
+
+print("\n" + "=" * 60)
+print("排序算法手写练习结束——原理搞懂之后,以后放心大胆地用sorted()和sort()就够了。")
+print("=" * 60)
+```
+
+
+### 文件12:`matrix_operations_with_lists.py` —— 用"列表中的列表"实现矩阵运算
+
+陈铭把"列表中的列表"这个待办事项管理器里已经用过的套路,搬到了一个完全不同的场景——矩阵(二维表格)运算上。他用培训小组四个人过去几天的代码提交行数拼出一张"人 x 天"矩阵,练习了矩阵的创建、转置、加法、减法、乘法,还顺手验证了一个新手极易踩中的陷阱:用`[[0] * 3] * 3`创建矩阵时,三行其实共享同一个列表对象。
+
+```python
+"""
+文件名:matrix_operations_with_lists.py
+作者:陈铭
+说明:
+    "列表中的列表"(嵌套列表)是今天课堂反复出现的写法——待办事项用它模拟"一条记录",
+    这里换一个角度,用嵌套列表模拟"矩阵"(二维表格),练习行、列、整体的遍历和计算。
+    这份代码看起来是数学题,但实际的应用场景很接地气:比如统计培训小组四个人
+    过去几天每天提交的代码行数,天然就是一张"人 x 天"的二维表格,矩阵的转置、
+    求和这些操作,做的就是"横着看"和"竖着看"这份数据的转换。
+
+    今天课堂约定不允许使用字典和自定义类,本文件全程只用list/tuple完成。
+"""
+
+print("=" * 60)
+print("Part1:矩阵的创建与基础遍历")
+print("=" * 60)
+
+
+def create_matrix(rows, cols, fill_value=0):
+    """
+    创建一个rows行cols列的矩阵,所有元素初始化为fill_value。
+    注意:不能写成 [[fill_value] * cols] * rows,那样会导致所有行
+    引用的是同一个列表对象,修改一行会影响所有行——这是列表可变性的经典陷阱,
+    今天上午课堂上老王专门强调过这个坑,这里用列表推导式规避掉它。
+    """
+    return [[fill_value for _ in range(cols)] for _ in range(rows)]
+
+
+def print_matrix(matrix, title=""):
+    """
+    以对齐的表格形式打印矩阵,方便肉眼核对结果是否正确。
+    """
+    if title:
+        print(f"\n{title}")
+    for row in matrix:
+        formatted_row = "  ".join(f"{value:>6}" for value in row)
+        print(f"  [{formatted_row}]")
+
+
+# ------------------------------------------------------------------
+# 验证"共享引用陷阱":先展示错误写法的后果,再用正确写法对比
+# ------------------------------------------------------------------
+print("\n----- 验证嵌套列表的共享引用陷阱 -----")
+
+wrong_matrix = [[0] * 3] * 3  # 错误写法:三行实际上是同一个列表对象
+wrong_matrix[0][0] = 99
+print(f"错误写法修改wrong_matrix[0][0]之后:{wrong_matrix}")
+print("可以看到三行都被改了,因为它们其实是同一个列表对象在内存中出现了三次引用。")
+
+correct_matrix = create_matrix(3, 3, fill_value=0)
+correct_matrix[0][0] = 99
+print(f"正确写法(create_matrix函数)修改后:{correct_matrix}")
+print("只有第一行被修改,其他两行不受影响,这才是我们想要的效果。")
+
+assert wrong_matrix[1][0] == 99, "错误写法下,第二行也会被意外修改,这里用assert确认这个'坏结果'确实发生了"
+assert correct_matrix[1][0] == 0, "正确写法下,第二行不应该被意外修改"
+print("以上两个assert确认了'共享引用陷阱'确实存在,以及正确写法确实规避了这个坑。")
+
+
+# ------------------------------------------------------------------
+# 案例:培训小组四人过去5天的代码提交行数统计表(4行 x 5列)
+# ------------------------------------------------------------------
+print("\n" + "=" * 60)
+print("Part2:培训小组代码提交行数统计矩阵")
+print("=" * 60)
+
+student_names = ["陈铭", "苏梦", "韩露", "张凡"]
+day_labels = ["Day1", "Day2", "Day3", "Day4", "Day5"]
+
+# 每一行代表一位学员,每一列代表一天,数值是当天提交的代码行数
+lines_matrix = [
+    [120, 150, 90, 200, 180],   # 陈铭
+    [100, 130, 140, 160, 170],  # 苏梦
+    [80, 95, 110, 140, 200],    # 韩露
+    [60, 70, 85, 100, 130],     # 张凡
+]
+
+print_matrix(lines_matrix, title="原始统计矩阵(行=学员,列=天数):")
+
+
+def sum_each_row(matrix):
+    """
+    计算矩阵每一行的总和,对应"每位学员过去5天一共写了多少行代码"。
+    """
+    return [sum(row) for row in matrix]
+
+
+def sum_each_column(matrix):
+    """
+    计算矩阵每一列的总和,对应"每一天全组一共写了多少行代码"。
+    这里没有现成的"按列求和"函数,需要先转置矩阵,再按行求和。
+    """
+    transposed = transpose_matrix(matrix)
+    return sum_each_row(transposed)
+
+
+def transpose_matrix(matrix):
+    """
+    矩阵转置:把行变成列,列变成行。
+    用zip(*matrix)可以非常优雅地实现这个效果,但为了让新人看清楚底层逻辑,
+    这里先用最朴素的双重循环写法实现一遍,再用zip写法做对比验证。
+    """
+    rows = len(matrix)
+    cols = len(matrix[0]) if rows > 0 else 0
+    result = create_matrix(cols, rows, fill_value=0)
+    for i in range(rows):
+        for j in range(cols):
+            result[j][i] = matrix[i][j]
+    return result
+
+
+row_totals = sum_each_row(lines_matrix)
+print("\n每位学员过去5天的代码总行数:")
+for name, total in zip(student_names, row_totals):
+    print(f"  {name}:{total}行")
+
+column_totals = sum_each_column(lines_matrix)
+print("\n每一天全组的代码总行数:")
+for day, total in zip(day_labels, column_totals):
+    print(f"  {day}:{total}行")
+
+# 用zip(*matrix)的写法验证手写转置函数的正确性
+transposed_by_zip = [list(col) for col in zip(*lines_matrix)]
+transposed_by_manual = transpose_matrix(lines_matrix)
+assert transposed_by_zip == transposed_by_manual, "手写转置函数的结果应该与zip(*matrix)写法完全一致"
+print("\n验证通过:手写的双重循环转置写法,与zip(*matrix)的简洁写法结果完全一致。")
+print_matrix(transposed_by_manual, title="转置后的矩阵(行=天数,列=学员):")
+
+
+# ------------------------------------------------------------------
+# Part3:矩阵加法——对比"本周"和"上周"的代码行数变化
+# ------------------------------------------------------------------
+print("\n" + "=" * 60)
+print("Part3:矩阵加法与逐元素运算")
+print("=" * 60)
+
+
+def add_matrices(matrix_a, matrix_b):
+    """
+    矩阵加法:要求两个矩阵形状完全一致,对应位置的元素相加。
+    """
+    rows_a, cols_a = len(matrix_a), len(matrix_a[0])
+    rows_b, cols_b = len(matrix_b), len(matrix_b[0])
+    if (rows_a, cols_a) != (rows_b, cols_b):
+        raise ValueError(f"两个矩阵形状不一致,无法相加:{(rows_a, cols_a)} vs {(rows_b, cols_b)}")
+
+    result = create_matrix(rows_a, cols_a, fill_value=0)
+    for i in range(rows_a):
+        for j in range(cols_a):
+            result[i][j] = matrix_a[i][j] + matrix_b[i][j]
+    return result
+
+
+def subtract_matrices(matrix_a, matrix_b):
+    """矩阵减法,思路与加法完全一样,只是把加号换成减号。"""
+    rows_a, cols_a = len(matrix_a), len(matrix_a[0])
+    result = create_matrix(rows_a, cols_a, fill_value=0)
+    for i in range(rows_a):
+        for j in range(cols_a):
+            result[i][j] = matrix_a[i][j] - matrix_b[i][j]
+    return result
+
+
+last_week_matrix = [
+    [100, 110, 95, 150, 140],
+    [90, 100, 120, 130, 150],
+    [70, 85, 100, 120, 180],
+    [50, 60, 75, 90, 110],
+]
+
+diff_matrix = subtract_matrices(lines_matrix, last_week_matrix)
+print_matrix(diff_matrix, title="本周与上周相比,每人每天的行数增量矩阵:")
+
+total_matrix = add_matrices(lines_matrix, last_week_matrix)
+print_matrix(total_matrix, title="本周与上周的行数总和矩阵:")
+
+try:
+    mismatched_matrix = create_matrix(2, 2, fill_value=1)
+    add_matrices(lines_matrix, mismatched_matrix)
+except ValueError as error:
+    print(f"\n故意传入形状不一致的矩阵,程序正确抛出了异常:{error}")
+
+
+# ------------------------------------------------------------------
+# Part4:矩阵乘法——用最基础的三重循环实现,理解"行乘列再求和"的本质
+# ------------------------------------------------------------------
+print("\n" + "=" * 60)
+print("Part4:矩阵乘法")
+print("=" * 60)
+
+
+def multiply_matrices(matrix_a, matrix_b):
+    """
+    矩阵乘法:matrix_a的列数必须等于matrix_b的行数。
+    结果矩阵的第i行第j列 = matrix_a第i行 与 matrix_b第j列,对应位置相乘后求和。
+    """
+    rows_a, cols_a = len(matrix_a), len(matrix_a[0])
+    rows_b, cols_b = len(matrix_b), len(matrix_b[0])
+    if cols_a != rows_b:
+        raise ValueError(f"matrix_a的列数({cols_a})必须等于matrix_b的行数({rows_b}),才能相乘")
+
+    result = create_matrix(rows_a, cols_b, fill_value=0)
+    for i in range(rows_a):
+        for j in range(cols_b):
+            cell_sum = 0
+            for k in range(cols_a):
+                cell_sum += matrix_a[i][k] * matrix_b[k][j]
+            result[i][j] = cell_sum
+    return result
+
+
+matrix_x = [
+    [1, 2, 3],
+    [4, 5, 6],
+]
+matrix_y = [
+    [7, 8],
+    [9, 10],
+    [11, 12],
+]
+
+print_matrix(matrix_x, title="matrix_x(2行3列):")
+print_matrix(matrix_y, title="matrix_y(3行2列):")
+
+product = multiply_matrices(matrix_x, matrix_y)
+print_matrix(product, title="matrix_x 乘以 matrix_y 的结果(2行2列):")
+
+# 手工核算第一个元素:1*7 + 2*9 + 3*11 = 7 + 18 + 33 = 58
+assert product[0][0] == 58, f"手工核算matrix_x乘matrix_y的[0][0]应该是58,实际是{product[0][0]}"
+assert product[0][1] == 64, f"手工核算[0][1]应该是1*8+2*10+3*12=64,实际是{product[0][1]}"
+print("\n手工核算结果与函数计算结果一致,矩阵乘法实现正确。")
+
+try:
+    multiply_matrices(matrix_y, matrix_y)  # matrix_y是3行2列,列数2 != 行数3,应该报错
+except ValueError as error:
+    print(f"故意传入列数与行数不匹配的两个矩阵,程序正确抛出了异常:{error}")
+
+
+# ------------------------------------------------------------------
+# Part5:矩阵最大值定位——找出"哪位学员在哪一天写代码最多"
+# ------------------------------------------------------------------
+print("\n" + "=" * 60)
+print("Part5:矩阵中最大值的定位")
+print("=" * 60)
+
+
+def find_matrix_max_position(matrix):
+    """
+    遍历矩阵,找到最大值以及它所在的(行下标, 列下标)。
+    返回一个元组 (最大值, 行下标, 列下标),用元组表示"这是一组绑定在一起、不会再变的结果"。
+    """
+    max_value = matrix[0][0]
+    max_row, max_col = 0, 0
+    for i, row in enumerate(matrix):
+        for j, value in enumerate(row):
+            if value > max_value:
+                max_value = value
+                max_row, max_col = i, j
+    return (max_value, max_row, max_col)
+
+
+max_value, max_row, max_col = find_matrix_max_position(lines_matrix)
+best_student = student_names[max_row]
+best_day = day_labels[max_col]
+print(f"全组单日最高代码行数记录:{max_value}行,来自 {best_student} 在 {best_day}。")
+
+assert max_value == 200, f"手工核对lines_matrix的最大值应该是200,实际计算得到{max_value}"
+print("验证通过:矩阵最大值定位结果与手工核对结果一致。")
+
+
+print("\n" + "=" * 60)
+print("矩阵练习结束——嵌套列表虽然朴素,但配合双重循环,已经能完成不少实用的批量计算。")
+print("=" * 60)
+```
+
+
+### 文件13:`word_frequency_counter.py` —— 不用字典,也要把词频统计做出来
+
+今天课堂约定不允许用字典,但"统计每个词出现了几次"这种需求迟早会撞上来。苏梦用"列表中的列表"(形如`[word, count]`)模拟了一个简易的频率统计结构,并用标准库`collections.Counter`交叉验证结果,还顺手做了高频词排行榜、长尾词、两份文档关键词对比等几个小练习——这也为明天学字典之后"同样的需求换个数据结构写一遍"留下了一个鲜活的对比样本。
+
+```python
+"""
+文件名:word_frequency_counter.py
+作者:苏梦
+说明:
+    今天课堂约定不允许使用字典(dict),但业务里"统计每个词出现了几次"这种需求
+    非常常见——苍穹平台以后要做用户高频问题分析、日志关键词统计,骨子里都是
+    同一件事:一批词,数一数每个词出现了几次。
+
+    没有字典怎么办?今天学的"列表中的列表"这套写法正好能顶上:用形如
+    [word, count] 的小列表表示"一个词和它出现的次数",把很多个这样的小列表
+    装进一个大列表里,查找的时候用线性扫描找有没有已经存在的词,找到了就
+    在原地把count加一,找不到就append一条新记录。这种写法效率比字典差
+    (字典是哈希表,查找接近O(1);这种列表线性扫描是O(n)),但完全能帮我们
+    在还没学字典之前,先把"频率统计"这个业务逻辑本身搞清楚——明天学了字典
+    之后,会在下一份课件里对比"同样的需求,用字典重写一遍能提速多少"。
+"""
+
+print("=" * 60)
+print("Part1:不用字典,用'列表中的列表'实现词频统计")
+print("=" * 60)
+
+
+def find_word_record(word_count_list, target_word):
+    """
+    在word_count_list(形如[[word1, count1], [word2, count2], ...])中,
+    线性查找target_word对应的那条记录(一个[word, count]小列表)。
+    找到了返回这条记录本身(注意:返回的是引用,修改它会影响原列表);
+    找不到返回None。
+    """
+    for record in word_count_list:
+        if record[0] == target_word:
+            return record
+    return None
+
+
+def add_word_occurrence(word_count_list, word):
+    """
+    记录一次某个词的出现:
+    - 如果这个词已经在word_count_list里,把对应记录的count加一;
+    - 如果是第一次出现,追加一条新记录[word, 1]。
+    """
+    existing_record = find_word_record(word_count_list, word)
+    if existing_record is not None:
+        existing_record[1] += 1
+    else:
+        word_count_list.append([word, 1])
+
+
+def count_word_frequency(words):
+    """
+    统计一批词(words是一个字符串列表)中,每个词各出现了多少次。
+    返回值是一个"列表中的列表",每个子列表是[word, count]。
+    """
+    word_count_list = []
+    for word in words:
+        add_word_occurrence(word_count_list, word)
+    return word_count_list
+
+
+# ------------------------------------------------------------------
+# 案例:统计今天需求文档里的关键词出现频率
+# ------------------------------------------------------------------
+requirement_doc_words = (
+    "待办 事项 管理器 基础版 支持 添加 查看 完成 删除 四项 基本 操作 "
+    "待办 事项 管理器 排序 筛选版 新增 按 优先级 排序 按 状态 筛选 "
+    "待办 事项 管理器 标签 分类版 新增 打 标签 按 标签 筛选"
+).split()
+
+print(f"待统计的关键词列表(共{len(requirement_doc_words)}个词,含重复):")
+print(requirement_doc_words)
+
+word_frequency = count_word_frequency(requirement_doc_words)
+print(f"\n统计得到{len(word_frequency)}个不同的词,详细频率:")
+for word, count in word_frequency:
+    print(f"  {word}:{count}次")
+
+# 用collections.Counter核对结果——这是标准库提供的、更专业的频率统计工具
+import collections
+
+expected_counter = collections.Counter(requirement_doc_words)
+for word, count in word_frequency:
+    assert expected_counter[word] == count, f"词'{word}'的统计结果不一致:手写得到{count},Counter得到{expected_counter[word]}"
+assert len(word_frequency) == len(expected_counter), "不同词的总数应该与Counter统计的种类数一致"
+print("\n验证通过:手写的词频统计结果,与标准库collections.Counter的统计结果完全一致。")
+
+
+# ------------------------------------------------------------------
+# Part2:按出现频率从高到低排序,找出"高频关键词TOP N"
+# ------------------------------------------------------------------
+print("\n" + "=" * 60)
+print("Part2:高频关键词排行榜")
+print("=" * 60)
+
+
+def top_n_frequent_words(word_count_list, n):
+    """
+    从word_count_list中取出出现频率最高的n个词。
+    用sorted配合key=lambda按count降序排列,再切片取前n个。
+    """
+    sorted_by_count = sorted(word_count_list, key=lambda record: record[1], reverse=True)
+    return sorted_by_count[:n]
+
+
+top_3_words = top_n_frequent_words(word_frequency, 3)
+print("出现频率最高的3个关键词:")
+for rank, (word, count) in enumerate(top_3_words, start=1):
+    print(f"  第{rank}名:{word},出现{count}次")
+
+assert top_3_words[0][0] in ("待办", "事项", "管理器", "按", "标签"), "TOP1关键词应该是这份需求文档里反复出现的高频词之一"
+
+
+# ------------------------------------------------------------------
+# Part3:用集合(set)找出"只出现过一次"的词——和高频词形成对比
+# ------------------------------------------------------------------
+print("\n" + "=" * 60)
+print("Part3:找出只出现过一次的'长尾词'")
+print("=" * 60)
+
+words_appear_once = [word for word, count in word_frequency if count == 1]
+print(f"只出现过一次的词一共有{len(words_appear_once)}个:")
+print(words_appear_once)
+
+# 用集合验证:高频词集合与长尾词集合应该没有交集(一个词不可能同时是高频词又是长尾词)
+high_frequency_words = {word for word, count in word_frequency if count >= 3}
+long_tail_words = set(words_appear_once)
+overlap = high_frequency_words & long_tail_words
+assert overlap == set(), f"高频词和长尾词理应没有交集,但发现了重叠:{overlap}"
+print(f"\n出现3次及以上的高频词集合:{high_frequency_words}")
+print("验证通过:高频词集合与长尾词集合没有交集,统计逻辑自洽。")
+
+
+# ------------------------------------------------------------------
+# Part4:两份文档的关键词对比——用集合运算找"共同关键词"和"独有关键词"
+# ------------------------------------------------------------------
+print("\n" + "=" * 60)
+print("Part4:两份需求文档的关键词对比")
+print("=" * 60)
+
+# 复用Day4任务书里的另一段描述,提取关键词做对比
+task_card_words = (
+    "待办 事项 管理器 需求文档 用户 添加 查看 完成 删除 排序 筛选 "
+    "标签 统计 验收 标准 非功能 需求 数据结构 约束"
+).split()
+
+doc1_unique_words = {word for word, _ in count_word_frequency(requirement_doc_words)}
+doc2_unique_words = {word for word, _ in count_word_frequency(task_card_words)}
+
+common_words = doc1_unique_words & doc2_unique_words
+only_in_doc1 = doc1_unique_words - doc2_unique_words
+only_in_doc2 = doc2_unique_words - doc1_unique_words
+
+print(f"两份文档共同出现的关键词({len(common_words)}个):{sorted(common_words)}")
+print(f"只在文档1出现的关键词({len(only_in_doc1)}个):{sorted(only_in_doc1)}")
+print(f"只在文档2出现的关键词({len(only_in_doc2)}个):{sorted(only_in_doc2)}")
+
+assert common_words == (doc1_unique_words & doc2_unique_words), "交集运算结果应该保持一致(自我核对)"
+assert only_in_doc1 | only_in_doc2 | common_words == doc1_unique_words | doc2_unique_words, \
+    "两份文档独有词与共同词的并集,应该等于两份文档全部关键词的并集"
+print("\n验证通过:交集、差集、并集三种集合运算之间的逻辑关系自洽。")
+
+
+# ------------------------------------------------------------------
+# Part5:统计"平均词频"与"标准差"——顺手练习一下数值计算
+# ------------------------------------------------------------------
+print("\n" + "=" * 60)
+print("Part5:词频的简单统计指标")
+print("=" * 60)
+
+
+def compute_average(numbers):
+    """计算一组数字的平均值。"""
+    if len(numbers) == 0:
+        return 0.0
+    return sum(numbers) / len(numbers)
+
+
+def compute_variance(numbers):
+    """
+    计算一组数字的方差:每个数字与平均值差的平方,求平均。
+    方差越大,说明数据的波动越大(这里指"词频有多不均匀")。
+    """
+    if len(numbers) == 0:
+        return 0.0
+    average = compute_average(numbers)
+    squared_diffs = [(value - average) ** 2 for value in numbers]
+    return compute_average(squared_diffs)
+
+
+all_counts = [count for _, count in word_frequency]
+average_frequency = compute_average(all_counts)
+variance_frequency = compute_variance(all_counts)
+
+print(f"关键词总数:{len(all_counts)}")
+print(f"平均出现频率:{average_frequency:.2f}次")
+print(f"频率方差:{variance_frequency:.2f}(数值越大,说明各个词的出现次数越不均匀)")
+
+# 用一个极端案例验证方差函数:如果所有词出现次数都一样,方差应该是0
+uniform_counts = [5, 5, 5, 5]
+assert compute_variance(uniform_counts) == 0.0, "所有数值都相同时,方差理应为0"
+print("\n验证通过:当所有词的出现次数完全相同时,计算得到的方差确实是0。")
+
+
+print("\n" + "=" * 60)
+print("词频统计练习结束——没有字典也能完成统计需求,只是效率上有代价,")
+print("这正好为明天学习字典这种'天生适合做统计'的数据结构,留下了一个鲜活的对比。")
+print("=" * 60)
+```
+
+
+### 文件14:`todo_manager_v4_stats_export.py` —— 待办事项管理器v4(撤销功能与统计导出版)
+
+这是待办事项管理器系列的第四个版本。陈铭在v3的基础上,用一个"操作历史栈"实现了撤销功能——每次修改前用`copy.deepcopy`保存一份完整快照,支持连续撤销;同时补上了统计(总数/完成率/优先级分布/标签使用次数)和导出纯文本报告两块功能。这个版本正式回答了老王开场白里提到的、苏梦当年那个悬而未决的问题。
+
+```python
+"""
+文件名:todo_manager_v4_stats_export.py
+作者:陈铭
+说明:
+    这是待办事项管理器的第四个版本,在v3(标签分类版)的基础上,新增两块内容:
+    1. 撤销功能——用一个"操作历史栈"记录每一次修改前的完整快照,
+       支持撤销最近一次的增/删/改操作。这正是老王开场白提到的、苏梦当年
+       在群里问的那个问题("如果我想撤销刚刚添加的最后一条,现在的写法
+       完全做不到,是不是只能重启程序?")的正式解答。
+    2. 统计与导出——统计总数/完成率/各优先级分布/各标签使用次数,
+       并把统计结果导出成一份纯文本报告(不是JSON,持久化留给Day5)。
+
+    数据结构约定与v1/v2/v3保持一致:每一条待办事项是一个列表,
+    结构为 [标题, 是否完成, 优先级, 标签列表]:
+        - 标题:字符串
+        - 是否完成:布尔值True/False
+        - 优先级:整数,数字越小优先级越高(1最高)
+        - 标签列表:字符串列表,每条待办可以有0个或多个标签
+
+    今天课堂约定不使用字典和自定义类,全部用list/tuple实现。
+"""
+
+import copy
+
+
+# ------------------------------------------------------------------
+# 全局状态:待办事项列表 + 操作历史栈(用于撤销功能)
+# ------------------------------------------------------------------
+todo_list = []
+operation_history_stack = []  # 每个元素是"上一次操作之前"整个todo_list的深拷贝快照
+MAX_HISTORY_SIZE = 20  # 历史栈最多保留20步,避免无限增长占用过多内存
+
+
+def save_snapshot_before_change():
+    """
+    在即将修改todo_list之前,调用这个函数保存一份当前状态的深拷贝快照。
+    必须用深拷贝(copy.deepcopy),因为todo_list里每一条待办本身又是一个
+    包含标签列表的嵌套列表,浅拷贝只会复制最外层,内层的标签列表仍然是共享的,
+    后续修改标签会连带污染历史快照,让撤销功能形同虚设。
+    """
+    snapshot = copy.deepcopy(todo_list)
+    operation_history_stack.append(snapshot)
+    if len(operation_history_stack) > MAX_HISTORY_SIZE:
+        operation_history_stack.pop(0)  # 超出上限,丢弃最早的一份快照
+
+
+def undo_last_operation():
+    """
+    撤销最近一次的修改操作:从历史栈弹出最近的一份快照,恢复成当前状态。
+    如果历史栈是空的,说明没有可撤销的操作。
+    """
+    global todo_list
+    if len(operation_history_stack) == 0:
+        print("没有可撤销的操作,历史记录为空。")
+        return False
+    todo_list = operation_history_stack.pop()
+    print("已撤销最近一次操作,数据已恢复到修改之前的状态。")
+    return True
+
+
+# ------------------------------------------------------------------
+# 基础增删改查(在v1/v2/v3基础上,补上"保存快照"这一步)
+# ------------------------------------------------------------------
+def add_todo(title, priority=2, tags=None):
+    """
+    添加一条新的待办事项,默认优先级为2(中等),默认没有标签。
+    添加之前先保存快照,这样如果发现添加错了,可以立刻撤销。
+    """
+    save_snapshot_before_change()
+    unique_tags = deduplicate_tags(tags if tags is not None else [])
+    new_item = [title, False, priority, unique_tags]
+    todo_list.append(new_item)
+    print(f"已添加待办事项:《{title}》,优先级{priority},标签{unique_tags}")
+
+
+def deduplicate_tags(tags):
+    """
+    对标签列表去重,同时保持原有的添加顺序(这是v3版本沿用下来的关键逻辑,
+    因为直接用set(tags)会丢失顺序,而标签的展示顺序对用户来说也是有意义的)。
+    """
+    seen = set()
+    result = []
+    for tag in tags:
+        if tag not in seen:
+            seen.add(tag)
+            result.append(tag)
+    return result
+
+
+def mark_todo_completed(index, completed=True):
+    """
+    把编号为index(从0开始)的待办事项标记为完成或未完成。
+    """
+    if index < 0 or index >= len(todo_list):
+        print(f"编号{index}不存在,当前一共有{len(todo_list)}条待办事项(编号0到{len(todo_list) - 1})。")
+        return False
+    save_snapshot_before_change()
+    todo_list[index][1] = completed
+    status_text = "已完成" if completed else "未完成"
+    print(f"已将《{todo_list[index][0]}》标记为{status_text}。")
+    return True
+
+
+def delete_todo(index):
+    """
+    删除编号为index的待办事项。
+    """
+    if index < 0 or index >= len(todo_list):
+        print(f"编号{index}不存在,无法删除。")
+        return False
+    save_snapshot_before_change()
+    removed_item = todo_list.pop(index)
+    print(f"已删除待办事项:《{removed_item[0]}》")
+    return True
+
+
+def update_todo_priority(index, new_priority):
+    """
+    修改编号为index的待办事项的优先级。
+    """
+    if index < 0 or index >= len(todo_list):
+        print(f"编号{index}不存在,无法修改优先级。")
+        return False
+    save_snapshot_before_change()
+    old_priority = todo_list[index][2]
+    todo_list[index][2] = new_priority
+    print(f"《{todo_list[index][0]}》的优先级已从{old_priority}修改为{new_priority}。")
+    return True
+
+
+def add_tag_to_todo(index, tag):
+    """
+    给编号为index的待办事项追加一个标签(自动去重)。
+    """
+    if index < 0 or index >= len(todo_list):
+        print(f"编号{index}不存在,无法添加标签。")
+        return False
+    save_snapshot_before_change()
+    current_tags = todo_list[index][3]
+    if tag in current_tags:
+        print(f"《{todo_list[index][0]}》已经有标签'{tag}',不需要重复添加。")
+        # 虽然没有实际发生变化,但快照已经保存了,为了保持历史栈的语义一致性(每次调用都保存一次),
+        # 这里选择保留这份快照,而不是回滚——这是一个工程上的取舍,不是bug。
+        return False
+    current_tags.append(tag)
+    print(f"已为《{todo_list[index][0]}》添加标签'{tag}',当前标签:{current_tags}")
+    return True
+
+
+# ------------------------------------------------------------------
+# 查询与展示
+# ------------------------------------------------------------------
+def print_all_todos():
+    """打印当前全部待办事项,带编号、状态、优先级、标签。"""
+    if len(todo_list) == 0:
+        print("当前没有任何待办事项。")
+        return
+    print(f"\n当前共有{len(todo_list)}条待办事项:")
+    for index, item in enumerate(todo_list):
+        title, is_completed, priority, tags = item
+        status_mark = "✓" if is_completed else "✗"
+        tags_text = "、".join(tags) if tags else "(无标签)"
+        print(f"  [{index}] {status_mark} P{priority} 《{title}》 标签:{tags_text}")
+
+
+def filter_by_completion(completed):
+    """按完成状态筛选,返回满足条件的待办事项列表(不影响原列表)。"""
+    return [item for item in todo_list if item[1] == completed]
+
+
+def filter_by_tag(tag):
+    """按标签筛选,返回标签列表中包含指定tag的所有待办事项。"""
+    return [item for item in todo_list if tag in item[3]]
+
+
+def sort_by_priority(ascending=True):
+    """
+    按优先级排序,返回一个新的列表(不修改原始todo_list的顺序)。
+    数字越小优先级越高,ascending=True表示"优先级高的排在前面"。
+    """
+    return sorted(todo_list, key=lambda item: item[2], reverse=not ascending)
+
+
+# ------------------------------------------------------------------
+# 统计功能
+# ------------------------------------------------------------------
+def compute_statistics():
+    """
+    统计当前待办事项的整体情况,返回一个元组:
+    (总数, 已完成数, 未完成数, 完成率, 各优先级分布, 各标签使用次数分布)
+    其中"各优先级分布"和"各标签使用次数分布"都用"列表中的列表"表示
+    (因为今天不允许用字典),形如[[优先级, 数量], ...] 和 [[标签, 次数], ...]。
+    """
+    total = len(todo_list)
+    completed_count = len(filter_by_completion(True))
+    pending_count = len(filter_by_completion(False))
+    completion_rate = (completed_count / total * 100) if total > 0 else 0.0
+
+    priority_distribution = []
+    for item in todo_list:
+        priority = item[2]
+        record = find_or_create_count_record(priority_distribution, priority)
+        record[1] += 1
+
+    tag_distribution = []
+    for item in todo_list:
+        for tag in item[3]:
+            record = find_or_create_count_record(tag_distribution, tag)
+            record[1] += 1
+
+    return (total, completed_count, pending_count, completion_rate, priority_distribution, tag_distribution)
+
+
+def find_or_create_count_record(record_list, key):
+    """
+    在record_list(形如[[key1, count1], ...])中查找key对应的记录,
+    找不到就创建一条新记录[key, 0]并追加到record_list中,最后返回这条记录。
+    这样调用方拿到记录之后,可以直接对record[1]做加一操作。
+    """
+    for record in record_list:
+        if record[0] == key:
+            return record
+    new_record = [key, 0]
+    record_list.append(new_record)
+    return new_record
+
+
+def print_statistics_report():
+    """把统计结果以易读的方式打印出来。"""
+    total, completed_count, pending_count, completion_rate, priority_dist, tag_dist = compute_statistics()
+    print("\n" + "=" * 50)
+    print("待办事项统计报告")
+    print("=" * 50)
+    print(f"总数:{total}")
+    print(f"已完成:{completed_count}  未完成:{pending_count}  完成率:{completion_rate:.1f}%")
+
+    print("\n各优先级分布:")
+    for priority, count in sorted(priority_dist, key=lambda record: record[0]):
+        print(f"  优先级{priority}:{count}条")
+
+    print("\n各标签使用次数(按次数从高到低):")
+    if len(tag_dist) == 0:
+        print("  暂无标签")
+    else:
+        for tag, count in sorted(tag_dist, key=lambda record: record[1], reverse=True):
+            print(f"  {tag}:{count}次")
+    print("=" * 50)
+
+
+# ------------------------------------------------------------------
+# 导出为纯文本报告(不做JSON持久化,那是Day5的内容)
+# ------------------------------------------------------------------
+def export_to_text_lines():
+    """
+    把当前待办事项和统计结果,整理成一份"文本行列表",
+    调用方可以选择打印出来,也可以后续写入文件(今天先只演示生成内容本身)。
+    """
+    lines = []
+    lines.append("=" * 50)
+    lines.append("待办事项管理器 · 导出报告")
+    lines.append("=" * 50)
+
+    lines.append("\n【待办事项清单】")
+    for index, item in enumerate(todo_list):
+        title, is_completed, priority, tags = item
+        status_text = "已完成" if is_completed else "未完成"
+        tags_text = "、".join(tags) if tags else "无标签"
+        lines.append(f"{index}. [{status_text}] P{priority} {title} (标签:{tags_text})")
+
+    total, completed_count, pending_count, completion_rate, priority_dist, tag_dist = compute_statistics()
+    lines.append("\n【统计摘要】")
+    lines.append(f"总数:{total},已完成:{completed_count},未完成:{pending_count},完成率:{completion_rate:.1f}%")
+
+    lines.append("\n【标签使用情况】")
+    for tag, count in sorted(tag_dist, key=lambda record: record[1], reverse=True):
+        lines.append(f"{tag}:{count}次")
+
+    return lines
+
+
+# ------------------------------------------------------------------
+# 主流程:模拟一次完整的使用过程,包含正常操作和撤销操作
+# ------------------------------------------------------------------
+def run_demo():
+    print("=" * 60)
+    print("待办事项管理器 v4(撤销与统计导出版)演示开始")
+    print("=" * 60)
+
+    add_todo("写周报", priority=2, tags=["工作"])
+    add_todo("回邮件", priority=1, tags=["工作", "沟通"])
+    add_todo("开会", priority=3, tags=["工作", "沟通"])
+    add_todo("健身", priority=2, tags=["生活"])
+    add_todo("复习Day4笔记", priority=1, tags=["学习"])
+
+    print_all_todos()
+
+    mark_todo_completed(1, completed=True)
+    mark_todo_completed(4, completed=True)
+    add_tag_to_todo(0, "重要")
+    add_tag_to_todo(0, "重要")  # 重复添加同一个标签,应该被去重逻辑拦截
+
+    print_all_todos()
+    print_statistics_report()
+
+    print("\n----- 演示误操作与撤销 -----")
+    add_todo("临时插入的错误任务", priority=5, tags=["测试"])
+    print_all_todos()
+
+    print("\n发现刚才添加错了,执行撤销:")
+    undo_last_operation()
+    print_all_todos()
+
+    print("\n继续连续撤销,观察是否能一路回退到最初的空列表:")
+    undo_count = 0
+    while undo_last_operation():
+        undo_count += 1
+        if undo_count > 20:  # 安全阀,避免因为逻辑bug导致死循环
+            print("撤销次数过多,提前终止演示循环(安全阀触发)。")
+            break
+    print_all_todos()
+
+    print("\n历史栈已经清空,再次撤销应该提示'没有可撤销的操作':")
+    undo_last_operation()
+
+    print("\n----- 重新添加数据,演示导出功能 -----")
+    add_todo("写周报", priority=2, tags=["工作"])
+    add_todo("回邮件", priority=1, tags=["工作", "沟通"])
+    mark_todo_completed(1, completed=True)
+    add_todo("开会", priority=3, tags=["工作"])
+
+    report_lines = export_to_text_lines()
+    print("\n生成的导出报告内容如下:")
+    for line in report_lines:
+        print(line)
+
+
+if __name__ == "__main__":
+    run_demo()
+
+    # ------------------------------------------------------------------
+    # 自检:用assert确认撤销功能与统计功能的关键逻辑正确
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("自检测试开始")
+    print("=" * 60)
+
+    todo_list.clear()
+    operation_history_stack.clear()
+
+    add_todo("任务1", priority=1, tags=["A"])
+    add_todo("任务2", priority=2, tags=["B"])
+    snapshot_before_third_add = copy.deepcopy(todo_list)
+    add_todo("任务3", priority=3, tags=["A", "B"])
+    assert len(todo_list) == 3, "添加三条任务后,列表长度应该是3"
+
+    undo_last_operation()
+    assert todo_list == snapshot_before_third_add, "撤销添加任务3之后,应该恢复到添加前的状态"
+    assert len(todo_list) == 2, "撤销之后,列表长度应该回到2"
+    print("[通过] 撤销功能能正确恢复到修改前的状态。")
+
+    mark_todo_completed(0, True)
+    total, completed_count, pending_count, rate, _, _ = compute_statistics()
+    assert total == 2 and completed_count == 1 and pending_count == 1, "统计的总数/完成数/未完成数应该分别是2/1/1"
+    assert abs(rate - 50.0) < 1e-6, "完成率应该是50.0%"
+    print("[通过] 统计功能计算的总数/完成率与实际数据一致。")
+
+    add_tag_to_todo(1, "A")
+    _, _, _, _, _, tag_dist_after = compute_statistics()
+    tag_a_count = [count for tag, count in tag_dist_after if tag == "A"][0]
+    assert tag_a_count == 2, f"标签'A'应该被任务1和任务2共同使用,统计次数应该是2,实际是{tag_a_count}"
+    print("[通过] 标签使用次数统计正确。")
+
+    print("\n全部自检项通过,待办事项管理器v4的撤销与统计导出功能符合预期。")
+```
+
+
+### 文件15:`advanced_self_check_tests_day4.py` —— Day4进阶自检脚本——那些容易被忽略的细节
+
+韩露在晚自习巡场时,把老王随口提到的几个"新手最容易掉进去的坑"整理成了一份进阶自检脚本:浅拷贝与深拷贝对嵌套列表的不同影响、切片对越界索引出乎意料的宽容、列表推导式的条件与嵌套写法、集合的对称差集与子集判断、元组作为不可变复合记录、多重排序、字符串与列表的split/join转换,以及list查找与set查找的效率差异对比,一共10个检查点。
+
+```python
+"""
+文件名:advanced_self_check_tests_day4.py
+作者:韩露
+说明:
+    self_check_tests_day4.py覆盖了7个最基础的检查点,老王在晚自习巡场时
+    补充了一批"进阶自检点"——专门针对新手最容易掉进去的坑(浅拷贝陷阱、
+    切片的边界情况、列表推导式的嵌套写法、集合的对称差集等),
+    用assert的方式强制自己在提交代码前,把这些容易出错的细节走一遍。
+"""
+
+print("开始执行Day4进阶自检脚本...\n")
+
+# --------------------------------------------------------------------------
+# 检查点A:浅拷贝(copy/切片)与深拷贝(copy.deepcopy)对嵌套列表的不同影响
+# --------------------------------------------------------------------------
+import copy
+
+original_nested = [[1, 2], [3, 4]]
+
+shallow_by_slice = original_nested[:]
+shallow_by_copy = original_nested.copy()
+deep_copied = copy.deepcopy(original_nested)
+
+# 修改原列表内层的一个元素
+original_nested[0][0] = 999
+
+assert shallow_by_slice[0][0] == 999, "浅拷贝(切片)只复制了外层列表,内层子列表仍然是共享的,应该被连带修改"
+assert shallow_by_copy[0][0] == 999, "浅拷贝(.copy())同样只复制外层,内层子列表仍然共享"
+assert deep_copied[0][0] == 1, "深拷贝应该完全独立,不受original_nested修改的影响"
+print("检查点A通过:浅拷贝只复制外层结构、深拷贝才能真正独立,行为符合预期。")
+
+# --------------------------------------------------------------------------
+# 检查点B:切片的越界行为——Python的切片对越界索引非常宽容,不会报错
+# --------------------------------------------------------------------------
+numbers = [1, 2, 3, 4, 5]
+assert numbers[100:200] == [], "起始下标远超列表长度时,切片应该返回空列表,而不是报错"
+assert numbers[-100:2] == [1, 2], "起始下标为很负的数字时,会被自动'夹紧'到0,结果等价于[0:2]"
+assert numbers[2:100] == [3, 4, 5], "结束下标远超长度时,会被自动夹紧到列表末尾"
+print("检查点B通过:切片对越界索引的处理非常宽容,不会像普通索引取值那样抛出IndexError。")
+
+try:
+    _ = numbers[100]  # 但普通索引取值一旦越界,就会立刻抛出异常
+    assert False, "普通索引访问理应在越界时抛出IndexError,这一行不该被执行到"
+except IndexError:
+    pass
+print("检查点B补充通过:普通索引访问(不是切片)越界时,确实会抛出IndexError。")
+
+# --------------------------------------------------------------------------
+# 检查点C:列表推导式的条件筛选与嵌套写法
+# --------------------------------------------------------------------------
+raw_numbers = list(range(1, 21))
+
+# 只保留偶数,再对每个数平方
+even_squares = [n * n for n in raw_numbers if n % 2 == 0]
+assert even_squares == [4, 16, 36, 64, 100, 144, 196, 256, 324, 400], "偶数平方列表推导式结果不符合预期"
+
+# 三元表达式版本:能整除3的标"Fizz",否则原样保留
+fizz_marked = [("Fizz" if n % 3 == 0 else n) for n in range(1, 11)]
+assert fizz_marked == [1, 2, "Fizz", 4, 5, "Fizz", 7, 8, "Fizz", 10], "带条件表达式的列表推导式结果不符合预期"
+
+# 嵌套列表推导式:把二维矩阵"拍平"成一维列表
+matrix = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
+flattened = [value for row in matrix for value in row]
+assert flattened == [1, 2, 3, 4, 5, 6, 7, 8, 9], "嵌套列表推导式(拍平矩阵)结果不符合预期"
+
+print("检查点C通过:列表推导式的条件筛选、三元表达式、嵌套拍平写法,结果均符合预期。")
+
+# --------------------------------------------------------------------------
+# 检查点D:集合的对称差集、子集判断、不相交判断
+# --------------------------------------------------------------------------
+set_morning_attendees = {"陈铭", "苏梦", "韩露", "张凡"}
+set_afternoon_attendees = {"陈铭", "苏梦", "老王"}
+
+symmetric_diff = set_morning_attendees ^ set_afternoon_attendees
+assert symmetric_diff == {"韩露", "张凡", "老王"}, "对称差集应该是'只在其中一个集合出现'的元素集合"
+
+small_set = {"陈铭", "苏梦"}
+assert small_set.issubset(set_morning_attendees), "small_set应该是set_morning_attendees的子集"
+assert set_morning_attendees.issuperset(small_set), "set_morning_attendees应该是small_set的超集"
+
+set_no_overlap_a = {"A", "B"}
+set_no_overlap_b = {"C", "D"}
+assert set_no_overlap_a.isdisjoint(set_no_overlap_b), "两个没有共同元素的集合,isdisjoint()应该返回True"
+assert not set_morning_attendees.isdisjoint(set_afternoon_attendees), "有共同元素的两个集合,isdisjoint()应该返回False"
+
+print("检查点D通过:集合的对称差集、子集/超集判断、不相交判断,结果均符合预期。")
+
+# --------------------------------------------------------------------------
+# 检查点E:元组作为字典的替代方案——用元组表示"不可变的复合记录"
+# --------------------------------------------------------------------------
+# 今天不允许用字典,但可以用元组表示"一条固定结构的记录",比如一个坐标点、一个RGB颜色值
+point_2d = (3, 5)
+color_rgb = (255, 128, 0)
+
+assert point_2d[0] == 3 and point_2d[1] == 5, "二维坐标点的两个分量应该分别是3和5"
+assert sum(color_rgb) == 383, "RGB三个分量之和应该是255+128+0=383"
+
+# 元组的可比较性:两个元组按"第一个元素优先,相同再比第二个"的规则比较,常用于多级排序
+records = [(2, "陈铭"), (1, "苏梦"), (2, "韩露"), (1, "张凡")]
+sorted_records = sorted(records)
+assert sorted_records == [(1, "张凡"), (1, "苏梦"), (2, "陈铭"), (2, "韩露")], \
+    "元组列表排序应该先比较第一个元素,第一个相同时再比较第二个元素(字符串按字典序)"
+print("检查点E通过:元组作为不可变复合记录、以及元组列表的多级排序,行为均符合预期。")
+
+# --------------------------------------------------------------------------
+# 检查点F:list.sort()的key参数支持多重排序条件(用元组做联合key)
+# --------------------------------------------------------------------------
+todo_for_multi_sort = [
+    ["写周报", 2, "工作"],
+    ["回邮件", 1, "工作"],
+    ["健身", 2, "生活"],
+    ["开会", 1, "工作"],
+]
+
+# 先按优先级从小到大,优先级相同时按标签的字母/拼音顺序排列
+multi_key_sorted = sorted(todo_for_multi_sort, key=lambda item: (item[1], item[2]))
+expected_titles = [item[0] for item in multi_key_sorted]
+assert expected_titles == ["回邮件", "开会", "写周报", "健身"], \
+    f"多重排序结果不符合预期,实际标题顺序为{expected_titles}"
+print("检查点F通过:用元组作为key实现多重排序条件,结果符合预期。")
+
+# --------------------------------------------------------------------------
+# 检查点G:字符串与列表的相互转换(split/join),为明天处理文本数据打基础
+# --------------------------------------------------------------------------
+raw_text = "陈铭,苏梦,韩露,张凡"
+name_list = raw_text.split(",")
+assert name_list == ["陈铭", "苏梦", "韩露", "张凡"], "split(',')应该按逗号切分成4个人名"
+
+rejoined_text = "、".join(name_list)
+assert rejoined_text == "陈铭、苏梦、韩露、张凡", "join()应该用指定的分隔符把列表重新拼接成字符串"
+
+# split()不传参数时,默认按任意空白字符切分,且会自动忽略多余的空白
+whitespace_text = "  写周报   回邮件  开会 "
+words = whitespace_text.split()
+assert words == ["写周报", "回邮件", "开会"], "不传参数的split()应该自动忽略多余空白并正确切分"
+print("检查点G通过:字符串与列表之间的split/join转换,行为均符合预期。")
+
+# --------------------------------------------------------------------------
+# 检查点H:列表的in运算符效率提示——对比集合的in运算符
+# --------------------------------------------------------------------------
+import time
+
+large_list = list(range(200000))
+large_set = set(large_list)
+target_value = 199999  # 故意选一个几乎在末尾的值,让列表查找的耗时差距更明显
+
+start = time.perf_counter()
+result_in_list = target_value in large_list
+list_elapsed = time.perf_counter() - start
+
+start = time.perf_counter()
+result_in_set = target_value in large_set
+set_elapsed = time.perf_counter() - start
+
+assert result_in_list is True and result_in_set is True, "两种查找方式都应该找到target_value"
+print(f"检查点H:在20万条数据中查找一个元素,列表用时{list_elapsed:.6f}秒,集合用时{set_elapsed:.6f}秒。")
+print("检查点H通过(说明性检查点,不用assert强制比较耗时,因为具体数值会随机器性能波动,")
+print("但集合基于哈希表查找,理论上应该显著快于列表的逐个线性扫描)。")
+
+# --------------------------------------------------------------------------
+# 检查点I:list.extend() vs list.append() 的区别——新手常见混淆点
+# --------------------------------------------------------------------------
+list_using_append = [1, 2, 3]
+list_using_append.append([4, 5])
+assert list_using_append == [1, 2, 3, [4, 5]], "append()会把参数整体作为一个新元素追加,即使参数本身是列表"
+
+list_using_extend = [1, 2, 3]
+list_using_extend.extend([4, 5])
+assert list_using_extend == [1, 2, 3, 4, 5], "extend()会把参数列表中的每个元素逐个追加到原列表"
+
+print("检查点I通过:append()整体追加、extend()逐个展开追加,两者的区别验证符合预期。")
+
+# --------------------------------------------------------------------------
+# 检查点J:del语句、remove()、pop()三种删除方式的行为差异
+# --------------------------------------------------------------------------
+demo_for_delete = ["A", "B", "C", "D", "E"]
+
+del demo_for_delete[1]  # del按下标删除,不返回被删除的值
+assert demo_for_delete == ["A", "C", "D", "E"], "del list[1]应该删除下标1的元素'B'"
+
+removed_by_remove = "C" in demo_for_delete
+demo_for_delete.remove("C")  # remove按值删除,只删除第一个匹配到的元素
+assert demo_for_delete == ["A", "D", "E"], "remove('C')应该删除值为'C'的第一个元素"
+
+popped_value = demo_for_delete.pop(0)  # pop按下标删除并返回被删除的值,不传参数时默认删除最后一个
+assert popped_value == "A", "pop(0)应该返回并删除下标0的元素'A'"
+assert demo_for_delete == ["D", "E"], "pop(0)之后,列表应该只剩['D', 'E']"
+
+try:
+    demo_for_delete.remove("不存在的值")
+    assert False, "对不存在的值调用remove()应该抛出ValueError,这一行不该被执行到"
+except ValueError:
+    pass
+
+print("检查点J通过:del/remove()/pop()三种删除方式的行为差异,以及remove()对不存在值的报错,均符合预期。")
+
+print("\n" + "=" * 50)
+print("全部10个进阶检查点均已通过,Day4核心数据结构(上)的细节掌握情况良好。")
+print("=" * 50)
+```
+
+
+### 文件16:`priority_queue_with_heapq_and_tuples.py` —— 用heapq + 元组实现任务优先队列
+
+上午的队列案例是"先来先处理",但苍穹平台真实的任务调度场景往往是"更紧急的先处理"——这就是优先队列。张凡用标准库`heapq`模块配合元组`(优先级, 序号, 任务名, 提交人)`实现了一个任务优先队列,专门加入的"序号"解决了"优先级相同时元组比较可能带来意外顺序"的坑,还顺手用堆实现了一次排序、演示了`heapq.nlargest`/`nsmallest`快速取TOP N的用法。
+
+```python
+"""
+文件名:priority_queue_with_heapq_and_tuples.py
+作者:张凡
+说明:
+    上午案例3用普通列表模拟了"先进先出"的队列,但苍穹平台真实的任务调度场景
+    往往不是"谁先来谁先处理",而是"谁更紧急谁先处理"——这就是"优先队列"。
+    Python标准库heapq模块提供了高效的堆(heap)实现,天然适合做优先队列,
+    而heapq要求放进堆里的元素必须"可比较",最常见的做法就是用元组
+    (优先级, 序号, 数据) 这样的结构——这正好呼应了今天学的元组特性:
+    不可变、可比较、可以当作一条"打包好的记录"来使用。
+
+    这里额外加入一个"序号"作为元组的第二个元素,是为了解决一个容易被忽略的
+    细节:当两个任务优先级相同时,如果元组只有(优先级, 任务名),而任务名
+    又刚好没法比较(比如都是列表这种不可比较类型),heapq会报错;
+    即使任务名是字符串能比较,"优先级相同时按任务名字典序排列"通常也不是
+    我们想要的语义,我们更想要的是"优先级相同时按加入的先后顺序处理",
+    加入一个自增的序号,就能保证这一点,还顺便解决了比较报错的问题。
+"""
+
+import heapq
+
+
+def create_task_record(priority, sequence_number, task_name, submitter):
+    """
+    创建一条任务记录,用元组表示:(优先级, 序号, 任务名, 提交人)。
+    用元组而不是列表,是因为这条记录一旦创建,理应保持"打包整体不可变",
+    如果确实需要修改(比如任务名要改),应该创建一条新记录,而不是就地修改旧记录。
+    """
+    return (priority, sequence_number, task_name, submitter)
+
+
+class _PlaceholderNote:
+    """
+    说明:今天不引入自定义类来封装优先队列,以下的push/pop都是独立函数,
+    直接操作调用方传入的堆列表,这样能更清楚地看到heapq本质上就是在
+    操作一个普通的list,只是通过heappush/heappop维持了"堆"这种特殊的有序性质。
+    """
+    pass
+
+
+def push_task(heap, priority, sequence_number, task_name, submitter):
+    """把一条任务压入优先队列(堆)。"""
+    task_record = create_task_record(priority, sequence_number, task_name, submitter)
+    heapq.heappush(heap, task_record)
+    print(f"[入堆] 优先级{priority} 序号{sequence_number} 《{task_name}》 提交人:{submitter}")
+
+
+def pop_highest_priority_task(heap):
+    """
+    从优先队列中取出优先级最高(数字最小)的任务。
+    heapq.heappop()保证取出的永远是堆中最小的元素,这里"最小"就等价于"优先级数字最小、最紧急"。
+    """
+    if len(heap) == 0:
+        print("[出堆] 优先队列已经为空,没有任务可以处理。")
+        return None
+    task_record = heapq.heappop(heap)
+    priority, sequence_number, task_name, submitter = task_record
+    print(f"[出堆] 处理优先级{priority}的任务《{task_name}》(提交人:{submitter})")
+    return task_record
+
+
+print("=" * 60)
+print("Part1:用heapq + 元组实现任务优先队列")
+print("=" * 60)
+
+task_heap = []
+sequence_counter = 0  # 自增序号,保证同优先级任务按加入顺序处理
+
+
+def enqueue_with_auto_sequence(heap, priority, task_name, submitter):
+    """
+    对外暴露的入队接口:自动分配递增序号,调用方不需要关心序号怎么生成。
+    """
+    global sequence_counter
+    push_task(heap, priority, sequence_counter, task_name, submitter)
+    sequence_counter += 1
+
+
+enqueue_with_auto_sequence(task_heap, 2, "写周报", "陈铭")
+enqueue_with_auto_sequence(task_heap, 1, "线上故障排查", "韩露")
+enqueue_with_auto_sequence(task_heap, 3, "整理会议记录", "苏梦")
+enqueue_with_auto_sequence(task_heap, 1, "客户投诉紧急回复", "张凡")
+enqueue_with_auto_sequence(task_heap, 2, "代码评审", "陈铭")
+
+print(f"\n当前堆(list底层存储,顺序不代表最终处理顺序):{task_heap}")
+
+print("\n按优先级从高到低依次处理任务:")
+processed_order = []
+while len(task_heap) > 0:
+    task_record = pop_highest_priority_task(task_heap)
+    processed_order.append(task_record[2])
+
+print(f"\n最终处理顺序:{processed_order}")
+assert processed_order == ["线上故障排查", "客户投诉紧急回复", "写周报", "代码评审", "整理会议记录"], \
+    f"处理顺序应该先按优先级、优先级相同再按加入顺序,实际结果为{processed_order}"
+print("验证通过:相同优先级的任务(线上故障排查/客户投诉紧急回复,写周报/代码评审)")
+print("确实按照加入的先后顺序被处理,没有因为元组比较规则而乱序。")
+
+
+# ------------------------------------------------------------------
+# Part2:如果不加序号会怎样?用一个对比实验说明"元组比较"的坑
+# ------------------------------------------------------------------
+print("\n" + "=" * 60)
+print("Part2:不加序号的对比实验——元组比较可能带来的意外行为")
+print("=" * 60)
+
+# 如果元组第二项直接是任务名(字符串),同优先级时会按字符串的字典序比较,
+# 这不是我们想要的"按加入顺序",而是"按名字顺序",两者结果可能完全不同
+naive_heap = []
+heapq.heappush(naive_heap, (2, "写周报"))
+heapq.heappush(naive_heap, (1, "线上故障排查"))
+heapq.heappush(naive_heap, (1, "客户投诉紧急回复"))
+
+naive_order = []
+while len(naive_heap) > 0:
+    naive_order.append(heapq.heappop(naive_heap)[1])
+
+print(f"不加序号时的处理顺序:{naive_order}")
+print("可以看到,'客户投诉紧急回复'排到了'线上故障排查'前面,")
+print("原因是字符串'客'的拼音/Unicode编码顺序排在'线'前面,而不是因为它真的更早提交——")
+print("这正是今天学习元组比较规则时,容易被忽略的一个实际业务坑。")
+
+assert naive_order[0] in ("客户投诉紧急回复", "线上故障排查"), "两条优先级都是1的任务应该排在最前面"
+
+
+# ------------------------------------------------------------------
+# Part3:堆与排序的关系——手写一个"用堆实现排序"的小实验
+# ------------------------------------------------------------------
+print("\n" + "=" * 60)
+print("Part3:用堆实现排序(heap sort的核心思想)")
+print("=" * 60)
+
+
+def sort_by_heap(numbers):
+    """
+    堆排序的核心思想:把所有数字依次压入堆,再依次弹出,弹出的顺序天然就是从小到大有序的。
+    这不是最高效的堆排序实现(真正的堆排序会原地建堆,不需要额外的堆列表),
+    但足够直观地展示"堆为什么天然适合做优先队列/排序"这件事。
+    """
+    heap = []
+    for number in numbers:
+        heapq.heappush(heap, number)
+
+    sorted_result = []
+    while len(heap) > 0:
+        sorted_result.append(heapq.heappop(heap))
+    return sorted_result
+
+
+unsorted_numbers = [5, 2, 8, 1, 9, 3, 7, 4, 6]
+heap_sorted_result = sort_by_heap(unsorted_numbers)
+assert heap_sorted_result == sorted(unsorted_numbers), "堆排序结果应该与内置sorted()完全一致"
+print(f"原始数据:{unsorted_numbers}")
+print(f"堆排序结果:{heap_sorted_result}")
+print("验证通过:通过'全部压入堆再全部弹出'的方式,确实能得到一个有序序列。")
+
+
+# ------------------------------------------------------------------
+# Part4:heapq.nlargest / nsmallest——不用完整排序,直接取TOP N
+# ------------------------------------------------------------------
+print("\n" + "=" * 60)
+print("Part4:heapq.nlargest / nsmallest快速取TOP N")
+print("=" * 60)
+
+# 场景:从全组过去一段时间的任务优先级记录中,找出"最紧急的3个"和"最不紧急的2个"
+all_task_priorities = [3, 1, 4, 1, 5, 2, 6, 1, 8, 2, 9]
+
+top_3_urgent = heapq.nsmallest(3, all_task_priorities)  # 数字越小越紧急
+bottom_2_relaxed = heapq.nlargest(2, all_task_priorities)  # 数字越大越不紧急
+
+print(f"全部优先级记录:{all_task_priorities}")
+print(f"最紧急的3个优先级(数值最小):{top_3_urgent}")
+print(f"最不紧急的2个优先级(数值最大):{bottom_2_relaxed}")
+
+assert top_3_urgent == sorted(all_task_priorities)[:3], "nsmallest(3, ...)应该与'排序后取前3个'结果一致"
+assert bottom_2_relaxed == sorted(all_task_priorities, reverse=True)[:2], "nlargest(2, ...)应该与'降序排序后取前2个'结果一致"
+print("\n验证通过:heapq.nsmallest/nlargest的结果,与'先完整排序再切片'的结果完全一致,")
+print("但heapq的实现方式在数据量很大、只需要TOP N时,通常比完整排序更节省时间。")
+
+
+print("\n" + "=" * 60)
+print("优先队列练习结束——元组的可比较性,加上heapq模块,")
+print("就能非常自然地实现'按紧急程度处理任务'这种常见的业务需求。")
+print("=" * 60)
+```
+
+---
+
 ## 今日复盘
 
 晚自习结束,陈铭习惯性地打开那本贴着"慢慢来,比较快"的笔记本,写下了今天的复盘。以下是他笔记内容的整理版本。
