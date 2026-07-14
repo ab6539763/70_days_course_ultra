@@ -2784,6 +2784,2060 @@ class TestCheckpointRecovery:
         assert response.explanation is not None
 ```
 
+四份测试全部跑绿之后,陈铭没有立刻收工。晨会记录还摆在他的另一个屏幕上,贺敏那句"数据安全这块,如果模型生成的SQL里带了删表、改数据的语句怎么办"已经被sql_validator.py接得很扎实,但他重新读了一遍需求文档,发现贺敏的顾虑其实还有另外半句没被完全解决——集团是横跨多个区域、多个业务线的组织,一个区域销售经理理论上不应该看到其他区域的数据,即便他问的问题本身完全合规、生成的SQL也完全是只读查询,这跟"SQL安不安全"是两个不同维度的问题。他把这条记在了笔记本上,决定趁热打铁先把行级权限控制的原型搭出来,而不是留到明天封闭开发时手忙脚乱地补。
+
+搭完权限控制之后,他又回头看了一眼PRD里"单次查询端到端响应时间控制在8秒以内"这条验收标准——今天用MockLLMClient测试感觉不到延迟,但如果换成真实的大模型调用,同一个问题被不同的人在早会上反复问上几遍,是一笔实实在在的重复成本。他顺手补了一个带权限维度隔离的查询缓存。再往后,他想起林悦在会议室随口说的一句话——业务人员问完一个问题,往往紧接着会追问"那华南区呢"这种省略式的短句,今天验证的二十条问题都是完整独立的问句,压根没覆盖这种真实场景里最常见的交互方式,于是又把多轮对话上下文补上了。最后,他想到审计合规——祺瑞是集团级客户,"谁在什么时候查过什么数据"这件事迟早会被客户的信息安全团队问到,干脆把审计日志也一并搭好,还借着上午学的hashlib多走一步,给日志加上了一条能自证是否被篡改过的哈希链。
+
+这四块能力今天都不在验收范围内,严格说不是"必须写完"的任务,但陈铭的判断是:这些都是从今天的晨会和PRD里能直接推导出来的真实需求,与其等到客户验收时被现场问出来,不如现在数据库和整条链路都还热乎的时候,一并把原型和测试补上。
+
+### 15. 行级权限控制——业务域校验与结果集范围过滤:`permission_control.py`
+
+这是陈铭对贺敏那个问题"下半句"的回应:即便SQL本身是安全的只读查询,也不能假设模型一定会记得帮不同权限的人过滤范围。他延续了sql_validator.py的哲学——不相信模型的自觉,在结果返回前再做一层独立的、确定性的校验。
+
+```python
+# permission_control.py
+"""行级权限控制模块。
+
+背景:晨会上贺敏提出的问题是"模型生成危险SQL怎么办",sql_validator.py已经
+把这一层拦得很死。但陈铭晚上梳理需求文档时意识到还有另一类完全不同的风险
+没有被覆盖——即便生成的SQL本身是"安全的只读查询",如果调用方是某个区域的
+销售经理,理论上他只应该看到自己负责区域的数据,而不是集团全量数据。这不是
+"SQL会不会作恶"的问题,而是"这次查询结果里,有没有超出这个人权限范围的行"
+的问题,必须在结果返回给用户之前再做一次独立的行级过滤。
+
+设计上刻意遵循与sql_validator.py相同的哲学——"安全不能只靠prompt里说
+一句'请只返回该区域的数据',大模型的话不能全信"。即便生成的SQL忘了加区域
+过滤条件(这种情况完全可能发生,比如用户问"这个月成交量最高的销售顾问是谁"
+这种问题本身没有显式提到区域,模型很可能不会主动加区域限制),这一层也要能
+在结果集里把不属于当前用户权限范围的行过滤掉,作为纵深防御的最后一道闸门。
+"""
+
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
+
+logger = logging.getLogger(__name__)
+
+
+class PermissionDeniedError(Exception):
+    """当查询涉及的业务域超出当前角色权限范围时抛出。"""
+
+    def __init__(self, reason: str, category: str = "domain"):
+        super().__init__(reason)
+        self.reason = reason
+        self.category = category  # domain / region_scope
+
+
+@dataclass(frozen=True)
+class RoleDefinition:
+    """角色的权限定义。
+
+    allowed_domains: 该角色能够查询的业务域集合,取值来自
+        schema_inspector.TABLE_METADATA 中每张表的 domain 字段
+        (目前是 "sales" 或 "property")。
+    scoped: 是否需要按具体的区域/城市名单做行级过滤。如果为False,
+        表示该角色在allowed_domains范围内可以看到全量数据
+        (比如集团管理层、财务只读角色)。
+    """
+
+    role_name: str
+    display_name: str
+    allowed_domains: FrozenSet[str]
+    scoped: bool
+    description: str = ""
+
+
+# ---------------------------------------------------------------------------
+# 角色定义表:人工维护,与HR系统/权限中台对接后应替换为动态查询,
+# 这里为演示简化为硬编码的静态字典。
+# ---------------------------------------------------------------------------
+ROLE_DEFINITIONS: Dict[str, RoleDefinition] = {
+    "group_admin": RoleDefinition(
+        role_name="group_admin",
+        display_name="集团管理层",
+        allowed_domains=frozenset({"sales", "property"}),
+        scoped=False,
+        description="可查看销售与物业两大业务域的全量数据,不受区域/城市限制",
+    ),
+    "finance_viewer": RoleDefinition(
+        role_name="finance_viewer",
+        display_name="财务只读角色",
+        allowed_domains=frozenset({"sales", "property"}),
+        scoped=False,
+        description="财务对账需要看全量数据,但仅具备只读权限"
+                     "(只读性质由query_executor的只读连接保证,本模块不重复处理)",
+    ),
+    "region_sales_manager": RoleDefinition(
+        role_name="region_sales_manager",
+        display_name="区域销售经理",
+        allowed_domains=frozenset({"sales"}),
+        scoped=True,
+        description="只能查看销售业务域数据,且仅限本人负责的销售区域",
+    ),
+    "property_manager": RoleDefinition(
+        role_name="property_manager",
+        display_name="物业项目经理",
+        allowed_domains=frozenset({"property"}),
+        scoped=True,
+        description="只能查看物业业务域数据,且仅限本人负责的城市/小区",
+    ),
+}
+
+
+@dataclass
+class UserContext:
+    """一次请求携带的用户身份与权限上下文。
+
+    真实生产环境中,这些信息应该来自统一的身份认证与权限中台
+    (比如解析JWT里的claims),这里为演示简化为直接构造的对象。
+    """
+
+    user_id: str
+    display_name: str
+    role: str
+    allowed_region_names: Optional[Set[str]] = None
+    allowed_city_names: Optional[Set[str]] = None
+
+    def role_definition(self) -> RoleDefinition:
+        if self.role not in ROLE_DEFINITIONS:
+            raise PermissionDeniedError(
+                f"未知角色「{self.role}」,拒绝一切数据访问", category="domain"
+            )
+        return ROLE_DEFINITIONS[self.role]
+
+    def cache_scope_key(self) -> str:
+        """返回一个能唯一标识"这个用户能看到哪些数据"的字符串。
+
+        这个字符串会被query_cache.py用作缓存key的一部分——如果两个用户
+        问了完全相同的问题,但权限范围不同(比如一个是集团管理层、一个是
+        区域销售经理),他们理应得到不同的结果,绝不能共用同一份缓存,
+        否则会造成严重的越权数据泄露。这是本模块与缓存模块之间最重要的一处
+        协作契约,陈铭特意把这个方法放在UserContext上,方便被跨模块直接调用。
+        """
+        regions = ",".join(sorted(self.allowed_region_names)) if self.allowed_region_names else "ALL"
+        cities = ",".join(sorted(self.allowed_city_names)) if self.allowed_city_names else "ALL"
+        return f"{self.role}|region={regions}|city={cities}"
+
+
+# ---------------------------------------------------------------------------
+# 表名到业务域的映射,与schema_inspector.TABLE_METADATA保持一致。
+# 这里没有直接依赖schema_inspector模块,是为了让permission_control.py
+# 能够独立于具体的数据库schema实现被单独测试和复用,
+# 两处的映射关系需要靠单元测试做一致性校验(见test_permission_control.py)。
+# ---------------------------------------------------------------------------
+TABLE_DOMAIN_MAP: Dict[str, str] = {
+    "sales_regions": "sales",
+    "sales_projects": "sales",
+    "sales_reps": "sales",
+    "sales_customers": "sales",
+    "sales_contracts": "sales",
+    "property_communities": "property",
+    "property_units": "property",
+    "property_owners": "property",
+    "property_fee_bills": "property",
+    "property_maintenance_requests": "property",
+}
+
+# 结果集里可能出现的、用于行级过滤的"范围列"名称,按优先级排列。
+# 一次查询的结果里未必会同时出现这些列,只要出现其中任意一个,
+# 就用它来做范围过滤;如果一个都没出现,说明这次查询本身没有暴露
+# 区域/城市维度信息,视为"无法判断范围",按角色的默认策略处理。
+REGION_SCOPE_COLUMNS: Tuple[str, ...] = ("region_name",)
+CITY_SCOPE_COLUMNS: Tuple[str, ...] = ("city",)
+
+
+@dataclass
+class PermissionEnforcementResult:
+    allowed_rows: List[Dict[str, Any]]
+    removed_row_count: int
+    total_row_count_before: int
+    scope_applied: bool
+    scope_column_used: str = ""
+
+
+class PermissionEnforcer:
+    """负责域级校验与行级过滤的核心执行器。"""
+
+    def __init__(self, table_domain_map: Optional[Dict[str, str]] = None):
+        self.table_domain_map = table_domain_map or TABLE_DOMAIN_MAP
+
+    # ------------------------------------------------------------------
+    # 域级校验:整条SQL touch到的表,是否都在角色允许的业务域内
+    # ------------------------------------------------------------------
+    def check_domain_access(self, sql: str, user_context: UserContext) -> Set[str]:
+        """检查SQL涉及的业务域是否都在角色允许范围内,返回命中的表名集合。
+
+        采用与sql_validator.py一致的"够用级别"策略:通过表名是否作为
+        独立的词出现在SQL文本中来判断是否涉及该表,不追求完整的SQL语法解析。
+        这个判断发生在sql_validator已经通过表白名单校验之后,此时SQL里
+        出现的表名一定是TABLE_DOMAIN_MAP里已知的合法表,不存在"未知表"的情况,
+        因此这里不需要重复处理未知表名的分支。
+        """
+        role_def = user_context.role_definition()
+        touched_tables: Set[str] = set()
+        upper_sql = sql.upper()
+
+        for table_name in self.table_domain_map:
+            if table_name.upper() in upper_sql:
+                touched_tables.add(table_name)
+
+        touched_domains = {
+            self.table_domain_map[table] for table in touched_tables
+        }
+
+        forbidden_domains = touched_domains - role_def.allowed_domains
+        if forbidden_domains:
+            raise PermissionDeniedError(
+                f"用户「{user_context.display_name}」(角色: {role_def.display_name})"
+                f"无权访问业务域 {sorted(forbidden_domains)},查询已被拒绝",
+                category="domain",
+            )
+
+        return touched_tables
+
+    # ------------------------------------------------------------------
+    # 行级过滤:在域级校验通过之后,对结果集做二次收敛
+    # ------------------------------------------------------------------
+    def filter_rows_by_scope(
+        self, rows: List[Dict[str, Any]], user_context: UserContext
+    ) -> PermissionEnforcementResult:
+        role_def = user_context.role_definition()
+        total_before = len(rows)
+
+        if not role_def.scoped:
+            return PermissionEnforcementResult(
+                allowed_rows=rows,
+                removed_row_count=0,
+                total_row_count_before=total_before,
+                scope_applied=False,
+            )
+
+        scope_column = self._detect_scope_column(rows, user_context)
+        if scope_column == "":
+            # 结果集里没有出现任何可用于范围判断的列,无法做行级过滤。
+            # 这种情况下,陈铭选择的策略是"宁可保守拒绝,不放行未知范围的数据"——
+            # 对scoped角色而言,拿不到范围信息就等同于拿不到授权证明。
+            logger.warning(
+                "结果集未包含可用于范围判断的列,scoped角色「%s」的本次查询"
+                "结果将被整体拒绝返回", user_context.role,
+            )
+            return PermissionEnforcementResult(
+                allowed_rows=[],
+                removed_row_count=total_before,
+                total_row_count_before=total_before,
+                scope_applied=True,
+                scope_column_used="(none)",
+            )
+
+        allowed_values = self._allowed_values_for_column(scope_column, user_context)
+        filtered_rows = [
+            row for row in rows if row.get(scope_column) in allowed_values
+        ]
+
+        return PermissionEnforcementResult(
+            allowed_rows=filtered_rows,
+            removed_row_count=total_before - len(filtered_rows),
+            total_row_count_before=total_before,
+            scope_applied=True,
+            scope_column_used=scope_column,
+        )
+
+    def enforce(
+        self,
+        sql: str,
+        rows: List[Dict[str, Any]],
+        user_context: UserContext,
+    ) -> PermissionEnforcementResult:
+        """一次调用完成"域级校验 + 行级过滤"两步完整的权限执行流程。"""
+        self.check_domain_access(sql, user_context)
+        result = self.filter_rows_by_scope(rows, user_context)
+
+        if result.removed_row_count > 0:
+            logger.info(
+                "行级权限过滤生效 user=%s role=%s scope_column=%s "
+                "移除行数=%s 剩余行数=%s",
+                user_context.user_id, user_context.role,
+                result.scope_column_used, result.removed_row_count,
+                len(result.allowed_rows),
+            )
+
+        return result
+
+    @staticmethod
+    def _detect_scope_column(
+        rows: List[Dict[str, Any]], user_context: UserContext
+    ) -> str:
+        if not rows:
+            return ""
+        sample_row = rows[0]
+        candidate_columns = REGION_SCOPE_COLUMNS if user_context.allowed_region_names is not None else ()
+        candidate_columns = candidate_columns + (
+            CITY_SCOPE_COLUMNS if user_context.allowed_city_names is not None else ()
+        )
+        for column in candidate_columns:
+            if column in sample_row:
+                return column
+        return ""
+
+    @staticmethod
+    def _allowed_values_for_column(
+        column: str, user_context: UserContext
+    ) -> Set[str]:
+        if column in REGION_SCOPE_COLUMNS:
+            return user_context.allowed_region_names or set()
+        if column in CITY_SCOPE_COLUMNS:
+            return user_context.allowed_city_names or set()
+        return set()
+
+
+# ---------------------------------------------------------------------------
+# 演示区
+# ---------------------------------------------------------------------------
+def _print_section(title: str) -> None:
+    print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
+
+
+def demo_group_admin_sees_everything() -> None:
+    _print_section("演示一:集团管理层不受区域限制")
+    enforcer = PermissionEnforcer()
+    admin_context = UserContext(
+        user_id="u-admin-01", display_name="集团管理层-王总",
+        role="group_admin",
+    )
+    rows = [
+        {"region_name": "华东区", "total_amount": 1520.0},
+        {"region_name": "华南区", "total_amount": 980.0},
+        {"region_name": "华北区", "total_amount": 620.0},
+    ]
+    sql = "SELECT r.region_name, SUM(c.contract_amount) AS total_amount FROM sales_contracts c JOIN sales_regions r ON 1=1;"
+    result = enforcer.enforce(sql, rows, admin_context)
+    print(f"集团管理层看到的行数: {len(result.allowed_rows)} (应为全部{len(rows)}行)")
+    assert len(result.allowed_rows) == len(rows)
+    assert result.scope_applied is False
+    print("验证通过: scoped=False的角色不会触发任何行级过滤逻辑。")
+
+
+def demo_region_manager_scoped_filtering() -> None:
+    _print_section("演示二:区域销售经理只能看到本区域数据,即便SQL忘了加过滤条件")
+    enforcer = PermissionEnforcer()
+    huadong_manager = UserContext(
+        user_id="u-sales-huadong", display_name="华东区销售经理-陈瑶",
+        role="region_sales_manager",
+        allowed_region_names={"华东区"},
+    )
+    # 故意模拟一条"没有按区域过滤"的SQL结果集,验证行级过滤能不能兜底
+    rows = [
+        {"region_name": "华东区", "total_amount": 1520.0},
+        {"region_name": "华南区", "total_amount": 980.0},
+        {"region_name": "华北区", "total_amount": 620.0},
+    ]
+    sql = "SELECT r.region_name, SUM(c.contract_amount) AS total_amount FROM sales_contracts c JOIN sales_regions r ON c.rep_id = r.region_id GROUP BY r.region_name;"
+    result = enforcer.enforce(sql, rows, huadong_manager)
+    print(f"华东区经理看到的行数: {len(result.allowed_rows)} (应为1行,只有华东区)")
+    assert len(result.allowed_rows) == 1
+    assert result.allowed_rows[0]["region_name"] == "华东区"
+    assert result.removed_row_count == 2
+    print("验证通过: 即便生成的SQL本身没有加区域过滤条件,行级权限过滤依然把"
+          "不属于该经理管辖范围的两行数据挡在了返回结果之外。")
+
+
+def demo_property_manager_blocked_from_sales_domain() -> None:
+    _print_section("演示三:物业项目经理试图查询销售数据,应在域级校验被直接拒绝")
+    enforcer = PermissionEnforcer()
+    property_manager = UserContext(
+        user_id="u-property-01", display_name="物业项目经理-刘芳",
+        role="property_manager",
+        allowed_city_names={"杭州"},
+    )
+    sql = "SELECT SUM(contract_amount) AS total FROM sales_contracts;"
+    try:
+        enforcer.check_domain_access(sql, property_manager)
+        raise AssertionError("这里应该抛出PermissionDeniedError,不该走到这一行")
+    except PermissionDeniedError as error:
+        print(f"正确拒绝了跨域访问: {error}")
+        assert error.category == "domain"
+    print("验证通过: 物业项目经理无法借助任何自然语言问题绕过业务域边界"
+          "去查询销售数据,这一层校验发生在行级过滤之前,属于更粗粒度的第一道闸门。")
+
+
+def demo_missing_scope_column_is_rejected_conservatively() -> None:
+    _print_section("演示四:结果集里没有范围列时,scoped角色的查询被保守拒绝")
+    enforcer = PermissionEnforcer()
+    huadong_manager = UserContext(
+        user_id="u-sales-huadong", display_name="华东区销售经理-陈瑶",
+        role="region_sales_manager",
+        allowed_region_names={"华东区"},
+    )
+    # 这条结果集只有聚合数值,完全没有暴露region_name这样的范围列
+    rows = [{"deal_count": 42}]
+    sql = "SELECT COUNT(*) AS deal_count FROM sales_contracts;"
+    result = enforcer.enforce(sql, rows, huadong_manager)
+    print(f"缺失范围列时的最终行数: {len(result.allowed_rows)} (应为0,保守拒绝)")
+    assert len(result.allowed_rows) == 0
+    assert result.scope_column_used == "(none)"
+    print("验证通过: 这条设计选择背后的权衡是,对于一个总量聚合数字"
+          "(比如全公司成交量),没有区域信息就无法判断这个数字里有多少属于"
+          "华东区、多少属于其他区域,与其冒险返回一个可能包含越权信息的数字,"
+          "不如保守拒绝并提示用户换一种问法(比如显式追加'华东区的')。")
+
+
+def run_all_demos() -> None:
+    demo_group_admin_sees_everything()
+    demo_region_manager_scoped_filtering()
+    demo_property_manager_blocked_from_sales_domain()
+    demo_missing_scope_column_is_rejected_conservatively()
+    print("\n全部权限控制演示执行完毕。")
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+### 16. 查询结果缓存——权限维度隔离的LRU+TTL缓存:`query_cache.py`
+
+这个模块最容易被写错的地方,陈铭一开始也没意识到——如果缓存key只用问题文本本身,不同权限范围的两个人问了同一句话,后一个人极可能直接读到前一个人缓存下来的、范围更大的结果,这是一个真实存在的越权风险。他把这个教训写进了模块开头的说明里,提醒自己以后设计任何缓存都要先想清楚"这份数据对谁可见"这个问题,而不是只想"数据本身对不对"。
+
+```python
+# query_cache.py
+"""查询结果缓存模块。
+
+背景:PRD里明确要求"单次查询端到端响应时间控制在8秒以内",而Text-to-SQL
+这条链路里,调用LLM生成SQL、调用LLM生成结果解释,这两步加起来往往占了
+大部分耗时。业务场景里,同一个问题被反复问的概率其实不低——比如"这个月
+成交量最高的销售顾问是谁"这种问题,可能在早会上被好几个人各问一次,
+如果每次都重新走一遍生成SQL、执行查询、生成解释的全流程,是明显的浪费。
+
+这个模块提供一个轻量级的内存缓存,按"归一化后的问题文本 + 用户权限范围"
+作为缓存key,命中时直接返回上一次的完整响应,不需要重新调用LLM。
+
+**权限维度必须纳入缓存key,这是本模块最重要的设计约束**——如果只用问题
+文本本身做key,集团管理层问"这个月成交量最高的销售顾问是谁"拿到的是全量
+结果,如果这份结果被区域销售经理的同一句问题复用,就会造成他看到了本不
+该看到的其他区域数据,这是一个真实存在的越权风险,不是理论上的边界情况。
+"""
+
+import hashlib
+import logging
+import time
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
+
+logger = logging.getLogger(__name__)
+
+
+def normalize_question(question: str) -> str:
+    """归一化问题文本,减少因为空白字符、全角/半角符号差异导致的缓存未命中。
+
+    这里只做最基础的处理(去除首尾空白、合并中间连续空白、统一问号形态),
+    不做同义词归一或语义层面的归一化——那属于conversation_context.py和
+    schema_inspector.py该管的事,本模块只负责"字面上几乎一样的问题"能命中缓存。
+    """
+    normalized = question.strip()
+    normalized = " ".join(normalized.split())
+    normalized = normalized.replace("?", "?")
+    return normalized
+
+
+def make_cache_key(question: str, scope_key: str) -> str:
+    """根据归一化问题与权限范围标识,生成缓存key。
+
+    使用sha256而不是直接拼接字符串作为key,一方面统一了key的长度,
+    另一方面避免问题文本里如果恰好包含分隔符导致的key冲突(虽然概率很低,
+    但作为缓存基础设施,不应该对输入内容的字符集做任何假设)。
+    """
+    normalized_question = normalize_question(question)
+    raw_key = f"{normalized_question}||{scope_key}"
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+
+@dataclass
+class CacheEntry:
+    key: str
+    question: str
+    scope_key: str
+    payload: Any
+    created_at: float
+    last_accessed_at: float
+    hit_count: int = 0
+
+
+@dataclass
+class CacheStats:
+    hits: int = 0
+    misses: int = 0
+    evictions: int = 0
+    expirations: int = 0
+    current_size: int = 0
+
+    @property
+    def hit_rate(self) -> float:
+        total = self.hits + self.misses
+        if total == 0:
+            return 0.0
+        return self.hits / total
+
+
+class QueryCache:
+    """带TTL过期与LRU淘汰的查询结果缓存。
+
+    实现上使用collections.OrderedDict模拟LRU:每次访问(get)命中后,
+    把该条目移动到字典末尾,represents"最近使用";超出容量时,
+    从字典开头(最久未使用的一端)淘汰。这是标准库层面实现LRU的经典手法,
+    比自己维护一份额外的访问时间排序结构要简洁得多。
+    """
+
+    def __init__(self, max_size: int = 128, ttl_seconds: float = 300.0):
+        if max_size <= 0:
+            raise ValueError("max_size必须为正整数")
+        self.max_size = max_size
+        self.ttl_seconds = ttl_seconds
+        self._store: "OrderedDict[str, CacheEntry]" = OrderedDict()
+        self.stats = CacheStats()
+
+    def get(self, question: str, scope_key: str) -> Optional[Any]:
+        key = make_cache_key(question, scope_key)
+        entry = self._store.get(key)
+
+        if entry is None:
+            self.stats.misses += 1
+            return None
+
+        if self._is_expired(entry):
+            logger.debug("缓存条目已过期,主动清理 key=%s", key[:12])
+            del self._store[key]
+            self.stats.expirations += 1
+            self.stats.misses += 1
+            self.stats.current_size = len(self._store)
+            return None
+
+        entry.hit_count += 1
+        entry.last_accessed_at = time.monotonic()
+        self._store.move_to_end(key)
+        self.stats.hits += 1
+        return entry.payload
+
+    def put(self, question: str, scope_key: str, payload: Any) -> str:
+        key = make_cache_key(question, scope_key)
+        now = time.monotonic()
+
+        if key in self._store:
+            # 已存在则视为一次刷新,同样要移动到LRU队列末尾
+            self._store[key].payload = payload
+            self._store[key].created_at = now
+            self._store[key].last_accessed_at = now
+            self._store.move_to_end(key)
+            self.stats.current_size = len(self._store)
+            return key
+
+        entry = CacheEntry(
+            key=key,
+            question=normalize_question(question),
+            scope_key=scope_key,
+            payload=payload,
+            created_at=now,
+            last_accessed_at=now,
+        )
+        self._store[key] = entry
+
+        while len(self._store) > self.max_size:
+            evicted_key, evicted_entry = self._store.popitem(last=False)
+            logger.debug(
+                "LRU淘汰缓存条目 key=%s question=%s",
+                evicted_key[:12], evicted_entry.question,
+            )
+            self.stats.evictions += 1
+
+        self.stats.current_size = len(self._store)
+        return key
+
+    def invalidate(self, question: str, scope_key: str) -> bool:
+        """主动失效某一条缓存,用于业务数据发生已知变更之后的场景。
+
+        比如某条合同被人工订正了签约金额,运营人员可以显式调用这个方法,
+        清掉与该问题相关的缓存,而不是被动等待TTL过期,避免在这段时间内
+        用户看到的是订正前的旧数据。
+        """
+        key = make_cache_key(question, scope_key)
+        if key in self._store:
+            del self._store[key]
+            self.stats.current_size = len(self._store)
+            return True
+        return False
+
+    def clear(self) -> None:
+        self._store.clear()
+        self.stats.current_size = 0
+
+    def purge_expired(self) -> int:
+        """批量清理所有已过期的条目,可以配合定时任务周期性调用。"""
+        expired_keys = [
+            key for key, entry in self._store.items() if self._is_expired(entry)
+        ]
+        for key in expired_keys:
+            del self._store[key]
+        self.stats.expirations += len(expired_keys)
+        self.stats.current_size = len(self._store)
+        return len(expired_keys)
+
+    def _is_expired(self, entry: CacheEntry) -> bool:
+        return (time.monotonic() - entry.created_at) > self.ttl_seconds
+
+    def __len__(self) -> int:
+        return len(self._store)
+
+
+# ---------------------------------------------------------------------------
+# 演示区
+# ---------------------------------------------------------------------------
+def _print_section(title: str) -> None:
+    print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
+
+
+def demo_basic_hit_and_miss() -> None:
+    _print_section("演示一:缓存的基本命中与未命中")
+    cache = QueryCache(max_size=10, ttl_seconds=60)
+    scope = "group_admin|region=ALL|city=ALL"
+
+    result = cache.get("这个月成交量最高的销售顾问是谁?", scope)
+    print(f"第一次查询(应为未命中): {result}")
+    assert result is None
+
+    cache.put("这个月成交量最高的销售顾问是谁?", scope, {"rep_name": "陈瑶", "deal_count": 5})
+    result = cache.get("这个月成交量最高的销售顾问是谁?", scope)
+    print(f"第二次查询(应为命中): {result}")
+    assert result == {"rep_name": "陈瑶", "deal_count": 5}
+
+    print(f"当前缓存统计: 命中={cache.stats.hits} 未命中={cache.stats.misses} "
+          f"命中率={cache.stats.hit_rate:.0%}")
+    print("验证通过: 相同问题、相同权限范围的第二次查询直接命中了缓存。")
+
+
+def demo_different_scope_does_not_leak() -> None:
+    _print_section("演示二:不同权限范围的相同问题不会互相污染缓存")
+    cache = QueryCache(max_size=10, ttl_seconds=60)
+
+    admin_scope = "group_admin|region=ALL|city=ALL"
+    huadong_scope = "region_sales_manager|region=华东区|city=ALL"
+
+    cache.put("这个月的签约金额是多少?", admin_scope, {"total_amount": 5680.0})
+
+    huadong_result = cache.get("这个月的签约金额是多少?", huadong_scope)
+    print(f"华东区经理问同样的问题(应为未命中,因为权限范围不同): {huadong_result}")
+    assert huadong_result is None
+
+    cache.put("这个月的签约金额是多少?", huadong_scope, {"total_amount": 1520.0})
+    admin_result = cache.get("这个月的签约金额是多少?", admin_scope)
+    huadong_result_2 = cache.get("这个月的签约金额是多少?", huadong_scope)
+
+    print(f"集团管理层看到的缓存结果: {admin_result}")
+    print(f"华东区经理看到的缓存结果: {huadong_result_2}")
+    assert admin_result != huadong_result_2
+    print("验证通过: 缓存key里携带的权限范围标识,成功隔离了两份不同视角的数据,"
+          "没有出现越权数据通过缓存泄露的问题。")
+
+
+def demo_ttl_expiration() -> None:
+    _print_section("演示三:TTL过期后缓存自动失效")
+    cache = QueryCache(max_size=10, ttl_seconds=0.05)
+    scope = "group_admin|region=ALL|city=ALL"
+
+    cache.put("空置率是多少?", scope, {"vacancy_rate_percent": 16.7})
+    immediate_result = cache.get("空置率是多少?", scope)
+    print(f"立即查询(应命中): {immediate_result}")
+    assert immediate_result is not None
+
+    time.sleep(0.08)
+    expired_result = cache.get("空置率是多少?", scope)
+    print(f"等待TTL过期后查询(应未命中,已过期): {expired_result}")
+    assert expired_result is None
+    assert cache.stats.expirations == 1
+    print("验证通过: 超过ttl_seconds后,缓存条目会被自动判定为过期并清理,"
+          "不会返回过时的数据。")
+
+
+def demo_lru_eviction() -> None:
+    _print_section("演示四:超出容量时,最久未使用的条目会被优先淘汰")
+    cache = QueryCache(max_size=3, ttl_seconds=60)
+    scope = "group_admin|region=ALL|city=ALL"
+
+    cache.put("问题A", scope, "答案A")
+    cache.put("问题B", scope, "答案B")
+    cache.put("问题C", scope, "答案C")
+
+    # 重新访问一次"问题A",让它变成"最近使用过"的条目
+    cache.get("问题A", scope)
+
+    # 再插入一个新问题,此时容量已满,应该淘汰"最久未被访问"的"问题B"
+    cache.put("问题D", scope, "答案D")
+
+    print(f"问题A(最近访问过,应仍在缓存中): {cache.get('问题A', scope)}")
+    print(f"问题B(最久未使用,应已被淘汰): {cache.get('问题B', scope)}")
+    print(f"问题C(应仍在缓存中): {cache.get('问题C', scope)}")
+    print(f"问题D(刚插入,应在缓存中): {cache.get('问题D', scope)}")
+
+    assert cache.stats.evictions == 1
+    print(f"验证通过: 容量上限为{cache.max_size}时,插入第4条不同的问题触发了"
+          "一次LRU淘汰,且淘汰的是最久未被访问的那一条,而不是最早插入的那一条"
+          "(这两者在有过重新访问的情况下并不是同一条)。")
+
+
+def demo_manual_invalidation() -> None:
+    _print_section("演示五:业务数据订正后主动失效缓存")
+    cache = QueryCache(max_size=10, ttl_seconds=300)
+    scope = "group_admin|region=ALL|city=ALL"
+
+    cache.put("南港湾项目签了多少个客户?", scope, {"customer_count": 3})
+    assert cache.get("南港湾项目签了多少个客户?", scope) is not None
+
+    invalidated = cache.invalidate("南港湾项目签了多少个客户?", scope)
+    print(f"主动失效结果: {invalidated}")
+    assert invalidated is True
+
+    result_after = cache.get("南港湾项目签了多少个客户?", scope)
+    print(f"失效后再次查询: {result_after}")
+    assert result_after is None
+    print("验证通过: 当运营人员订正了合同数据之后,可以精确地失效掉受影响的那一条"
+          "缓存,而不需要清空整个缓存(避免误伤其他仍然有效的缓存条目)。")
+
+
+def run_all_demos() -> None:
+    demo_basic_hit_and_miss()
+    demo_different_scope_does_not_leak()
+    demo_ttl_expiration()
+    demo_lru_eviction()
+    demo_manual_invalidation()
+    print("\n全部查询缓存演示执行完毕。")
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+### 17. 多轮对话上下文——省略式追问的识别与补全:`conversation_context.py`
+
+延续schema_inspector.py里"当前业务域清晰、术语可枚举"的判断,陈铭同样选择了确定性的规则匹配而不是让模型自己去猜上下文——区域、小区、时间短语都是有限的、可枚举的集合,规则匹配足够可靠,排查成本也远低于一个"有时候补全对、有时候补全错"的黑盒方案。
+
+```python
+# conversation_context.py
+"""多轮对话上下文管理模块。
+
+背景:今天验证过的二十条预设问题,都是"独立的完整问题"——每一条都能
+单独理解,不依赖上文。但陈铭想到,真实业务场景里,人问完一个问题之后,
+下一句往往是"那华南区呢?"或者"上季度呢?"这种依赖上文才能理解的
+省略式追问,如果Agent每次都把这种残缺的句子原样丢给SQL生成器,
+大概率会生成一条语义完全不对或者直接报错的SQL。
+
+这个模块负责在"用户的原始省略式问题"和"SQL生成器能正确理解的完整问题"
+之间搭一层桥:维护每个对话会话的历史记录,识别当前问题是不是一句省略式
+追问,如果是,就尝试结合上一轮的完整问题,把当前这句"补全"成一个独立的、
+语义完整的问题,再交给下游流程处理。
+
+这里刻意采用确定性的规则匹配而不是让LLM自己去"猜上下文",理由和
+schema_inspector.py里选择关键词匹配的理由是一样的——当前场景下可枚举的
+业务实体(区域、小区、时间短语)数量有限,规则匹配足够可靠、足够可解释,
+排查问题的成本远低于"LLM有时候补全对了、有时候补全错了"这种不确定性。
+"""
+
+import logging
+import re
+import time
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# 可枚举的业务实体清单,与schema_inspector.py / sample数据保持一致
+# ---------------------------------------------------------------------------
+ENTITY_CATEGORIES: Dict[str, Tuple[str, ...]] = {
+    "region": ("华东区", "华南区", "华北区"),
+    "community": (
+        "祺瑞·望江花园", "祺瑞·中央广场", "祺瑞·南港湾",
+        "祺瑞·云上里", "祺瑞·星悦荟",
+    ),
+    "time_phrase": (
+        "上个月", "这个月", "本月", "上季度", "本季度",
+        "今年", "去年", "上周", "这周", "昨天", "今天",
+    ),
+}
+
+# 判断"这是一句需要依赖上文才能理解的省略式追问"的正则特征。
+# 覆盖三类典型模式:"那XX呢""XX呢?"这种极短的关照式追问,
+# 以及"那...呢"这种带转折语气词的追问。
+FOLLOW_UP_PATTERNS: Tuple[re.Pattern, ...] = (
+    re.compile(r"^那(.{0,20})呢[??]?$"),
+    re.compile(r"^(.{1,20})呢[??]?$"),
+    re.compile(r"^那(.{0,20})的(话)?$"),
+    re.compile(r"^呢[??]?$"),
+)
+
+# 一句话如果短于这个字数,且不包含任何"完整问句"该有的动词类特征词,
+# 也倾向于被判定为省略式追问(而不是一句独立完整的新问题)。
+SHORT_QUESTION_LENGTH_THRESHOLD = 10
+COMPLETE_QUESTION_INDICATOR_WORDS = ("多少", "是谁", "哪个", "怎么样", "几个", "多高", "多长")
+
+
+@dataclass
+class Turn:
+    """对话中的一轮记录。"""
+
+    raw_question: str
+    resolved_question: str
+    sql: Optional[str] = None
+    timestamp: float = field(default_factory=time.monotonic)
+    was_follow_up: bool = False
+
+
+@dataclass
+class ResolveResult:
+    resolved_question: str
+    was_follow_up: bool
+    matched_categories: List[str] = field(default_factory=list)
+    resolvable: bool = True
+    reason: str = ""
+
+
+class ConversationSession:
+    """单个会话(通常对应一个用户的一次连续交互)的历史记录。"""
+
+    def __init__(self, session_id: str, max_history: int = 10):
+        self.session_id = session_id
+        self.max_history = max_history
+        self.turns: List[Turn] = []
+
+    def add_turn(self, turn: Turn) -> None:
+        self.turns.append(turn)
+        if len(self.turns) > self.max_history:
+            self.turns.pop(0)
+
+    def last_turn(self) -> Optional[Turn]:
+        return self.turns[-1] if self.turns else None
+
+    def clear(self) -> None:
+        self.turns.clear()
+
+
+def is_follow_up_question(question: str) -> bool:
+    """判断一句话是否"看起来"是一句依赖上文的省略式追问。"""
+    stripped = question.strip()
+
+    for pattern in FOLLOW_UP_PATTERNS:
+        if pattern.match(stripped):
+            return True
+
+    if len(stripped) <= SHORT_QUESTION_LENGTH_THRESHOLD:
+        has_indicator = any(word in stripped for word in COMPLETE_QUESTION_INDICATOR_WORDS)
+        has_entity = _extract_entities(stripped)
+        if has_entity and not has_indicator:
+            return True
+
+    return False
+
+
+def _extract_entities(text: str) -> Dict[str, str]:
+    """从一段文本中提取出命中的业务实体,按类别返回(每个类别最多取第一个命中项)。"""
+    found: Dict[str, str] = {}
+    for category, candidates in ENTITY_CATEGORIES.items():
+        for candidate in candidates:
+            if candidate in text:
+                found[category] = candidate
+                break
+    return found
+
+
+class ConversationContextManager:
+    """对话上下文管理器,负责维护多个会话并提供问题补全能力。"""
+
+    def __init__(self, max_sessions: int = 500, session_ttl_seconds: float = 1800.0):
+        self.max_sessions = max_sessions
+        self.session_ttl_seconds = session_ttl_seconds
+        self._sessions: Dict[str, ConversationSession] = {}
+        self._last_active_at: Dict[str, float] = {}
+
+    def get_or_create_session(self, session_id: str) -> ConversationSession:
+        self._evict_expired_sessions()
+
+        if session_id not in self._sessions:
+            if len(self._sessions) >= self.max_sessions:
+                self._evict_oldest_session()
+            self._sessions[session_id] = ConversationSession(session_id)
+
+        self._last_active_at[session_id] = time.monotonic()
+        return self._sessions[session_id]
+
+    def resolve(self, session_id: str, question: str) -> ResolveResult:
+        """尝试把一句可能残缺的问题,结合会话历史补全为完整问题。
+
+        补全策略:
+        1. 如果不是省略式追问,或者会话里还没有历史记录,原样返回。
+        2. 提取当前问题里命中的业务实体(按类别:region/community/time_phrase)。
+        3. 取出上一轮的完整问题,对每个当前问题里出现的类别,
+           把上一轮问题里对应类别的旧实体替换成当前问题里的新实体;
+           当前问题里没提到的类别,原样保留上一轮的取值(即"继承上下文")。
+        4. 如果当前问题里一个可识别的实体都没有(比如只是单纯的"呢?"),
+           判定为"无法补全",交由上层决定是走澄清式追问还是直接拒绝。
+        """
+        session = self.get_or_create_session(session_id)
+        last_turn = session.last_turn()
+
+        if last_turn is None:
+            return ResolveResult(
+                resolved_question=question, was_follow_up=False, resolvable=True,
+            )
+
+        if not is_follow_up_question(question):
+            return ResolveResult(
+                resolved_question=question, was_follow_up=False, resolvable=True,
+            )
+
+        current_entities = _extract_entities(question)
+        if not current_entities:
+            return ResolveResult(
+                resolved_question=question,
+                was_follow_up=True,
+                resolvable=False,
+                reason="识别到这是一句追问,但未能从中提取出任何可用于替换的"
+                       "业务实体(区域/小区/时间),无法基于上一轮问题补全",
+            )
+
+        resolved = last_turn.resolved_question
+        matched_categories: List[str] = []
+        previous_entities = _extract_entities(last_turn.resolved_question)
+
+        for category, new_value in current_entities.items():
+            old_value = previous_entities.get(category)
+            matched_categories.append(category)
+            if old_value and old_value in resolved:
+                resolved = resolved.replace(old_value, new_value)
+            else:
+                # 上一轮问题里没有找到同类别的旧值可替换,退化为直接拼接,
+                # 保证至少不会丢失用户这次明确提到的新实体信息。
+                resolved = f"{resolved}(限定: {new_value})"
+
+        logger.info(
+            "会话%s: 追问「%s」基于上一轮「%s」补全为「%s」",
+            session_id, question, last_turn.resolved_question, resolved,
+        )
+
+        return ResolveResult(
+            resolved_question=resolved,
+            was_follow_up=True,
+            matched_categories=matched_categories,
+            resolvable=True,
+        )
+
+    def record_turn(
+        self, session_id: str, raw_question: str, resolve_result: ResolveResult,
+        sql: Optional[str] = None,
+    ) -> None:
+        session = self.get_or_create_session(session_id)
+        session.add_turn(Turn(
+            raw_question=raw_question,
+            resolved_question=resolve_result.resolved_question,
+            sql=sql,
+            was_follow_up=resolve_result.was_follow_up,
+        ))
+
+    def _evict_expired_sessions(self) -> None:
+        now = time.monotonic()
+        expired_ids = [
+            sid for sid, last_active in self._last_active_at.items()
+            if (now - last_active) > self.session_ttl_seconds
+        ]
+        for sid in expired_ids:
+            self._sessions.pop(sid, None)
+            self._last_active_at.pop(sid, None)
+        if expired_ids:
+            logger.debug("清理了%s个超过%s秒未活跃的会话", len(expired_ids), self.session_ttl_seconds)
+
+    def _evict_oldest_session(self) -> None:
+        if not self._last_active_at:
+            return
+        oldest_session_id = min(self._last_active_at, key=self._last_active_at.get)
+        self._sessions.pop(oldest_session_id, None)
+        self._last_active_at.pop(oldest_session_id, None)
+        logger.debug("会话数量达到上限,淘汰最久未活跃的会话: %s", oldest_session_id)
+
+
+# ---------------------------------------------------------------------------
+# 演示区
+# ---------------------------------------------------------------------------
+def _print_section(title: str) -> None:
+    print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
+
+
+def demo_region_follow_up() -> None:
+    _print_section("演示一:区域维度的省略式追问补全")
+    manager = ConversationContextManager()
+    session_id = "session-huadong-manager"
+
+    first_result = manager.resolve(session_id, "上个月华东区的签约金额一共是多少?")
+    print(f"第一轮(应原样返回): {first_result.resolved_question}")
+    manager.record_turn(session_id, "上个月华东区的签约金额一共是多少?", first_result)
+
+    follow_up_result = manager.resolve(session_id, "那华南区呢?")
+    print(f"第二轮追问补全结果: {follow_up_result.resolved_question}")
+    assert follow_up_result.was_follow_up is True
+    assert "华南区" in follow_up_result.resolved_question
+    assert "华东区" not in follow_up_result.resolved_question
+    assert "签约金额" in follow_up_result.resolved_question
+    print("验证通过: 「那华南区呢?」被正确补全为一句包含完整业务语义的独立问题,"
+          "区域从华东区替换成了华南区,其余部分(签约金额、上个月)沿用了上一轮的表述。")
+
+
+def demo_time_phrase_follow_up() -> None:
+    _print_section("演示二:时间维度的省略式追问补全")
+    manager = ConversationContextManager()
+    session_id = "session-property-manager"
+
+    first_result = manager.resolve(session_id, "祺瑞·望江花园本月的物业费欠缴率是多少?")
+    manager.record_turn(session_id, "祺瑞·望江花园本月的物业费欠缴率是多少?", first_result)
+
+    follow_up_result = manager.resolve(session_id, "上季度呢?")
+    print(f"追问补全结果: {follow_up_result.resolved_question}")
+    assert "上季度" in follow_up_result.resolved_question
+    assert "本月" not in follow_up_result.resolved_question
+    assert "祺瑞·望江花园" in follow_up_result.resolved_question
+    print("验证通过: 时间短语从「本月」正确替换成了「上季度」,小区名称保持不变。")
+
+
+def demo_multi_turn_chain() -> None:
+    _print_section("演示三:连续多轮追问,每一轮都基于上一轮的解析结果继续演进")
+    manager = ConversationContextManager()
+    session_id = "session-chain"
+
+    turn1 = manager.resolve(session_id, "祺瑞·南港湾小区的空置率是多少?")
+    manager.record_turn(session_id, "祺瑞·南港湾小区的空置率是多少?", turn1)
+    print(f"第一轮: {turn1.resolved_question}")
+
+    turn2 = manager.resolve(session_id, "祺瑞·云上里呢?")
+    manager.record_turn(session_id, "祺瑞·云上里呢?", turn2)
+    print(f"第二轮: {turn2.resolved_question}")
+    assert "祺瑞·云上里" in turn2.resolved_question
+
+    turn3 = manager.resolve(session_id, "那祺瑞·望江花园的话")
+    manager.record_turn(session_id, "那祺瑞·望江花园的话", turn3)
+    print(f"第三轮: {turn3.resolved_question}")
+    assert "祺瑞·望江花园" in turn3.resolved_question
+    assert "空置率" in turn3.resolved_question
+    print("验证通过: 连续三轮追问,每一轮都正确地基于上一轮的解析结果(而不是"
+          "最早的第一轮原始问题)继续演进,即便小区名称一路在变化,"
+          "'空置率'这个核心指标始终被正确保留了下来。")
+
+
+def demo_unresolvable_follow_up() -> None:
+    _print_section("演示四:无法从追问中提取出实体时,明确返回不可补全")
+    manager = ConversationContextManager()
+    session_id = "session-unresolvable"
+
+    turn1 = manager.resolve(session_id, "这个月成交量最高的销售顾问是谁?")
+    manager.record_turn(session_id, "这个月成交量最高的销售顾问是谁?", turn1)
+
+    turn2 = manager.resolve(session_id, "呢?")
+    print(f"第二轮(应无法补全): resolvable={turn2.resolvable} reason={turn2.reason}")
+    assert turn2.resolvable is False
+    print("验证通过: 当追问里完全没有出现任何可识别的业务实体时,系统没有强行"
+          "猜测一个补全结果,而是诚实地报告'无法补全',这种情况下更合适的做法是"
+          "触发一次澄清式追问(对应课后作业第5题讨论的策略二),而不是硬着头皮"
+          "拿一个可能猜错的问题去调用SQL生成器,浪费一次昂贵的LLM调用。")
+
+
+def demo_independent_question_is_not_treated_as_follow_up() -> None:
+    _print_section("演示五:一句完整独立的新问题,不会被误判为追问")
+    manager = ConversationContextManager()
+    session_id = "session-independent"
+
+    turn1 = manager.resolve(session_id, "上个月华东区的签约金额一共是多少?")
+    manager.record_turn(session_id, "上个月华东区的签约金额一共是多少?", turn1)
+
+    turn2 = manager.resolve(session_id, "祺瑞·南港湾小区的空置率是多少?")
+    print(f"第二轮(应判定为独立新问题): was_follow_up={turn2.was_follow_up}")
+    assert turn2.was_follow_up is False
+    assert turn2.resolved_question == "祺瑞·南港湾小区的空置率是多少?"
+    print("验证通过: 一句本身语义完整、包含明确的疑问指示词'是多少'的新问题,"
+          "不会被误判成需要补全的追问,避免了对完整问题做不必要甚至错误的改写。")
+
+
+def run_all_demos() -> None:
+    demo_region_follow_up()
+    demo_time_phrase_follow_up()
+    demo_multi_turn_chain()
+    demo_unresolvable_follow_up()
+    demo_independent_question_is_not_treated_as_follow_up()
+    print("\n全部多轮对话上下文演示执行完毕。")
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+### 18. 审计日志——带哈希链完整性保护的操作留痕:`audit_logger.py`
+
+陈铭借用了上午学hashlib时的思路,给每条审计记录都算一个内容哈希,并把上一条记录的哈希编织进当前记录里,形成一条哈希链——这样即便日志文件被人直接打开改了某个字段,或者被删掉了中间一行,重新校验整条链条时都能在断裂的地方被发现,不需要额外引入专门的审计系统。
+
+```python
+# audit_logger.py
+"""审计日志模块。
+
+背景:PRD里"任务的可靠性与可控性"这条需求,今天已经用检查点机制回应了
+"任务能不能中断恢复"这一半,但还有另一半没有被覆盖——集团级客户对
+"谁在什么时候用这个系统查过什么数据、生成过什么SQL、有没有查询被拦截"
+这件事,天然会有审计合规的要求(尤其祺瑞是横跨地产、物业、零售的集团,
+内部审计和外部监管的要求都不会少)。
+
+这个模块提供一份结构化、可追溯的审计日志实现,记录每一次问答的关键信息
+(谁问的、问了什么、生成了什么SQL、是否成功、耗时、命中行数)。更进一步,
+陈铭借用了上午学到的hashlib的思路,给每条日志记录都算了一个"内容哈希",
+并且把上一条记录的哈希值也编织进当前记录的哈希计算里,形成一条哈希链——
+这样一来,如果日志文件中间某一行被人为删除或篡改,重新校验整条哈希链时
+就会在断裂的地方被发现,这是一种轻量级的"防篡改"手段,不需要引入额外的
+审计系统基础设施,用标准库就能给日志文件加上一层可验证的完整性保证。
+"""
+
+import hashlib
+import json
+import logging
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+GENESIS_HASH = "0" * 64
+
+
+@dataclass
+class AuditRecord:
+    """一条完整的审计记录。"""
+
+    trace_id: str
+    timestamp: float
+    user_id: str
+    role: str
+    question: str
+    resolved_question: str
+    sql: Optional[str]
+    success: bool
+    row_count: int
+    error_message: Optional[str]
+    elapsed_ms: float
+    previous_hash: str = ""
+    record_hash: str = ""
+
+    def to_hashable_dict(self) -> Dict[str, Any]:
+        """返回参与哈希计算的字段集合,故意排除record_hash自身。"""
+        data = asdict(self)
+        data.pop("record_hash", None)
+        return data
+
+
+def _compute_record_hash(record: AuditRecord) -> str:
+    payload = json.dumps(
+        record.to_hashable_dict(), ensure_ascii=False, sort_keys=True, default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+@dataclass
+class IntegrityCheckResult:
+    is_intact: bool
+    total_records: int
+    broken_at_index: Optional[int] = None
+    problems: List[str] = field(default_factory=list)
+
+
+class AuditLogger:
+    """基于本地JSONL文件、带哈希链完整性保护的审计日志记录器。
+
+    真实生产环境中,这类审计日志通常应该写入专门的、具备防篡改能力的
+    存储系统(比如只允许追加写入的对象存储、或者接入企业统一的日志审计平台),
+    这里用本地文件实现,重点演示哈希链这个可以独立于具体存储介质使用的
+    完整性校验思路。
+    """
+
+    def __init__(self, log_path: Optional[str] = None):
+        self.log_path = Path(log_path) if log_path else Path("audit_log.jsonl")
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._previous_hash = self._load_last_hash()
+
+    def _load_last_hash(self) -> str:
+        if not self.log_path.exists():
+            return GENESIS_HASH
+        last_hash = GENESIS_HASH
+        with self.log_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                data = json.loads(line)
+                last_hash = data.get("record_hash", GENESIS_HASH)
+        return last_hash
+
+    def log(
+        self,
+        trace_id: str,
+        user_id: str,
+        role: str,
+        question: str,
+        resolved_question: str,
+        sql: Optional[str],
+        success: bool,
+        row_count: int,
+        error_message: Optional[str],
+        elapsed_ms: float,
+    ) -> AuditRecord:
+        record = AuditRecord(
+            trace_id=trace_id,
+            timestamp=time.time(),
+            user_id=user_id,
+            role=role,
+            question=question,
+            resolved_question=resolved_question,
+            sql=sql,
+            success=success,
+            row_count=row_count,
+            error_message=error_message,
+            elapsed_ms=elapsed_ms,
+            previous_hash=self._previous_hash,
+        )
+        record.record_hash = _compute_record_hash(record)
+
+        with self.log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(asdict(record), ensure_ascii=False, default=str))
+            f.write("\n")
+
+        self._previous_hash = record.record_hash
+        logger.debug(
+            "审计日志已写入 trace_id=%s success=%s row_count=%s",
+            trace_id, success, row_count,
+        )
+        return record
+
+    def read_all(self) -> List[AuditRecord]:
+        if not self.log_path.exists():
+            return []
+        records: List[AuditRecord] = []
+        with self.log_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                data = json.loads(line)
+                records.append(AuditRecord(**data))
+        return records
+
+    def query_by_user(self, user_id: str) -> List[AuditRecord]:
+        return [record for record in self.read_all() if record.user_id == user_id]
+
+    def query_failed_only(self) -> List[AuditRecord]:
+        return [record for record in self.read_all() if not record.success]
+
+    def verify_integrity(self) -> IntegrityCheckResult:
+        """重新计算整条哈希链,校验日志文件是否被篡改或删除过某一行。
+
+        校验逻辑:
+        1. 每条记录的record_hash,必须等于"用该记录除record_hash之外的
+           全部字段(包括previous_hash)重新计算出的哈希值",否则说明这条
+           记录本身的内容被改过。
+        2. 每条记录的previous_hash,必须等于它前一条记录的record_hash,
+           否则说明中间可能被删除或插入过记录,链条出现了断裂。
+        """
+        records = self.read_all()
+        problems: List[str] = []
+        expected_previous_hash = GENESIS_HASH
+
+        for index, record in enumerate(records):
+            recomputed_hash = _compute_record_hash(record)
+            if recomputed_hash != record.record_hash:
+                problems.append(
+                    f"第{index}条记录(trace_id={record.trace_id})的内容哈希"
+                    f"与存储的record_hash不一致,记录内容可能被篡改"
+                )
+                return IntegrityCheckResult(
+                    is_intact=False, total_records=len(records),
+                    broken_at_index=index, problems=problems,
+                )
+
+            if record.previous_hash != expected_previous_hash:
+                problems.append(
+                    f"第{index}条记录(trace_id={record.trace_id})的previous_hash"
+                    f"与前一条记录的record_hash不匹配,哈希链断裂,"
+                    f"疑似有记录被删除或篡改顺序"
+                )
+                return IntegrityCheckResult(
+                    is_intact=False, total_records=len(records),
+                    broken_at_index=index, problems=problems,
+                )
+
+            expected_previous_hash = record.record_hash
+
+        return IntegrityCheckResult(is_intact=True, total_records=len(records))
+
+
+# ---------------------------------------------------------------------------
+# 演示区
+# ---------------------------------------------------------------------------
+def _print_section(title: str) -> None:
+    print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
+
+
+def _make_temp_logger() -> AuditLogger:
+    import tempfile
+    tmp_dir = tempfile.mkdtemp(prefix="qiyun_audit_")
+    return AuditLogger(log_path=str(Path(tmp_dir) / "audit_log.jsonl"))
+
+
+def demo_basic_logging_and_query() -> None:
+    _print_section("演示一:基础审计记录与按用户查询")
+    audit_logger = _make_temp_logger()
+
+    audit_logger.log(
+        trace_id="trace-001", user_id="u-sales-huadong", role="region_sales_manager",
+        question="上个月华东区的签约金额一共是多少?",
+        resolved_question="上个月华东区的签约金额一共是多少?",
+        sql="SELECT SUM(contract_amount) FROM sales_contracts;",
+        success=True, row_count=1, error_message=None, elapsed_ms=120.5,
+    )
+    audit_logger.log(
+        trace_id="trace-002", user_id="u-admin-01", role="group_admin",
+        question="帮我删除所有的销售数据",
+        resolved_question="帮我删除所有的销售数据",
+        sql=None, success=False, row_count=0,
+        error_message="检测到危险关键字「DELETE」,已拦截", elapsed_ms=45.2,
+    )
+
+    all_records = audit_logger.read_all()
+    print(f"审计日志总条数: {len(all_records)}")
+    assert len(all_records) == 2
+
+    huadong_records = audit_logger.query_by_user("u-sales-huadong")
+    print(f"华东区经理的审计记录条数: {len(huadong_records)}")
+    assert len(huadong_records) == 1
+
+    failed_records = audit_logger.query_failed_only()
+    print(f"失败(被拦截)的审计记录条数: {len(failed_records)}")
+    assert len(failed_records) == 1
+    assert "DELETE" in failed_records[0].error_message
+    print("验证通过: 每一次问答,无论成功还是被安全校验拦截,都留下了可追溯的记录。")
+
+
+def demo_hash_chain_integrity_ok() -> None:
+    _print_section("演示二:正常情况下,哈希链完整性校验应通过")
+    audit_logger = _make_temp_logger()
+
+    for i in range(5):
+        audit_logger.log(
+            trace_id=f"trace-{i:03d}", user_id="u-admin-01", role="group_admin",
+            question=f"测试问题{i}", resolved_question=f"测试问题{i}",
+            sql="SELECT 1;", success=True, row_count=1,
+            error_message=None, elapsed_ms=10.0 + i,
+        )
+
+    result = audit_logger.verify_integrity()
+    print(f"完整性校验结果: is_intact={result.is_intact} total_records={result.total_records}")
+    assert result.is_intact is True
+    assert result.total_records == 5
+    print("验证通过: 连续写入的5条记录形成了一条完整的哈希链,校验全部通过。")
+
+
+def demo_hash_chain_detects_tampering() -> None:
+    _print_section("演示三:日志文件被人为篡改后,哈希链校验能检测出来")
+    audit_logger = _make_temp_logger()
+
+    for i in range(3):
+        audit_logger.log(
+            trace_id=f"trace-{i:03d}", user_id="u-admin-01", role="group_admin",
+            question=f"测试问题{i}", resolved_question=f"测试问题{i}",
+            sql="SELECT 1;", success=True, row_count=1,
+            error_message=None, elapsed_ms=10.0,
+        )
+
+    # 模拟"有人手动打开日志文件,偷偷把第2条记录的row_count从1改成了999"
+    lines = audit_logger.log_path.read_text(encoding="utf-8").splitlines()
+    tampered_record = json.loads(lines[1])
+    tampered_record["row_count"] = 999
+    lines[1] = json.dumps(tampered_record, ensure_ascii=False)
+    audit_logger.log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = audit_logger.verify_integrity()
+    print(f"篡改后的校验结果: is_intact={result.is_intact} broken_at_index={result.broken_at_index}")
+    assert result.is_intact is False
+    assert result.broken_at_index == 1
+    print(f"检测到的问题: {result.problems[0]}")
+    print("验证通过: 篡改了第2条记录的row_count字段之后,该记录自身的内容哈希"
+          "与重新计算出的哈希不再一致,校验立刻在第1个下标(即第2条记录)处发现了问题。")
+
+
+def demo_hash_chain_detects_deleted_record() -> None:
+    _print_section("演示四:日志文件中间某一行被整行删除,哈希链也能检测出来")
+    audit_logger = _make_temp_logger()
+
+    for i in range(4):
+        audit_logger.log(
+            trace_id=f"trace-{i:03d}", user_id="u-admin-01", role="group_admin",
+            question=f"测试问题{i}", resolved_question=f"测试问题{i}",
+            sql="SELECT 1;", success=True, row_count=1,
+            error_message=None, elapsed_ms=10.0,
+        )
+
+    lines = audit_logger.log_path.read_text(encoding="utf-8").splitlines()
+    # 模拟"有人想抹掉第3条记录的痕迹,直接把这一行删掉"
+    del lines[2]
+    audit_logger.log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = audit_logger.verify_integrity()
+    print(f"删除记录后的校验结果: is_intact={result.is_intact} broken_at_index={result.broken_at_index}")
+    assert result.is_intact is False
+    print(f"检测到的问题: {result.problems[0]}")
+    print("验证通过: 即便删除的是整整一行、内容本身'自洽'的记录,由于后一条记录的"
+          "previous_hash字段仍然指向被删除的那条记录的哈希值,校验能够定位到"
+          "哈希链在此处断裂,这正是哈希链设计相比'单条记录自带一个签名'更强的地方——"
+          "它保护的是记录之间的顺序与完整性,而不只是单条记录本身有没有被改。")
+
+
+def run_all_demos() -> None:
+    demo_basic_logging_and_query()
+    demo_hash_chain_integrity_ok()
+    demo_hash_chain_detects_tampering()
+    demo_hash_chain_detects_deleted_record()
+    print("\n全部审计日志演示执行完毕。")
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+### 19. 配套单元测试:权限控制、查询缓存、对话上下文、审计日志
+
+四个新模块陆续写完之后,陈铭没有让它们停留在"跑一遍demo看着输出对"的阶段,而是照着sql_validator.py和test_agent.py的规格,分别补上了单元测试。他给自己定的规矩很直接:凡是涉及"权限""安全""数据一致性"这几个关键词的模块,没有测试覆盖之前不允许提交,今天新增的四个模块显然全部命中了这几个关键词。
+
+#### `tests/test_permission_control.py`
+
+```python
+# tests/test_permission_control.py
+"""行级权限控制模块的单元测试。
+
+覆盖场景:
+1. 未受限角色(group_admin/finance_viewer)不触发行级过滤
+2. 受限角色(region_sales_manager/property_manager)的域级校验
+3. 受限角色的行级结果过滤,包括"SQL本身没有加过滤条件"的兜底场景
+4. 缺失范围列时的保守拒绝策略
+5. TABLE_DOMAIN_MAP与schema_inspector.TABLE_METADATA的一致性校验
+"""
+
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from permission_control import (  # noqa: E402
+    PermissionDeniedError,
+    PermissionEnforcer,
+    ROLE_DEFINITIONS,
+    TABLE_DOMAIN_MAP,
+    UserContext,
+)
+from schema_inspector import TABLE_METADATA  # noqa: E402
+
+
+@pytest.fixture()
+def enforcer() -> PermissionEnforcer:
+    return PermissionEnforcer()
+
+
+class TestUnscopedRoles:
+    def test_group_admin_not_scoped(self, enforcer: PermissionEnforcer):
+        admin = UserContext(user_id="u1", display_name="管理员", role="group_admin")
+        rows = [{"region_name": "华东区"}, {"region_name": "华南区"}]
+        result = enforcer.filter_rows_by_scope(rows, admin)
+        assert result.scope_applied is False
+        assert len(result.allowed_rows) == 2
+
+    def test_finance_viewer_can_access_both_domains(self, enforcer: PermissionEnforcer):
+        finance = UserContext(user_id="u2", display_name="财务", role="finance_viewer")
+        sql = "SELECT * FROM sales_contracts JOIN property_fee_bills ON 1=1;"
+        touched = enforcer.check_domain_access(sql, finance)
+        assert "sales_contracts" in touched
+        assert "property_fee_bills" in touched
+
+
+class TestDomainAccessControl:
+    def test_property_manager_blocked_from_sales(self, enforcer: PermissionEnforcer):
+        property_manager = UserContext(
+            user_id="u3", display_name="物业经理", role="property_manager",
+            allowed_city_names={"杭州"},
+        )
+        with pytest.raises(PermissionDeniedError) as exc_info:
+            enforcer.check_domain_access("SELECT * FROM sales_contracts;", property_manager)
+        assert exc_info.value.category == "domain"
+
+    def test_region_sales_manager_blocked_from_property(self, enforcer: PermissionEnforcer):
+        sales_manager = UserContext(
+            user_id="u4", display_name="销售经理", role="region_sales_manager",
+            allowed_region_names={"华东区"},
+        )
+        with pytest.raises(PermissionDeniedError):
+            enforcer.check_domain_access("SELECT * FROM property_fee_bills;", sales_manager)
+
+    def test_region_sales_manager_allowed_for_sales(self, enforcer: PermissionEnforcer):
+        sales_manager = UserContext(
+            user_id="u5", display_name="销售经理", role="region_sales_manager",
+            allowed_region_names={"华东区"},
+        )
+        touched = enforcer.check_domain_access("SELECT * FROM sales_contracts;", sales_manager)
+        assert "sales_contracts" in touched
+
+    def test_unknown_role_is_rejected(self, enforcer: PermissionEnforcer):
+        rogue_user = UserContext(user_id="u6", display_name="未知角色", role="ceo_backdoor")
+        with pytest.raises(PermissionDeniedError):
+            enforcer.check_domain_access("SELECT * FROM sales_contracts;", rogue_user)
+
+
+class TestRowLevelFiltering:
+    def test_region_scoped_filtering_removes_out_of_scope_rows(self, enforcer: PermissionEnforcer):
+        sales_manager = UserContext(
+            user_id="u7", display_name="华东区经理", role="region_sales_manager",
+            allowed_region_names={"华东区"},
+        )
+        rows = [
+            {"region_name": "华东区", "amount": 100},
+            {"region_name": "华南区", "amount": 200},
+            {"region_name": "华东区", "amount": 300},
+        ]
+        result = enforcer.filter_rows_by_scope(rows, sales_manager)
+        assert len(result.allowed_rows) == 2
+        assert all(row["region_name"] == "华东区" for row in result.allowed_rows)
+        assert result.removed_row_count == 1
+
+    def test_city_scoped_filtering(self, enforcer: PermissionEnforcer):
+        property_manager = UserContext(
+            user_id="u8", display_name="物业经理", role="property_manager",
+            allowed_city_names={"杭州", "广州"},
+        )
+        rows = [
+            {"city": "杭州", "vacancy_rate": 10},
+            {"city": "天津", "vacancy_rate": 20},
+            {"city": "广州", "vacancy_rate": 5},
+        ]
+        result = enforcer.filter_rows_by_scope(rows, property_manager)
+        assert len(result.allowed_rows) == 2
+        assert {row["city"] for row in result.allowed_rows} == {"杭州", "广州"}
+
+    def test_no_rows_returns_no_rows_without_error(self, enforcer: PermissionEnforcer):
+        sales_manager = UserContext(
+            user_id="u9", display_name="经理", role="region_sales_manager",
+            allowed_region_names={"华东区"},
+        )
+        result = enforcer.filter_rows_by_scope([], sales_manager)
+        assert result.allowed_rows == []
+        assert result.removed_row_count == 0
+
+
+class TestMissingScopeColumnFallback:
+    def test_missing_scope_column_is_conservatively_rejected(self, enforcer: PermissionEnforcer):
+        sales_manager = UserContext(
+            user_id="u10", display_name="经理", role="region_sales_manager",
+            allowed_region_names={"华东区"},
+        )
+        rows = [{"deal_count": 42}]
+        result = enforcer.filter_rows_by_scope(rows, sales_manager)
+        assert result.allowed_rows == []
+        assert result.removed_row_count == 1
+        assert result.scope_column_used == "(none)"
+
+
+class TestEndToEndEnforce:
+    def test_enforce_combines_domain_check_and_row_filter(self, enforcer: PermissionEnforcer):
+        sales_manager = UserContext(
+            user_id="u11", display_name="经理", role="region_sales_manager",
+            allowed_region_names={"华东区"},
+        )
+        sql = "SELECT region_name, SUM(contract_amount) FROM sales_contracts JOIN sales_regions ON 1=1;"
+        rows = [
+            {"region_name": "华东区", "total_amount": 1000},
+            {"region_name": "华北区", "total_amount": 2000},
+        ]
+        result = enforcer.enforce(sql, rows, sales_manager)
+        assert len(result.allowed_rows) == 1
+        assert result.allowed_rows[0]["region_name"] == "华东区"
+
+    def test_enforce_raises_before_touching_rows_when_domain_forbidden(
+        self, enforcer: PermissionEnforcer
+    ):
+        property_manager = UserContext(
+            user_id="u12", display_name="物业经理", role="property_manager",
+            allowed_city_names={"杭州"},
+        )
+        with pytest.raises(PermissionDeniedError):
+            enforcer.enforce(
+                "SELECT * FROM sales_contracts;",
+                [{"region_name": "华东区"}],
+                property_manager,
+            )
+
+
+class TestConsistencyWithSchemaInspector:
+    def test_table_domain_map_matches_schema_inspector(self):
+        """确保permission_control.py独立维护的表-域映射,与schema_inspector.py
+        里TABLE_METADATA的domain字段完全一致,避免两处配置"文档漂移"。
+        """
+        schema_domain_map = {
+            table_name: table_info.domain
+            for table_name, table_info in TABLE_METADATA.items()
+        }
+        assert TABLE_DOMAIN_MAP == schema_domain_map
+
+    def test_all_roles_have_non_empty_allowed_domains(self):
+        for role_name, role_def in ROLE_DEFINITIONS.items():
+            assert len(role_def.allowed_domains) > 0, (
+                f"角色{role_name}的allowed_domains不应为空,"
+                "空权限集合的角色应该在用户体系里直接禁用,而不是留一个空集合在这里"
+            )
+```
+
+#### `tests/test_query_cache.py`
+
+```python
+# tests/test_query_cache.py
+"""查询缓存模块的单元测试。
+
+覆盖场景:
+1. 基础的命中/未命中与统计计数
+2. 权限范围隔离(不同scope_key不共享缓存)
+3. TTL过期
+4. LRU淘汰顺序
+5. 主动失效与批量清理过期条目
+6. 缓存key的稳定性(相同输入产生相同key,归一化生效)
+"""
+
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from query_cache import QueryCache, make_cache_key, normalize_question  # noqa: E402
+
+
+SCOPE = "group_admin|region=ALL|city=ALL"
+
+
+class TestBasicHitMiss:
+    def test_miss_then_hit(self):
+        cache = QueryCache(max_size=10, ttl_seconds=60)
+        assert cache.get("问题A", SCOPE) is None
+        cache.put("问题A", SCOPE, "答案A")
+        assert cache.get("问题A", SCOPE) == "答案A"
+        assert cache.stats.hits == 1
+        assert cache.stats.misses == 1
+
+    def test_hit_count_accumulates_on_entry(self):
+        cache = QueryCache(max_size=10, ttl_seconds=60)
+        cache.put("问题A", SCOPE, "答案A")
+        for _ in range(3):
+            cache.get("问题A", SCOPE)
+        key = make_cache_key("问题A", SCOPE)
+        assert cache._store[key].hit_count == 3
+
+
+class TestScopeIsolation:
+    def test_same_question_different_scope_do_not_collide(self):
+        cache = QueryCache(max_size=10, ttl_seconds=60)
+        scope_a = "region_sales_manager|region=华东区|city=ALL"
+        scope_b = "region_sales_manager|region=华南区|city=ALL"
+
+        cache.put("这个月签约金额是多少?", scope_a, {"total": 100})
+        cache.put("这个月签约金额是多少?", scope_b, {"total": 200})
+
+        assert cache.get("这个月签约金额是多少?", scope_a) == {"total": 100}
+        assert cache.get("这个月签约金额是多少?", scope_b) == {"total": 200}
+
+    def test_cache_key_differs_by_scope(self):
+        key_a = make_cache_key("问题A", "scope1")
+        key_b = make_cache_key("问题A", "scope2")
+        assert key_a != key_b
+
+
+class TestTTLExpiration:
+    def test_expired_entry_returns_none_and_counts_as_expiration(self):
+        cache = QueryCache(max_size=10, ttl_seconds=0.03)
+        cache.put("问题A", SCOPE, "答案A")
+        assert cache.get("问题A", SCOPE) == "答案A"
+        time.sleep(0.05)
+        assert cache.get("问题A", SCOPE) is None
+        assert cache.stats.expirations == 1
+
+    def test_purge_expired_batch_cleans_multiple_entries(self):
+        cache = QueryCache(max_size=10, ttl_seconds=0.03)
+        cache.put("问题A", SCOPE, "答案A")
+        cache.put("问题B", SCOPE, "答案B")
+        time.sleep(0.05)
+        purged_count = cache.purge_expired()
+        assert purged_count == 2
+        assert len(cache) == 0
+
+
+class TestLRUEviction:
+    def test_least_recently_used_is_evicted_first(self):
+        cache = QueryCache(max_size=2, ttl_seconds=60)
+        cache.put("A", SCOPE, "答案A")
+        cache.put("B", SCOPE, "答案B")
+        cache.put("C", SCOPE, "答案C")  # 应淘汰A(最久未使用)
+
+        assert cache.get("A", SCOPE) is None
+        assert cache.get("B", SCOPE) == "答案B"
+        assert cache.get("C", SCOPE) == "答案C"
+        assert cache.stats.evictions == 1
+
+    def test_recently_accessed_entry_survives_eviction(self):
+        cache = QueryCache(max_size=2, ttl_seconds=60)
+        cache.put("A", SCOPE, "答案A")
+        cache.put("B", SCOPE, "答案B")
+        cache.get("A", SCOPE)  # 重新访问A,使其变为"最近使用"
+        cache.put("C", SCOPE, "答案C")  # 此时应淘汰B而不是A
+
+        assert cache.get("A", SCOPE) == "答案A"
+        assert cache.get("B", SCOPE) is None
+
+    def test_invalid_max_size_raises(self):
+        with pytest.raises(ValueError):
+            QueryCache(max_size=0)
+
+
+class TestManualInvalidation:
+    def test_invalidate_existing_entry_returns_true(self):
+        cache = QueryCache(max_size=10, ttl_seconds=60)
+        cache.put("问题A", SCOPE, "答案A")
+        assert cache.invalidate("问题A", SCOPE) is True
+        assert cache.get("问题A", SCOPE) is None
+
+    def test_invalidate_nonexistent_entry_returns_false(self):
+        cache = QueryCache(max_size=10, ttl_seconds=60)
+        assert cache.invalidate("不存在的问题", SCOPE) is False
+
+    def test_clear_removes_all_entries(self):
+        cache = QueryCache(max_size=10, ttl_seconds=60)
+        cache.put("问题A", SCOPE, "答案A")
+        cache.put("问题B", SCOPE, "答案B")
+        cache.clear()
+        assert len(cache) == 0
+        assert cache.get("问题A", SCOPE) is None
+
+
+class TestQuestionNormalization:
+    def test_extra_whitespace_is_normalized(self):
+        assert normalize_question("  上个月   华东区的签约金额  ") == "上个月 华东区的签约金额"
+
+    def test_same_semantic_question_with_different_whitespace_shares_cache(self):
+        cache = QueryCache(max_size=10, ttl_seconds=60)
+        cache.put("上个月 华东区 的签约金额", SCOPE, "答案A")
+        assert cache.get("上个月   华东区   的签约金额", SCOPE) == "答案A"
+```
+
+#### `tests/test_conversation_context.py`
+
+```python
+# tests/test_conversation_context.py
+"""多轮对话上下文管理模块的单元测试。
+
+覆盖场景:
+1. 省略式追问的识别(is_follow_up_question)
+2. 区域/小区/时间三类实体的追问补全
+3. 连续多轮追问的链式演进
+4. 无法补全时的诚实报告
+5. 完整独立问题不被误判为追问
+6. 会话数量与会话历史长度的边界控制
+"""
+
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from conversation_context import (  # noqa: E402
+    ConversationContextManager,
+    is_follow_up_question,
+)
+
+
+class TestFollowUpDetection:
+    @pytest.mark.parametrize("question", [
+        "那华南区呢?",
+        "华南区呢",
+        "上季度呢?",
+        "那祺瑞·南港湾的话",
+        "呢?",
+    ])
+    def test_follow_up_patterns_detected(self, question: str):
+        assert is_follow_up_question(question) is True
+
+    @pytest.mark.parametrize("question", [
+        "上个月华东区的签约金额一共是多少?",
+        "这个月成交量最高的销售顾问是谁?",
+        "祺瑞·南港湾小区的空置率是多少?",
+    ])
+    def test_complete_questions_not_treated_as_follow_up(self, question: str):
+        assert is_follow_up_question(question) is False
+
+
+class TestRegionEntityResolution:
+    def test_region_replacement(self):
+        manager = ConversationContextManager()
+        session_id = "s1"
+        turn1 = manager.resolve(session_id, "上个月华东区的签约金额一共是多少?")
+        manager.record_turn(session_id, "上个月华东区的签约金额一共是多少?", turn1)
+
+        turn2 = manager.resolve(session_id, "那华南区呢?")
+        assert turn2.was_follow_up is True
+        assert "华南区" in turn2.resolved_question
+        assert "华东区" not in turn2.resolved_question
+        assert "region" in turn2.matched_categories
+
+
+class TestTimeEntityResolution:
+    def test_time_phrase_replacement(self):
+        manager = ConversationContextManager()
+        session_id = "s2"
+        turn1 = manager.resolve(session_id, "祺瑞·望江花园本月的物业费欠缴率是多少?")
+        manager.record_turn(session_id, "祺瑞·望江花园本月的物业费欠缴率是多少?", turn1)
+
+        turn2 = manager.resolve(session_id, "上季度呢?")
+        assert "上季度" in turn2.resolved_question
+        assert "本月" not in turn2.resolved_question
+
+
+class TestCommunityEntityResolution:
+    def test_community_replacement_keeps_metric(self):
+        manager = ConversationContextManager()
+        session_id = "s3"
+        turn1 = manager.resolve(session_id, "祺瑞·南港湾小区的空置率是多少?")
+        manager.record_turn(session_id, "祺瑞·南港湾小区的空置率是多少?", turn1)
+
+        turn2 = manager.resolve(session_id, "祺瑞·云上里呢?")
+        assert "祺瑞·云上里" in turn2.resolved_question
+        assert "空置率" in turn2.resolved_question
+        assert "祺瑞·南港湾" not in turn2.resolved_question
+
+
+class TestMultiTurnChain:
+    def test_three_consecutive_follow_ups(self):
+        manager = ConversationContextManager()
+        session_id = "s4"
+
+        t1 = manager.resolve(session_id, "祺瑞·南港湾小区的空置率是多少?")
+        manager.record_turn(session_id, "祺瑞·南港湾小区的空置率是多少?", t1)
+
+        t2 = manager.resolve(session_id, "祺瑞·云上里呢?")
+        manager.record_turn(session_id, "祺瑞·云上里呢?", t2)
+        assert "祺瑞·云上里" in t2.resolved_question
+
+        t3 = manager.resolve(session_id, "那祺瑞·望江花园的话")
+        manager.record_turn(session_id, "那祺瑞·望江花园的话", t3)
+        assert "祺瑞·望江花园" in t3.resolved_question
+        assert "空置率" in t3.resolved_question
+
+
+class TestUnresolvableFollowUp:
+    def test_bare_follow_up_marker_is_unresolvable(self):
+        manager = ConversationContextManager()
+        session_id = "s5"
+        t1 = manager.resolve(session_id, "这个月成交量最高的销售顾问是谁?")
+        manager.record_turn(session_id, "这个月成交量最高的销售顾问是谁?", t1)
+
+        t2 = manager.resolve(session_id, "呢?")
+        assert t2.resolvable is False
+        assert t2.reason != ""
+
+    def test_first_turn_in_empty_session_is_never_follow_up(self):
+        manager = ConversationContextManager()
+        result = manager.resolve("s6", "那华南区呢?")
+        # 会话里还没有任何历史,即便文字上像追问,也没有上下文可以依附
+        assert result.was_follow_up is False
+        assert result.resolved_question == "那华南区呢?"
+
+
+class TestSessionManagement:
+    def test_session_history_is_capped(self):
+        manager = ConversationContextManager()
+        session = manager.get_or_create_session("s7")
+        session.max_history = 3
+        for i in range(5):
+            result = manager.resolve("s7", f"独立问题{i}是多少?")
+            manager.record_turn("s7", f"独立问题{i}是多少?", result)
+        assert len(session.turns) == 3
+        # 应保留最近的3轮,而不是最早的3轮
+        assert session.turns[0].raw_question == "独立问题2是多少?"
+        assert session.turns[-1].raw_question == "独立问题4是多少?"
+
+    def test_oldest_session_evicted_when_over_capacity(self):
+        manager = ConversationContextManager(max_sessions=2)
+        manager.get_or_create_session("session-1")
+        manager.get_or_create_session("session-2")
+        manager.get_or_create_session("session-3")
+        assert len(manager._sessions) == 2
+        assert "session-1" not in manager._sessions
+```
+
+#### `tests/test_audit_logger.py`
+
+```python
+# tests/test_audit_logger.py
+"""审计日志模块的单元测试。
+
+覆盖场景:
+1. 基础写入与按用户/按失败状态查询
+2. 正常写入下哈希链完整性校验通过
+3. 单条记录内容被篡改后能被检测出来
+4. 记录被整行删除后能被检测出来(哈希链断裂)
+5. 跨进程/重启后能正确衔接上一次写入的哈希链(不会从GENESIS_HASH重新开始)
+"""
+
+import json
+import sys
+import tempfile
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from audit_logger import AuditLogger, GENESIS_HASH  # noqa: E402
+
+
+@pytest.fixture()
+def temp_log_path():
+    tmp_dir = tempfile.mkdtemp(prefix="qiyun_audit_test_")
+    yield str(Path(tmp_dir) / "audit_log.jsonl")
+
+
+class TestBasicLogging:
+    def test_log_and_read_all(self, temp_log_path):
+        logger = AuditLogger(log_path=temp_log_path)
+        logger.log(
+            trace_id="t1", user_id="u1", role="group_admin",
+            question="Q1", resolved_question="Q1", sql="SELECT 1;",
+            success=True, row_count=1, error_message=None, elapsed_ms=10.0,
+        )
+        records = logger.read_all()
+        assert len(records) == 1
+        assert records[0].trace_id == "t1"
+
+    def test_query_by_user_filters_correctly(self, temp_log_path):
+        logger = AuditLogger(log_path=temp_log_path)
+        logger.log(trace_id="t1", user_id="u1", role="group_admin", question="Q1",
+                    resolved_question="Q1", sql="SELECT 1;", success=True,
+                    row_count=1, error_message=None, elapsed_ms=1.0)
+        logger.log(trace_id="t2", user_id="u2", role="group_admin", question="Q2",
+                    resolved_question="Q2", sql="SELECT 1;", success=True,
+                    row_count=1, error_message=None, elapsed_ms=1.0)
+        assert len(logger.query_by_user("u1")) == 1
+        assert len(logger.query_by_user("u2")) == 1
+        assert len(logger.query_by_user("u3")) == 0
+
+    def test_query_failed_only(self, temp_log_path):
+        logger = AuditLogger(log_path=temp_log_path)
+        logger.log(trace_id="t1", user_id="u1", role="group_admin", question="Q1",
+                    resolved_question="Q1", sql="SELECT 1;", success=True,
+                    row_count=1, error_message=None, elapsed_ms=1.0)
+        logger.log(trace_id="t2", user_id="u1", role="group_admin", question="危险请求",
+                    resolved_question="危险请求", sql=None, success=False,
+                    row_count=0, error_message="已拦截", elapsed_ms=1.0)
+        failed = logger.query_failed_only()
+        assert len(failed) == 1
+        assert failed[0].trace_id == "t2"
+
+
+class TestHashChainIntegrity:
+    def test_empty_log_is_intact(self, temp_log_path):
+        logger = AuditLogger(log_path=temp_log_path)
+        result = logger.verify_integrity()
+        assert result.is_intact is True
+        assert result.total_records == 0
+
+    def test_multiple_records_form_valid_chain(self, temp_log_path):
+        logger = AuditLogger(log_path=temp_log_path)
+        for i in range(4):
+            logger.log(trace_id=f"t{i}", user_id="u1", role="group_admin",
+                       question=f"Q{i}", resolved_question=f"Q{i}",
+                       sql="SELECT 1;", success=True, row_count=1,
+                       error_message=None, elapsed_ms=1.0)
+        result = logger.verify_integrity()
+        assert result.is_intact is True
+        assert result.total_records == 4
+
+    def test_first_record_previous_hash_is_genesis(self, temp_log_path):
+        logger = AuditLogger(log_path=temp_log_path)
+        logger.log(trace_id="t1", user_id="u1", role="group_admin", question="Q1",
+                    resolved_question="Q1", sql="SELECT 1;", success=True,
+                    row_count=1, error_message=None, elapsed_ms=1.0)
+        records = logger.read_all()
+        assert records[0].previous_hash == GENESIS_HASH
+
+    def test_tampered_field_breaks_chain(self, temp_log_path):
+        logger = AuditLogger(log_path=temp_log_path)
+        for i in range(3):
+            logger.log(trace_id=f"t{i}", user_id="u1", role="group_admin",
+                       question=f"Q{i}", resolved_question=f"Q{i}",
+                       sql="SELECT 1;", success=True, row_count=1,
+                       error_message=None, elapsed_ms=1.0)
+
+        lines = Path(temp_log_path).read_text(encoding="utf-8").splitlines()
+        tampered = json.loads(lines[1])
+        tampered["row_count"] = 9999
+        lines[1] = json.dumps(tampered, ensure_ascii=False)
+        Path(temp_log_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        result = logger.verify_integrity()
+        assert result.is_intact is False
+        assert result.broken_at_index == 1
+
+    def test_deleted_record_breaks_chain(self, temp_log_path):
+        logger = AuditLogger(log_path=temp_log_path)
+        for i in range(4):
+            logger.log(trace_id=f"t{i}", user_id="u1", role="group_admin",
+                       question=f"Q{i}", resolved_question=f"Q{i}",
+                       sql="SELECT 1;", success=True, row_count=1,
+                       error_message=None, elapsed_ms=1.0)
+
+        lines = Path(temp_log_path).read_text(encoding="utf-8").splitlines()
+        del lines[1]
+        Path(temp_log_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        result = logger.verify_integrity()
+        assert result.is_intact is False
+
+
+class TestChainContinuityAcrossRestarts:
+    def test_new_logger_instance_continues_the_same_chain(self, temp_log_path):
+        logger1 = AuditLogger(log_path=temp_log_path)
+        logger1.log(trace_id="t1", user_id="u1", role="group_admin", question="Q1",
+                     resolved_question="Q1", sql="SELECT 1;", success=True,
+                     row_count=1, error_message=None, elapsed_ms=1.0)
+
+        # 模拟进程重启:重新构造一个AuditLogger实例指向同一份日志文件
+        logger2 = AuditLogger(log_path=temp_log_path)
+        logger2.log(trace_id="t2", user_id="u1", role="group_admin", question="Q2",
+                     resolved_question="Q2", sql="SELECT 1;", success=True,
+                     row_count=1, error_message=None, elapsed_ms=1.0)
+
+        records = logger2.read_all()
+        assert len(records) == 2
+        assert records[1].previous_hash == records[0].record_hash
+
+        result = logger2.verify_integrity()
+        assert result.is_intact is True
+```
+
+四份新测试跑完,连同今天上午写的两份测试一起,终端里滚出了一长串绿色的`passed`,陈铭数了一下,今天一天新增的单元测试一共六十多条。他把这个数字也截图发进了项目群里,配文"安全和权限相关的模块,测试比功能代码写得还认真",老王回了一个大拇指的表情,没多说什么——这种时候,沉默本身就是一种认可。
+
 代码写完之后,陈铭没有着急去跑通所有测试细节,而是先把整条链路串起来跑了一遍`cli.py`里那五个演示问题,重点盯着最后一条"帮我删除所有的销售数据"——这条请求在Mock客户端里会被规则匹配到,生成一句`DELETE FROM sales_contracts WHERE 1=1;`,然后在安全校验层被结结实实地拦下来,终端里打出"检测到危险关键字「DELETE」,该操作不允许通过自然语言查询执行,已拦截"的时候,他心里那块悬着的石头才算落地——这不是因为大模型"学会了不生成危险语句",而是因为不管模型生成什么,校验层这道闸门始终立在那里,这正是老王上午反复强调的那句话的落地证明。
 
 ---
