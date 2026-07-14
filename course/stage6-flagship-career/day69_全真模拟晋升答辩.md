@@ -1395,6 +1395,921 @@ if __name__ == "__main__":
 
 值得一提的是,陈铭在写这版改进代码的过程中,还发现了一个原本没有被郭建军和老王指出的小问题——展示版本里`_invoke_with_timeout`方法使用线程加`join(timeout)`来实现超时控制,当超时发生时,原来执行工具调用的那个子线程实际上并没有真正被终止,只是主线程不再等待它,如果这个子线程内部的操作本身没有做好资源释放(比如一个还没断开的数据库连接),就可能造成资源悄悄泄漏。他在给老王汇报改进代码的时候主动提出了这一点,虽然当天晚上时间有限,没有来得及在代码里彻底解决这个问题(更完善的方案通常需要引入支持取消的异步任务模型,或者在子线程内部显式监听一个取消信号量),但他把这个已知的局限性写进了代码注释里,并列入了自己后续要跟进处理的技术债清单。老王对这一点评价很高:"你不是等着别人来找问题,是自己在推敲的过程中,发现了更深一层的问题——这种主动挖掘的习惯,比单纯完成任务本身更值钱。"
 
+### 三、备选展示代码:Token预算预测模块(答辩中提及但未选用的候选方案)
+
+前面提到,陈铭在准备"最能代表个人技术能力"的展示代码时,曾经在"编排引擎状态机"和"Token预算预测模块"之间纠结过,最终选择了前者,因为它更能讲出完整的设计权衡故事。但当天晚上写完编排引擎的改进版之后,陈铭想起自己在回答"哪个模块回过头看依然觉得设计得不够好"这道题时,曾经提到过一个改进思路——用轻量级回归模型代替固定历史均值来预估Token消耗。他觉得这个想法既然已经在答辩现场讲出来了,不能只停留在口头,于是当天晚上顺手把这个方案的一个可运行原型也写了出来,作为对自己那句"我会把这个方案写成一份完整的技术建议"的兑现。
+
+```python
+"""
+苍穹企业级智能体中台 - Token预算预测模块(改进原型)
+背景:答辩现场陈铭提到,现有方案基于历史均值预估Token消耗,
+面对"本次输入明显比历史均值更长更复杂"的场景经常预估偏低。
+本模块提供一个轻量级特征回归预估器,作为对现有方案的补充候选。
+作者:陈铭(答辩当晚基于口头方案整理成代码原型)
+"""
+
+from __future__ import annotations
+
+import math
+import statistics
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable, Dict, List, Optional, Tuple
+
+
+class AgentPhase(Enum):
+    """Agent当前所处的推理阶段,阶段不同,Token消耗特征差异很大"""
+    SIMPLE_QA = "SIMPLE_QA"                # 简单问答,一轮结束
+    MULTI_TURN_CHAT = "MULTI_TURN_CHAT"    # 多轮对话,尚未涉及工具调用
+    TOOL_REASONING = "TOOL_REASONING"      # 处于多轮工具调用的复杂推理阶段
+    REFLECTION = "REFLECTION"              # 处于反思/重新规划阶段,消耗通常更高
+
+
+@dataclass
+class CallFeatureSample:
+    """一条历史调用的特征与真实Token消耗,用于训练/评估预估器"""
+
+    input_token_count: int
+    conversation_turn_count: int
+    agent_phase: AgentPhase
+    actual_total_tokens: int
+
+
+@dataclass
+class PredictionResult:
+    """一次预估结果,同时保留预估依据,便于事后审计和归因"""
+
+    predicted_tokens: float
+    lower_bound: float
+    upper_bound: float
+    method: str
+    feature_contributions: Dict[str, float] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# 基线方案:历史均值预估器(对应答辩前的现有实现)
+# ---------------------------------------------------------------------------
+
+class HistoricalMeanPredictor:
+    """
+    基线方案:固定使用历史均值(不区分输入特征)作为预估值。
+    这是答辩前苍穹平台现有实现的简化复现,用于和改进方案做对比评估。
+    """
+
+    def __init__(self) -> None:
+        self._history: List[int] = []
+
+    def fit(self, samples: List[CallFeatureSample]) -> None:
+        self._history = [s.actual_total_tokens for s in samples]
+
+    def predict(self, sample: CallFeatureSample) -> PredictionResult:
+        if not self._history:
+            return PredictionResult(predicted_tokens=0.0, lower_bound=0.0,
+                                     upper_bound=0.0, method="历史均值(无数据)")
+        mean_value = statistics.mean(self._history)
+        stddev_value = statistics.pstdev(self._history) if len(self._history) > 1 else 0.0
+        return PredictionResult(
+            predicted_tokens=mean_value,
+            lower_bound=max(0.0, mean_value - stddev_value),
+            upper_bound=mean_value + stddev_value,
+            method="历史均值",
+        )
+
+
+# ---------------------------------------------------------------------------
+# 改进方案:轻量特征回归预估器
+# ---------------------------------------------------------------------------
+
+# 各Agent阶段的经验消耗系数,用于把离散特征转化为可参与线性组合的数值特征
+PHASE_MULTIPLIER: Dict[AgentPhase, float] = {
+    AgentPhase.SIMPLE_QA: 1.0,
+    AgentPhase.MULTI_TURN_CHAT: 1.3,
+    AgentPhase.TOOL_REASONING: 2.1,
+    AgentPhase.REFLECTION: 2.6,
+}
+
+
+@dataclass
+class LinearRegressionWeights:
+    """简单多元线性回归的权重系数,用最小二乘法在fit阶段求解"""
+
+    intercept: float = 0.0
+    weight_input_tokens: float = 0.0
+    weight_turn_count: float = 0.0
+    weight_phase_multiplier: float = 0.0
+
+
+class LightweightFeaturePredictor:
+    """
+    改进方案:引入输入Token数、历史对话轮次、Agent当前阶段三个特征,
+    用简单多元线性回归拟合Token消耗,不依赖任何第三方机器学习库,
+    只用标准库实现最小二乘法求解,保证部署轻量、易于审计。
+    """
+
+    def __init__(self) -> None:
+        self._weights = LinearRegressionWeights()
+        self._residual_stddev: float = 0.0
+
+    def _build_feature_matrix(
+        self, samples: List[CallFeatureSample]
+    ) -> Tuple[List[List[float]], List[float]]:
+        feature_rows: List[List[float]] = []
+        targets: List[float] = []
+        for sample in samples:
+            phase_value = PHASE_MULTIPLIER[sample.agent_phase]
+            feature_rows.append([
+                1.0,  # 截距项
+                float(sample.input_token_count),
+                float(sample.conversation_turn_count),
+                phase_value,
+            ])
+            targets.append(float(sample.actual_total_tokens))
+        return feature_rows, targets
+
+    def fit(self, samples: List[CallFeatureSample]) -> None:
+        """
+        用普通最小二乘法(正规方程)求解回归系数。
+        由于特征维度只有4维,直接用高斯消元求解正规方程,
+        不需要引入numpy等第三方依赖,便于在轻量部署环境中运行。
+        """
+        if len(samples) < 5:
+            raise ValueError("训练样本过少,至少需要5条历史记录才能拟合回归模型")
+
+        feature_rows, targets = self._build_feature_matrix(samples)
+        weights_vector = self._solve_normal_equation(feature_rows, targets)
+
+        self._weights = LinearRegressionWeights(
+            intercept=weights_vector[0],
+            weight_input_tokens=weights_vector[1],
+            weight_turn_count=weights_vector[2],
+            weight_phase_multiplier=weights_vector[3],
+        )
+
+        residuals = []
+        for row, target in zip(feature_rows, targets):
+            predicted = sum(w * x for w, x in zip(weights_vector, row))
+            residuals.append(target - predicted)
+        self._residual_stddev = (
+            statistics.pstdev(residuals) if len(residuals) > 1 else 0.0
+        )
+
+    def _solve_normal_equation(
+        self, feature_rows: List[List[float]], targets: List[float]
+    ) -> List[float]:
+        """
+        求解 (X^T X) w = X^T y 的正规方程,使用高斯消元法。
+        特征维度固定为4维,计算量很小,足以在请求路径上实时重新拟合。
+        """
+        dim = len(feature_rows[0])
+        xtx = [[0.0] * dim for _ in range(dim)]
+        xty = [0.0] * dim
+
+        for row, target in zip(feature_rows, targets):
+            for i in range(dim):
+                xty[i] += row[i] * target
+                for j in range(dim):
+                    xtx[i][j] += row[i] * row[j]
+
+        return self._gaussian_elimination(xtx, xty)
+
+    @staticmethod
+    def _gaussian_elimination(matrix: List[List[float]], vector: List[float]) -> List[float]:
+        n = len(vector)
+        augmented = [row[:] + [vector[i]] for i, row in enumerate(matrix)]
+
+        for pivot in range(n):
+            max_row = max(range(pivot, n), key=lambda r: abs(augmented[r][pivot]))
+            if abs(augmented[max_row][pivot]) < 1e-9:
+                # 矩阵接近奇异,添加微小扰动避免除零,牺牲一点精度换取稳定性
+                augmented[pivot][pivot] += 1e-6
+            augmented[pivot], augmented[max_row] = augmented[max_row], augmented[pivot]
+
+            pivot_value = augmented[pivot][pivot]
+            for col in range(pivot, n + 1):
+                augmented[pivot][col] /= pivot_value
+
+            for row in range(n):
+                if row == pivot:
+                    continue
+                factor = augmented[row][pivot]
+                for col in range(pivot, n + 1):
+                    augmented[row][col] -= factor * augmented[pivot][col]
+
+        return [augmented[i][n] for i in range(n)]
+
+    def predict(self, sample: CallFeatureSample) -> PredictionResult:
+        w = self._weights
+        phase_value = PHASE_MULTIPLIER[sample.agent_phase]
+
+        contribution_input = w.weight_input_tokens * sample.input_token_count
+        contribution_turn = w.weight_turn_count * sample.conversation_turn_count
+        contribution_phase = w.weight_phase_multiplier * phase_value
+
+        predicted = w.intercept + contribution_input + contribution_turn + contribution_phase
+        predicted = max(0.0, predicted)
+
+        return PredictionResult(
+            predicted_tokens=predicted,
+            lower_bound=max(0.0, predicted - self._residual_stddev),
+            upper_bound=predicted + self._residual_stddev,
+            method="轻量特征回归",
+            feature_contributions={
+                "截距项": w.intercept,
+                "输入Token数贡献": contribution_input,
+                "对话轮次贡献": contribution_turn,
+                "推理阶段贡献": contribution_phase,
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# 评估工具:对比基线方案与改进方案的预估误差
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EvaluationReport:
+    method_name: str
+    mean_absolute_percentage_error: float
+    sample_count: int
+    underestimate_rate: float  # 预估值低于实际值的比例,对应答辩中提到的"预估偏低"问题
+
+
+def evaluate_predictor(
+    predictor_name: str,
+    predict_fn: Callable[[CallFeatureSample], PredictionResult],
+    test_samples: List[CallFeatureSample],
+) -> EvaluationReport:
+    """用一组留出的测试样本评估预估器的误差表现"""
+
+    absolute_percentage_errors: List[float] = []
+    underestimate_count = 0
+
+    for sample in test_samples:
+        result = predict_fn(sample)
+        actual = sample.actual_total_tokens
+        if actual == 0:
+            continue
+        error_ratio = abs(result.predicted_tokens - actual) / actual
+        absolute_percentage_errors.append(error_ratio)
+        if result.predicted_tokens < actual:
+            underestimate_count += 1
+
+    mape = (
+        statistics.mean(absolute_percentage_errors) * 100
+        if absolute_percentage_errors else 0.0
+    )
+    underestimate_rate = (
+        underestimate_count / len(test_samples) * 100 if test_samples else 0.0
+    )
+
+    return EvaluationReport(
+        method_name=predictor_name,
+        mean_absolute_percentage_error=mape,
+        sample_count=len(test_samples),
+        underestimate_rate=underestimate_rate,
+    )
+
+
+def render_comparison_summary(reports: List[EvaluationReport]) -> str:
+    lines = ["方案对比 | 平均绝对百分比误差(MAPE) | 预估偏低占比 | 样本数", "-" * 60]
+    for report in reports:
+        lines.append(
+            f"{report.method_name} | {report.mean_absolute_percentage_error:.1f}% | "
+            f"{report.underestimate_rate:.1f}% | {report.sample_count}"
+        )
+    return "\n".join(lines)
+
+
+def _generate_synthetic_samples(count: int) -> List[CallFeatureSample]:
+    """生成一批用于演示的合成历史样本,模拟真实场景下Token消耗随特征变化的规律"""
+
+    import random
+    random.seed(42)
+
+    samples: List[CallFeatureSample] = []
+    phases = list(AgentPhase)
+    for _ in range(count):
+        phase = random.choice(phases)
+        input_tokens = random.randint(50, 2000)
+        turn_count = random.randint(1, 15)
+        base_ratio = PHASE_MULTIPLIER[phase]
+        noise = random.gauss(0, 80)
+        actual = max(
+            10,
+            int(input_tokens * base_ratio * 0.6 + turn_count * 40 + noise),
+        )
+        samples.append(
+            CallFeatureSample(
+                input_token_count=input_tokens,
+                conversation_turn_count=turn_count,
+                agent_phase=phase,
+                actual_total_tokens=actual,
+            )
+        )
+    return samples
+
+
+if __name__ == "__main__":
+    all_samples = _generate_synthetic_samples(300)
+    split_point = int(len(all_samples) * 0.7)
+    train_samples, test_samples = all_samples[:split_point], all_samples[split_point:]
+
+    baseline = HistoricalMeanPredictor()
+    baseline.fit(train_samples)
+
+    improved = LightweightFeaturePredictor()
+    improved.fit(train_samples)
+
+    baseline_report = evaluate_predictor("历史均值(基线方案)", baseline.predict, test_samples)
+    improved_report = evaluate_predictor("轻量特征回归(改进方案)", improved.predict, test_samples)
+
+    print(render_comparison_summary([baseline_report, improved_report]))
+```
+
+陈铭跑完这个演示脚本之后,把输出结果贴进了自己的笔记本——在合成数据上,只用固定历史均值的基线方案,平均绝对百分比误差高达八成左右,尤其是在输入规模差异很大的场景下几乎"预估失灵";引入输入Token数、对话轮次、推理阶段这三个特征之后,改进方案的误差被压缩到了两成左右,验证了他在答辩现场提出的判断方向是对的——固定均值确实无法适应"输入明显偏离历史均值"的场景。他也注意到,两个方案的"预估偏低占比"数字很接近,说明仅仅降低整体误差并不能自动解决"容易预估偏低"这个具体问题,这提示他后续如果要正式立项这个优化,还需要在损失函数里对"低估"施加更高的惩罚权重,而不能只满足于平均误差下降。他很清楚这只是一份用合成数据跑出来的演示结果,不能直接当作生产环境的真实效果承诺,于是在代码注释和后续的技术建议文档里都特别标注了"以上对比基于模拟数据,实际效果需要用线上真实历史调用数据重新训练和验证"。老王看到这份补充材料时说:"这个态度是对的——你在答辩现场敢把一个'还没做完'的想法讲出来,已经很难得了,但讲完之后连夜把它变成一个能跑的原型,还诚实地标注'这只是演示,不是承诺',甚至主动指出'误差降低了但偏低问题没有自动解决'这个新发现,这种严谨性,比匆忙对外宣称'已经验证过'要负责得多。"
+
+### 四、反馈跟踪工具脚本:把答辩反馈变成可持续跟踪的行动项
+
+反馈会结束后,陈铭手里攥着满满一页纸的反馈清单,但他很快意识到一个问题:如果这份清单只是存在笔记本里,用不了多久就会被日常工作的琐事淹没,变成"看过一遍就再也没有回头看过"的东西。他想起老王之前提过的一句话——"待观察"不是等待,而是要主动创造证据。于是他当天晚上又写了一个小工具,把今天反馈会上"做得好的/需要改进的/待观察的"三类反馈,转化成结构化的、可以持续跟踪进展的行动项清单,而不是一份写完就束之高阁的文字记录。
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+promotion_feedback_tracker.py
+
+苍穹企业级智能体中台 - 晋升答辩反馈跟踪工具
+
+背景:
+    Day69全真模拟答辩结束后,郭建军和老王给出了大量结构化反馈,
+    分为"做得好的""需要改进的""待观察的"三大类。陈铭意识到,
+    这类反馈如果只停留在笔记本的文字记录里,很容易在日常工作中被淡忘。
+    本工具把反馈转化为带有截止日期、进展记录、验证证据的行动项,
+    支持定期生成跟踪报告,提醒哪些行动项该推进了。
+
+功能:
+    1. 定义反馈条目与行动项的结构化数据模型
+    2. 支持为"需要改进的"和"待观察的"两类反馈自动生成默认跟进节奏建议
+    3. 支持记录行动项的进展更新与验证证据
+    4. 支持生成"距离下次答辩还有N天"的倒计时视角跟踪报告
+    5. 支持识别"长期停滞未更新"的行动项并高亮提醒
+
+使用方式:
+    python scripts/promotion_feedback_tracker.py init --output feedback.json
+    python scripts/promotion_feedback_tracker.py add-progress \\
+        --input feedback.json --item-id fb-002 --note "已完成一次三分钟结论压缩练习"
+    python scripts/promotion_feedback_tracker.py report --input feedback.json
+
+作者: 陈铭
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import sys
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+from typing import Dict, List, Optional
+
+
+class FeedbackCategory(str, Enum):
+    STRENGTH = "做得好的"
+    NEEDS_IMPROVEMENT = "需要改进的"
+    TO_BE_OBSERVED = "待观察的"
+
+
+class ActionItemStatus(str, Enum):
+    NOT_STARTED = "未开始"
+    IN_PROGRESS = "进行中"
+    VERIFIED = "已验证"
+    STALLED = "停滞中"
+
+
+# 不同反馈类别对应的默认跟进周期(天),用于生成默认的检查提醒节奏。
+# "需要改进的"问题通常是行为习惯类的,建议高频短周期跟进;
+# "待观察的"问题依赖机会样本积累,建议较长周期跟进,不宜频繁催促。
+DEFAULT_REVIEW_CYCLE_DAYS: Dict[FeedbackCategory, int] = {
+    FeedbackCategory.NEEDS_IMPROVEMENT: 7,
+    FeedbackCategory.TO_BE_OBSERVED: 30,
+    FeedbackCategory.STRENGTH: 90,
+}
+
+# 停滞判定阈值:超过该天数没有任何进展更新,视为"停滞中"
+STALLED_THRESHOLD_MULTIPLIER = 2.0
+
+
+@dataclass
+class ProgressNote:
+    """一条行动项的进展记录"""
+
+    date: str
+    note: str
+    evidence_link: str = ""
+
+
+@dataclass
+class ActionItem:
+    """一条由反馈转化而来的可跟踪行动项"""
+
+    item_id: str
+    category: FeedbackCategory
+    source_reviewer: str          # 反馈来源(如"郭建军"或"老王")
+    description: str
+    recommended_practice: str = ""
+    status: ActionItemStatus = ActionItemStatus.NOT_STARTED
+    created_date: str = field(default_factory=lambda: datetime.date.today().isoformat())
+    review_cycle_days: Optional[int] = None
+    progress_notes: List[ProgressNote] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.review_cycle_days is None:
+            self.review_cycle_days = DEFAULT_REVIEW_CYCLE_DAYS.get(self.category, 14)
+
+    def last_update_date(self) -> datetime.date:
+        if not self.progress_notes:
+            return datetime.date.fromisoformat(self.created_date)
+        return max(
+            datetime.date.fromisoformat(note.date) for note in self.progress_notes
+        )
+
+    def days_since_last_update(self, today: Optional[datetime.date] = None) -> int:
+        today = today or datetime.date.today()
+        return (today - self.last_update_date()).days
+
+    def is_stalled(self, today: Optional[datetime.date] = None) -> bool:
+        if self.status == ActionItemStatus.VERIFIED:
+            return False
+        threshold = (self.review_cycle_days or 14) * STALLED_THRESHOLD_MULTIPLIER
+        return self.days_since_last_update(today) > threshold
+
+    def add_progress(self, note: str, evidence_link: str = "",
+                      date: Optional[str] = None) -> None:
+        self.progress_notes.append(
+            ProgressNote(
+                date=date or datetime.date.today().isoformat(),
+                note=note,
+                evidence_link=evidence_link,
+            )
+        )
+        if self.status == ActionItemStatus.NOT_STARTED:
+            self.status = ActionItemStatus.IN_PROGRESS
+
+    def mark_verified(self, evidence_link: str = "") -> None:
+        self.status = ActionItemStatus.VERIFIED
+        self.add_progress("行动项已具备可验证证据,标记为已验证", evidence_link)
+
+    def to_dict(self) -> Dict:
+        payload = asdict(self)
+        payload["category"] = self.category.value
+        payload["status"] = self.status.value
+        return payload
+
+    @staticmethod
+    def from_dict(payload: Dict) -> "ActionItem":
+        notes = [ProgressNote(**n) for n in payload.get("progress_notes", [])]
+        return ActionItem(
+            item_id=payload["item_id"],
+            category=FeedbackCategory(payload["category"]),
+            source_reviewer=payload.get("source_reviewer", ""),
+            description=payload.get("description", ""),
+            recommended_practice=payload.get("recommended_practice", ""),
+            status=ActionItemStatus(payload.get("status", ActionItemStatus.NOT_STARTED.value)),
+            created_date=payload.get("created_date", datetime.date.today().isoformat()),
+            review_cycle_days=payload.get("review_cycle_days"),
+            progress_notes=notes,
+        )
+
+
+class FeedbackTracker:
+    """管理一整套反馈行动项,支持加载、保存、进展更新与报告生成"""
+
+    def __init__(self, items: Optional[List[ActionItem]] = None,
+                 next_review_date: Optional[str] = None) -> None:
+        self.items: List[ActionItem] = items or []
+        self.next_review_date = next_review_date
+
+    def add_item(self, item: ActionItem) -> None:
+        if any(existing.item_id == item.item_id for existing in self.items):
+            raise ValueError(f"行动项ID已存在: {item.item_id}")
+        self.items.append(item)
+
+    def find_item(self, item_id: str) -> ActionItem:
+        for item in self.items:
+            if item.item_id == item_id:
+                return item
+        raise KeyError(f"未找到行动项: {item_id}")
+
+    @classmethod
+    def load(cls, file_path: str) -> "FeedbackTracker":
+        with open(file_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        items = [ActionItem.from_dict(item) for item in payload.get("items", [])]
+        return cls(items=items, next_review_date=payload.get("next_review_date"))
+
+    def save(self, file_path: str) -> None:
+        payload = {
+            "next_review_date": self.next_review_date,
+            "items": [item.to_dict() for item in self.items],
+        }
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    def days_until_next_review(self, today: Optional[datetime.date] = None) -> Optional[int]:
+        if not self.next_review_date:
+            return None
+        today = today or datetime.date.today()
+        target = datetime.date.fromisoformat(self.next_review_date)
+        return (target - today).days
+
+    def stalled_items(self, today: Optional[datetime.date] = None) -> List[ActionItem]:
+        return [item for item in self.items if item.is_stalled(today)]
+
+    def items_by_category(self, category: FeedbackCategory) -> List[ActionItem]:
+        return [item for item in self.items if item.category == category]
+
+    def completion_rate(self, category: Optional[FeedbackCategory] = None) -> float:
+        pool = self.items_by_category(category) if category else self.items
+        if not pool:
+            return 0.0
+        verified = sum(1 for item in pool if item.status == ActionItemStatus.VERIFIED)
+        return verified / len(pool) * 100
+
+    def render_report(self) -> str:
+        today = datetime.date.today()
+        lines: List[str] = ["# 晋升答辩反馈跟踪报告", "", f"生成日期: {today.isoformat()}"]
+
+        days_left = self.days_until_next_review(today)
+        if days_left is not None:
+            if days_left >= 0:
+                lines.append(f"距离下一次正式答辩: {days_left} 天")
+            else:
+                lines.append(f"下一次正式答辩已过去 {abs(days_left)} 天")
+        lines.append("")
+
+        for category in FeedbackCategory:
+            category_items = self.items_by_category(category)
+            if not category_items:
+                continue
+            lines.append(f"## {category.value}({len(category_items)}项,已验证 {self.completion_rate(category):.0f}%)")
+            lines.append("")
+            for item in category_items:
+                lines.append(
+                    f"- [{item.status.value}] {item.item_id} (来源: {item.source_reviewer}): "
+                    f"{item.description}"
+                )
+                if item.recommended_practice:
+                    lines.append(f"    建议练习方式: {item.recommended_practice}")
+                if item.progress_notes:
+                    latest = item.progress_notes[-1]
+                    lines.append(f"    最近进展({latest.date}): {latest.note}")
+                if item.is_stalled(today):
+                    lines.append(
+                        f"    ⚠ 已 {item.days_since_last_update(today)} 天未更新进展,建议本周主动推进一次"
+                    )
+            lines.append("")
+
+        stalled = self.stalled_items(today)
+        if stalled:
+            lines.append("## 需要优先关注的停滞项")
+            for item in stalled:
+                lines.append(f"- {item.item_id}: {item.description}")
+
+        return "\n".join(lines)
+
+
+def build_day69_default_tracker(next_review_date: str) -> FeedbackTracker:
+    """根据Day69反馈会实录,预置一份默认的行动项清单,方便直接使用而不用手动录入"""
+
+    tracker = FeedbackTracker(next_review_date=next_review_date)
+
+    tracker.add_item(ActionItem(
+        item_id="fb-001",
+        category=FeedbackCategory.NEEDS_IMPROVEMENT,
+        source_reviewer="老王",
+        description="表达简洁性不足,技术问答平均回答时长超出建议时长约40%",
+        recommended_practice="采用倒金字塔结构:先说结论和关键数字,再补充过程;"
+        "每次汇报后请同事帮忙计时并反馈",
+    ))
+    tracker.add_item(ActionItem(
+        item_id="fb-002",
+        category=FeedbackCategory.NEEDS_IMPROVEMENT,
+        source_reviewer="老王",
+        description="量化描述能力偏弱,关键数字缺少参照物,不便于非技术背景评委理解",
+        recommended_practice="每次给出关键指标数字时,补充一句'相比行业平均水平/历史基线'的对照说明",
+    ))
+    tracker.add_item(ActionItem(
+        item_id="fb-003",
+        category=FeedbackCategory.NEEDS_IMPROVEMENT,
+        source_reviewer="郭建军",
+        description="向上管理意识薄弱,较少主动提及如何向上争取资源、对齐预期",
+        recommended_practice="每次提出技术改进建议时,附上收益量化、顾虑说明与时间节点承诺三项内容",
+    ))
+    tracker.add_item(ActionItem(
+        item_id="fb-004",
+        category=FeedbackCategory.TO_BE_OBSERVED,
+        source_reviewer="郭建军",
+        description="团队管理经验样本量不足,目前只完整带过一名新人",
+        recommended_practice="主动申请带一名新的团队成员,或申请参与一次跨团队协作项目,积累可评估的行为证据",
+    ))
+    tracker.add_item(ActionItem(
+        item_id="fb-005",
+        category=FeedbackCategory.TO_BE_OBSERVED,
+        source_reviewer="郭建军",
+        description="战略视野目前主要体现在技术趋势判断,业务战略层面的判断力有待验证",
+        recommended_practice="每月做一次'假设自己是CTO,只有一份预算该投向哪个方向'的自我推演练习",
+    ))
+    tracker.add_item(ActionItem(
+        item_id="fb-006",
+        category=FeedbackCategory.STRENGTH,
+        source_reviewer="郭建军",
+        description="技术深度经得起多层追问,能主动暴露方案局限性",
+        recommended_practice="保持这个习惯,继续在后续项目中主动记录方案的已知局限性",
+    ))
+
+    return tracker
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="晋升答辩反馈跟踪工具")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    init_parser = subparsers.add_parser("init", help="基于Day69反馈会实录初始化跟踪清单")
+    init_parser.add_argument("--output", type=str, required=True)
+    init_parser.add_argument("--next-review-date", type=str, default=None,
+                              help="下一次正式答辩日期,格式如2026-07-15")
+
+    progress_parser = subparsers.add_parser("add-progress", help="为某个行动项添加一条进展记录")
+    progress_parser.add_argument("--input", type=str, required=True)
+    progress_parser.add_argument("--item-id", type=str, required=True)
+    progress_parser.add_argument("--note", type=str, required=True)
+    progress_parser.add_argument("--evidence-link", type=str, default="")
+    progress_parser.add_argument("--verified", action="store_true",
+                                  help="将该行动项标记为已验证")
+
+    report_parser = subparsers.add_parser("report", help="生成反馈跟踪报告")
+    report_parser.add_argument("--input", type=str, required=True)
+    report_parser.add_argument("--output", type=str, default=None)
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.command == "init":
+        next_review_date = args.next_review_date or (
+            datetime.date.today() + datetime.timedelta(days=1)
+        ).isoformat()
+        tracker = build_day69_default_tracker(next_review_date)
+        tracker.save(args.output)
+        print(f"[完成] 已初始化反馈跟踪清单: {args.output}, 共 {len(tracker.items)} 项")
+        return
+
+    if args.command == "add-progress":
+        tracker = FeedbackTracker.load(args.input)
+        try:
+            item = tracker.find_item(args.item_id)
+        except KeyError as exc:
+            print(f"[错误] {exc}", file=sys.stderr)
+            sys.exit(1)
+
+        if args.verified:
+            item.mark_verified(args.evidence_link)
+        else:
+            item.add_progress(args.note, args.evidence_link)
+
+        tracker.save(args.input)
+        print(f"[完成] 已为 {args.item_id} 添加进展记录")
+        return
+
+    if args.command == "report":
+        tracker = FeedbackTracker.load(args.input)
+        report = tracker.render_report()
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write(report)
+            print(f"[完成] 报告已生成: {args.output}")
+        else:
+            print(report)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+陈铭用这个工具初始化了自己的反馈跟踪清单之后,当晚就先给`fb-001`(表达简洁性)加了一条进展记录:"已把明天开场的项目汇报稿重新压缩一版,平均每个项目的讲述时长从4分钟压缩到了2分50秒"。他打算把这个工具作为一个长期习惯保留下来,不只是为了明天的正式答辩,更是为了在这之后的日常工作里,持续跟踪自己在"向上管理意识""战略视野"这些需要更长周期才能积累证据的维度上,是否真的在往前走,而不是让今天这份沉甸甸的反馈清单,变成又一份"看过就忘"的会议记录。
+
+### 五、技术问答计时与超时分析工具
+
+反馈会上被指出的"平均回答时长超出建议值约40%"这条反馈,给陈铭留下了很具体的数字印象,但他也想清楚了一个问题——光记住"要更简洁"这句话没有用,他需要一个能让自己在日常练习时"量化地看见自己有没有进步"的小工具,而不是靠自己的主观感觉判断"这次好像比上次简洁一点了"。于是他把老王当天掐着表计时的方式,写成了一个可以反复使用的计时与分析脚本。
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+mock_qa_timer.py
+
+苍穹企业级智能体中台 - 技术问答计时与超时分析工具
+
+背景:
+    Day69全真模拟答辩反馈指出,陈铭的技术问答平均回答时长超出建议值约40%。
+    本工具用于日常自我练习时,记录每次模拟回答的用时,
+    与预设的建议时长对比,统计超时比例与趋势变化,
+    帮助把"要更简洁"这种模糊的反馈,转化为可持续追踪的量化指标。
+
+使用方式:
+    python scripts/mock_qa_timer.py record --question "向量库选型" \\
+        --duration-seconds 95 --recommended-seconds 75
+    python scripts/mock_qa_timer.py trend --input qa_timing_log.json
+
+作者: 陈铭
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import statistics
+from dataclasses import dataclass, field, asdict
+from typing import List, Optional
+
+
+DEFAULT_LOG_PATH = "qa_timing_log.json"
+DEFAULT_RECOMMENDED_SECONDS = 75  # 对应反馈会上老王给出的建议时长(1分15秒)
+
+
+@dataclass
+class QARecord:
+    """一次问答练习的计时记录"""
+
+    question: str
+    duration_seconds: int
+    recommended_seconds: int
+    practice_date: str = field(default_factory=lambda: datetime.date.today().isoformat())
+    note: str = ""
+
+    @property
+    def overtime_ratio(self) -> float:
+        if self.recommended_seconds == 0:
+            return 0.0
+        return (self.duration_seconds - self.recommended_seconds) / self.recommended_seconds * 100
+
+    @property
+    def is_overtime(self) -> bool:
+        return self.duration_seconds > self.recommended_seconds
+
+
+class QATimingLog:
+    """管理一组问答计时记录,支持加载、保存、趋势分析"""
+
+    def __init__(self, records: Optional[List[QARecord]] = None) -> None:
+        self.records: List[QARecord] = records or []
+
+    @classmethod
+    def load(cls, file_path: str) -> "QATimingLog":
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except FileNotFoundError:
+            return cls()
+        records = [QARecord(**item) for item in payload.get("records", [])]
+        return cls(records=records)
+
+    def save(self, file_path: str) -> None:
+        payload = {"records": [asdict(r) for r in self.records]}
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    def add_record(self, record: QARecord) -> None:
+        self.records.append(record)
+
+    def average_overtime_ratio(self, records: Optional[List[QARecord]] = None) -> float:
+        pool = records if records is not None else self.records
+        if not pool:
+            return 0.0
+        return statistics.mean(r.overtime_ratio for r in pool)
+
+    def overtime_count(self, records: Optional[List[QARecord]] = None) -> int:
+        pool = records if records is not None else self.records
+        return sum(1 for r in pool if r.is_overtime)
+
+    def records_by_date(self) -> dict:
+        grouped: dict = {}
+        for record in self.records:
+            grouped.setdefault(record.practice_date, []).append(record)
+        return grouped
+
+    def render_trend_report(self) -> str:
+        """按练习日期分组,展示超时比例的变化趋势,验证练习是否真的在改善"""
+
+        grouped = self.records_by_date()
+        if not grouped:
+            return "暂无练习记录。"
+
+        lines = ["# 技术问答计时趋势报告", ""]
+        lines.append(f"累计练习次数: {len(self.records)}")
+        lines.append(f"整体平均超时比例: {self.average_overtime_ratio():.1f}%")
+        lines.append(f"整体超时次数占比: {self.overtime_count() / len(self.records) * 100:.1f}%")
+        lines.append("")
+        lines.append("| 练习日期 | 练习次数 | 当日平均超时比例 | 当日超时次数 |")
+        lines.append("|---|---|---|---|")
+
+        for date_str in sorted(grouped.keys()):
+            day_records = grouped[date_str]
+            lines.append(
+                f"| {date_str} | {len(day_records)} | "
+                f"{self.average_overtime_ratio(day_records):+.1f}% | "
+                f"{self.overtime_count(day_records)} |"
+            )
+
+        sorted_dates = sorted(grouped.keys())
+        if len(sorted_dates) >= 2:
+            first_day_ratio = self.average_overtime_ratio(grouped[sorted_dates[0]])
+            last_day_ratio = self.average_overtime_ratio(grouped[sorted_dates[-1]])
+            improvement = first_day_ratio - last_day_ratio
+            lines.append("")
+            if improvement > 0:
+                lines.append(
+                    f"相比第一次练习({sorted_dates[0]}),最近一次练习"
+                    f"({sorted_dates[-1]})的平均超时比例改善了 {improvement:.1f} 个百分点。"
+                )
+            else:
+                lines.append(
+                    f"相比第一次练习({sorted_dates[0]}),最近一次练习"
+                    f"({sorted_dates[-1]})的平均超时比例反而上升了 {abs(improvement):.1f} 个百分点,"
+                    f"建议重新审视回答结构。"
+                )
+
+        worst_records = sorted(self.records, key=lambda r: r.overtime_ratio, reverse=True)[:3]
+        if worst_records:
+            lines.append("")
+            lines.append("## 超时最严重的三个问题(建议重点复盘)")
+            for record in worst_records:
+                lines.append(
+                    f"- {record.question}: 实际用时{record.duration_seconds}秒,"
+                    f"建议时长{record.recommended_seconds}秒,超时{record.overtime_ratio:.0f}%"
+                )
+
+        return "\n".join(lines)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="技术问答计时与超时分析工具")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    record_parser = subparsers.add_parser("record", help="记录一次问答练习的用时")
+    record_parser.add_argument("--question", type=str, required=True)
+    record_parser.add_argument("--duration-seconds", type=int, required=True)
+    record_parser.add_argument("--recommended-seconds", type=int,
+                                default=DEFAULT_RECOMMENDED_SECONDS)
+    record_parser.add_argument("--note", type=str, default="")
+    record_parser.add_argument("--log-path", type=str, default=DEFAULT_LOG_PATH)
+
+    trend_parser = subparsers.add_parser("trend", help="生成计时趋势报告")
+    trend_parser.add_argument("--input", type=str, default=DEFAULT_LOG_PATH)
+    trend_parser.add_argument("--output", type=str, default=None)
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.command == "record":
+        log = QATimingLog.load(args.log_path)
+        record = QARecord(
+            question=args.question,
+            duration_seconds=args.duration_seconds,
+            recommended_seconds=args.recommended_seconds,
+            note=args.note,
+        )
+        log.add_record(record)
+        log.save(args.log_path)
+        status = "超时" if record.is_overtime else "未超时"
+        print(f"[记录完成] {args.question}: 用时{args.duration_seconds}秒,{status}"
+              f"(超时比例{record.overtime_ratio:+.1f}%)")
+        return
+
+    if args.command == "trend":
+        log = QATimingLog.load(args.input)
+        report = log.render_trend_report()
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write(report)
+            print(f"[完成] 趋势报告已生成: {args.output}")
+        else:
+            print(report)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+当天深夜,陈铭对着镜子练习了三次"向量库选型"那道题的精简版回答,每次都用这个工具记了一下时间——第一次99秒,第二次82秒,第三次71秒,已经压到了建议时长以内。他把这三次记录都存了下来,笑着跟自己说了一句:"数字不会说谎,这次是真的在变简洁,不是感觉上的变简洁。"这句话后来也被他写进了当晚笔记本的复盘里,作为对老王那句"表达的密度"最直接的呼应——不是靠感觉判断自己有没有进步,是靠一个个可以被验证的数字。
+
 ---
 
 ## 今日复盘
