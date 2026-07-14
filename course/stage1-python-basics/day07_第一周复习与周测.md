@@ -1996,6 +1996,1115 @@ if __name__ == "__main__":
     run_all_checks()
 ```
 
+### 文件4:`contacts_manager_v2_extended.py` —— 通讯录管理系统增强版(收藏、历史撤销、重复检测、导出报表)
+
+> 晚自习结束后,陈铭没有马上收工。他把老王点评时提到的几个"如果时间允许可以做的加分项"记在了笔记本最后一页,回到宿舍又花了一个多小时,在`contacts_manager.py`的基础上做了一版增强版本,单独存成新文件,没有覆盖原始提交版本(老王一贯的要求是"验收版本不要事后偷偷改",加练可以另起文件)。这一版重点解决三个问题:一是"删错了想撤销却做不到"——他加了一个基于列表实现的、最多能回溯5步的简单操作历史;二是"数据里可能存在两个人共用一个电话号码却没人发现"——他加了一个重复电话检测报表;三是"常联系的人每次都要重新搜索"——他加了一个"收藏联系人"标记功能。这些功能全部严格控制在Day1-Day6知识范围内。
+
+```python
+"""
+文件名:contacts_manager_v2_extended.py
+作者:陈铭
+说明:
+    这是contacts_manager.py的加练增强版本,在保留原有全部功能的
+    设计思路基础上,补充了三块内容:
+    1. 简单的操作历史与撤销机制(基于列表实现的"最近N步快照"栈)
+    2. 收藏联系人功能(在联系人字段中新增is_favorite布尔标记)
+    3. 重复电话号码检测报表(用于发现"同一个人被录入了两次"这类数据问题)
+
+    知识范围说明:
+    本文件依然严格限定在第一周(Day1-Day6)已学知识点范围内,
+    没有引入任何模块化(import自定义模块)或异常处理的新写法,
+    只是在contacts_manager.py已有函数的基础上做功能延伸。
+    这里为了保持文件独立、可以单独运行,重新实现了一遍数据持久化
+    和部分工具函数(与contacts_manager.py保持逻辑一致),等Day10
+    学完模块与包之后,这种"重复实现"就可以通过import互相复用了。
+"""
+
+import json
+import copy
+
+# ============================================================
+# 全局常量
+# ============================================================
+
+DATA_FILE_V2 = "contacts_data_v2.json"
+BACKUP_FILE_V2 = "contacts_data_v2_backup.json"
+GROUP_OPTIONS = ["家人", "朋友", "同事", "客户", "其他"]
+
+# 操作历史最多保留多少步快照——历史记录越多,占用的内存越大,
+# 教学场景下5步已经足够演示"撤销"的效果,不追求做成无限撤销栈
+MAX_HISTORY_STEPS = 5
+
+COMMON_SURNAME_PINYIN_INITIAL = {
+    "陈": "C", "王": "W", "林": "L", "苏": "S", "韩": "H", "张": "Z",
+    "赵": "Z", "郭": "G", "孙": "S", "周": "Z", "徐": "X", "李": "L",
+    "刘": "L", "杨": "Y", "黄": "H", "吴": "W", "马": "M", "朱": "Z",
+}
+
+
+# ============================================================
+# 数据持久化层(与contacts_manager.py逻辑一致)
+# ============================================================
+
+def load_contacts_v2():
+    """
+    读取本地JSON数据文件,返回通讯录完整数据结构。
+    与contacts_manager.py中load_contacts()逻辑一致,文件不存在时
+    返回一份初始空结构。
+    :return: 通讯录完整数据结构(dict)
+    """
+    try:
+        with open(DATA_FILE_V2, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if "next_id" not in data or "contacts" not in data:
+                return {"next_id": 1, "contacts": []}
+            return data
+    except FileNotFoundError:
+        return {"next_id": 1, "contacts": []}
+
+
+def save_contacts_v2(data):
+    """
+    保存前先备份旧数据,再写入新数据,顺序与contacts_manager.py保持一致
+    (这个细节曾经在正式验收时被老王当场指出过,这个加练版本吸取了教训)。
+    :param data: 通讯录完整数据结构(dict)
+    """
+    backup_contacts_v2()
+    with open(DATA_FILE_V2, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def backup_contacts_v2():
+    """备份当前主数据文件到备份文件,主文件不存在时安全跳过。"""
+    try:
+        with open(DATA_FILE_V2, "r", encoding="utf-8") as f:
+            old_data = f.read()
+        with open(BACKUP_FILE_V2, "w", encoding="utf-8") as f:
+            f.write(old_data)
+    except FileNotFoundError:
+        pass
+
+
+# ============================================================
+# 操作历史与撤销机制
+# ============================================================
+
+def push_history_snapshot(history_stack, data):
+    """
+    把当前数据结构的一份"深拷贝"快照压入历史栈,供之后撤销时还原。
+
+    设计意图(为什么必须用深拷贝而不是直接存引用):
+        如果不用copy.deepcopy(),而是直接把data这个字典对象本身存进
+        history_stack,那么history_stack里存的和当前正在使用的data,
+        实际上是同一份内存数据——之后对data做任何修改,历史栈里
+        "存档"的那一份也会跟着一起变,起不到任何撤销的作用。
+        deepcopy会创建一份完全独立的、递归复制了所有嵌套字典和列表的
+        全新数据,两者互不影响,这才是"存档"的正确做法。
+
+    设计意图(为什么限制历史步数):
+        如果无限制地往history_stack里塞快照,程序运行越久占用的内存
+        会越多。这里用一个简单的策略——超过MAX_HISTORY_STEPS步之后,
+        用列表切片丢弃最早的一份快照,只保留最近的N步,足够教学演示使用。
+    :param history_stack: 历史快照列表,每个元素是一份data的深拷贝
+    :param data: 当前的通讯录完整数据结构
+    """
+    snapshot = copy.deepcopy(data)
+    history_stack.append(snapshot)
+
+    if len(history_stack) > MAX_HISTORY_STEPS:
+        # 丢弃最早的一份快照,只保留最近MAX_HISTORY_STEPS步
+        del history_stack[0]
+
+
+def undo_last_operation(history_stack):
+    """
+    从历史栈中弹出最近一份快照,作为"撤销"之后应该恢复到的数据状态。
+
+    :param history_stack: 历史快照列表
+    :return: 撤销后应该使用的数据结构(dict);如果历史栈为空,返回None
+             表示"没有可以撤销的操作"
+    """
+    if not history_stack:
+        return None
+    # pop()默认弹出并返回列表最后一个元素,正好对应"最近一次的存档点"
+    return history_stack.pop()
+
+
+# ============================================================
+# 收藏联系人功能
+# ============================================================
+
+def toggle_favorite(data, keyword):
+    """
+    根据编号或姓名定位联系人,切换其收藏状态(收藏<->取消收藏)。
+    :param data: 通讯录完整数据结构(dict)
+    :param keyword: 联系人编号或姓名
+    :return: 一个二元组(操作是否成功, 提示信息)
+    """
+    keyword = keyword.strip()
+    target = None
+    for c in data["contacts"]:
+        if keyword.isdigit() and c["id"] == int(keyword):
+            target = c
+            break
+        if c["name"] == keyword:
+            target = c
+            break
+
+    if target is None:
+        return False, f"未找到编号或姓名为‘{keyword}’的联系人。"
+
+    # get()配合默认值False,兼容"这条记录原本没有is_favorite字段"的历史数据
+    current_state = target.get("is_favorite", False)
+    target["is_favorite"] = not current_state
+
+    if target["is_favorite"]:
+        return True, f"已将‘{target['name']}’加入收藏。"
+    return True, f"已将‘{target['name']}’取消收藏。"
+
+
+def list_favorite_contacts(data):
+    """
+    返回全部被标记为收藏的联系人列表,按姓名排序。
+    这是一个不依赖input()的纯函数,方便单独测试。
+    :param data: 通讯录完整数据结构(dict)
+    :return: 收藏联系人组成的列表(可能为空)
+    """
+    favorites = [c for c in data["contacts"] if c.get("is_favorite", False)]
+    return sorted(favorites, key=lambda c: c["name"])
+
+
+# ============================================================
+# 重复电话检测
+# ============================================================
+
+def find_duplicate_phone_groups(data):
+    """
+    检测通讯录中被多个联系人共用的电话号码,返回一个字典,
+    键是电话号码,值是共用这个号码的全部联系人姓名组成的列表。
+    只返回真正重复(共用人数>=2)的号码,不重复的号码不会出现在结果中。
+    :param data: 通讯录完整数据结构(dict)
+    :return: {电话号码: [姓名1, 姓名2, ...]} 形式的字典
+    """
+    phone_to_names = {}
+    for c in data["contacts"]:
+        phone = c["phone"]
+        phone_to_names.setdefault(phone, []).append(c["name"])
+
+    duplicate_groups = {}
+    for phone, names in phone_to_names.items():
+        if len(names) >= 2:
+            duplicate_groups[phone] = names
+
+    return duplicate_groups
+
+
+def print_duplicate_phone_report(data):
+    """
+    打印重复电话号码检测报表,如果没有发现任何重复,给出明确的"一切正常"提示,
+    而不是打印一张空表让人误以为程序出了问题。
+    :param data: 通讯录完整数据结构(dict)
+    """
+    print("=" * 60)
+    print("重复电话号码检测报表".center(60))
+    print("=" * 60)
+
+    duplicate_groups = find_duplicate_phone_groups(data)
+
+    if not duplicate_groups:
+        print("未发现任何重复的电话号码,数据看起来是干净的。")
+        return
+
+    print(f"共发现 {len(duplicate_groups)} 组重复电话号码:\n")
+    for phone, names in duplicate_groups.items():
+        names_text = "、".join(names)
+        print(f"电话 {phone} 被以下 {len(names)} 位联系人共用:{names_text}")
+
+    print("\n提示:重复电话通常意味着同一个人被重复录入,或者存在数据录入错误,")
+    print("建议人工核实后使用修改/删除功能进行清理。")
+
+
+# ============================================================
+# 导出报表功能
+# ============================================================
+
+def export_contacts_to_text_report(data):
+    """
+    生成一份纯文本格式的通讯录完整报表(不写文件,只返回字符串),
+    包含总人数、各分组人数、收藏联系人列表、重复电话预警,是一个
+    典型的"汇总多个信息来源、拼装成一份综合报告"的纯函数。
+    :param data: 通讯录完整数据结构(dict)
+    :return: 多行文本字符串
+    """
+    contacts = data["contacts"]
+    lines = []
+
+    lines.append("=" * 50)
+    lines.append("通讯录综合报表")
+    lines.append("=" * 50)
+    lines.append(f"总联系人数:{len(contacts)}")
+
+    stats = {}
+    for c in contacts:
+        group = c["group"]
+        stats[group] = stats.get(group, 0) + 1
+
+    lines.append("\n【分组分布】")
+    for group in GROUP_OPTIONS:
+        lines.append(f"  {group}:{stats.get(group, 0)}位")
+
+    favorites = list_favorite_contacts(data)
+    lines.append(f"\n【收藏联系人】(共{len(favorites)}位)")
+    if favorites:
+        for c in favorites:
+            lines.append(f"  {c['name']}  {c['phone']}")
+    else:
+        lines.append("  暂无收藏联系人")
+
+    duplicate_groups = find_duplicate_phone_groups(data)
+    lines.append(f"\n【重复电话预警】(共{len(duplicate_groups)}组)")
+    if duplicate_groups:
+        for phone, names in duplicate_groups.items():
+            lines.append(f"  {phone}: {'、'.join(names)}")
+    else:
+        lines.append("  未发现重复电话")
+
+    lines.append("=" * 50)
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# 交互式菜单(在原有菜单基础上新增三个入口)
+# ============================================================
+
+def print_menu_v2():
+    """打印增强版菜单,新增收藏、撤销、重复检测、导出报表四个选项。"""
+    print()
+    print("=" * 60)
+    print("蓬远科技新人训练营 · 通讯录管理系统 v2.0(加练增强版)".center(60))
+    print("=" * 60)
+    print("1. 新增联系人")
+    print("2. 查看全部联系人")
+    print("3. 切换收藏状态")
+    print("4. 查看收藏联系人")
+    print("5. 撤销上一步操作")
+    print("6. 重复电话检测报表")
+    print("7. 导出综合报表")
+    print("0. 保存并退出")
+    print("=" * 60)
+
+
+def add_contact_v2(data, history_stack):
+    """
+    新增联系人(简化版采集流程,专注演示历史快照机制),
+    新增前先压入一份历史快照,以便新增之后可以撤销。
+    :param data: 通讯录完整数据结构(dict)
+    :param history_stack: 历史快照列表
+    """
+    push_history_snapshot(history_stack, data)
+
+    name = input("请输入姓名:").strip()
+    phone = input("请输入电话号码:").strip()
+
+    if not name or not phone:
+        print("姓名和电话不能为空,新增已取消。")
+        # 因为已经压入了快照,但实际没有发生任何数据变更,
+        # 把刚才多压的这一份无意义快照弹出去,保持历史栈的准确性
+        history_stack.pop()
+        return
+
+    new_contact = {
+        "id": data["next_id"],
+        "name": name,
+        "phone": phone,
+        "email": "",
+        "address": "",
+        "group": "其他",
+        "pinyin_initial": name[0] if name and name[0] in COMMON_SURNAME_PINYIN_INITIAL
+                          else "#",
+        "note": "",
+        "is_favorite": False,
+    }
+    data["contacts"].append(new_contact)
+    data["next_id"] += 1
+
+    save_contacts_v2(data)
+    print(f"新增成功!编号{new_contact['id']}的联系人‘{name}’已保存。")
+
+
+def main_v2():
+    """增强版程序主入口,演示如何把新功能整合进原有的主循环结构中。"""
+    print("欢迎使用通讯录管理系统 v2.0(加练增强版)")
+    data = load_contacts_v2()
+    history_stack = []   # 历史快照栈,程序刚启动时是空的,还没有任何可撤销的操作
+
+    print(f"读取完成,当前通讯录共有 {len(data['contacts'])} 位联系人。")
+
+    valid_choices = ["0", "1", "2", "3", "4", "5", "6", "7"]
+
+    while True:
+        print_menu_v2()
+        choice = input("请输入操作编号:").strip()
+
+        if choice not in valid_choices:
+            print("输入无效,请重新输入。")
+            continue
+
+        if choice == "1":
+            add_contact_v2(data, history_stack)
+        elif choice == "2":
+            for c in data["contacts"]:
+                favorite_mark = "★" if c.get("is_favorite", False) else " "
+                print(f"[{favorite_mark}] {c['id']:<4}{c['name']:<10}{c['phone']}")
+        elif choice == "3":
+            keyword = input("请输入要切换收藏状态的编号或姓名:").strip()
+            push_history_snapshot(history_stack, data)
+            success, message = toggle_favorite(data, keyword)
+            if success:
+                save_contacts_v2(data)
+            else:
+                history_stack.pop()   # 操作没有真正生效,撤回刚才多压的快照
+            print(message)
+        elif choice == "4":
+            favorites = list_favorite_contacts(data)
+            if not favorites:
+                print("暂无收藏联系人。")
+            else:
+                for c in favorites:
+                    print(f"★ {c['name']}  {c['phone']}")
+        elif choice == "5":
+            restored_data = undo_last_operation(history_stack)
+            if restored_data is None:
+                print("没有可以撤销的操作了。")
+            else:
+                data = restored_data
+                save_contacts_v2(data)
+                print("已撤销上一步操作,数据已还原。")
+        elif choice == "6":
+            print_duplicate_phone_report(data)
+        elif choice == "7":
+            report = export_contacts_to_text_report(data)
+            print(report)
+        elif choice == "0":
+            save_contacts_v2(data)
+            print("数据已保存,再见!")
+            break
+
+
+if __name__ == "__main__":
+    main_v2()
+```
+
+### 文件5:`contacts_data_validator_and_repair.py` —— 数据完整性校验与修复工具
+
+> 这份脚本的诞生,来自晚自习验收环节的一个小插曲——韩露在测试自己项目的时候,不小心手动改坏了一次JSON文件(多打了一个逗号),导致程序启动直接报`json.decoder.JSONDecodeError`崩溃。老王临场提了一个问题:"如果数据文件被不小心改坏了,或者某条记录里缺了字段,你的程序除了崩溃,还能不能做点更聪明的事?"这句话促使陈铭写了这份独立的数据校验与修复工具——它不是`contacts_manager.py`运行时的一部分,而是一个可以单独运行的"体检脚本",用于在数据文件出问题之前(或者出问题之后)做检查和尽力修复。
+
+```python
+"""
+文件名:contacts_data_validator_and_repair.py
+作者:陈铭
+说明:
+    这是一个独立的数据完整性校验与修复工具,用于检查contacts_data.json
+    是否存在结构性问题(缺字段、字段类型不对、id重复等),并尝试给出
+    修复建议或自动修复一部分可以安全处理的问题。
+
+    知识范围说明:
+    本文件依然严格限定在第一周(Day1-Day6)已学知识点范围内。
+    虽然读取JSON文件本身用到了try/except(Day10提前预告知识点,
+    与contacts_manager.py中的用法保持一致),但校验逻辑本身完全
+    基于if判断、for循环、列表与字典操作,没有引入任何新语法。
+
+    设计思路:
+    校验分为"结构级别"和"记录级别"两层——
+    结构级别检查整个JSON顶层是不是一个包含next_id和contacts的字典;
+    记录级别逐条检查每一个联系人字典是否包含必填字段、字段类型是否正确、
+    id是否重复。检查完成后,会生成一份问题清单,并区分"可以自动修复"
+    和"必须人工处理"两类问题。
+"""
+
+import json
+
+DATA_FILE = "contacts_data.json"
+
+# 每条联系人记录必须包含的字段,以及各字段期望的Python类型
+REQUIRED_FIELDS = {
+    "id": int,
+    "name": str,
+    "phone": str,
+    "email": str,
+    "address": str,
+    "group": str,
+    "pinyin_initial": str,
+    "note": str,
+}
+
+VALID_GROUPS = ["家人", "朋友", "同事", "客户", "其他"]
+
+
+def load_raw_json(file_path):
+    """
+    尝试读取指定路径的JSON文件,返回一个二元组(是否成功, 数据或错误信息)。
+
+    设计意图:
+        这个函数把"文件不存在"和"文件存在但内容不是合法JSON"这两种
+        不同的失败原因分开处理,给出更具体的错误提示,而不是笼统地
+        报告"读取失败"。
+    :param file_path: JSON文件路径
+    :return: (True, 数据字典) 或 (False, 错误描述字符串)
+    """
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except FileNotFoundError:
+        return False, f"文件‘{file_path}’不存在。"
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        # JSONDecodeError虽然是Day10之后系统学习异常处理时才会深入讲解的具体异常类型,
+        # 但这里作为工具脚本,提前"够用地"捕获一下,给出比程序直接崩溃更友好的提示
+        return False, f"文件内容不是合法的JSON格式,解析错误信息:{e}"
+
+    return True, data
+
+
+def validate_top_level_structure(data):
+    """
+    校验JSON顶层结构是否符合"{next_id: int, contacts: list}"的约定。
+    :param data: 已解析的JSON数据
+    :return: 问题描述组成的列表(为空表示没有发现结构性问题)
+    """
+    problems = []
+
+    if not isinstance(data, dict):
+        problems.append("顶层结构不是一个字典,整份数据文件格式严重不符合预期。")
+        return problems   # 顶层都不是字典,后面的检查没有意义,直接返回
+
+    if "next_id" not in data:
+        problems.append("缺少顶层字段‘next_id’。")
+    elif not isinstance(data["next_id"], int):
+        problems.append(f"‘next_id’字段类型应为整数,实际为{type(data['next_id']).__name__}。")
+
+    if "contacts" not in data:
+        problems.append("缺少顶层字段‘contacts’。")
+    elif not isinstance(data["contacts"], list):
+        problems.append(f"‘contacts’字段类型应为列表,实际为{type(data['contacts']).__name__}。")
+
+    return problems
+
+
+def validate_single_contact(contact, index):
+    """
+    校验单条联系人记录是否包含全部必填字段、字段类型是否正确。
+    :param contact: 单条联系人字典
+    :param index: 该记录在contacts列表中的位置(用于问题定位)
+    :return: 问题描述组成的列表(为空表示这一条记录没有发现问题)
+    """
+    problems = []
+
+    if not isinstance(contact, dict):
+        problems.append(f"第{index}条记录不是一个字典,无法进一步校验字段。")
+        return problems
+
+    for field, expected_type in REQUIRED_FIELDS.items():
+        if field not in contact:
+            problems.append(f"第{index}条记录缺少字段‘{field}’。")
+            continue
+        if not isinstance(contact[field], expected_type):
+            actual_type = type(contact[field]).__name__
+            problems.append(
+                f"第{index}条记录的字段‘{field}’类型应为{expected_type.__name__},"
+                f"实际为{actual_type}。"
+            )
+
+    # group字段的取值必须在预设的合法分组范围内,这是"业务规则"层面的校验,
+    # 和上面"字段是否存在、类型是否正确"的结构性校验属于不同层次
+    if "group" in contact and isinstance(contact["group"], str):
+        if contact["group"] not in VALID_GROUPS:
+            problems.append(
+                f"第{index}条记录的分组‘{contact['group']}’不在合法分组"
+                f"{VALID_GROUPS}范围内。"
+            )
+
+    return problems
+
+
+def find_duplicate_ids(contacts):
+    """
+    检查contacts列表中是否存在重复的id值。
+    :param contacts: 联系人字典组成的列表
+    :return: 重复的id值组成的列表(每个重复的id只出现一次)
+    """
+    id_count = {}
+    for c in contacts:
+        if isinstance(c, dict) and "id" in c:
+            contact_id = c["id"]
+            id_count[contact_id] = id_count.get(contact_id, 0) + 1
+
+    return [cid for cid, count in id_count.items() if count >= 2]
+
+
+def run_full_validation(data):
+    """
+    对整份通讯录数据进行完整校验,汇总全部发现的问题。
+    :param data: 已解析的JSON数据
+    :return: 一个字典,包含"structure_problems"(结构问题)、
+             "record_problems"(逐条记录问题)、"duplicate_ids"(重复id)三部分
+    """
+    result = {
+        "structure_problems": [],
+        "record_problems": [],
+        "duplicate_ids": [],
+    }
+
+    structure_problems = validate_top_level_structure(data)
+    result["structure_problems"] = structure_problems
+
+    if structure_problems:
+        # 顶层结构已经出问题,继续做逐条记录校验意义不大(可能连contacts都拿不到)
+        return result
+
+    contacts = data["contacts"]
+    for index, contact in enumerate(contacts, start=1):
+        record_problems = validate_single_contact(contact, index)
+        if record_problems:
+            result["record_problems"].extend(record_problems)
+
+    result["duplicate_ids"] = find_duplicate_ids(contacts)
+
+    return result
+
+
+def repair_missing_optional_fields(data):
+    """
+    自动修复"选填字段缺失"这一类相对安全的问题——把缺失的选填字段
+    (email/address/note)统一补齐为空字符串,不会造成任何数据丢失。
+
+    设计意图(为什么只自动修复选填字段,不自动修复必填字段):
+        选填字段缺失时,补一个空字符串是绝对安全的默认行为;但如果
+        name或phone这类必填字段缺失,程序没有办法凭空猜出应该填什么,
+        这类问题必须留给人工处理,自动"瞎补"反而可能制造出看起来正常、
+        实际是错误数据的记录,比明确报错更危险。
+    :param data: 通讯录完整数据结构(dict),函数会直接修改这个字典
+    :return: 本次修复涉及的记录数量
+    """
+    if "contacts" not in data or not isinstance(data["contacts"], list):
+        return 0
+
+    optional_fields_with_defaults = {"email": "", "address": "", "note": ""}
+    repaired_count = 0
+
+    for contact in data["contacts"]:
+        if not isinstance(contact, dict):
+            continue
+        record_was_repaired = False
+        for field, default_value in optional_fields_with_defaults.items():
+            if field not in contact:
+                contact[field] = default_value
+                record_was_repaired = True
+        if record_was_repaired:
+            repaired_count += 1
+
+    return repaired_count
+
+
+def renumber_duplicate_ids(data):
+    """
+    自动修复"id重复"问题——重新给全部联系人按顺序分配从1开始的新id。
+
+    设计意图(为什么可以安全地这样修复):
+        id只是一个内部使用的编号,不像姓名电话那样是"业务本身的信息",
+        重新编号不会丢失任何有意义的数据,只是让每条记录重新拥有一个
+        唯一的标识。这类"结构性但不涉及业务数据本身"的问题,
+        通常可以放心自动修复。
+    :param data: 通讯录完整数据结构(dict),函数会直接修改这个字典
+    """
+    if "contacts" not in data or not isinstance(data["contacts"], list):
+        return
+
+    next_id = 1
+    for contact in data["contacts"]:
+        if isinstance(contact, dict):
+            contact["id"] = next_id
+            next_id += 1
+
+    data["next_id"] = next_id
+
+
+def print_validation_report(result):
+    """
+    把run_full_validation()的校验结果,格式化打印成一份易读的报告。
+    :param result: run_full_validation()的返回值
+    """
+    print("=" * 60)
+    print("通讯录数据完整性校验报告".center(60))
+    print("=" * 60)
+
+    total_problems = (
+        len(result["structure_problems"])
+        + len(result["record_problems"])
+        + len(result["duplicate_ids"])
+    )
+
+    if total_problems == 0:
+        print("恭喜,未发现任何数据完整性问题!")
+        return
+
+    if result["structure_problems"]:
+        print(f"\n【结构性问题】(共{len(result['structure_problems'])}项)")
+        for problem in result["structure_problems"]:
+            print(f"  - {problem}")
+
+    if result["record_problems"]:
+        print(f"\n【记录字段问题】(共{len(result['record_problems'])}项)")
+        for problem in result["record_problems"]:
+            print(f"  - {problem}")
+
+    if result["duplicate_ids"]:
+        ids_text = "、".join(str(cid) for cid in result["duplicate_ids"])
+        print(f"\n【重复id问题】发现重复的id值:{ids_text}")
+
+    print(f"\n共发现 {total_problems} 项问题。")
+
+
+def main():
+    """脚本入口:读取数据、校验、打印报告,并询问是否执行自动修复。"""
+    success, data_or_error = load_raw_json(DATA_FILE)
+
+    if not success:
+        print(f"无法完成校验:{data_or_error}")
+        return
+
+    data = data_or_error
+    result = run_full_validation(data)
+    print_validation_report(result)
+
+    if result["structure_problems"]:
+        print("\n检测到顶层结构性问题,自动修复工具无法安全处理,请人工检查数据文件。")
+        return
+
+    if not result["record_problems"] and not result["duplicate_ids"]:
+        return   # 没有问题,不需要进入修复流程
+
+    choice = input("\n是否尝试自动修复可以安全处理的问题?(y/n):").strip().lower()
+    if choice != "y":
+        print("已跳过自动修复。")
+        return
+
+    repaired_optional_count = repair_missing_optional_fields(data)
+    print(f"已为 {repaired_optional_count} 条记录补全缺失的选填字段。")
+
+    if result["duplicate_ids"]:
+        renumber_duplicate_ids(data)
+        print("已重新分配全部联系人的id,消除了重复id问题。")
+
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print("修复后的数据已写回文件。")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 文件6:`contacts_manager_v2_selfcheck.py` —— 增强功能与数据校验工具自检脚本
+
+```python
+"""
+文件名:contacts_manager_v2_selfcheck.py
+作者:陈铭
+说明:
+    针对contacts_manager_v2_extended.py(收藏、撤销、重复检测、导出报表)
+    以及contacts_data_validator_and_repair.py(数据完整性校验与修复)
+    这两份加练文件,编写的自检测试脚本。测试方式沿用之前的风格——
+    每个test_开头的函数覆盖一个独立场景,使用assert断言验证结果,
+    最后统一汇总执行结果,而不是逐个手动运行观察输出是否正确。
+"""
+
+import copy
+
+
+# ============================================================
+# 第一部分:从contacts_manager_v2_extended.py搬运的纯逻辑函数
+# ============================================================
+
+def push_history_snapshot(history_stack, data):
+    """(逻辑与contacts_manager_v2_extended.py中同名函数一致)"""
+    snapshot = copy.deepcopy(data)
+    history_stack.append(snapshot)
+    if len(history_stack) > 5:
+        del history_stack[0]
+
+
+def undo_last_operation(history_stack):
+    """(逻辑与contacts_manager_v2_extended.py中同名函数一致)"""
+    if not history_stack:
+        return None
+    return history_stack.pop()
+
+
+def toggle_favorite(data, keyword):
+    """(逻辑与contacts_manager_v2_extended.py中同名函数一致)"""
+    keyword = keyword.strip()
+    target = None
+    for c in data["contacts"]:
+        if keyword.isdigit() and c["id"] == int(keyword):
+            target = c
+            break
+        if c["name"] == keyword:
+            target = c
+            break
+    if target is None:
+        return False, f"未找到编号或姓名为‘{keyword}’的联系人。"
+    current_state = target.get("is_favorite", False)
+    target["is_favorite"] = not current_state
+    if target["is_favorite"]:
+        return True, f"已将‘{target['name']}’加入收藏。"
+    return True, f"已将‘{target['name']}’取消收藏。"
+
+
+def list_favorite_contacts(data):
+    """(逻辑与contacts_manager_v2_extended.py中同名函数一致)"""
+    favorites = [c for c in data["contacts"] if c.get("is_favorite", False)]
+    return sorted(favorites, key=lambda c: c["name"])
+
+
+def find_duplicate_phone_groups(data):
+    """(逻辑与contacts_manager_v2_extended.py中同名函数一致)"""
+    phone_to_names = {}
+    for c in data["contacts"]:
+        phone = c["phone"]
+        phone_to_names.setdefault(phone, []).append(c["name"])
+    duplicate_groups = {}
+    for phone, names in phone_to_names.items():
+        if len(names) >= 2:
+            duplicate_groups[phone] = names
+    return duplicate_groups
+
+
+# ============================================================
+# 第二部分:从contacts_data_validator_and_repair.py搬运的纯逻辑函数
+# ============================================================
+
+REQUIRED_FIELDS = {
+    "id": int, "name": str, "phone": str, "email": str,
+    "address": str, "group": str, "pinyin_initial": str, "note": str,
+}
+VALID_GROUPS = ["家人", "朋友", "同事", "客户", "其他"]
+
+
+def validate_single_contact(contact, index):
+    """(逻辑与contacts_data_validator_and_repair.py中同名函数一致)"""
+    problems = []
+    if not isinstance(contact, dict):
+        problems.append(f"第{index}条记录不是一个字典,无法进一步校验字段。")
+        return problems
+    for field, expected_type in REQUIRED_FIELDS.items():
+        if field not in contact:
+            problems.append(f"第{index}条记录缺少字段‘{field}’。")
+            continue
+        if not isinstance(contact[field], expected_type):
+            problems.append(f"第{index}条记录的字段‘{field}’类型不正确。")
+    if "group" in contact and isinstance(contact["group"], str):
+        if contact["group"] not in VALID_GROUPS:
+            problems.append(f"第{index}条记录的分组不在合法范围内。")
+    return problems
+
+
+def find_duplicate_ids(contacts):
+    """(逻辑与contacts_data_validator_and_repair.py中同名函数一致)"""
+    id_count = {}
+    for c in contacts:
+        if isinstance(c, dict) and "id" in c:
+            id_count[c["id"]] = id_count.get(c["id"], 0) + 1
+    return [cid for cid, count in id_count.items() if count >= 2]
+
+
+def repair_missing_optional_fields(data):
+    """(逻辑与contacts_data_validator_and_repair.py中同名函数一致)"""
+    if "contacts" not in data or not isinstance(data["contacts"], list):
+        return 0
+    optional_fields_with_defaults = {"email": "", "address": "", "note": ""}
+    repaired_count = 0
+    for contact in data["contacts"]:
+        if not isinstance(contact, dict):
+            continue
+        record_was_repaired = False
+        for field, default_value in optional_fields_with_defaults.items():
+            if field not in contact:
+                contact[field] = default_value
+                record_was_repaired = True
+        if record_was_repaired:
+            repaired_count += 1
+    return repaired_count
+
+
+def renumber_duplicate_ids(data):
+    """(逻辑与contacts_data_validator_and_repair.py中同名函数一致)"""
+    if "contacts" not in data or not isinstance(data["contacts"], list):
+        return
+    next_id = 1
+    for contact in data["contacts"]:
+        if isinstance(contact, dict):
+            contact["id"] = next_id
+            next_id += 1
+    data["next_id"] = next_id
+
+
+# ============================================================
+# 第三部分:测试用数据构造与断言测试
+# ============================================================
+
+def build_sample_data_for_test():
+    """构造一份用于测试的、固定的通讯录数据结构。"""
+    return {
+        "next_id": 4,
+        "contacts": [
+            {"id": 1, "name": "陈铭", "phone": "13800000001", "email": "",
+             "address": "", "group": "同事", "pinyin_initial": "C", "note": ""},
+            {"id": 2, "name": "苏梦", "phone": "13800000002", "email": "",
+             "address": "", "group": "同事", "pinyin_initial": "S", "note": ""},
+            {"id": 3, "name": "韩露", "phone": "13800000001", "email": "",
+             "address": "", "group": "同事", "pinyin_initial": "H", "note": ""},
+        ],
+    }
+
+
+def test_push_and_undo_history_basic():
+    """测试1:压入一份历史快照后,数据被修改,撤销应能还原到修改前的状态。"""
+    data = build_sample_data_for_test()
+    history_stack = []
+
+    push_history_snapshot(history_stack, data)
+    data["contacts"][0]["name"] = "陈铭(已改名测试)"
+
+    assert data["contacts"][0]["name"] == "陈铭(已改名测试)", "修改应该立即生效"
+
+    restored = undo_last_operation(history_stack)
+    assert restored is not None, "历史栈中应该有一份可以撤销的快照"
+    assert restored["contacts"][0]["name"] == "陈铭", "撤销后应该恢复到修改前的姓名"
+    print("测试1通过:历史快照压入与撤销的基本流程符合预期。")
+
+
+def test_undo_does_not_affect_original_after_snapshot():
+    """测试2:验证深拷贝的隔离性——压入快照之后修改原数据,快照内容不应受影响。"""
+    data = build_sample_data_for_test()
+    history_stack = []
+
+    push_history_snapshot(history_stack, data)
+    # 压入快照之后,对原数据做多次修改
+    data["contacts"][0]["phone"] = "19999999999"
+    data["contacts"].append({"id": 4, "name": "新插入的人", "phone": "10000000000",
+                              "email": "", "address": "", "group": "其他",
+                              "pinyin_initial": "#", "note": ""})
+
+    assert len(data["contacts"]) == 4, "原数据应该已经增加到4条记录"
+
+    restored = undo_last_operation(history_stack)
+    assert len(restored["contacts"]) == 3, "快照里应该仍然只有3条记录,不受后续修改影响"
+    assert restored["contacts"][0]["phone"] == "13800000001", \
+        "快照里的电话号码应该是压入快照那一刻的原始值"
+    print("测试2通过:深拷贝快照与原数据完全隔离,符合预期。")
+
+
+def test_undo_empty_history_returns_none():
+    """测试3:历史栈为空时调用撤销,应该返回None而不是抛出异常。"""
+    empty_history_stack = []
+    result = undo_last_operation(empty_history_stack)
+    assert result is None, "空历史栈调用撤销应该返回None"
+    print("测试3通过:空历史栈的撤销操作被安全处理。")
+
+
+def test_history_stack_max_length_limit():
+    """测试4:历史栈超过上限时,应该自动丢弃最早的快照,只保留最近5步。"""
+    data = build_sample_data_for_test()
+    history_stack = []
+
+    # 连续压入8次快照,每次压入前都对数据做一点修改,方便区分先后顺序
+    for i in range(8):
+        data["contacts"][0]["note"] = f"第{i}次修改"
+        push_history_snapshot(history_stack, data)
+
+    assert len(history_stack) == 5, "历史栈长度应该被限制在5步以内"
+    # 最早压入的几份快照(note为‘第0次修改’‘第1次修改’‘第2次修改’)应该已经被丢弃,
+    # 栈中剩下的应该是最近5次(第3到第7次修改)
+    oldest_remaining_note = history_stack[0]["contacts"][0]["note"]
+    assert oldest_remaining_note == "第3次修改", \
+        "历史栈中最早保留的一份快照应该对应第3次修改"
+    print("测试4通过:历史栈长度限制逻辑符合预期。")
+
+
+def test_toggle_favorite_basic_flow():
+    """测试5:收藏状态切换的基本流程,包括初次收藏和取消收藏两种情况。"""
+    data = build_sample_data_for_test()
+
+    success, message = toggle_favorite(data, "陈铭")
+    assert success is True, "对存在的联系人切换收藏状态应该成功"
+    assert data["contacts"][0]["is_favorite"] is True, "陈铭应该已被标记为收藏"
+    assert "加入收藏" in message, "首次切换应该提示‘加入收藏’"
+
+    success2, message2 = toggle_favorite(data, "陈铭")
+    assert data["contacts"][0]["is_favorite"] is False, "再次切换应该取消收藏"
+    assert "取消收藏" in message2, "第二次切换应该提示‘取消收藏’"
+    print("测试5通过:收藏状态切换逻辑符合预期。")
+
+
+def test_toggle_favorite_not_found():
+    """测试6:对不存在的联系人切换收藏状态,应该返回失败而不是抛出异常。"""
+    data = build_sample_data_for_test()
+    success, message = toggle_favorite(data, "不存在的人")
+    assert success is False, "对不存在的联系人应该返回失败"
+    assert "未找到" in message, "失败提示应该说明未找到该联系人"
+    print("测试6通过:切换收藏状态时对不存在联系人的处理符合预期。")
+
+
+def test_list_favorite_contacts_sorted():
+    """测试7:收藏联系人列表应该按姓名排序返回。"""
+    data = build_sample_data_for_test()
+    toggle_favorite(data, "韩露")
+    toggle_favorite(data, "陈铭")
+
+    favorites = list_favorite_contacts(data)
+    favorite_names = [c["name"] for c in favorites]
+    assert favorite_names == sorted(favorite_names), "收藏列表应该按姓名排序"
+    assert len(favorites) == 2, "应该有两位联系人被收藏"
+    print("测试7通过:收藏联系人列表排序与数量符合预期。")
+
+
+def test_find_duplicate_phone_groups():
+    """测试8:重复电话检测应该正确识别出共用同一电话号码的多位联系人。"""
+    data = build_sample_data_for_test()
+    duplicate_groups = find_duplicate_phone_groups(data)
+
+    assert "13800000001" in duplicate_groups, "13800000001应该被识别为重复号码"
+    assert set(duplicate_groups["13800000001"]) == {"陈铭", "韩露"}, \
+        "共用13800000001的应该是陈铭和韩露"
+    assert "13800000002" not in duplicate_groups, "只被一人使用的号码不应该出现在重复结果中"
+    print("测试8通过:重复电话检测逻辑符合预期。")
+
+
+def test_validate_single_contact_missing_field():
+    """测试9:数据校验应该能识别出缺失字段的记录。"""
+    broken_contact = {"id": 1, "name": "陈铭", "phone": "13800000001"}
+    problems = validate_single_contact(broken_contact, 1)
+    assert len(problems) > 0, "缺失多个字段的记录应该产生对应数量的问题"
+    assert any("email" in p for p in problems), "应该报告缺少email字段"
+    print("测试9通过:数据校验能正确识别缺失字段。")
+
+
+def test_validate_single_contact_wrong_type():
+    """测试10:数据校验应该能识别出字段类型不正确的记录(如id被存成了字符串)。"""
+    broken_contact = {
+        "id": "1",   # 故意存成字符串而不是整数
+        "name": "陈铭", "phone": "13800000001", "email": "",
+        "address": "", "group": "同事", "pinyin_initial": "C", "note": "",
+    }
+    problems = validate_single_contact(broken_contact, 1)
+    assert any("id" in p for p in problems), "应该报告id字段类型不正确"
+    print("测试10通过:数据校验能正确识别字段类型错误。")
+
+
+def test_validate_single_contact_invalid_group():
+    """测试11:数据校验应该能识别出分组取值不在合法范围内的记录。"""
+    broken_contact = {
+        "id": 1, "name": "陈铭", "phone": "13800000001", "email": "",
+        "address": "", "group": "不存在的分组", "pinyin_initial": "C", "note": "",
+    }
+    problems = validate_single_contact(broken_contact, 1)
+    assert any("分组" in p for p in problems), "应该报告分组不在合法范围内"
+    print("测试11通过:数据校验能正确识别非法分组取值。")
+
+
+def test_find_duplicate_ids():
+    """测试12:重复id检测逻辑。"""
+    contacts_with_duplicate_ids = [
+        {"id": 1, "name": "陈铭"},
+        {"id": 2, "name": "苏梦"},
+        {"id": 1, "name": "重复id的记录"},
+    ]
+    duplicates = find_duplicate_ids(contacts_with_duplicate_ids)
+    assert duplicates == [1], "应该识别出id=1被重复使用"
+    print("测试12通过:重复id检测逻辑符合预期。")
+
+
+def test_repair_missing_optional_fields():
+    """测试13:自动修复缺失选填字段的逻辑。"""
+    data = {
+        "next_id": 2,
+        "contacts": [
+            {"id": 1, "name": "陈铭", "phone": "13800000001"},   # 缺email/address/note
+        ],
+    }
+    repaired_count = repair_missing_optional_fields(data)
+    assert repaired_count == 1, "应该有1条记录被修复"
+    contact = data["contacts"][0]
+    assert contact["email"] == "" and contact["address"] == "" and contact["note"] == "", \
+        "缺失的选填字段应该被补齐为空字符串"
+    print("测试13通过:缺失选填字段的自动修复逻辑符合预期。")
+
+
+def test_renumber_duplicate_ids():
+    """测试14:重新分配id的修复逻辑,验证修复后id不再重复且从1开始连续编号。"""
+    data = {
+        "next_id": 3,
+        "contacts": [
+            {"id": 1, "name": "陈铭"},
+            {"id": 1, "name": "重复id的记录"},
+            {"id": 5, "name": "id跳号的记录"},
+        ],
+    }
+    renumber_duplicate_ids(data)
+
+    ids_after_repair = [c["id"] for c in data["contacts"]]
+    assert ids_after_repair == [1, 2, 3], "重新编号后id应该从1开始连续排列"
+    assert data["next_id"] == 4, "next_id应该更新为下一个可用编号"
+    print("测试14通过:重复id重新编号的修复逻辑符合预期。")
+
+
+def run_all_v2_checks():
+    """依次运行全部14个测试用例,统计并打印通过情况。"""
+    all_tests = [
+        test_push_and_undo_history_basic,
+        test_undo_does_not_affect_original_after_snapshot,
+        test_undo_empty_history_returns_none,
+        test_history_stack_max_length_limit,
+        test_toggle_favorite_basic_flow,
+        test_toggle_favorite_not_found,
+        test_list_favorite_contacts_sorted,
+        test_find_duplicate_phone_groups,
+        test_validate_single_contact_missing_field,
+        test_validate_single_contact_wrong_type,
+        test_validate_single_contact_invalid_group,
+        test_find_duplicate_ids,
+        test_repair_missing_optional_fields,
+        test_renumber_duplicate_ids,
+    ]
+
+    passed_count = 0
+    failed_tests = []
+
+    print("开始执行v2增强功能与数据校验工具自检……\n")
+
+    for test_func in all_tests:
+        try:
+            test_func()
+            passed_count += 1
+        except AssertionError as e:
+            failed_tests.append((test_func.__name__, str(e)))
+            print(f"测试失败:{test_func.__name__} —— {e}")
+
+    print("\n" + "=" * 50)
+    print(f"测试完成:共{len(all_tests)}项,通过{passed_count}项,失败{len(failed_tests)}项。")
+    if not failed_tests:
+        print("全部测试通过!")
+    print("=" * 50)
+
+
+if __name__ == "__main__":
+    run_all_v2_checks()
+```
+
 ---
 
 ## 今日复盘
