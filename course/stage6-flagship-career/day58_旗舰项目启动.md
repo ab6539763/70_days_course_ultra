@@ -1691,6 +1691,885 @@ if __name__ == "__main__":
 
 陈铭第一次跑这份脚本检查自己写的方案配置时,`check_cross_tenant_no_implicit_access`这一项直接报了BLOCKER——因为他最初的YAML草稿里,`self_service_apply`写的是`true`,他自己都没意识到这个默认值留下了隐患,是脚本先把这个问题揪出来的,比老王当面问出来还早了几个小时。这也是这份checklist脚本存在的意义:不是替代评审人,而是把评审人反复强调的原则,变成一道能提前拦住低级失误的关卡。
 
+晚上八点半,老王临走前又留了一个"作业":他让陈铭把今晚写的这套权限数据模型,再往前推一步——`resolve_scm_field_mask`这类函数虽然解决了眼前三个租户的具体权限判断,但老王指出了一个更本质的问题:"你现在这套东西,每加一个新的判断维度,就要新写一个函数,新加一段if-elif。等财务中心接进来,你估计又要写`resolve_finance_field_mask`,后面再来第五个部门,难道还要一直这样堆函数下去?你不觉得这本身也是一种'看起来平台化,实际上没平台化'的信号吗?"陈铭一开始还想辩解说"业务逻辑本来就是各不相同的,没法完全统一",但老王紧接着又问了一句让他哑口无言的问题:"业务规则不一样,不代表'规则的表达方式'不能统一。你回去想想,能不能把这些权限判断,变成一套'声明式的策略配置',而不是每次都要写一段新代码。"陈铭带着这个问题回到工位,决定连夜把这一层再往下挖一挖,顺便把评审checklist脚本也补得更完整一些,毕竟明天就要面对更硬的两场评审。
+
+### 四、多租户权限模型扩展:RBAC角色体系与声明式策略引擎
+
+陈铭先想清楚了问题的本质:之前写的`resolve_scm_field_mask`之类的函数,本质上是把"职级到字段屏蔽规则"这层映射关系,直接用代码逻辑表达了出来,这样做的问题不是"错",而是"不够通用"——每新增一个业务维度(职级、业务线、地区、部门),就要新写一个类似的函数,函数之间没有统一的抽象,长期维护下去,权限判断逻辑会散落在代码库的各个角落,变成事实上的"隐性权限系统",没有人能一眼看清楚"现在到底配置了哪些权限规则"。他决定引入一套标准的RBAC(基于角色的访问控制)模型作为权限的"骨架",再在骨架之上叠加一套声明式的策略引擎,把"什么角色能看哪些字段、哪些数据范围"这件事,从"写代码判断"变成"写配置声明",这样任何一个业务维度的权限规则调整,理论上只需要改配置,不需要改代码,也方便合规团队直接审阅"当前配置了哪些权限规则",而不必去读代码才能搞清楚。
+
+```python
+"""
+苍穹1.0 全域智能体平台 —— RBAC角色体系与声明式策略引擎
+文件: rbac_policy_engine.py
+
+设计说明:
+    本模块是对 tenant_isolation_models.py 中权限校验逻辑的进一步抽象。
+    此前的实现里,"职级不足屏蔽哪些字段"这类判断散落在
+    resolve_scm_field_mask、resolve_scm_business_line_filter 等
+    独立函数里,每新增一个业务维度就要新写一个函数。
+
+    本模块引入两层抽象:
+        1. RBAC 角色体系:用户不再直接绑定"职级数字"这种业务原始属性,
+           而是被授予一个或多个"角色"(Role),角色是权限判断的
+           唯一入口,业务原始属性(职级、业务线、地区)只是"角色分配"
+           阶段的判断依据,不直接参与运行时的权限判断。
+        2. 声明式策略引擎:每个角色关联一组"策略"(Policy),策略用
+           结构化的规则描述"允许访问的字段集合""允许访问的数据范围
+           过滤条件""是否允许跨租户"等,策略本身可以在配置中心/数据库
+           里维护,不需要改动代码就能新增或调整权限规则。
+
+    这套设计直接回应了老王提出的问题——"新增一个判断维度,是不是
+    只需要加配置,不需要加代码"是检验这套权限系统是否真正做到
+    平台化的关键测试点。
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional, Set
+
+
+class PolicyEffect(str, Enum):
+    """策略的效果:允许或拒绝,拒绝优先于允许(deny-overrides),
+    这是权限系统设计里最常见也最稳妥的合并策略——一旦有任何一条
+    策略明确拒绝某个字段或某个数据范围,即使有其他策略允许,
+    最终结果也应该是拒绝,避免"多角色叠加导致权限意外放大"的风险。"""
+    ALLOW = "allow"
+    DENY = "deny"
+
+
+class ResourceScope(str, Enum):
+    """策略作用的资源范围类型"""
+    FIELD = "field"                 # 字段级(列级)权限,如"合同具体价格"字段
+    ROW_FILTER = "row_filter"        # 行级过滤条件,如"仅本业务线数据"
+    SUB_DOMAIN = "sub_domain"        # 知识库子域访问权限
+    CROSS_TENANT = "cross_tenant"     # 跨租户访问权限
+    ACTION = "action"                 # 操作级权限,如"是否允许导出结果"
+
+
+@dataclass
+class PolicyRule:
+    """
+    单条策略规则。
+    设计上尽量保持"人也能读懂"的可读性,合规团队应该能够直接看着
+    一份策略规则的JSON/字典表示,判断出"这条规则到底允许了什么、
+    拒绝了什么",而不需要去看实现代码。
+    """
+    rule_id: str
+    scope: ResourceScope
+    effect: PolicyEffect
+    target: str                      # 具体作用对象,如字段名/子域编码/资源标识
+    condition: Dict[str, Any] = field(default_factory=dict)  # 附加条件,如 {"business_line": "${user.business_line}"}
+    description: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "rule_id": self.rule_id,
+            "scope": self.scope.value,
+            "effect": self.effect.value,
+            "target": self.target,
+            "condition": self.condition,
+            "description": self.description,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "PolicyRule":
+        return PolicyRule(
+            rule_id=d["rule_id"],
+            scope=ResourceScope(d["scope"]),
+            effect=PolicyEffect(d["effect"]),
+            target=d["target"],
+            condition=d.get("condition", {}),
+            description=d.get("description", ""),
+        )
+
+
+@dataclass
+class Role:
+    """
+    角色定义。用户不直接持有权限,而是通过被授予角色间接获得权限,
+    这是RBAC模型的核心思想——权限管理的最小操作单元是"角色的授予
+    与撤销",而不是逐条修改每个用户的具体权限,这在用户规模较大
+    (寰宇集团三大中心加起来预计有几百上千用户)的场景下,
+    能大幅降低权限管理的复杂度。
+    """
+    role_id: str
+    role_name: str
+    tenant_code: str                  # 角色归属的租户,角色不能跨租户复用,避免权限模型混乱
+    policies: List[PolicyRule] = field(default_factory=list)
+    description: str = ""
+
+    def add_policy(self, rule: PolicyRule) -> None:
+        self.policies.append(rule)
+
+
+@dataclass
+class UserRoleBinding:
+    """用户与角色的绑定关系,一个用户可以绑定多个角色(如既是普通采购专员,又临时被授予某个协同项目的额外角色)"""
+    user_id: str
+    role_ids: List[str] = field(default_factory=list)
+
+
+class RoleRegistry:
+    """角色注册中心,负责角色的增删改查与策略维护"""
+
+    def __init__(self):
+        self._roles: Dict[str, Role] = {}
+
+    def register(self, role: Role) -> None:
+        self._roles[role.role_id] = role
+
+    def get(self, role_id: str) -> Optional[Role]:
+        return self._roles.get(role_id)
+
+    def list_by_tenant(self, tenant_code: str) -> List[Role]:
+        return [r for r in self._roles.values() if r.tenant_code == tenant_code]
+
+    def export_to_dict(self) -> dict:
+        return {
+            role_id: {
+                "role_name": role.role_name,
+                "tenant_code": role.tenant_code,
+                "description": role.description,
+                "policies": [p.to_dict() for p in role.policies],
+            }
+            for role_id, role in self._roles.items()
+        }
+
+    def load_from_dict(self, data: dict) -> None:
+        for role_id, role_data in data.items():
+            role = Role(
+                role_id=role_id,
+                role_name=role_data["role_name"],
+                tenant_code=role_data["tenant_code"],
+                description=role_data.get("description", ""),
+                policies=[PolicyRule.from_dict(p) for p in role_data.get("policies", [])],
+            )
+            self.register(role)
+
+
+@dataclass
+class PolicyDecision:
+    """策略引擎对某次具体资源访问请求给出的最终决策"""
+    allowed: bool
+    scope: ResourceScope
+    target: str
+    matched_rules: List[str] = field(default_factory=list)
+    reason: str = ""
+
+
+class PolicyEvaluationContext:
+    """
+    策略求值上下文,携带请求发起用户的业务属性(职级、业务线、
+    员工工号等),用于解析策略规则里的动态条件表达式,例如
+    condition = {"business_line": "${user.business_line}"} 表示
+    "该规则的适用范围限定为请求用户自己所属的业务线"。
+    """
+
+    def __init__(self, user_attributes: Dict[str, Any]):
+        self.user_attributes = user_attributes
+
+    def resolve(self, value: Any) -> Any:
+        """解析形如 '${user.xxx}' 的动态占位符,静态值原样返回"""
+        if isinstance(value, str) and value.startswith("${user.") and value.endswith("}"):
+            attr_name = value[len("${user."):-1]
+            return self.user_attributes.get(attr_name)
+        return value
+
+
+class PolicyEngine:
+    """
+    声明式策略引擎主类。
+
+    与此前"每个业务维度写一个判断函数"的方式相比,策略引擎的调用方
+    只需要说明"我想访问哪个 scope 下的哪个 target",引擎会遍历该用户
+    所有已绑定角色关联的策略规则,按照 deny-overrides 的合并逻辑,
+    计算出最终是否允许访问,以及具体命中了哪些规则(便于审计和调试)。
+    """
+
+    def __init__(self, role_registry: RoleRegistry, role_bindings: Dict[str, UserRoleBinding]):
+        self._registry = role_registry
+        self._bindings = role_bindings
+
+    def _get_user_roles(self, user_id: str) -> List[Role]:
+        binding = self._bindings.get(user_id)
+        if binding is None:
+            return []
+        roles = []
+        for role_id in binding.role_ids:
+            role = self._registry.get(role_id)
+            if role is not None:
+                roles.append(role)
+        return roles
+
+    def evaluate(
+        self,
+        user_id: str,
+        scope: ResourceScope,
+        target: str,
+        context_attributes: Optional[Dict[str, Any]] = None,
+    ) -> PolicyDecision:
+        """
+        评估某个用户对某个具体资源(scope+target)的访问是否被允许。
+
+        合并逻辑(deny-overrides):
+            1. 收集该用户所有角色下,与本次请求 scope/target 匹配的规则。
+            2. 如果匹配到的规则中,存在任意一条 effect=DENY 且条件满足,
+               直接判定为拒绝,不再考虑其他 ALLOW 规则。
+            3. 如果不存在 DENY 规则,但存在至少一条 ALLOW 规则且条件满足,
+               判定为允许。
+            4. 如果没有任何匹配规则,默认拒绝(最小权限原则:未被
+               显式授权的资源,默认不可访问,而不是默认放行)。
+        """
+        roles = self._get_user_roles(user_id)
+        ctx = PolicyEvaluationContext(context_attributes or {})
+
+        matched_deny: List[str] = []
+        matched_allow: List[str] = []
+
+        for role in roles:
+            for rule in role.policies:
+                if rule.scope != scope:
+                    continue
+                if rule.target != target and rule.target != "*":
+                    continue
+                if not self._condition_satisfied(rule.condition, ctx):
+                    continue
+                if rule.effect == PolicyEffect.DENY:
+                    matched_deny.append(rule.rule_id)
+                else:
+                    matched_allow.append(rule.rule_id)
+
+        if matched_deny:
+            return PolicyDecision(
+                allowed=False,
+                scope=scope,
+                target=target,
+                matched_rules=matched_deny,
+                reason="命中显式拒绝规则,拒绝优先于允许",
+            )
+        if matched_allow:
+            return PolicyDecision(
+                allowed=True,
+                scope=scope,
+                target=target,
+                matched_rules=matched_allow,
+                reason="命中显式允许规则",
+            )
+        return PolicyDecision(
+            allowed=False,
+            scope=scope,
+            target=target,
+            matched_rules=[],
+            reason="未命中任何显式规则,按最小权限原则默认拒绝",
+        )
+
+    def _condition_satisfied(self, condition: Dict[str, Any], ctx: PolicyEvaluationContext) -> bool:
+        """
+        校验规则的附加条件是否满足。condition 是一个字典,
+        key 是用户属性名,value 可以是静态值或 '${user.xxx}' 动态占位符,
+        表示"该字段的值必须等于用户自身对应属性的值"——这是实现
+        "只能查询自己所属业务线数据"这类行级权限最常见的表达方式。
+        """
+        if not condition:
+            return True
+        for key, expected in condition.items():
+            resolved_expected = ctx.resolve(expected)
+            actual = ctx.user_attributes.get(key)
+            if resolved_expected != actual and expected != actual:
+                # 兼容两种写法:condition里既可能直接写死目标值,
+                # 也可能用动态占位符引用用户自身属性,两种都要能匹配
+                if str(resolved_expected) != str(actual):
+                    return False
+        return True
+
+    def resolve_visible_fields(
+        self, user_id: str, all_fields: List[str], context_attributes: Optional[Dict[str, Any]] = None
+    ) -> List[str]:
+        """
+        便捷方法:给定一份资源的全部字段列表,返回该用户当前实际
+        可见的字段子集。用于替代此前 resolve_scm_field_mask 这类
+        硬编码函数——新增职级、新增字段权限规则时,只需要新增角色
+        或策略配置,不需要修改这个方法本身。
+        """
+        visible = []
+        for f in all_fields:
+            decision = self.evaluate(user_id, ResourceScope.FIELD, f, context_attributes)
+            if decision.allowed:
+                visible.append(f)
+        return visible
+
+    def resolve_row_filter(
+        self, user_id: str, context_attributes: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        便捷方法:返回该用户所有生效的行级过滤条件(ROW_FILTER类策略中
+        effect=ALLOW的规则的condition),调用方应将这些条件以AND方式
+        追加到实际的数据查询中,确保用户只能看到条件范围内的数据行。
+        """
+        roles = self._get_user_roles(user_id)
+        ctx = PolicyEvaluationContext(context_attributes or {})
+        filters = []
+        for role in roles:
+            for rule in role.policies:
+                if rule.scope != ResourceScope.ROW_FILTER or rule.effect != PolicyEffect.ALLOW:
+                    continue
+                resolved_condition = {
+                    k: ctx.resolve(v) for k, v in rule.condition.items()
+                }
+                filters.append(resolved_condition)
+        return filters
+
+
+def build_huanyu_rbac_registry() -> RoleRegistry:
+    """
+    构建寰宇集团项目当前已知的角色与策略配置,作为方案评审阶段的
+    参考实现。这份配置替代了此前 resolve_scm_field_mask 等函数里
+    硬编码的判断逻辑,后续新增财务中心或调整职级规则,直接在这里
+    (或对接的配置中心)追加角色和策略即可。
+    """
+    registry = RoleRegistry()
+
+    # ---------------- 供应链管理中心角色 ----------------
+    scm_specialist = Role(
+        "scm_role_specialist", "普通采购专员", "scm_center",
+        description="仅能查看本业务线数据,不可见跨品类价格对比与合同具体价格明细",
+    )
+    scm_specialist.add_policy(PolicyRule(
+        "scm_p001", ResourceScope.FIELD, PolicyEffect.DENY, "contract_specific_price",
+        description="普通采购专员不可见合同具体价格明细",
+    ))
+    scm_specialist.add_policy(PolicyRule(
+        "scm_p002", ResourceScope.FIELD, PolicyEffect.DENY, "cross_category_price_comparison",
+        description="普通采购专员不可见跨品类价格对比",
+    ))
+    scm_specialist.add_policy(PolicyRule(
+        "scm_p003", ResourceScope.ROW_FILTER, PolicyEffect.ALLOW, "supplier_data",
+        condition={"business_line": "${user.business_line}"},
+        description="仅能查询本人所属业务线的供应商数据",
+    ))
+    registry.register(scm_specialist)
+
+    scm_manager = Role(
+        "scm_role_manager", "采购经理", "scm_center",
+        description="可见跨品类价格对比,不可见合同具体价格明细",
+    )
+    scm_manager.add_policy(PolicyRule(
+        "scm_p004", ResourceScope.FIELD, PolicyEffect.DENY, "contract_specific_price",
+        description="采购经理不可见合同具体价格明细",
+    ))
+    scm_manager.add_policy(PolicyRule(
+        "scm_p005", ResourceScope.FIELD, PolicyEffect.ALLOW, "cross_category_price_comparison",
+        description="采购经理可见跨品类价格对比",
+    ))
+    scm_manager.add_policy(PolicyRule(
+        "scm_p006", ResourceScope.ROW_FILTER, PolicyEffect.ALLOW, "supplier_data",
+        condition={"business_line": "${user.business_line}"},
+        description="仅能查询本人所属业务线的供应商数据",
+    ))
+    registry.register(scm_manager)
+
+    scm_director = Role(
+        "scm_role_director", "采购总监", "scm_center",
+        description="无字段限制,可查询全部业务线数据",
+    )
+    scm_director.add_policy(PolicyRule(
+        "scm_p007", ResourceScope.FIELD, PolicyEffect.ALLOW, "*",
+        description="采购总监无字段级限制",
+    ))
+    scm_director.add_policy(PolicyRule(
+        "scm_p008", ResourceScope.ROW_FILTER, PolicyEffect.ALLOW, "supplier_data",
+        condition={},
+        description="采购总监可查询全部业务线数据,无行级限制",
+    ))
+    registry.register(scm_director)
+
+    # ---------------- 法务中心角色 ----------------
+    legal_domestic = Role(
+        "legal_role_domestic", "法务专员(境内业务)", "legal_center",
+        description="仅可访问境内业务子域合同知识库",
+    )
+    legal_domestic.add_policy(PolicyRule(
+        "legal_p001", ResourceScope.SUB_DOMAIN, PolicyEffect.ALLOW, "domestic",
+        description="允许访问境内业务子域",
+    ))
+    registry.register(legal_domestic)
+
+    legal_senior = Role(
+        "legal_role_senior", "资深法务专员/法务经理", "legal_center",
+        description="可访问境内、境外、子公司专属三个子域",
+    )
+    for domain in ["domestic", "overseas", "subsidiary"]:
+        legal_senior.add_policy(PolicyRule(
+            f"legal_p_senior_{domain}", ResourceScope.SUB_DOMAIN, PolicyEffect.ALLOW, domain,
+            description=f"资深法务允许访问{domain}子域",
+        ))
+    registry.register(legal_senior)
+
+    # ---------------- 人力资源中心角色 ----------------
+    hr_employee = Role(
+        "hr_role_employee", "普通员工", "hr_center",
+        description="仅能查询本人个人数据,严格行级隔离",
+    )
+    hr_employee.add_policy(PolicyRule(
+        "hr_p001", ResourceScope.ROW_FILTER, PolicyEffect.ALLOW, "employee_self_data",
+        condition={"employee_id": "${user.employee_id}"},
+        description="仅能查询员工工号与本人一致的数据",
+    ))
+    registry.register(hr_employee)
+
+    hr_specialist = Role(
+        "hr_role_specialist", "HR专员", "hr_center",
+        description="可查看后台统计数据(不含个人薪酬明细),用于优化知识库",
+    )
+    hr_specialist.add_policy(PolicyRule(
+        "hr_p002", ResourceScope.FIELD, PolicyEffect.DENY, "individual_salary_detail",
+        description="HR专员不可见个人薪酬明细字段(需更高权限角色单独授予)",
+    ))
+    hr_specialist.add_policy(PolicyRule(
+        "hr_p003", ResourceScope.ACTION, PolicyEffect.ALLOW, "view_consultation_statistics",
+        description="HR专员可查看咨询记录统计",
+    ))
+    registry.register(hr_specialist)
+
+    return registry
+
+
+def build_huanyu_role_bindings() -> Dict[str, UserRoleBinding]:
+    """构建演示用的用户角色绑定关系"""
+    return {
+        "user_zhang_procurement": UserRoleBinding("user_zhang_procurement", ["scm_role_specialist"]),
+        "user_li_procurement_mgr": UserRoleBinding("user_li_procurement_mgr", ["scm_role_manager"]),
+        "user_wang_director": UserRoleBinding("user_wang_director", ["scm_role_director"]),
+        "user_chen_legal_junior": UserRoleBinding("user_chen_legal_junior", ["legal_role_domestic"]),
+        "user_zhao_legal_senior": UserRoleBinding("user_zhao_legal_senior", ["legal_role_senior"]),
+        "user_liu_employee": UserRoleBinding("user_liu_employee", ["hr_role_employee"]),
+        "user_sun_hrbp": UserRoleBinding("user_sun_hrbp", ["hr_role_specialist"]),
+    }
+
+
+if __name__ == "__main__":
+    registry = build_huanyu_rbac_registry()
+    bindings = build_huanyu_role_bindings()
+    engine = PolicyEngine(registry, bindings)
+
+    all_scm_fields = [
+        "supplier_name", "delivery_rate", "quality_score",
+        "contract_specific_price", "cross_category_price_comparison",
+    ]
+
+    print("=== 供应链场景:不同角色可见字段对比 ===")
+    for user_id, business_line in [
+        ("user_zhang_procurement", "raw_material"),
+        ("user_li_procurement_mgr", "raw_material"),
+        ("user_wang_director", "raw_material"),
+    ]:
+        visible = engine.resolve_visible_fields(
+            user_id, all_scm_fields, context_attributes={"business_line": business_line}
+        )
+        print(f"  {user_id}: 可见字段 = {visible}")
+
+    print("\n=== 供应链场景:行级过滤条件 ===")
+    for user_id in ["user_zhang_procurement", "user_wang_director"]:
+        filters = engine.resolve_row_filter(
+            user_id, context_attributes={"business_line": "raw_material"}
+        )
+        print(f"  {user_id}: 行级过滤条件 = {filters}")
+
+    print("\n=== 法务场景:子域访问校验 ===")
+    for user_id in ["user_chen_legal_junior", "user_zhao_legal_senior"]:
+        for domain in ["domestic", "overseas", "subsidiary"]:
+            decision = engine.evaluate(user_id, ResourceScope.SUB_DOMAIN, domain)
+            print(f"  {user_id} 访问子域[{domain}]: {'允许' if decision.allowed else '拒绝'} ({decision.reason})")
+
+    print("\n=== HR场景:行级隔离校验 ===")
+    decision = engine.evaluate(
+        "user_liu_employee", ResourceScope.ROW_FILTER, "employee_self_data",
+        context_attributes={"employee_id": "EMP10023"},
+    )
+    print(f"  user_liu_employee 查询行级过滤生效条件的评估结果: {decision.allowed}, 命中规则: {decision.matched_rules}")
+```
+
+写完这套RBAC和策略引擎之后,陈铭专门做了一次对比测试:分别用旧的`resolve_scm_field_mask`函数和新的`PolicyEngine.resolve_visible_fields`方法,针对同样的三个职级角色跑一遍,确认输出结果完全一致——这一步他格外谨慎,因为策略引擎是要在明天的评审里作为"升级版方案"提出来的,如果连基本的行为等价性都没验证过,直接在评审会上展示,一旦被问到"新旧逻辑结果是不是一样的",答不上来就很尴尬。验证通过之后,他又追加了一个新旧方案迁移成本的对比说明,写进了给老王的补充说明里:旧方案新增一个判断维度要改代码、要重新测试、要重新发布;新方案新增一个判断维度,只需要在`build_huanyu_rbac_registry`里(或者未来对接的权限配置后台里)增加一条角色或策略配置,不需要碰任何已有的引擎代码,这正好回应了老王那句"业务规则不一样,不代表表达方式不能统一"。
+
+### 五、技术方案评审checklist脚本扩展:更多检查项、评分机制与多格式报告导出
+
+补完权限模型之后,陈铭回头看了一眼之前写的`tech_plan_review_checklist.py`,发现这份脚本目前只覆盖了权限隔离相关的几条核心原则,但今天晨会和需求会上,老王和郭建军还反复强调过好几条同样重要、却没有被脚本覆盖到的要求——比如非功能性需求(性能、可用性)有没有量化数字、风险与假设清单是否都指定了跟踪责任人、里程碑计划是否和6天冲刺的时间线吻合。他决定趁着还没睡,把这份checklist脚本再扩充一轮,同时补上一套简单的评分机制和多格式报告导出能力,方便这份自查报告本身也能作为提交给评审委员会的附件材料,而不只是自己用来"过一遍心里有底"的工具。
+
+```python
+"""
+苍穹1.0 技术方案评审 Checklist 扩展版
+文件: tech_plan_review_checklist_ext.py
+
+在 tech_plan_review_checklist.py 已有九项检查的基础上,补充:
+    1. 非功能性需求量化检查(性能/可用性指标是否给出具体数值,
+       而不是"响应要快""要稳定"这类无法验收的模糊表述)
+    2. 风险与假设清单的责任人追踪检查(每条风险是否指定了
+       跟踪责任人和验证阶段,避免"写了但没人跟"的情况)
+    3. 里程碑时间线与冲刺周期一致性检查
+    4. 权限模型是否采用了声明式配置(而非硬编码判断函数),
+       呼应今晚新增的 RBAC 策略引擎设计
+    5. 加权评分机制:不同检查项按重要性赋予不同权重,
+       给出一个0-100的方案健康度评分,比单纯罗列PASS/FAIL
+       更直观,方便向郭建军和林悦这类非纯技术背景的干系人汇报
+    6. 报告导出为 JSON 和 Markdown 两种格式,前者供CI流水线
+       自动化调用,后者可以直接贴进评审会的会议纪要文档
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Callable, Optional
+
+try:
+    import yaml
+except ImportError:
+    print("请先安装依赖: pip install pyyaml")
+    sys.exit(1)
+
+# 复用基础版checklist中已经写好的规则,扩展版不重复实现,只做增量补充
+from tech_plan_review_checklist import (
+    Severity,
+    CheckResult,
+    ChecklistReport,
+    load_plan,
+    check_isolation_level_declared,
+    check_shared_capabilities_not_duplicated,
+    check_cross_tenant_no_implicit_access,
+    check_audit_log_completeness,
+    check_sensitive_field_denial_not_masking,
+    check_hr_no_data_sync,
+    check_submission_policy_human_confirm,
+    check_new_tenant_onboarding_cost,
+    check_pending_integrations_flagged,
+)
+
+
+# ------------------------------------------------------------------
+# 新增检查项
+# ------------------------------------------------------------------
+
+def check_non_functional_requirements_quantified(plan: dict) -> CheckResult:
+    """
+    检查非功能性需求是否给出了具体的量化数值。
+    这一条呼应需求文档"非功能性需求"章节里明确写出的P95响应时间、
+    并发QPS、可用性百分比这类具体数字——如果方案配置里只写了
+    "high_performance": true 这种无法验收的模糊布尔值,应该被视为
+    高风险信号,因为验收时根本无法判断"高性能"这个词有没有达标。
+    """
+    nfr = plan.get("non_functional_requirements", {})
+    required_numeric_keys = ["p95_latency_ms", "target_qps", "availability_percent"]
+    missing = [k for k in required_numeric_keys if not isinstance(nfr.get(k), (int, float))]
+    if missing:
+        return CheckResult(
+            check_name="非功能性需求量化",
+            passed=False,
+            severity=Severity.WARNING,
+            message=f"以下非功能性指标未提供具体数值: {missing},"
+                    f"建议补充明确数字,避免验收阶段口径不一致",
+        )
+    return CheckResult(
+        check_name="非功能性需求量化",
+        passed=True,
+        severity=Severity.WARNING,
+        message=f"非功能性指标已量化: {[f'{k}={nfr[k]}' for k in required_numeric_keys]}",
+    )
+
+
+def check_risk_items_have_owner(plan: dict) -> CheckResult:
+    """
+    检查风险与假设清单中,每一条风险是否都指定了跟踪责任人(owner)
+    和验证阶段(verify_stage)。老王在评审中反复强调"风险不能只是
+    被识别出来,还要有人负责跟"。
+    """
+    risks = plan.get("risks_and_assumptions", [])
+    if not risks:
+        return CheckResult(
+            check_name="风险责任人追踪",
+            passed=False,
+            severity=Severity.WARNING,
+            message="未配置 risks_and_assumptions 清单,建议补充",
+        )
+    missing_owner = [r.get("risk_id", "未知风险") for r in risks if not r.get("owner")]
+    missing_stage = [r.get("risk_id", "未知风险") for r in risks if not r.get("verify_stage")]
+    if missing_owner or missing_stage:
+        return CheckResult(
+            check_name="风险责任人追踪",
+            passed=False,
+            severity=Severity.BLOCKER,
+            message=f"缺少责任人的风险: {missing_owner}; 缺少验证阶段的风险: {missing_stage}",
+        )
+    return CheckResult(
+        check_name="风险责任人追踪",
+        passed=True,
+        severity=Severity.BLOCKER,
+        message=f"全部 {len(risks)} 条风险均已指定责任人与验证阶段",
+    )
+
+
+def check_milestone_matches_sprint_window(plan: dict) -> CheckResult:
+    """检查里程碑计划中的开发冲刺天数,是否与项目声明的冲刺周期一致"""
+    project = plan.get("project", {})
+    milestones = plan.get("milestones", [])
+    declared_sprint_days = project.get("sprint_duration_days")
+
+    dev_milestone = next(
+        (m for m in milestones if m.get("phase") == "开发冲刺" or m.get("phase_code") == "dev_sprint"),
+        None,
+    )
+    if declared_sprint_days is None or dev_milestone is None:
+        return CheckResult(
+            check_name="里程碑与冲刺周期一致性",
+            passed=False,
+            severity=Severity.WARNING,
+            message="未找到 sprint_duration_days 或开发冲刺里程碑配置,跳过精确校验",
+        )
+    milestone_days = dev_milestone.get("duration_days")
+    if milestone_days != declared_sprint_days:
+        return CheckResult(
+            check_name="里程碑与冲刺周期一致性",
+            passed=False,
+            severity=Severity.BLOCKER,
+            message=f"项目声明冲刺周期为{declared_sprint_days}天,"
+                    f"但开发冲刺里程碑配置为{milestone_days}天,两者不一致",
+        )
+    return CheckResult(
+        check_name="里程碑与冲刺周期一致性",
+        passed=True,
+        severity=Severity.BLOCKER,
+        message=f"里程碑冲刺周期({milestone_days}天)与项目声明一致",
+    )
+
+
+def check_permission_model_declarative(plan: dict) -> CheckResult:
+    """
+    检查权限模型是否声明采用了声明式策略配置(RBAC+Policy),
+    而非纯代码硬编码判断。这一条对应今晚新增的 rbac_policy_engine.py
+    设计思路,是对此前"新增职级要新写函数"这一设计局限的正面回应。
+    """
+    permission_arch = plan.get("permission_architecture", {})
+    style = permission_arch.get("style")
+    if style != "declarative_rbac_policy":
+        return CheckResult(
+            check_name="权限模型声明式配置",
+            passed=False,
+            severity=Severity.WARNING,
+            message=f"当前权限模型风格为'{style}',建议采用声明式RBAC+策略引擎,"
+                    f"以降低新增权限维度时的代码改动成本",
+        )
+    return CheckResult(
+        check_name="权限模型声明式配置",
+        passed=True,
+        severity=Severity.WARNING,
+        message="权限模型已采用声明式RBAC+策略引擎设计",
+    )
+
+
+def check_capacity_planning_for_sprint(plan: dict) -> CheckResult:
+    """检查是否为6天开发冲刺预留了公共能力层的集成测试窗口,而不是把全部时间排给上层业务功能"""
+    sprint_plan = plan.get("sprint_plan", {})
+    integration_days = sprint_plan.get("shared_capability_integration_days", 0)
+    total_days = sprint_plan.get("total_days", 0)
+    if total_days == 0:
+        return CheckResult(
+            check_name="冲刺期公共能力集成窗口",
+            passed=False,
+            severity=Severity.WARNING,
+            message="未配置 sprint_plan.total_days,无法校验集成测试窗口占比",
+        )
+    ratio = integration_days / total_days
+    if ratio < 0.15:
+        return CheckResult(
+            check_name="冲刺期公共能力集成窗口",
+            passed=False,
+            severity=Severity.BLOCKER,
+            message=f"公共能力层集成测试窗口占比仅为{ratio:.0%},低于建议下限15%,"
+                    f"存在风险评估中提到的'资源冲突挤占集成测试时间'的隐患",
+        )
+    return CheckResult(
+        check_name="冲刺期公共能力集成窗口",
+        passed=True,
+        severity=Severity.BLOCKER,
+        message=f"公共能力层集成测试窗口占比为{ratio:.0%},已预留合理窗口",
+    )
+
+
+# ------------------------------------------------------------------
+# 加权评分机制
+# ------------------------------------------------------------------
+
+# 每个检查项的权重,BLOCKER级别的检查项权重更高,
+# 一旦某个高权重BLOCKER检查失败,总分会有明显的下降,
+# 这样评分结果能直观反映"方案中最要命的问题有没有解决"
+CHECK_WEIGHTS: dict = {
+    "租户隔离粒度声明": 15,
+    "公共能力复用声明": 15,
+    "跨租户显式授权模式": 15,
+    "审计日志字段完整性": 10,
+    "供应链敏感字段拒绝策略": 10,
+    "HR场景数据不落地同步策略": 8,
+    "事务性操作人工确认策略": 8,
+    "新增租户接入成本清单": 5,
+    "待接入外部系统标记": 2,
+    "非功能性需求量化": 4,
+    "风险责任人追踪": 4,
+    "里程碑与冲刺周期一致性": 2,
+    "权限模型声明式配置": 2,
+}
+
+
+def compute_health_score(report: ChecklistReport) -> dict:
+    """
+    计算方案的加权健康度评分(0-100分)。
+    评分逻辑: 每一项检查通过,获得该项满分权重;不通过,得0分。
+    最终分数 = 实际获得权重之和 / 总权重之和 * 100。
+    这个评分本身不是为了"打分排名",而是给非技术背景的干系人
+    (比如郭建军、林悦)一个直观的、一句话就能说清楚的健康度概览,
+    技术细节仍然要看具体的检查明细。
+    """
+    total_weight = 0
+    earned_weight = 0
+    for result in report.results:
+        weight = CHECK_WEIGHTS.get(result.check_name, 1)
+        total_weight += weight
+        if result.passed:
+            earned_weight += weight
+    score = round(earned_weight / total_weight * 100, 1) if total_weight else 0.0
+    if score >= 90:
+        grade = "A(可提交正式评审)"
+    elif score >= 75:
+        grade = "B(建议修复WARNING项后提交)"
+    elif score >= 60:
+        grade = "C(存在明显风险,不建议直接提交)"
+    else:
+        grade = "D(方案未成型,需要重新梳理)"
+    return {"score": score, "grade": grade, "earned_weight": earned_weight, "total_weight": total_weight}
+
+
+EXTENDED_CHECKS: list = [
+    check_isolation_level_declared,
+    check_shared_capabilities_not_duplicated,
+    check_cross_tenant_no_implicit_access,
+    check_audit_log_completeness,
+    check_sensitive_field_denial_not_masking,
+    check_hr_no_data_sync,
+    check_submission_policy_human_confirm,
+    check_new_tenant_onboarding_cost,
+    check_pending_integrations_flagged,
+    check_non_functional_requirements_quantified,
+    check_risk_items_have_owner,
+    check_milestone_matches_sprint_window,
+    check_permission_model_declarative,
+    check_capacity_planning_for_sprint,
+]
+
+
+def run_extended_checklist(plan: dict) -> ChecklistReport:
+    report = ChecklistReport()
+    for check_fn in EXTENDED_CHECKS:
+        report.add(check_fn(plan))
+    return report
+
+
+# ------------------------------------------------------------------
+# 多格式报告导出
+# ------------------------------------------------------------------
+
+class ReportExporter:
+    """将checklist执行结果导出为不同格式,供不同场景使用"""
+
+    def to_json(self, report: ChecklistReport) -> str:
+        health = compute_health_score(report)
+        data = {
+            "generated_at": datetime.now().isoformat(),
+            "health_score": health,
+            "checks": [
+                {
+                    "check_name": r.check_name,
+                    "passed": r.passed,
+                    "severity": r.severity.value,
+                    "message": r.message,
+                }
+                for r in report.results
+            ],
+            "blocker_count": len(report.blockers),
+            "warning_count": len(report.warnings),
+            "review_ready": report.is_review_ready(),
+        }
+        return json.dumps(data, ensure_ascii=False, indent=2)
+
+    def to_markdown(self, report: ChecklistReport, plan_name: str = "苍穹1.0-寰宇集团技术方案") -> str:
+        health = compute_health_score(report)
+        lines = [
+            f"# {plan_name} 评审自查报告",
+            "",
+            f"- 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"- 健康度评分: **{health['score']} 分**({health['grade']})",
+            f"- 阻塞性问题: {len(report.blockers)} 项 | 提示性问题: {len(report.warnings)} 项",
+            f"- 是否可提交正式评审: {'是' if report.is_review_ready() else '否,需先修复阻塞性问题'}",
+            "",
+            "## 检查项明细",
+            "",
+            "| 检查项 | 结果 | 级别 | 说明 |",
+            "|---|---|---|---|",
+        ]
+        for r in report.results:
+            flag = "PASS" if r.passed else "FAIL"
+            lines.append(f"| {r.check_name} | {flag} | {r.severity.value} | {r.message} |")
+
+        if report.blockers:
+            lines.append("")
+            lines.append("## 阻塞性问题(必须修复后才能提交评审)")
+            lines.append("")
+            for r in report.blockers:
+                lines.append(f"- **{r.check_name}**: {r.message}")
+
+        return "\n".join(lines)
+
+    def save(self, content: str, filepath: str) -> None:
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="苍穹1.0 技术方案评审 Checklist 扩展版自查工具")
+    parser.add_argument("--plan", required=True, help="技术方案YAML配置文件路径")
+    parser.add_argument("--export-json", help="导出JSON格式报告的文件路径")
+    parser.add_argument("--export-markdown", help="导出Markdown格式报告的文件路径")
+    args = parser.parse_args()
+
+    plan = load_plan(args.plan)
+    report = run_extended_checklist(plan)
+    report.print_summary()
+
+    health = compute_health_score(report)
+    print(f"\n方案健康度评分: {health['score']} 分 —— {health['grade']}")
+
+    exporter = ReportExporter()
+    if args.export_json:
+        exporter.save(exporter.to_json(report), args.export_json)
+        print(f"JSON报告已导出至: {args.export_json}")
+    if args.export_markdown:
+        exporter.save(exporter.to_markdown(report), args.export_markdown)
+        print(f"Markdown报告已导出至: {args.export_markdown}")
+
+    if not report.is_review_ready():
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+这份扩展版脚本跑起来之后,`check_permission_model_declarative`这一项恰好命中了WARNING——因为陈铭还没来得及把YAML配置里`permission_architecture.style`这个字段补上,脚本诚实地报告了"当前方案还没有声明采用声明式权限模型"。他把这一项也记进了明天要更新的YAML配置清单里,顺手把健康度评分打印出来看了一眼:87.3分,B级,"建议修复WARNING项后提交"。他把这个数字截图发给老王,附言只写了一句:"今晚先做到这里,明天评审前把WARNING项清完,争取冲到A级再上会。"过了几分钟,老王回了一条消息:"分数是给别人看的参考,你自己心里要清楚每一分扣在哪、为什么扣、值不值得为了凑分数硬改。睡吧,明天两场评审,都不轻松。"
+
 ---
 
 ## 今日复盘
