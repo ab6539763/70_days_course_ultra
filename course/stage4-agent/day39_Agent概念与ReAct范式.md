@@ -1721,9 +1721,1006 @@ Final Answer: XJ-3200A注塑机的标准注射压力上限为180MPa,按当前压
 
 我们组还额外做了一次更极端的压力测试,故意把`max_parse_retries`临时调成0(也就是完全不允许任何格式修复重试),再用同样那个被弱化过约束的Prompt跑一次同样的任务。这一次,第一轮模型就把`Action Input`写成了不规范的格式,由于没有重试机会,`_call_llm_with_retry`直接返回了`(None, raw_output)`,整个`run()`方法随即优雅地终止,`trajectory.succeeded`被标记为`False`,而不是让程序抛出一个未处理的异常直接崩溃退出。这个结果让苏梦很有感触,她说:"原来‘优雅地失败’和‘直接崩溃’之间,差的就是这么一层专门设计的容错代码,而这层代码在Demo阶段几乎测不出差别,只有故意制造边界情况才能看出它真正的价值。"张凡则补充了一个观察:"我们组还试过把`temperature`临时调高到接近1.0再跑同样的任务,发现格式错误出现的频率明显比`temperature=0.2`时更高——这也验证了老王上午说的‘温度调低有助于格式稳定性’不是空口无凭的经验之谈,而是真的能在实际测试里观察到的现象。"这两组额外的压力测试,虽然没有被写进正式的验收记录,但陈铭觉得,它们比"一次性跑通"这件事本身,更能说明团队今天到底把"健壮性"这件事理解到了什么程度。
 
----
+晚饭后,陈铭没有直接回去休息,他想起苏梦下午问的那个问题——"如果模型永远都不判断'够了',会不会就一直循环下去",虽然CQ-106的轮次上限已经兜住了这个风险,但他总觉得今天的实现里,"错误恢复"这件事做得还不够完整:目前无论是LLM调用失败(网络超时、限流),还是工具本身抛出未预料的异常,都只是简单地记一条日志、把错误信息塞进Observation就完事了,并没有真正的"重试退避"机制,也没有考虑"如果某个工具连续多次失败,是不是应该暂时把它排除在候选范围之外,而不是让模型一直反复尝试同一个大概率会失败的操作"这类更接近生产环境真实情况的问题。他决定当晚把这部分补完整,顺便也把苏梦和张凡在下午暴露出的几个典型错误,变成可以长期防护的单元测试用例,不能只靠"当场纠正"就算完事。
 
-## 今日复盘
+### 14. 补充工具:`DateTimeTool` 与 `UnitConverterTool`(扩充工具集合,验证ToolRegistry的可插拔性)
+
+老王在架构评审时强调过,今天的`ToolRegistry`要设计成"可插拔"的,陈铭觉得,验证"可插拔"这件事,最好的方式就是真的再插两个新工具进去看看顺不顺畅——他选了`DateTimeTool`(日期时间计算,呼应作业里提到的"明天""下周三"这类相对日期换算问题)和`UnitConverterTool`(常见单位换算,呼应设备参数场景里"MPa和kgf/cm²之间换算"这类真实可能出现的需求)。
+
+```python
+# ============================================================
+# 文件:day39_react_scratch/tools/datetime_tool.py (新增,晚自习补充)
+# 说明:验证ToolRegistry的可插拔设计——新增一个与搜索、计算完全不同领域的工具,
+#       不需要改动react_agent.py、prompt_builder.py等任何核心调度代码,
+#       只需要实现BaseTool接口并调用registry.register()即可完成接入。
+# ============================================================
+"""
+day39_react_scratch.tools.datetime_tool
+-------------------------------------------
+日期时间计算工具。
+
+设计动机:课后作业第4题讨论到,用户提出的任务里经常包含"明天""下周三"
+这类相对日期表达,如果Agent需要据此调用其他要求标准日期格式的工具
+(比如作业里设计的WeatherTool),就需要先把相对日期换算成绝对日期。
+本工具补上这个能力,同时也用于验证今天的ToolRegistry设计是否真的
+足够通用,可以顺畅地接入与搜索、计算完全不同领域的新工具。
+"""
+
+import logging
+import re
+from datetime import date, datetime, timedelta
+
+from .base import BaseTool
+
+logger = logging.getLogger("agent_lab.tools.datetime")
+
+_WEEKDAY_NAME_TO_INDEX = {
+    "周一": 0, "星期一": 0, "周二": 1, "星期二": 1,
+    "周三": 2, "星期三": 2, "周四": 3, "星期四": 3,
+    "周五": 4, "星期五": 4, "周六": 5, "星期六": 5,
+    "周日": 6, "星期日": 6, "周天": 6,
+}
+
+
+class DateTimeTool(BaseTool):
+    """
+    日期时间计算工具,支持"今天""明天""昨天""N天后""下周X"等相对日期表达的换算,
+    以及两个日期之间相差天数的计算。
+    """
+
+    name = "datetime_calc"
+    description = (
+        "用于日期时间相关的计算,当任务中出现'明天''下周三''3天后'这类相对日期表达,"
+        "或者需要计算两个日期相差多少天时使用。"
+        "输入应为以下两种形式之一:"
+        "1) 相对日期表达式,例如'明天'、'3天后'、'下周三',会返回对应的绝对日期(YYYY-MM-DD);"
+        "2) 两个日期用'到'连接,例如'2026-07-01到2026-07-14',会返回相差的天数。"
+    )
+
+    def __init__(self, reference_date: date | None = None) -> None:
+        # 允许注入一个固定的参考日期,主要是为了让单元测试可以确定性地断言结果,
+        # 生产环境不传参数时默认使用系统当前日期。
+        self._reference_date = reference_date or date.today()
+
+    def run(self, tool_input: str) -> str:
+        text = (tool_input or "").strip()
+        if not text:
+            return "计算失败:输入为空,请提供具体的日期表达式。"
+
+        if "到" in text:
+            return self._calculate_days_between(text)
+        return self._resolve_relative_date(text)
+
+    def _resolve_relative_date(self, text: str) -> str:
+        """解析'明天''3天后''下周三'等相对日期表达,返回绝对日期字符串。"""
+        if text in ("今天", "今日"):
+            target = self._reference_date
+        elif text in ("明天", "明日"):
+            target = self._reference_date + timedelta(days=1)
+        elif text in ("昨天", "昨日"):
+            target = self._reference_date - timedelta(days=1)
+        elif match := re.fullmatch(r"(\d+)\s*天后", text):
+            target = self._reference_date + timedelta(days=int(match.group(1)))
+        elif match := re.fullmatch(r"(\d+)\s*天前", text):
+            target = self._reference_date - timedelta(days=int(match.group(1)))
+        elif text.startswith("下周") and text[2:] in _WEEKDAY_NAME_TO_INDEX:
+            target = self._next_weekday(_WEEKDAY_NAME_TO_INDEX[text[2:]], weeks_ahead=1)
+        elif text.startswith("本周") and text[2:] in _WEEKDAY_NAME_TO_INDEX:
+            target = self._next_weekday(_WEEKDAY_NAME_TO_INDEX[text[2:]], weeks_ahead=0)
+        else:
+            return f"计算失败:无法识别的日期表达式'{text}',请使用'明天''3天后''下周三'等格式。"
+
+        logger.info("日期表达式'%s'解析为绝对日期:%s", text, target.isoformat())
+        return f"日期:{target.isoformat()}"
+
+    def _next_weekday(self, target_weekday: int, weeks_ahead: int) -> date:
+        """计算参考日期之后,下一个(或本周内)指定星期几对应的具体日期。"""
+        current_weekday = self._reference_date.weekday()
+        days_ahead = (target_weekday - current_weekday) % 7
+        if weeks_ahead > 0 and days_ahead == 0:
+            days_ahead = 7
+        return self._reference_date + timedelta(days=days_ahead + 7 * (weeks_ahead - 1 if weeks_ahead > 0 else 0))
+
+    def _calculate_days_between(self, text: str) -> str:
+        """解析'2026-07-01到2026-07-14'这类表达式,计算两个日期相差的天数。"""
+        parts = text.split("到")
+        if len(parts) != 2:
+            return f"计算失败:日期区间表达式'{text}'格式不正确,应为'开始日期到结束日期'。"
+        try:
+            start = datetime.strptime(parts[0].strip(), "%Y-%m-%d").date()
+            end = datetime.strptime(parts[1].strip(), "%Y-%m-%d").date()
+        except ValueError as exc:
+            return f"计算失败:日期格式不正确,请使用YYYY-MM-DD格式。详情:{exc}"
+        delta_days = (end - start).days
+        return f"相差天数:{delta_days}天"
+```
+
+```python
+# ============================================================
+# 文件:day39_react_scratch/tools/unit_converter_tool.py (新增,晚自习补充)
+# ============================================================
+"""
+day39_react_scratch.tools.unit_converter_tool
+--------------------------------------------------
+常见单位换算工具。
+
+设计动机:结合海纳制造集团的业务背景,设备参数手册里经常涉及压力单位
+(MPa、kgf/cm²、psi)、力矩单位、长度单位之间的换算,这是一个与
+CalculatorTool互补但又有明显边界的能力——CalculatorTool只做纯数字运算,
+不理解"单位"这个概念,而这里专门负责"数值+单位A → 数值+单位B"的转换。
+两个工具边界清晰、职责单一,这也是ToolRegistry设计理念的一次具体体现。
+"""
+
+import logging
+import re
+from typing import Dict, Tuple
+
+from .base import BaseTool
+
+logger = logging.getLogger("agent_lab.tools.unit_converter")
+
+
+# 换算系数字典:(源单位, 目标单位) -> 乘数系数。
+# 仅收录今天教学场景可能用到的、制造业设备手册里较常见的几组单位,
+# 不追求覆盖全部物理量,保持今天实现的可控范围。
+_CONVERSION_TABLE: Dict[Tuple[str, str], float] = {
+    ("MPa", "kgf/cm2"): 10.19716,
+    ("kgf/cm2", "MPa"): 1 / 10.19716,
+    ("MPa", "psi"): 145.038,
+    ("psi", "MPa"): 1 / 145.038,
+    ("kN", "kgf"): 101.9716,
+    ("kgf", "kN"): 1 / 101.9716,
+    ("mm", "cm"): 0.1,
+    ("cm", "mm"): 10.0,
+    ("m", "mm"): 1000.0,
+    ("mm", "m"): 0.001,
+}
+
+_INPUT_PATTERN = re.compile(
+    r"^\s*(?P<value>-?\d+(?:\.\d+)?)\s*(?P<from_unit>[A-Za-z/0-9]+)\s*(?:转换?为?|to|→)\s*(?P<to_unit>[A-Za-z/0-9]+)\s*$"
+)
+
+
+class UnsupportedUnitConversionError(ValueError):
+    """请求的单位换算组合不在支持范围内时抛出。"""
+
+
+class UnitConverterTool(BaseTool):
+    """常见单位换算工具,支持压力、力、长度等几类常见工程单位之间的换算。"""
+
+    name = "unit_convert"
+    description = (
+        "用于在不同计量单位之间进行数值换算,当任务中出现需要把某个数值从一种单位"
+        "转换为另一种单位时使用(例如把压力单位从MPa换算成kgf/cm2)。"
+        "输入格式为'数值 源单位 转换为 目标单位',例如:'180 MPa 转换为 kgf/cm2'。"
+        f"当前支持的单位换算组合包括:{sorted(set(u for pair in _CONVERSION_TABLE for u in pair))}。"
+    )
+
+    def run(self, tool_input: str) -> str:
+        text = (tool_input or "").strip()
+        if not text:
+            return "换算失败:输入为空,请提供具体的换算表达式,例如'180 MPa 转换为 kgf/cm2'。"
+
+        match = _INPUT_PATTERN.match(text)
+        if not match:
+            return (
+                f"换算失败:无法解析输入'{text}',请使用'数值 源单位 转换为 目标单位'的格式,"
+                "例如'180 MPa 转换为 kgf/cm2'。"
+            )
+
+        value = float(match.group("value"))
+        from_unit = match.group("from_unit")
+        to_unit = match.group("to_unit")
+
+        try:
+            result = self._convert(value, from_unit, to_unit)
+        except UnsupportedUnitConversionError as exc:
+            logger.warning("单位换算请求被拒绝:%s", exc)
+            return f"换算失败:{exc}"
+
+        logger.info("单位换算成功:%s%s -> %s%s", value, from_unit, result, to_unit)
+        return f"换算结果:{value}{from_unit} = {round(result, 4)}{to_unit}"
+
+    def _convert(self, value: float, from_unit: str, to_unit: str) -> float:
+        if from_unit == to_unit:
+            return value
+        key = (from_unit, to_unit)
+        if key not in _CONVERSION_TABLE:
+            raise UnsupportedUnitConversionError(
+                f"不支持从'{from_unit}'换算到'{to_unit}',当前支持的换算组合为:"
+                f"{list(_CONVERSION_TABLE.keys())}"
+            )
+        return value * _CONVERSION_TABLE[key]
+```
+
+陈铭把这两个新工具接入`run_demo.py`里的`build_default_agent()`函数,只加了两行`registry.register(...)`,没有改动`react_agent.py`、`prompt_builder.py`、`output_parser.py`里的任何一行代码,系统Prompt里的工具描述部分也自动包含了新工具的信息——这个"零改动核心逻辑、新增能力"的过程,让他第一次真切体会到老王说的"工具接口设计规范"到底规范在哪里:只要新工具严格遵循`BaseTool`的接口约定(`name`、`description`、`run()`),`ToolRegistry`和整个循环调度逻辑完全不需要知道这个工具内部具体是怎么实现的。
+
+### 15. 补充:更完整的错误恢复机制(LLM调用重试退避 + 工具级熔断保护)
+
+```python
+# ============================================================
+# 文件:day39_react_scratch/resilience.py (新增,晚自习补充)
+# 说明:补充今天代码里还比较薄弱的"错误恢复"能力——
+#       LLM调用失败时的指数退避重试,以及工具连续失败后的临时熔断保护。
+#       这两个机制都不改动react_agent.py的核心循环结构,而是分别包装在
+#       LLMClient和ToolRegistry的调用路径外层,符合"职责单一、可组合"的设计原则。
+# ============================================================
+"""
+day39_react_scratch.resilience
+----------------------------------
+Agent运行时的错误恢复与韧性保护模块。
+
+背景:今天白天实现的react_agent.py,对LLM调用失败(网络超时、限流)
+只是简单地让异常向上传播、直接终止整个任务;对工具执行失败,只是把
+错误信息塞进Observation,没有考虑"某个工具连续失败多次,是否应该
+暂时避免让模型继续尝试调用它"这类更贴近真实生产环境的场景。
+本模块补充两类错误恢复机制:
+1. RetryWithBackoff —— 对LLM调用做指数退避重试,应对偶发的网络抖动、限流。
+2. ToolCircuitBreaker —— 对单个工具的连续失败次数进行熔断保护,
+   避免Agent在一个持续故障的工具上反复浪费轮次和Token。
+"""
+
+from __future__ import annotations
+
+import logging
+import random
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable, TypeVar
+
+logger = logging.getLogger("agent_lab.resilience")
+
+T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """指数退避重试策略的参数配置。"""
+
+    max_attempts: int = 3
+    base_delay_seconds: float = 0.5
+    max_delay_seconds: float = 8.0
+    # 抖动系数,避免多个并发任务同时重试时"雪崩式"地在同一时刻集中重新请求,
+    # 这是生产环境里应对突发限流场景的一个常见工程习惯。
+    jitter_ratio: float = 0.2
+
+
+class RetryExhaustedError(Exception):
+    """重试次数耗尽后,仍未成功完成调用时抛出,携带最后一次的原始异常。"""
+
+    def __init__(self, attempts: int, last_error: Exception) -> None:
+        super().__init__(f"重试{attempts}次后仍然失败,最后一次错误:{last_error}")
+        self.attempts = attempts
+        self.last_error = last_error
+
+
+def call_with_retry(
+    func: Callable[[], T],
+    policy: RetryPolicy = RetryPolicy(),
+    retryable_exceptions: tuple[type[Exception], ...] = (Exception,),
+) -> T:
+    """
+    以指数退避策略重试执行给定的无参函数,直到成功或达到最大尝试次数。
+
+    :param func: 要执行的无参函数(通常是一个闭包,包裹了真正的LLM调用逻辑)
+    :param policy: 重试策略参数
+    :param retryable_exceptions: 只有这些类型的异常才会触发重试,
+        其它类型的异常会直接向上抛出——这一点很重要,不能把所有异常
+        都无差别地纳入重试范围,比如"参数本身不合法"这类错误重试再多次
+        结果也不会变,应该立刻失败而不是浪费时间反复尝试。
+    :raises RetryExhaustedError: 重试次数耗尽后仍然失败
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, policy.max_attempts + 1):
+        try:
+            return func()
+        except retryable_exceptions as exc:  # noqa: BLE001
+            last_error = exc
+            if attempt >= policy.max_attempts:
+                break
+            delay = min(
+                policy.base_delay_seconds * (2 ** (attempt - 1)),
+                policy.max_delay_seconds,
+            )
+            jitter = delay * policy.jitter_ratio * random.uniform(-1, 1)
+            sleep_seconds = max(0.0, delay + jitter)
+            logger.warning(
+                "调用失败(第%d次尝试),将在%.2f秒后重试:%s",
+                attempt, sleep_seconds, exc,
+            )
+            time.sleep(sleep_seconds)
+
+    assert last_error is not None
+    raise RetryExhaustedError(policy.max_attempts, last_error)
+
+
+class CircuitState(Enum):
+    """熔断器的三种状态,遵循经典熔断器模式(Circuit Breaker Pattern)的设计。"""
+
+    CLOSED = "closed"      # 正常状态,允许调用通过
+    OPEN = "open"          # 熔断状态,直接拒绝调用,不再尝试
+    HALF_OPEN = "half_open"  # 半开状态,允许尝试一次调用,根据结果决定回到CLOSED还是OPEN
+
+
+@dataclass
+class ToolCircuitBreaker:
+    """
+    单个工具的熔断保护器。
+
+    设计动机:如果某个工具(比如未来接入的真实搜索API、真实工单系统接口)
+    因为下游服务故障连续失败,让Agent在同一个任务的多轮循环里反复尝试调用
+    这个注定会失败的工具,不仅浪费Token和时间,还会让模型的推理轨迹充满
+    重复的失败信息,反而可能干扰它对任务全局的判断。熔断器的作用是:
+    连续失败达到阈值后,暂时"跳闸",在一段冷却时间内直接拒绝调用请求,
+    快速失败并明确告知调用方"该工具当前不可用",而不是让每一次调用都
+    白白等待一次完整的失败超时。
+    """
+
+    tool_name: str
+    failure_threshold: int = 3
+    recovery_timeout_seconds: float = 30.0
+
+    _state: CircuitState = field(default=CircuitState.CLOSED, init=False)
+    _consecutive_failures: int = field(default=0, init=False)
+    _opened_at: float | None = field(default=None, init=False)
+
+    def allow_request(self) -> bool:
+        """判断当前是否允许一次新的调用请求通过。"""
+        if self._state == CircuitState.CLOSED:
+            return True
+        if self._state == CircuitState.OPEN:
+            assert self._opened_at is not None
+            if time.time() - self._opened_at >= self.recovery_timeout_seconds:
+                logger.info("工具'%s'熔断冷却时间已到,进入半开状态尝试恢复。", self.tool_name)
+                self._state = CircuitState.HALF_OPEN
+                return True
+            return False
+        # HALF_OPEN状态下允许这一次尝试,结果由record_success/record_failure决定后续状态
+        return True
+
+    def record_success(self) -> None:
+        """记录一次成功的调用,重置失败计数,若原本处于半开状态则恢复为正常关闭状态。"""
+        if self._state == CircuitState.HALF_OPEN:
+            logger.info("工具'%s'半开状态下调用成功,熔断器恢复关闭状态。", self.tool_name)
+        self._state = CircuitState.CLOSED
+        self._consecutive_failures = 0
+        self._opened_at = None
+
+    def record_failure(self) -> None:
+        """记录一次失败的调用,达到阈值后跳闸进入熔断状态。"""
+        self._consecutive_failures += 1
+        if self._state == CircuitState.HALF_OPEN:
+            logger.warning("工具'%s'半开状态下再次失败,重新进入熔断状态。", self.tool_name)
+            self._state = CircuitState.OPEN
+            self._opened_at = time.time()
+            return
+        if self._consecutive_failures >= self.failure_threshold:
+            logger.warning(
+                "工具'%s'连续失败%d次,达到阈值,进入熔断状态,%.0f秒内将直接拒绝调用。",
+                self.tool_name, self._consecutive_failures, self.recovery_timeout_seconds,
+            )
+            self._state = CircuitState.OPEN
+            self._opened_at = time.time()
+
+    @property
+    def state(self) -> CircuitState:
+        return self._state
+
+
+class ResilientToolExecutor:
+    """
+    包装ToolRegistry的工具执行逻辑,为每个工具维护独立的熔断器,
+    并在工具执行前先检查熔断状态,提供比react_agent.py当前实现更完整的
+    错误恢复能力。
+
+    使用方式:在ReactAgent内部,把原本直接调用tool.run(...)的地方,
+    替换为调用本类的execute(...)方法。
+    """
+
+    def __init__(self, failure_threshold: int = 3, recovery_timeout_seconds: float = 30.0) -> None:
+        self._failure_threshold = failure_threshold
+        self._recovery_timeout_seconds = recovery_timeout_seconds
+        self._breakers: dict[str, ToolCircuitBreaker] = {}
+
+    def _get_breaker(self, tool_name: str) -> ToolCircuitBreaker:
+        if tool_name not in self._breakers:
+            self._breakers[tool_name] = ToolCircuitBreaker(
+                tool_name=tool_name,
+                failure_threshold=self._failure_threshold,
+                recovery_timeout_seconds=self._recovery_timeout_seconds,
+            )
+        return self._breakers[tool_name]
+
+    def execute(self, tool_name: str, run_func: Callable[[], str]) -> str:
+        """
+        在熔断保护下执行工具调用。
+
+        :param tool_name: 工具名称,用于区分不同工具各自独立的熔断状态
+        :param run_func: 真正执行工具逻辑的无参函数(通常是lambda: tool.run(action_input))
+        :return: 工具执行结果,或者熔断状态下的明确拒绝提示文本
+        """
+        breaker = self._get_breaker(tool_name)
+        if not breaker.allow_request():
+            return (
+                f"错误:工具'{tool_name}'当前处于熔断保护状态(连续失败次数过多),"
+                "暂时拒绝调用,请尝试使用其他工具或稍后重新规划任务。"
+            )
+        try:
+            result = run_func()
+        except Exception:  # noqa: BLE001 —— 这里必须兜底捕获,否则熔断计数无法正确累加
+            breaker.record_failure()
+            raise
+        breaker.record_success()
+        return result
+
+    def get_breaker_state(self, tool_name: str) -> CircuitState:
+        """查询指定工具当前的熔断状态,主要用于测试断言和可观测性展示。"""
+        return self._get_breaker(tool_name).state
+```
+
+陈铭把`ResilientToolExecutor`接入`react_agent.py`的方式很简单——在`ReactAgent.__init__`里额外持有一个`ResilientToolExecutor`实例,把`_execute_action`方法里`tool.run(action_input)`那一行,替换成`self._resilient_executor.execute(action, lambda: tool.run(action_input))`,其余逻辑完全不变。他把这个改动发到群里,附了一句自己的理解:"熔断器这个东西,今天用mock工具测试的时候完全感觉不到它的价值,因为mock工具几乎不会失败。但一旦以后接的是真实的工单系统、真实的邮件服务,这种下游服务偶尔抖动、偶尔整体宕机的情况会是常态,不是例外——今天先把这层保护加上,不是因为我们现在需要它,是因为我们知道以后一定会需要它。"老王后来在群里回复了一句:"这个思路是对的,但记住,熔断阈值(`failure_threshold`)和冷却时间(`recovery_timeout_seconds`)这两个参数,不能拍脑袋定,以后接真实系统的时候,要结合那个系统本身的SLA(服务等级协议)和真实故障恢复时间来调整,今天的默认值只是一个教学场景下的示意取值。"
+
+### 16. 单元测试套件:`test_day39_react_scratch.py`
+
+老王晚上检查提交时发现陈铭默默补上了这么多内容,专门问了一句:"这些新东西,你自己验证过正确性了吗?"陈铭说测过,但都是手动跑`run_demo.py`肉眼看输出,老王摇头:"手动跑一次不算数,尤其是`DateTimeTool`里那堆日期换算的边界条件、熔断器状态机的转换逻辑,光靠肉眼盯着输出看,很容易漏掉边界情况。今天这些内容,必须补一份自动化测试,不然你自己都不能保证下次改动不会悄悄破坏掉某个边界场景。"陈铭连夜把这份测试补完,覆盖了输出解析器、计算器安全性、日期工具、单位换算工具,以及新增的重试与熔断机制。
+
+```python
+# ============================================================
+# 文件:day39_react_scratch/tests/test_day39_react_scratch.py (新增)
+# 说明:覆盖今天(含晚自习补充部分)全部核心模块的单元测试,
+#       使用mock/fake对象隔离对真实大模型API的依赖,确保测试可以
+#       稳定、快速、无网络依赖地重复执行。
+# ============================================================
+"""Day39手写ReAct Agent核心模块单元测试套件。"""
+
+from __future__ import annotations
+
+from datetime import date
+from unittest.mock import MagicMock
+
+import pytest
+
+from day39_react_scratch.exceptions import OutputParseError
+from day39_react_scratch.output_parser import parse_agent_output
+from day39_react_scratch.resilience import (
+    CircuitState,
+    ResilientToolExecutor,
+    RetryExhaustedError,
+    RetryPolicy,
+    call_with_retry,
+)
+from day39_react_scratch.tools.base import ToolRegistry
+from day39_react_scratch.tools.calculator_tool import CalculatorTool, UnsafeExpressionError, safe_calculate
+from day39_react_scratch.tools.datetime_tool import DateTimeTool
+from day39_react_scratch.tools.search_tool import SearchTool
+from day39_react_scratch.tools.unit_converter_tool import UnitConverterTool
+
+
+class TestOutputParser:
+    """对应苏梦下午暴露出的正则表达式边界问题,补上回归测试。"""
+
+    def test_parses_normal_action_step(self):
+        raw = (
+            "Thought: 我需要先搜索一下这个设备的参数。\n"
+            "Action: search\n"
+            "Action Input: XJ-3200A 标准注射压力"
+        )
+        step = parse_agent_output(raw)
+        assert step.is_final is False
+        assert step.action == "search"
+        assert step.action_input == "XJ-3200A 标准注射压力"
+        assert "搜索" in step.thought
+
+    def test_parses_final_answer_step(self):
+        raw = "Thought: 信息已经足够了。\nFinal Answer: 最终结果是144MPa。"
+        step = parse_agent_output(raw)
+        assert step.is_final is True
+        assert step.final_answer == "最终结果是144MPa。"
+
+    def test_thought_does_not_swallow_action_field(self):
+        """回归测试:苏梦最初的正则表达式因为缺少非贪婪边界,会把Action字段也吞进Thought里。"""
+        raw = "Thought: 这是我的推理。\nAction: calculator\nAction Input: 1 + 1"
+        step = parse_agent_output(raw)
+        assert "Action" not in step.thought
+        assert step.action == "calculator"
+
+    def test_missing_action_input_raises_parse_error(self):
+        """回归测试:张凡最初的实现没有处理模型漏写Action Input这一行的边界情况。"""
+        raw = "Thought: 我打算搜索一下。\nAction: search"
+        with pytest.raises(OutputParseError):
+            parse_agent_output(raw)
+
+    def test_empty_output_raises_parse_error(self):
+        with pytest.raises(OutputParseError):
+            parse_agent_output("")
+
+    def test_action_with_extra_punctuation_is_cleaned(self):
+        """模型偶尔会给Action字段加上多余的引号或标点,解析器应做适度清洗。"""
+        raw = "Thought: 推理内容。\nAction: 'calculator'\nAction Input: 2 * 3"
+        step = parse_agent_output(raw)
+        assert step.action == "calculator"
+
+
+class TestCalculatorToolSafety:
+    """针对CalculatorTool的安全性与正确性测试。"""
+
+    def test_basic_arithmetic(self):
+        assert safe_calculate("180 * 0.8") == pytest.approx(144.0)
+
+    def test_nested_expression_with_parentheses(self):
+        assert safe_calculate("(3200 + 800) / 4") == pytest.approx(1000.0)
+
+    def test_rejects_function_call_expression(self):
+        """默认版本的safe_calculate不支持任何函数调用,应明确拒绝而不是崩溃。"""
+        with pytest.raises(UnsafeExpressionError):
+            safe_calculate("__import__('os')")
+
+    def test_rejects_name_reference(self):
+        """禁止引用任意变量名,避免通过全局变量泄露信息或触发意外行为。"""
+        with pytest.raises(UnsafeExpressionError):
+            safe_calculate("os")
+
+    def test_calculator_tool_run_returns_friendly_message_on_unsafe_input(self):
+        tool = CalculatorTool()
+        result = tool.run("os.system('ls')")
+        assert "计算失败" in result
+
+    def test_calculator_tool_run_handles_division_by_zero(self):
+        tool = CalculatorTool()
+        result = tool.run("1 / 0")
+        assert "计算失败" in result
+
+    def test_calculator_tool_formats_integer_results_without_decimal(self):
+        tool = CalculatorTool()
+        result = tool.run("100 / 4")
+        assert result == "计算结果:25"
+
+
+class TestSearchTool:
+    def test_matches_known_keyword(self):
+        tool = SearchTool()
+        result = tool.run("XJ-3200A注塑机 标准注射压力上限")
+        assert "180MPa" in result
+
+    def test_returns_not_found_message_for_unknown_query(self):
+        tool = SearchTool()
+        result = tool.run("火星上的天气")
+        assert "未找到" in result
+
+    def test_empty_query_returns_error_message(self):
+        tool = SearchTool()
+        result = tool.run("")
+        assert "查询词为空" in result
+
+
+class TestDateTimeTool:
+    """使用固定的参考日期,确保测试结果具有确定性,不受实际运行日期影响。"""
+
+    @pytest.fixture
+    def tool(self):
+        return DateTimeTool(reference_date=date(2026, 7, 14))  # 假设今天是周二
+
+    def test_today(self, tool):
+        assert tool.run("今天") == "日期:2026-07-14"
+
+    def test_tomorrow(self, tool):
+        assert tool.run("明天") == "日期:2026-07-15"
+
+    def test_yesterday(self, tool):
+        assert tool.run("昨天") == "日期:2026-07-13"
+
+    def test_n_days_later(self, tool):
+        assert tool.run("3天后") == "日期:2026-07-17"
+
+    def test_next_specific_weekday(self, tool):
+        """参考日期2026-07-14是周二,下周三应该是2026-07-22。"""
+        result = tool.run("下周三")
+        assert result == "日期:2026-07-22"
+
+    def test_days_between_two_dates(self, tool):
+        result = tool.run("2026-07-01到2026-07-14")
+        assert result == "相差天数:13天"
+
+    def test_unrecognized_expression_returns_error(self, tool):
+        result = tool.run("大后天的大后天")
+        assert "无法识别" in result
+
+    def test_invalid_date_range_format_returns_error(self, tool):
+        result = tool.run("2026/07/01到2026-07-14")
+        assert "计算失败" in result
+
+
+class TestUnitConverterTool:
+    def test_mpa_to_kgf_cm2(self):
+        tool = UnitConverterTool()
+        result = tool.run("180 MPa 转换为 kgf/cm2")
+        assert "换算结果" in result
+        assert "1835.4888" in result
+
+    def test_same_unit_returns_original_value(self):
+        tool = UnitConverterTool()
+        result = tool.run("50 mm 转换为 mm")
+        assert "50.0mm" in result
+
+    def test_unsupported_conversion_pair_returns_error(self):
+        tool = UnitConverterTool()
+        result = tool.run("10 kg 转换为 lb")
+        assert "换算失败" in result
+
+    def test_invalid_input_format_returns_error(self):
+        tool = UnitConverterTool()
+        result = tool.run("这不是一个合法的换算请求")
+        assert "换算失败" in result
+
+
+class TestRetryWithBackoff:
+    """对应新增的resilience.py模块——LLM调用指数退避重试机制。"""
+
+    def test_succeeds_on_first_attempt_without_retry(self):
+        mock_func = MagicMock(return_value="ok")
+        result = call_with_retry(mock_func, policy=RetryPolicy(max_attempts=3, base_delay_seconds=0.01))
+        assert result == "ok"
+        assert mock_func.call_count == 1
+
+    def test_succeeds_after_transient_failures(self):
+        mock_func = MagicMock(side_effect=[ConnectionError("网络抖动"), ConnectionError("网络抖动"), "ok"])
+        result = call_with_retry(
+            mock_func,
+            policy=RetryPolicy(max_attempts=3, base_delay_seconds=0.01, max_delay_seconds=0.02),
+        )
+        assert result == "ok"
+        assert mock_func.call_count == 3
+
+    def test_raises_retry_exhausted_after_max_attempts(self):
+        mock_func = MagicMock(side_effect=ConnectionError("持续故障"))
+        with pytest.raises(RetryExhaustedError) as exc_info:
+            call_with_retry(
+                mock_func,
+                policy=RetryPolicy(max_attempts=3, base_delay_seconds=0.01, max_delay_seconds=0.02),
+            )
+        assert exc_info.value.attempts == 3
+        assert mock_func.call_count == 3
+
+    def test_non_retryable_exception_raises_immediately(self):
+        """只有retryable_exceptions里列出的异常类型才应该触发重试,其它异常应立即失败。"""
+        mock_func = MagicMock(side_effect=ValueError("参数不合法,重试也没用"))
+        with pytest.raises(ValueError):
+            call_with_retry(
+                mock_func,
+                policy=RetryPolicy(max_attempts=3, base_delay_seconds=0.01),
+                retryable_exceptions=(ConnectionError,),
+            )
+        assert mock_func.call_count == 1
+
+
+class TestToolCircuitBreaker:
+    """对应新增的resilience.py模块——工具级熔断保护机制。"""
+
+    def test_allows_requests_while_closed(self):
+        executor = ResilientToolExecutor(failure_threshold=3, recovery_timeout_seconds=10.0)
+        result = executor.execute("search", lambda: "搜索结果")
+        assert result == "搜索结果"
+        assert executor.get_breaker_state("search") == CircuitState.CLOSED
+
+    def test_opens_after_reaching_failure_threshold(self):
+        executor = ResilientToolExecutor(failure_threshold=2, recovery_timeout_seconds=100.0)
+
+        def always_fail():
+            raise RuntimeError("下游服务故障")
+
+        for _ in range(2):
+            with pytest.raises(RuntimeError):
+                executor.execute("search", always_fail)
+
+        assert executor.get_breaker_state("search") == CircuitState.OPEN
+
+        # 熔断打开后,不应再真正尝试调用底层函数,而是直接返回拒绝提示
+        result = executor.execute("search", always_fail)
+        assert "熔断保护状态" in result
+
+    def test_different_tools_have_independent_breakers(self):
+        """熔断器必须按工具名隔离,一个工具的故障不应影响另一个工具的可用性。"""
+        executor = ResilientToolExecutor(failure_threshold=1, recovery_timeout_seconds=100.0)
+
+        with pytest.raises(RuntimeError):
+            executor.execute("search", lambda: (_ for _ in ()).throw(RuntimeError("search故障")))
+
+        assert executor.get_breaker_state("search") == CircuitState.OPEN
+        assert executor.get_breaker_state("calculator") == CircuitState.CLOSED
+
+        result = executor.execute("calculator", lambda: "计算结果:42")
+        assert result == "计算结果:42"
+
+    def test_recovers_after_cooldown_and_successful_half_open_attempt(self, monkeypatch):
+        """熔断冷却时间到达后,应进入半开状态并允许一次尝试,成功则恢复关闭状态。"""
+        executor = ResilientToolExecutor(failure_threshold=1, recovery_timeout_seconds=0.0)
+
+        with pytest.raises(RuntimeError):
+            executor.execute("search", lambda: (_ for _ in ()).throw(RuntimeError("故障")))
+        assert executor.get_breaker_state("search") == CircuitState.OPEN
+
+        # recovery_timeout_seconds设为0,意味着几乎立刻就允许进入半开状态重试
+        result = executor.execute("search", lambda: "恢复正常")
+        assert result == "恢复正常"
+        assert executor.get_breaker_state("search") == CircuitState.CLOSED
+
+
+class TestToolRegistryPluggability:
+    """验证新增的DateTimeTool、UnitConverterTool能够顺畅接入ToolRegistry,
+    且不需要对核心调度逻辑做任何改动——这正是今天架构设计强调的"可插拔"特性。
+    """
+
+    def test_registers_all_four_tools_without_conflict(self):
+        registry = ToolRegistry()
+        registry.register(SearchTool())
+        registry.register(CalculatorTool())
+        registry.register(DateTimeTool())
+        registry.register(UnitConverterTool())
+        assert set(registry.list_tool_names()) == {"search", "calculator", "datetime_calc", "unit_convert"}
+
+    def test_duplicate_registration_raises_value_error(self):
+        registry = ToolRegistry()
+        registry.register(SearchTool())
+        with pytest.raises(ValueError):
+            registry.register(SearchTool())
+
+    def test_prompt_section_includes_all_registered_tools(self):
+        registry = ToolRegistry()
+        registry.register(SearchTool())
+        registry.register(DateTimeTool())
+        prompt_section = registry.build_tools_prompt_section()
+        assert "search" in prompt_section
+        assert "datetime_calc" in prompt_section
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+```
+
+四个人第二天早上分头把这份测试跑了一遍,张凡的机器上`test_next_specific_weekday`这个用例第一次跑失败了——他很快发现是自己本地系统时区设置的问题导致`date.today()`在极端情况下的默认行为和预期有细微差异,但因为测试里已经显式注入了`reference_date=date(2026, 7, 14)`这个固定参考日期,这个问题实际上并不会真正影响测试结果的确定性,他后来定位到,是自己在本地临时改测试代码调试时手滑删掉了`reference_date`参数,恢复之后测试立刻通过。这个小插曲反而让陈铭更确信"用固定参考日期而不是`date.today()`真实当前日期来写测试"这个设计选择是正确的——如果不这样做,类似"下周三"这种测试断言的具体日期,会随着运行测试的那一天而不断变化,团队里任何人在任何一天跑这份测试,得到的结果都应该完全一致,这才是一份可靠的自动化测试应该具备的基本特性。
+
+### 17. 补充:基于FakeLLMClient的端到端集成测试(不依赖真实API,验证完整循环行为)
+
+苏梦看完这份单元测试之后提了一个更进一步的问题:"这些测试都是针对单个模块的,但我们今天最核心的东西是`react_agent.py`里那个完整的循环调度逻辑——Thought/Action/Observation怎么在多轮之间正确传递、重试机制到底有没有真的按预期工作,这些反而完全没有测试覆盖到,因为它们都依赖真实调用大模型API。"陈铭觉得这个问题问得很关键,如果核心循环本身的正确性完全没有自动化测试兜底,那前面这些"零件级"的测试,充其量只能证明"每个零件自己是好的",不能证明"组装起来之后整套系统的行为是对的"。他想到一个办法——写一个`FakeLLMClient`,用预先设定好的一系列"剧本"(每一轮该返回什么文本)来模拟真实大模型的行为,这样就可以完全脱离网络和真实API Key,对整个循环调度逻辑做端到端的确定性测试。
+
+```python
+# ============================================================
+# 文件:day39_react_scratch/tests/fakes.py (新增)
+# 说明:提供FakeLLMClient,用于在不依赖真实大模型API的情况下,
+#       对react_agent.py的核心循环逻辑做端到端集成测试。
+# ============================================================
+"""
+day39_react_scratch.tests.fakes
+------------------------------------
+测试专用的Fake对象集合。
+
+设计动机:react_agent.py的核心循环逻辑(重试机制、历史消息拼接、
+终止条件判断)如果只靠零件级的单元测试(比如只测output_parser、
+只测某个工具),完全无法验证"这些零件组装在一起之后,循环是否真的
+按预期方式运转"。但真实的LLMClient依赖网络请求和API Key,不适合
+在自动化测试流水线里直接使用(慢、不确定、有成本)。FakeLLMClient
+用一个预先设定好的"剧本"列表,按调用顺序依次返回预设的文本内容,
+从而让整个ReactAgent的循环逻辑可以在完全确定、完全可重复的条件下被测试。
+"""
+
+from __future__ import annotations
+
+from typing import Dict, List
+
+
+class FakeLLMClient:
+    """
+    模拟LLMClient的行为,按预设脚本顺序返回文本,不发起任何真实网络请求。
+
+    使用方式:
+        fake_client = FakeLLMClient(script=[
+            "Thought: ...\\nAction: search\\nAction Input: ...",
+            "Thought: ...\\nFinal Answer: ...",
+        ])
+    """
+
+    def __init__(self, script: List[str]) -> None:
+        self._script = list(script)
+        self.call_count = 0
+        self.received_messages_history: List[List[Dict[str, str]]] = []
+
+    def chat(self, messages: List[Dict[str, str]]) -> str:
+        # 记录每一次调用时完整的消息历史,方便测试用例断言"历史消息是否被正确拼接",
+        # 这正是苏梦提出的"零件测试无法覆盖"的那部分核心逻辑。
+        self.received_messages_history.append(list(messages))
+        if self.call_count >= len(self._script):
+            raise AssertionError(
+                f"FakeLLMClient的预设脚本已耗尽(共{len(self._script)}条),"
+                f"但循环逻辑发起了第{self.call_count + 1}次调用,"
+                "这通常说明测试用例的脚本长度与预期的循环轮次不匹配,或者被测代码存在意外的死循环。"
+            )
+        response = self._script[self.call_count]
+        self.call_count += 1
+        return response
+
+
+class FlakyLLMClient:
+    """
+    模拟"前几次调用格式异常,之后恢复正常"的场景,专门用于测试
+    react_agent.py中_call_llm_with_retry方法的格式修复重试路径。
+    """
+
+    def __init__(self, malformed_responses: List[str], final_response: str) -> None:
+        self._malformed_responses = list(malformed_responses)
+        self._final_response = final_response
+        self.call_count = 0
+
+    def chat(self, messages: List[Dict[str, str]]) -> str:
+        self.call_count += 1
+        if self.call_count <= len(self._malformed_responses):
+            return self._malformed_responses[self.call_count - 1]
+        return self._final_response
+```
+
+```python
+# ============================================================
+# 文件:day39_react_scratch/tests/test_react_agent_integration.py (新增)
+# 说明:使用FakeLLMClient对ReactAgent核心循环做端到端集成测试,
+#       覆盖多轮正常执行、格式解析重试、工具不存在、循环轮次超限
+#       这四类关键场景,弥补此前单元测试只能覆盖到"零件"、无法覆盖
+#       "组装后的整体行为"这一测试盲区。
+# ============================================================
+"""ReactAgent核心循环端到端集成测试。"""
+
+from __future__ import annotations
+
+import pytest
+
+from day39_react_scratch.config import AgentRuntimeConfig
+from day39_react_scratch.react_agent import ReactAgent
+from day39_react_scratch.tests.fakes import FakeLLMClient, FlakyLLMClient
+from day39_react_scratch.tools.base import ToolRegistry
+from day39_react_scratch.tools.calculator_tool import CalculatorTool
+from day39_react_scratch.tools.search_tool import SearchTool
+
+
+def _build_registry() -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.register(SearchTool())
+    registry.register(CalculatorTool())
+    return registry
+
+
+class TestReactAgentHappyPath:
+    """验证多轮"搜索→计算→给出最终答案"的正常路径,与课堂笔记里记录的
+    实际执行轨迹片段完全一致,这份测试相当于把陈铭手动观察到的那次成功运行,
+    固化成了一份可以随时重复验证的自动化用例。"""
+
+    def test_search_then_calculate_then_final_answer(self):
+        script = [
+            "Thought: 需要先查询压力上限。\nAction: search\nAction Input: XJ-3200A注塑机 标准注射压力上限",
+            "Thought: 已获得180MPa,需要计算80%数值。\nAction: calculator\nAction Input: 180 * 0.8",
+            "Thought: 信息已足够。\nFinal Answer: 安全阈值为144MPa。",
+        ]
+        fake_client = FakeLLMClient(script=script)
+        agent = ReactAgent(llm_client=fake_client, tool_registry=_build_registry())
+
+        trajectory = agent.run("帮我查一下XJ-3200A的标准注射压力上限,再算一下80%的安全阈值")
+
+        assert trajectory.succeeded is True
+        assert trajectory.final_answer == "安全阈值为144MPa。"
+        assert len(trajectory.steps) == 3
+        assert trajectory.steps[0].action == "search"
+        assert trajectory.steps[1].action == "calculator"
+        assert trajectory.steps[1].observation == "计算结果:144"
+        assert trajectory.steps[2].is_final is True
+        assert fake_client.call_count == 3
+
+    def test_observation_is_correctly_appended_to_message_history(self):
+        """验证工具真实执行结果(Observation)被正确追加进下一轮调用的消息历史,
+        这是ReAct循环"行动结果反哺推理"这一核心设计的直接验证。"""
+        script = [
+            "Thought: 需要计算一下。\nAction: calculator\nAction Input: 2 + 2",
+            "Thought: 已经得到结果。\nFinal Answer: 结果是4。",
+        ]
+        fake_client = FakeLLMClient(script=script)
+        agent = ReactAgent(llm_client=fake_client, tool_registry=_build_registry())
+
+        agent.run("帮我算一下2加2")
+
+        second_call_messages = fake_client.received_messages_history[1]
+        observation_messages = [m for m in second_call_messages if "计算结果:4" in m["content"]]
+        assert len(observation_messages) == 1, "第二轮调用的消息历史中应包含第一轮工具执行的真实Observation"
+
+
+class TestReactAgentParseRetryPath:
+    """验证输出格式解析失败后的重试修复机制,对应需求文档CQ-104。"""
+
+    def test_recovers_after_one_malformed_response(self):
+        flaky_client = FlakyLLMClient(
+            malformed_responses=["Thought: 我打算搜索。\nAction: search"],  # 缺失Action Input,格式不合法
+            final_response="Thought: 直接给出结果。\nFinal Answer: 已修复格式后的最终答案。",
+        )
+        agent = ReactAgent(llm_client=flaky_client, tool_registry=_build_registry())
+
+        trajectory = agent.run("任意任务")
+
+        assert trajectory.succeeded is True
+        assert trajectory.final_answer == "已修复格式后的最终答案。"
+        # 应该恰好有一条parse_error记录,对应那一次格式不合法的重试
+        parse_error_steps = [s for s in trajectory.steps if s.parse_error]
+        assert len(parse_error_steps) == 1
+
+    def test_terminates_gracefully_when_retries_exhausted(self):
+        """当格式修复重试次数耗尽后,应优雅终止而不是抛出未处理的异常。"""
+        runtime_config = AgentRuntimeConfig(max_iterations=8, max_parse_retries=1, max_observation_length=800)
+        flaky_client = FlakyLLMClient(
+            malformed_responses=["格式完全不对的输出", "还是格式不对", "依然不对"],
+            final_response="Thought: 不会走到这里。\nFinal Answer: 不应该被使用。",
+        )
+        agent = ReactAgent(
+            llm_client=flaky_client,
+            tool_registry=_build_registry(),
+            runtime_config=runtime_config,
+        )
+
+        trajectory = agent.run("一个会持续触发格式错误的任务")
+
+        assert trajectory.succeeded is False
+        # 重试耗尽后,run()应该直接返回,而不是继续消耗后续的循环轮次
+        assert flaky_client.call_count == runtime_config.max_parse_retries + 1
+
+
+class TestReactAgentToolNotFoundPath:
+    """验证模型生成了未注册工具名称时的容错处理,对应流程图中"工具是否已注册"分支。"""
+
+    def test_unregistered_tool_returns_error_observation_and_continues(self):
+        script = [
+            "Thought: 我打算调用一个并未注册的工具。\nAction: nonexistent_tool\nAction Input: 随便的参数",
+            "Thought: 上一步工具不存在,我改用计算器直接算。\nAction: calculator\nAction Input: 1 + 1",
+            "Thought: 已经得到结果。\nFinal Answer: 结果是2。",
+        ]
+        fake_client = FakeLLMClient(script=script)
+        agent = ReactAgent(llm_client=fake_client, tool_registry=_build_registry())
+
+        trajectory = agent.run("先尝试一个不存在的工具,再改用计算器")
+
+        assert trajectory.succeeded is True
+        assert "未注册" in trajectory.steps[0].observation or "错误" in trajectory.steps[0].observation
+        assert trajectory.steps[1].action == "calculator"
+
+
+class TestReactAgentMaxIterationsPath:
+    """验证循环轮次超限保护机制,对应需求文档CQ-106。"""
+
+    def test_force_stops_when_model_never_gives_final_answer(self):
+        """模拟模型陷入'一直觉得需要再搜索一次'的极端场景,验证轮次上限能够可靠地强制终止循环。"""
+        runtime_config = AgentRuntimeConfig(max_iterations=3, max_parse_retries=2, max_observation_length=800)
+        # 脚本永远只返回"继续搜索"的Action,不会输出Final Answer,
+        # 用于验证即使模型"不配合"结束任务,系统也能可靠地兜底终止。
+        never_ending_script = [
+            "Thought: 我觉得还需要再搜索一次。\nAction: search\nAction Input: 继续搜索"
+            for _ in range(10)
+        ]
+        fake_client = FakeLLMClient(script=never_ending_script)
+        agent = ReactAgent(
+            llm_client=fake_client,
+            tool_registry=_build_registry(),
+            runtime_config=runtime_config,
+        )
+
+        trajectory = agent.run("一个模型永远不会主动结束的任务")
+
+        assert trajectory.succeeded is False
+        assert "未能在限定的" in trajectory.final_answer
+        assert len(trajectory.steps) == runtime_config.max_iterations
+        # 调用次数应恰好等于最大轮次,不多不少,证明轮次上限被精确地遵守
+        assert fake_client.call_count == runtime_config.max_iterations
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+```
+
+老王第二天看到这份集成测试时,专门在晨会上多讲了两句:"你们注意`test_force_stops_when_model_never_gives_final_answer`这个用例——它构造了一个'模型永远不配合结束任务'的极端场景,这种场景在真实调用大模型时几乎不可能被人为、可控地复现出来(你没法保证真实的DeepSeek或者通义千问一定会在第几轮说'我还要继续搜索'),但用FakeLLMClient,我们可以精确、稳定、每次都一模一样地复现这个边界场景,这正是Mock/Fake对象在测试里最大的价值——它让那些在真实系统里极小概率发生、难以复现的边界情况,变成了可以随时、稳定触发的确定性测试。以后你们无论测什么系统,遇到‘这个场景真实环境很难复现’的问题时,先想一想,是不是可以通过写一个Fake对象来控制变量,而不是干等着这个场景真的发生一次才能验证代码对不对。"
+
+苏梦补充了一句自己的感受,也被陈铭记进了笔记本:"今天这份集成测试补完之后,我才真正理解‘测试覆盖率’不是‘测试用例数量多就叫覆盖率高’,而是要覆盖‘真正关键的行为路径’——今天四类场景(正常路径、重试修复、工具不存在、轮次超限),恰好对应的正是需求文档里CQ-104、CQ-106这几条硬性验收标准,以及流程图里画出来的那几个关键分支,这种‘测试用例和需求条款、流程图分支一一对应’的思路,比‘随便多写几十个测试凑数量’要靠谱得多。"
 
 晚上七点多,大家陆续收拾东西准备走的时候,老王把我和苏梦、张凡几个培训生留了一会儿,没有讲新内容,只是问了一句:"今天这一天,你们觉得最难的是哪个环节?"
 
