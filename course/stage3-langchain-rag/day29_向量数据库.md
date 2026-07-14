@@ -1765,6 +1765,1312 @@ if __name__ == "__main__":
 
 老王看完这个脚本的执行日志设计,补了一句提醒:"这个脚本你注意一下执行顺序——先删旧的,再加新的,中间这段时间,知识库对于'旧内容'和'新内容'都是空的,如果这段时间恰好有用户在提问,检索会短暂地什么都找不到。真正的生产环境,这一步应该设计成近似'先加新的、验证通过、再删旧的'这种更安全的顺序,或者用一个额外的版本标记字段做软切换,而不是硬删硬加,今天先把最直观的逻辑写清楚,生产级的零停机更新方案,是你以后要持续打磨的方向,不是今天一次性能做到位的。"
 
+### 文件13补充:`app/services/vectorstore/chroma_store.py` 追加辅助方法 —— `get_all_ids` / `get_by_ids`
+
+写增量更新脚本的过程中,陈铭发现自己经常需要"拿到Collection里全部文档的ID列表"或者"按一批ID查出原始文档内容和元数据"这两个操作,`ChromaVectorStore`目前的接口里都没有直接提供,只能每次都临时拼一段调用底层`self._collection`的代码。他把这两个操作也提炼成了正式的公共方法,补充进`ChromaVectorStore`类里,后面写健康检查工具时会直接用到。
+
+```python
+# 在 app/services/vectorstore/chroma_store.py 的 ChromaVectorStore 类中,
+# 补充两个只读的辅助方法,分别用于"获取全部ID"和"按ID批量获取原始数据"。
+# 这两个方法今天主要给下面的向量数据库健康检查工具使用,也可以被将来
+# 任何需要"扫描全量知识库数据"的场景复用,不需要每次都重新拼接底层调用代码。
+
+class ChromaVectorStore:
+    # ... 省略前面已定义的方法 ...
+
+    def get_all_ids(self) -> List[str]:
+        """获取当前Collection中的全部ID(用于健康检查/统计场景,数据量很大时请谨慎使用)。"""
+        result = self._collection.get(include=[])
+        return result.get("ids", [])
+
+    def get_by_ids(self, ids: List[str]) -> Dict[str, Any]:
+        """按ID批量获取原始数据(文档内容、元数据),用于健康检查等只读场景。"""
+        if not ids:
+            return {"ids": [], "documents": [], "metadatas": []}
+        return self._collection.get(ids=ids, include=["documents", "metadatas"])
+```
+
+### 文件14:选做拓展 · `app/services/vectorstore/metadata_filters.py` —— 更完整的元数据过滤场景支持
+
+技术预研报告提交之后,林悦在验收会上提出了三个新的过滤场景:客服只检索"当前客户能看到的"文档、运维人员想一次性检索"第3章到第5章"范围内的内容、质检场景下只想看最近一段时间内更新过的文档片段。陈铭发现如果继续手写`where`字典,嵌套结构很容易出错,于是做了一层构建器封装。
+
+```python
+"""
+app/services/vectorstore/metadata_filters.py
+===============================
+元数据过滤条件构建工具 · 更完整的过滤场景支持
+
+背景说明:
+    今天下午的技术预研报告里,陈铭只演示了最简单的一种元数据过滤——
+    `{"chapter": "第3章"}`这种"单字段精确匹配"。但海纳集团的实际知识库场景,
+    远比这个复杂:林悦在验收会上提出了三个新场景:
+
+    1. "客服在回答问题时,只想检索'当前客户能看到的'文档"——需要按customer
+       字段做精确匹配,同时可能还要求"排除掉已下线的旧版本文档";
+    2. "运维人员想一次性检索'第3章到第5章'范围内的内容,不想挨个试"——
+       需要支持"字段值属于某个集合"(IN)这种过滤;
+    3. "质检场景下,只想看最近30天内更新过的文档片段"——需要支持数值/时间的
+       比较类过滤(大于、小于等于等)。
+
+    Chroma的`where`参数本身已经支持`$and`/`$or`/`$in`/`$gte`/`$lte`这类
+    MongoDB风格的操作符,但如果业务代码里到处手写这些嵌套字典,一是容易写错
+    (比如operator拼错、字典结构嵌套层级搞混),二是没有任何校验,一旦
+    传入的字段名或操作符不被支持,只有在实际调用Chroma时才会报错,排查成本高。
+
+    这份文件提供一套"构建器风格"的Python API,把常见的过滤场景封装成
+    有类型提示、有输入校验的方法调用,最终统一转换成Chroma认识的`where`字典结构。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional, Union
+
+
+class FilterOperator(str, Enum):
+    """Chroma支持的元数据过滤操作符,这里只收录教学与实际业务场景中常用的一部分。"""
+
+    EQ = "$eq"
+    NE = "$ne"
+    GT = "$gt"
+    GTE = "$gte"
+    LT = "$lt"
+    LTE = "$lte"
+    IN = "$in"
+    NIN = "$nin"
+
+
+class FilterConjunction(str, Enum):
+    """多个过滤条件之间的逻辑关系。"""
+
+    AND = "$and"
+    OR = "$or"
+
+
+class MetadataFilterError(Exception):
+    """构建元数据过滤条件时出现的输入校验错误。"""
+
+
+@dataclass
+class FieldCondition:
+    """单个字段上的一条过滤条件,例如 chapter 等于 "第3章"。"""
+
+    field: str
+    operator: FilterOperator
+    value: Any
+
+    def to_chroma_clause(self) -> Dict[str, Any]:
+        """转换成Chroma的where子句片段,例如 {"chapter": {"$eq": "第3章"}}。"""
+        if not self.field or not isinstance(self.field, str):
+            raise MetadataFilterError(f"字段名必须是非空字符串,实际收到:{self.field!r}")
+
+        if self.operator in (FilterOperator.IN, FilterOperator.NIN):
+            if not isinstance(self.value, (list, tuple, set)):
+                raise MetadataFilterError(
+                    f"操作符{self.operator.value}要求value是一个列表/元组/集合,实际收到:{type(self.value)}"
+                )
+            value = list(self.value)
+        else:
+            if isinstance(self.value, (list, tuple, set, dict)):
+                raise MetadataFilterError(
+                    f"操作符{self.operator.value}要求value是标量值(字符串/数字/布尔值),"
+                    f"实际收到复合类型:{type(self.value)}"
+                )
+            value = self.value
+
+        return {self.field: {self.operator.value: value}}
+
+
+class MetadataFilterBuilder:
+    """
+    链式构建器,把多个字段条件组合成Chroma认识的`where`字典。
+
+    使用示例:
+
+        where = (
+            MetadataFilterBuilder()
+            .equals("customer", "hainatuo_manufacturing")
+            .not_equals("status", "archived")
+            .in_list("chapter", ["第3章", "第4章", "第5章"])
+            .build()
+        )
+
+    构建结果默认按AND关系组合所有条件(必须同时满足),
+    如果需要OR关系,使用`with_conjunction(FilterConjunction.OR)`显式指定。
+    """
+
+    def __init__(self) -> None:
+        self._conditions: List[FieldCondition] = []
+        self._conjunction: FilterConjunction = FilterConjunction.AND
+        self._nested_groups: List["MetadataFilterBuilder"] = []
+
+    def equals(self, field: str, value: Any) -> "MetadataFilterBuilder":
+        self._conditions.append(FieldCondition(field=field, operator=FilterOperator.EQ, value=value))
+        return self
+
+    def not_equals(self, field: str, value: Any) -> "MetadataFilterBuilder":
+        self._conditions.append(FieldCondition(field=field, operator=FilterOperator.NE, value=value))
+        return self
+
+    def greater_than(self, field: str, value: Union[int, float]) -> "MetadataFilterBuilder":
+        self._conditions.append(FieldCondition(field=field, operator=FilterOperator.GT, value=value))
+        return self
+
+    def greater_or_equal(self, field: str, value: Union[int, float]) -> "MetadataFilterBuilder":
+        self._conditions.append(FieldCondition(field=field, operator=FilterOperator.GTE, value=value))
+        return self
+
+    def less_than(self, field: str, value: Union[int, float]) -> "MetadataFilterBuilder":
+        self._conditions.append(FieldCondition(field=field, operator=FilterOperator.LT, value=value))
+        return self
+
+    def less_or_equal(self, field: str, value: Union[int, float]) -> "MetadataFilterBuilder":
+        self._conditions.append(FieldCondition(field=field, operator=FilterOperator.LTE, value=value))
+        return self
+
+    def in_list(self, field: str, values: List[Any]) -> "MetadataFilterBuilder":
+        self._conditions.append(FieldCondition(field=field, operator=FilterOperator.IN, value=values))
+        return self
+
+    def not_in_list(self, field: str, values: List[Any]) -> "MetadataFilterBuilder":
+        self._conditions.append(FieldCondition(field=field, operator=FilterOperator.NIN, value=values))
+        return self
+
+    def with_conjunction(self, conjunction: FilterConjunction) -> "MetadataFilterBuilder":
+        """指定当前这一层多个条件之间用AND还是OR组合,默认是AND。"""
+        self._conjunction = conjunction
+        return self
+
+    def add_nested_group(self, group: "MetadataFilterBuilder") -> "MetadataFilterBuilder":
+        """
+        添加一个嵌套的子条件组,用于构造更复杂的逻辑,比如:
+        "(customer等于A 且 chapter在[第3章,第4章]) 或 (customer等于B 且 status不等于archived)"
+        这种"组与组之间是OR,组内部是AND"的场景。
+        """
+        self._nested_groups.append(group)
+        return self
+
+    def is_empty(self) -> bool:
+        return not self._conditions and not self._nested_groups
+
+    def build(self) -> Optional[Dict[str, Any]]:
+        """
+        产出最终可以直接传给`ChromaVectorStore.similarity_search(where=...)`的字典。
+
+        如果既没有添加任何字段条件,也没有嵌套子组,返回None——
+        对应"不做任何元数据过滤"的语义,调用方不需要额外判断"是否为空字典"
+        这种容易出错的边界情况。
+        """
+        clauses: List[Dict[str, Any]] = [cond.to_chroma_clause() for cond in self._conditions]
+        clauses.extend(group.build() for group in self._nested_groups if not group.is_empty())
+        clauses = [c for c in clauses if c is not None]
+
+        if not clauses:
+            return None
+        if len(clauses) == 1:
+            return clauses[0]
+        return {self._conjunction.value: clauses}
+
+
+# ============================================================
+# 二、常见过滤场景的便捷封装:直接对应林悦提出的三个真实场景
+# ============================================================
+
+
+def build_customer_visible_filter(customer: str, exclude_archived: bool = True) -> Dict[str, Any]:
+    """
+    场景一:客服只检索"当前客户能看到的"文档,同时排除已下线的旧版本。
+
+    :param customer: 客户标识,例如"hainatuo_manufacturing"
+    :param exclude_archived: 是否排除status字段为"archived"的文档
+    """
+    builder = MetadataFilterBuilder().equals("customer", customer)
+    if exclude_archived:
+        builder.not_equals("status", "archived")
+    result = builder.build()
+    assert result is not None  # 至少有一条customer条件,不会构建出None
+    return result
+
+
+def build_chapter_range_filter(chapters: List[str]) -> Dict[str, Any]:
+    """场景二:一次性检索"第3章到第5章"这类章节集合范围内的内容。"""
+    if not chapters:
+        raise MetadataFilterError("章节列表不能为空")
+    result = MetadataFilterBuilder().in_list("chapter", chapters).build()
+    assert result is not None
+    return result
+
+
+def build_recently_updated_filter(min_updated_at_timestamp: Union[int, float]) -> Dict[str, Any]:
+    """
+    场景三:只检索最近一段时间内更新过的文档片段。
+
+    注意:这里假设元数据中存在一个数值型的`updated_at_ts`字段
+    (通常是入库时写入的Unix时间戳),Chroma的元数据过滤支持数值比较,
+    但不支持直接对字符串格式的日期做范围比较,构建知识库时需要注意
+    把时间信息额外存一份数值时间戳,而不是只存人类可读的日期字符串。
+    """
+    result = MetadataFilterBuilder().greater_or_equal("updated_at_ts", min_updated_at_timestamp).build()
+    assert result is not None
+    return result
+
+
+def build_customer_and_chapter_or_group_filter(
+    primary_customer: str,
+    primary_chapters: List[str],
+    fallback_customer: str,
+    fallback_excluded_status: str = "archived",
+) -> Dict[str, Any]:
+    """
+    组合场景:"(customer=A 且 chapter在[...]) 或 (customer=B 且 status!=archived)"。
+
+    这是给"某个知识库同时服务多个客户,但检索策略略有差异"这类场景准备的示例,
+    实际项目中很少会写得这么复杂,这里主要是为了演示嵌套分组的构建方式。
+    """
+    group_a = MetadataFilterBuilder().equals("customer", primary_customer).in_list("chapter", primary_chapters)
+    group_b = MetadataFilterBuilder().equals("customer", fallback_customer).not_equals(
+        "status", fallback_excluded_status
+    )
+
+    result = (
+        MetadataFilterBuilder()
+        .with_conjunction(FilterConjunction.OR)
+        .add_nested_group(group_a)
+        .add_nested_group(group_b)
+        .build()
+    )
+    assert result is not None
+    return result
+
+
+# ============================================================
+# 三、过滤条件的可读性辅助:把构建出的where字典,渲染成一句人类可读的描述
+# ============================================================
+
+
+_OPERATOR_DISPLAY_NAME: Dict[str, str] = {
+    "$eq": "等于",
+    "$ne": "不等于",
+    "$gt": "大于",
+    "$gte": "大于等于",
+    "$lt": "小于",
+    "$lte": "小于等于",
+    "$in": "属于集合",
+    "$nin": "不属于集合",
+}
+
+
+def describe_filter(where: Optional[Dict[str, Any]]) -> str:
+    """
+    把一个Chroma的where字典,渲染成一句便于在日志/调试面板里直接展示的中文描述,
+    方便运营人员在没有阅读代码的情况下,也能看懂"这次检索到底加了什么过滤条件"。
+    """
+    if not where:
+        return "(未使用任何元数据过滤条件)"
+
+    if "$and" in where or "$or" in where:
+        conjunction_key = "$and" if "$and" in where else "$or"
+        conjunction_text = "且" if conjunction_key == "$and" else "或"
+        sub_descriptions = [describe_filter(clause) for clause in where[conjunction_key]]
+        return f"({(' ' + conjunction_text + ' ').join(sub_descriptions)})"
+
+    parts = []
+    for field_name, condition in where.items():
+        if isinstance(condition, dict):
+            for op, value in condition.items():
+                op_text = _OPERATOR_DISPLAY_NAME.get(op, op)
+                parts.append(f"{field_name} {op_text} {value}")
+        else:
+            parts.append(f"{field_name} 等于 {condition}")
+    return " 且 ".join(parts)
+```
+
+配套测试文件`backend/tests/test_metadata_filters.py`分成三部分:纯逻辑单元测试(只验证构建出的字典结构)、针对林悦提出的三个真实场景的便捷封装函数测试、以及直接对着真实Chroma实例发起查询的集成测试(验证构建出的`where`字典确实能被Chroma正确解析并生效,而不只是"字典结构长得对"):
+
+```python
+"""
+backend/tests/test_metadata_filters.py
+===============================
+元数据过滤条件构建工具的测试套件,分三部分:
+1. 纯逻辑单元测试,只验证构建出的字典结构是否正确;
+2. 针对林悦提出的三个真实场景的便捷封装函数测试;
+3. 集成测试,验证构建出的where字典确实能被真实的Chroma实例正确解析并生效。
+"""
+
+import shutil
+import tempfile
+
+import pytest
+
+from app.services.vectorstore.chroma_store import ChromaVectorStore
+from app.services.vectorstore.metadata_filters import (
+    FilterConjunction,
+    MetadataFilterBuilder,
+    MetadataFilterError,
+    build_chapter_range_filter,
+    build_customer_and_chapter_or_group_filter,
+    build_customer_visible_filter,
+    build_recently_updated_filter,
+    describe_filter,
+)
+
+
+class TestMetadataFilterBuilderUnit:
+    """纯逻辑单元测试:只验证构建出的字典结构,不涉及真实的Chroma查询。"""
+
+    def test_single_equals_condition(self):
+        result = MetadataFilterBuilder().equals("customer", "A").build()
+        assert result == {"customer": {"$eq": "A"}}
+
+    def test_multiple_conditions_default_and(self):
+        result = MetadataFilterBuilder().equals("customer", "A").not_equals("status", "archived").build()
+        assert result == {"$and": [{"customer": {"$eq": "A"}}, {"status": {"$ne": "archived"}}]}
+
+    def test_or_conjunction(self):
+        result = (
+            MetadataFilterBuilder()
+            .with_conjunction(FilterConjunction.OR)
+            .equals("chapter", "第3章")
+            .equals("chapter", "第4章")
+            .build()
+        )
+        assert result == {"$or": [{"chapter": {"$eq": "第3章"}}, {"chapter": {"$eq": "第4章"}}]}
+
+    def test_in_list_condition(self):
+        result = MetadataFilterBuilder().in_list("chapter", ["第3章", "第4章"]).build()
+        assert result == {"chapter": {"$in": ["第3章", "第4章"]}}
+
+    def test_empty_builder_returns_none(self):
+        assert MetadataFilterBuilder().build() is None
+
+    def test_in_list_with_non_list_raises_error(self):
+        with pytest.raises(MetadataFilterError):
+            MetadataFilterBuilder().in_list("chapter", "第3章").build()  # 传入字符串而不是列表
+
+    def test_equals_with_list_value_raises_error(self):
+        with pytest.raises(MetadataFilterError):
+            MetadataFilterBuilder().equals("chapter", ["第3章"]).build()
+
+    def test_empty_field_name_raises_error(self):
+        with pytest.raises(MetadataFilterError):
+            MetadataFilterBuilder().equals("", "value").build()
+
+    def test_nested_group_or_of_ands(self):
+        group_a = MetadataFilterBuilder().equals("customer", "A").equals("chapter", "第3章")
+        group_b = MetadataFilterBuilder().equals("customer", "B")
+        result = (
+            MetadataFilterBuilder()
+            .with_conjunction(FilterConjunction.OR)
+            .add_nested_group(group_a)
+            .add_nested_group(group_b)
+            .build()
+        )
+        assert "$or" in result
+        assert len(result["$or"]) == 2
+        assert "$and" in result["$or"][0]
+
+    def test_empty_nested_group_is_ignored(self):
+        empty_group = MetadataFilterBuilder()
+        result = MetadataFilterBuilder().equals("customer", "A").add_nested_group(empty_group).build()
+        assert result == {"customer": {"$eq": "A"}}
+
+
+class TestPresetFilterScenarios:
+    """针对林悦提出的三个真实场景的便捷封装函数进行测试。"""
+
+    def test_customer_visible_filter_excludes_archived_by_default(self):
+        result = build_customer_visible_filter("hainatuo_manufacturing")
+        assert result == {
+            "$and": [
+                {"customer": {"$eq": "hainatuo_manufacturing"}},
+                {"status": {"$ne": "archived"}},
+            ]
+        }
+
+    def test_customer_visible_filter_without_excluding_archived(self):
+        result = build_customer_visible_filter("hainatuo_manufacturing", exclude_archived=False)
+        assert result == {"customer": {"$eq": "hainatuo_manufacturing"}}
+
+    def test_chapter_range_filter(self):
+        result = build_chapter_range_filter(["第3章", "第4章", "第5章"])
+        assert result == {"chapter": {"$in": ["第3章", "第4章", "第5章"]}}
+
+    def test_chapter_range_filter_rejects_empty_list(self):
+        with pytest.raises(MetadataFilterError):
+            build_chapter_range_filter([])
+
+    def test_recently_updated_filter(self):
+        result = build_recently_updated_filter(1700000000)
+        assert result == {"updated_at_ts": {"$gte": 1700000000}}
+
+    def test_combined_or_group_filter(self):
+        result = build_customer_and_chapter_or_group_filter(
+            primary_customer="A", primary_chapters=["第3章"], fallback_customer="B"
+        )
+        assert "$or" in result
+        assert len(result["$or"]) == 2
+
+
+class TestDescribeFilterReadability:
+    """验证过滤条件的可读化描述,主要用于日志和调试面板展示。"""
+
+    def test_describe_none_filter(self):
+        assert describe_filter(None) == "(未使用任何元数据过滤条件)"
+
+    def test_describe_single_equals(self):
+        where = {"customer": {"$eq": "A"}}
+        assert "等于" in describe_filter(where)
+        assert "customer" in describe_filter(where)
+
+    def test_describe_and_group(self):
+        where = {"$and": [{"customer": {"$eq": "A"}}, {"status": {"$ne": "archived"}}]}
+        text = describe_filter(where)
+        assert "且" in text
+        assert "不等于" in text
+
+    def test_describe_in_operator(self):
+        where = {"chapter": {"$in": ["第3章", "第4章"]}}
+        text = describe_filter(where)
+        assert "属于集合" in text
+
+
+@pytest.fixture()
+def temp_chroma_store():
+    temp_dir = tempfile.mkdtemp(prefix="chroma_filter_test_")
+
+    import app.services.vectorstore.config as config_module
+    original_dir = config_module.vector_store_settings.chroma.persist_directory
+    config_module.vector_store_settings.chroma.persist_directory = temp_dir
+
+    store = ChromaVectorStore(collection_name="filter_test_collection", use_fake_embedding=True)
+    yield store
+
+    config_module.vector_store_settings.chroma.persist_directory = original_dir
+    shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+class TestMetadataFilterAgainstRealChroma:
+    """集成测试:验证构建出的where字典,确实能被Chroma正确解析并生效。"""
+
+    def test_customer_visible_filter_narrows_results(self, temp_chroma_store):
+        store = temp_chroma_store
+        store.add_documents(
+            ids=["d1", "d2", "d3"],
+            texts=["设备保养内容A", "设备保养内容B", "设备保养内容C"],
+            metadatas=[
+                {"customer": "hainatuo_manufacturing", "status": "active"},
+                {"customer": "hainatuo_manufacturing", "status": "archived"},
+                {"customer": "other_customer", "status": "active"},
+            ],
+        )
+
+        where = build_customer_visible_filter("hainatuo_manufacturing")
+        results = store.similarity_search(query="设备保养", top_k=10, where=where)
+
+        assert len(results) == 1
+        assert results[0].content == "设备保养内容A"
+
+    def test_chapter_range_filter_against_real_chroma(self, temp_chroma_store):
+        store = temp_chroma_store
+        store.add_documents(
+            ids=["c1", "c2", "c3", "c4"],
+            texts=["第3章内容", "第4章内容", "第5章内容", "第6章内容"],
+            metadatas=[
+                {"chapter": "第3章"},
+                {"chapter": "第4章"},
+                {"chapter": "第5章"},
+                {"chapter": "第6章"},
+            ],
+        )
+
+        where = build_chapter_range_filter(["第3章", "第4章", "第5章"])
+        results = store.similarity_search(query="内容", top_k=10, where=where)
+
+        assert len(results) == 3
+        chapters = {item.metadata["chapter"] for item in results}
+        assert chapters == {"第3章", "第4章", "第5章"}
+
+    def test_recently_updated_filter_against_real_chroma(self, temp_chroma_store):
+        store = temp_chroma_store
+        store.add_documents(
+            ids=["u1", "u2"],
+            texts=["旧版本内容", "新版本内容"],
+            metadatas=[
+                {"updated_at_ts": 1000},
+                {"updated_at_ts": 2000},
+            ],
+        )
+
+        where = build_recently_updated_filter(1500)
+        results = store.similarity_search(query="内容", top_k=10, where=where)
+
+        assert len(results) == 1
+        assert results[0].content == "新版本内容"
+```
+
+跑完这份测试,陈铭把`describe_filter`的输出结果贴到项目群里给林悦看了一下效果——原本一段几层嵌套的`where`字典,现在能直接渲染成"customer 等于 hainatuo_manufacturing 且 status 不等于 archived"这样一句话,林悦回复说:"这样我们运营同学也能看懂日志里到底加了什么过滤条件了,不用非得找你们问。"
+
+### 文件15:选做拓展 · `scripts/benchmark_batch_ingestion.py` —— 批量入库性能优化基准测试
+
+技术预研报告提交之后,老王在评审会上问了一个问题:"如果海纳集团后续要把全部200多份设备手册都灌进知识库,一次性入库几万条文本块,现在的`build_knowledge_base_from_chunks.py`一次性调一次`add_documents`,会不会有性能问题?"陈铭当时答不上来,于是把这个问题带回来做了一次专门的基准测试。
+
+```python
+"""
+scripts/benchmark_batch_ingestion.py
+===============================
+批量入库性能优化基准测试脚本
+
+背景说明:
+    技术预研报告提交之后,老王在评审会上问了一个问题:"如果海纳集团后续要把
+    全部200多份设备手册都灌进知识库,一次性入库几万条文本块,现在的
+    `build_knowledge_base_from_chunks.py`一次性调一次`add_documents`,
+    会不会有性能问题?"陈铭当时答不上来,于是把这个问题带回来做了一次
+    专门的基准测试。
+
+    这份脚本对比了三种入库方式在不同数据规模下的表现:
+    1. 单批次全量入库(baseline):把全部文本一次性传给`add_documents`,
+       这是目前`build_knowledge_base_from_chunks.py`采用的朴素方式;
+    2. 固定批量大小的分批入库:把全部文本切分成固定大小的批次,依次调用
+       `add_documents`,理论上能避免"单次请求文本过多导致Embedding接口超时"
+       这个风险,但增加了多次网络往返(如果使用真实Embedding API)的开销;
+    3. 使用线程池并发处理多个批次的Embedding生成(仅当文本量较大且使用真实
+       网络请求的Embedding Provider时才有意义,离线FakeEmbeddingProvider场景下
+       主要用于演示并发控制模式本身)。
+
+    今天先用FakeEmbeddingProvider跑通全部流程和方法论,如果决定接入真实
+    Embedding API之后,可以直接复用这份脚本,只需要把`use_fake_embedding`
+    参数改成False。
+
+    运行方式:
+        python scripts/benchmark_batch_ingestion.py --doc-count 2000 --batch-size 100
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import statistics
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import Callable, List
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app.services.vectorstore.chroma_store import ChromaVectorStore
+
+
+@dataclass
+class BenchmarkResult:
+    """一次基准测试的结果摘要。"""
+
+    strategy_name: str
+    total_documents: int
+    total_elapsed_seconds: float
+    documents_per_second: float
+
+    def to_report_line(self) -> str:
+        return (
+            f"[{self.strategy_name:24s}] 文档数={self.total_documents:6d}  "
+            f"总耗时={self.total_elapsed_seconds:8.3f}s  "
+            f"吞吐量={self.documents_per_second:8.1f} 条/秒"
+        )
+
+
+def _generate_fake_documents(count: int) -> List[str]:
+    """生成一批用于压测的假文本内容,长度分布刻意做出一些随机性,更贴近真实文本块的长度差异。"""
+    documents: List[str] = []
+    for i in range(count):
+        # 让文本长度在50~200字之间波动,而不是完全一样长,更贴近真实场景下
+        # "有的文本块很短(标题/小节),有的文本块较长(完整段落)"的分布特点。
+        repeat_count = 5 + (i % 15)
+        documents.append(f"这是第{i}条用于压测的模拟设备手册文本块内容。" * repeat_count)
+    return documents
+
+
+def benchmark_single_batch_ingestion(store: ChromaVectorStore, documents: List[str]) -> BenchmarkResult:
+    """策略一:baseline,一次性把全部文本传给add_documents。"""
+    store.reset_collection()  # 保证重复测试时,不会因为ID重复而报错或产生脏数据
+    ids = [f"single_batch_{i}" for i in range(len(documents))]
+    metadatas = [{"strategy": "single_batch"} for _ in documents]
+
+    start_time = time.perf_counter()
+    store.add_documents(ids=ids, texts=documents, metadatas=metadatas)
+    elapsed = time.perf_counter() - start_time
+
+    return BenchmarkResult(
+        strategy_name="单批次全量入库",
+        total_documents=len(documents),
+        total_elapsed_seconds=elapsed,
+        documents_per_second=len(documents) / elapsed if elapsed > 0 else float("inf"),
+    )
+
+
+def benchmark_fixed_size_batches(
+    store: ChromaVectorStore, documents: List[str], batch_size: int
+) -> BenchmarkResult:
+    """策略二:按固定批量大小,依次分批调用add_documents。"""
+    store.reset_collection()
+    start_time = time.perf_counter()
+
+    total_batches = (len(documents) + batch_size - 1) // batch_size
+    for batch_index in range(total_batches):
+        start = batch_index * batch_size
+        end = start + batch_size
+        batch_texts = documents[start:end]
+        batch_ids = [f"fixed_batch_{batch_index}_{i}" for i in range(len(batch_texts))]
+        batch_metadatas = [{"strategy": "fixed_batch", "batch_index": batch_index} for _ in batch_texts]
+        store.add_documents(ids=batch_ids, texts=batch_texts, metadatas=batch_metadatas)
+
+    elapsed = time.perf_counter() - start_time
+
+    return BenchmarkResult(
+        strategy_name=f"固定批量入库(batch={batch_size})",
+        total_documents=len(documents),
+        total_elapsed_seconds=elapsed,
+        documents_per_second=len(documents) / elapsed if elapsed > 0 else float("inf"),
+    )
+
+
+def benchmark_concurrent_batches(
+    store: ChromaVectorStore,
+    documents: List[str],
+    batch_size: int,
+    max_workers: int = 4,
+) -> BenchmarkResult:
+    """
+    策略三:用线程池并发处理多个批次的Embedding生成,再依次写入(写入阶段仍串行,
+    因为多数向量数据库客户端本身对并发写入同一个Collection的支持程度参差不齐,
+    这里保守地只对"计算Embedding向量"这一步做并发,不对"写入数据库"这一步做并发)。
+
+    注意:如果`store`使用的是`FakeEmbeddingProvider`,由于这个假实现本身
+    是纯CPU计算(哈希函数),受Python GIL限制,线程池并不会带来真实的加速效果,
+    这份基准测试在离线模式下主要用于验证"并发控制逻辑本身正确、不会导致数据丢失
+    或重复写入",如果换成真实的、有网络IO等待的Embedding API,线程池才能带来
+    实质性的吞吐量提升(等待网络响应期间,其他线程可以继续工作)。
+    """
+    store.reset_collection()
+    embedding_provider = store._embedding_provider  # noqa: SLF001  基准测试脚本内部工具,允许访问内部实现细节
+
+    def _embed_batch(batch_texts: List[str]) -> List[List[float]]:
+        return embedding_provider.embed_documents(batch_texts)
+
+    total_batches = (len(documents) + batch_size - 1) // batch_size
+    batches = [
+        documents[i * batch_size: i * batch_size + batch_size] for i in range(total_batches)
+    ]
+
+    start_time = time.perf_counter()
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        all_vectors = list(executor.map(_embed_batch, batches))
+
+    for batch_index, (batch_texts, batch_vectors) in enumerate(zip(batches, all_vectors)):
+        batch_ids = [f"concurrent_batch_{batch_index}_{i}" for i in range(len(batch_texts))]
+        batch_metadatas = [{"strategy": "concurrent_batch", "batch_index": batch_index} for _ in batch_texts]
+        # 直接调用底层collection.add,跳过add_documents内部重复计算embedding的那一步,
+        # 因为向量已经在上面的线程池阶段计算好了。
+        store._collection.add(  # noqa: SLF001
+            ids=batch_ids,
+            embeddings=batch_vectors,
+            documents=batch_texts,
+            metadatas=batch_metadatas,
+        )
+
+    elapsed = time.perf_counter() - start_time
+
+    return BenchmarkResult(
+        strategy_name=f"并发批量入库(workers={max_workers})",
+        total_documents=len(documents),
+        total_elapsed_seconds=elapsed,
+        documents_per_second=len(documents) / elapsed if elapsed > 0 else float("inf"),
+    )
+
+
+def run_repeated_benchmark(
+    benchmark_fn: Callable[[], BenchmarkResult], repeat: int = 3
+) -> BenchmarkResult:
+    """
+    对同一个基准测试重复跑几次,取中位数耗时作为最终结果,减少偶发的系统抖动
+    (比如某一次GC恰好触发、或者操作系统临时调度了其他进程)对单次测量结果的影响。
+    """
+    results = [benchmark_fn() for _ in range(repeat)]
+    median_elapsed = statistics.median(r.total_elapsed_seconds for r in results)
+    representative = results[0]
+    return BenchmarkResult(
+        strategy_name=representative.strategy_name,
+        total_documents=representative.total_documents,
+        total_elapsed_seconds=median_elapsed,
+        documents_per_second=(
+            representative.total_documents / median_elapsed if median_elapsed > 0 else float("inf")
+        ),
+    )
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="批量入库性能基准测试")
+    parser.add_argument("--doc-count", type=int, default=500, help="本次基准测试使用的模拟文档总数")
+    parser.add_argument("--batch-size", type=int, default=50, help="分批入库策略使用的每批文档数")
+    parser.add_argument("--concurrent-workers", type=int, default=4, help="并发入库策略使用的线程数")
+    parser.add_argument("--repeat", type=int, default=1, help="每种策略重复测试的次数,取中位数")
+    return parser
+
+
+def main() -> None:
+    args = build_arg_parser().parse_args()
+
+    documents = _generate_fake_documents(args.doc_count)
+    print(f"本次基准测试共生成{len(documents)}条模拟文档,平均长度约"
+          f"{sum(len(d) for d in documents) / len(documents):.0f}字")
+
+    results: List[BenchmarkResult] = []
+
+    import tempfile
+
+    for strategy_index, strategy_builder in enumerate(
+        [
+            lambda: benchmark_single_batch_ingestion,
+            lambda: benchmark_fixed_size_batches,
+            lambda: benchmark_concurrent_batches,
+        ]
+    ):
+        temp_dir = tempfile.mkdtemp(prefix=f"benchmark_store_{strategy_index}_")
+        import app.services.vectorstore.config as config_module
+
+        original_dir = config_module.vector_store_settings.chroma.persist_directory
+        config_module.vector_store_settings.chroma.persist_directory = temp_dir
+        store = ChromaVectorStore(
+            collection_name=f"benchmark_collection_{strategy_index}", use_fake_embedding=True
+        )
+        config_module.vector_store_settings.chroma.persist_directory = original_dir
+
+        fn = strategy_builder()
+        if fn is benchmark_single_batch_ingestion:
+            result = run_repeated_benchmark(lambda: fn(store, documents), repeat=args.repeat)
+        elif fn is benchmark_fixed_size_batches:
+            result = run_repeated_benchmark(
+                lambda: fn(store, documents, args.batch_size), repeat=args.repeat
+            )
+        else:
+            result = run_repeated_benchmark(
+                lambda: fn(store, documents, args.batch_size, args.concurrent_workers), repeat=args.repeat
+            )
+        results.append(result)
+
+    print("\n" + "=" * 70)
+    print("批量入库性能基准测试报告")
+    print("=" * 70)
+    for result in results:
+        print(result.to_report_line())
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+在自己的开发机上跑了一版2000条文档的基准测试之后,陈铭发现三种策略在离线FakeEmbeddingProvider场景下耗时差异不大(符合预期,因为没有真实网络IO等待),但他把这个结论和"为什么没有真实网络IO等待时线程池不会带来加速"这个原理一起写进了技术预研报告的附录里,备注了一句:"等真正接入真实Embedding API之后,建议用同一份脚本重新跑一次,预期并发批量策略会明显更快,今天的数据只能验证'流程和统计口径是正确的',不能作为真实性能结论。"
+
+配套测试文件`backend/tests/test_benchmark_batch_ingestion.py`,覆盖了三种入库策略各自都能完整写入全部文档且不丢数据、重复执行不会导致数据翻倍、以及三种策略在同一批数据上最终文档总数一致这几个关键断言:
+
+```python
+"""
+backend/tests/test_benchmark_batch_ingestion.py
+===============================
+批量入库性能基准测试脚本的正确性验证套件。
+
+注意:这份测试关注的不是"性能数字本身"(那本来就会因机器负载而波动),
+而是"三种不同的入库策略,是否都能完整、无重复地把全部文档写入Collection"——
+性能基准测试脚本如果本身存在漏写、重复写的bug,产出的性能数据就毫无意义。
+"""
+
+import shutil
+import tempfile
+
+import pytest
+
+from app.services.vectorstore.chroma_store import ChromaVectorStore
+from scripts.benchmark_batch_ingestion import (
+    BenchmarkResult,
+    _generate_fake_documents,
+    benchmark_concurrent_batches,
+    benchmark_fixed_size_batches,
+    benchmark_single_batch_ingestion,
+    run_repeated_benchmark,
+)
+
+
+@pytest.fixture()
+def temp_chroma_store():
+    temp_dir = tempfile.mkdtemp(prefix="benchmark_test_")
+
+    import app.services.vectorstore.config as config_module
+    original_dir = config_module.vector_store_settings.chroma.persist_directory
+    config_module.vector_store_settings.chroma.persist_directory = temp_dir
+
+    store = ChromaVectorStore(collection_name="benchmark_unit_test", use_fake_embedding=True)
+    yield store
+
+    config_module.vector_store_settings.chroma.persist_directory = original_dir
+    shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_generate_fake_documents_returns_expected_count():
+    documents = _generate_fake_documents(30)
+    assert len(documents) == 30
+    assert all(isinstance(d, str) and len(d) > 0 for d in documents)
+
+
+def test_single_batch_ingestion_writes_all_documents(temp_chroma_store):
+    store = temp_chroma_store
+    documents = _generate_fake_documents(10)
+    result = benchmark_single_batch_ingestion(store, documents)
+
+    assert isinstance(result, BenchmarkResult)
+    assert result.total_documents == 10
+    assert store.count() == 10
+    assert result.documents_per_second > 0
+
+
+def test_fixed_size_batches_writes_all_documents(temp_chroma_store):
+    store = temp_chroma_store
+    documents = _generate_fake_documents(23)  # 故意用不能被batch_size整除的数量
+    result = benchmark_fixed_size_batches(store, documents, batch_size=7)
+
+    assert result.total_documents == 23
+    assert store.count() == 23
+
+
+def test_concurrent_batches_writes_all_documents_without_duplication(temp_chroma_store):
+    store = temp_chroma_store
+    documents = _generate_fake_documents(17)
+    result = benchmark_concurrent_batches(store, documents, batch_size=5, max_workers=3)
+
+    assert result.total_documents == 17
+    assert store.count() == 17
+
+
+def test_repeated_benchmark_resets_between_runs(temp_chroma_store):
+    store = temp_chroma_store
+    documents = _generate_fake_documents(12)
+
+    result = run_repeated_benchmark(
+        lambda: benchmark_single_batch_ingestion(store, documents), repeat=3
+    )
+
+    assert result.total_documents == 12
+    # 由于每次调用benchmark_single_batch_ingestion内部会先reset_collection,
+    # 重复3次之后,最终Collection里应该仍然只有12条文档,不会因为重复写入而翻倍。
+    assert store.count() == 12
+
+
+def test_all_strategies_produce_consistent_document_counts(temp_chroma_store):
+    """三种策略在同一批数据上,最终写入的文档总数应该完全一致,验证没有任何策略会丢数据或多写数据。"""
+    store = temp_chroma_store
+    documents = _generate_fake_documents(31)
+
+    r1 = benchmark_single_batch_ingestion(store, documents)
+    r2 = benchmark_fixed_size_batches(store, documents, batch_size=9)
+    r3 = benchmark_concurrent_batches(store, documents, batch_size=9, max_workers=2)
+
+    assert r1.total_documents == r2.total_documents == r3.total_documents == 31
+```
+
+### 文件16:选做拓展 · `scripts/vectorstore_health_check.py` —— 向量数据库健康检查工具
+
+技术预研报告提交、知识库正式接入生产流程之后,老王在Day27学到的那句话又被他搬出来用在了向量数据库这一层:"这东西用户也感知不到,不能等到客户反馈'为什么问XX问题AI答不上来'才发现知识库出了问题。"陈铭仿照Day27记忆库健康检查工具的思路,写了这份向量数据库专用的巡检脚本。
+
+```python
+"""
+scripts/vectorstore_health_check.py
+===============================
+向量数据库健康检查工具(命令行脚本)
+
+背景说明:
+    技术预研报告提交、知识库正式接入生产流程之后,老王在Day27学到的那句话
+    又被他搬出来用在了向量数据库这一层:"这东西用户也感知不到,不能等到
+    客户反馈'为什么问XX问题AI答不上来'才发现知识库出了问题。"
+
+    与Day27的记忆库健康检查工具类似,这份脚本负责巡检向量数据库的健康状态,
+    但检查的问题类型完全不同,更多聚焦在"向量数据是否完整、一致"这个维度:
+
+    1. 数量一致性检查:Collection中记录的向量总数,与预期的元数据统计
+       (比如"来源文档数 x 平均每份文档的文本块数")是否存在明显偏差;
+    2. 向量维度一致性检查:抽样检查Collection中的向量,维度是否与配置中
+       声明的EMBEDDING_DIMENSION一致(如果历史上更换过Embedding模型,
+       又没有重建整个知识库,可能会出现新旧向量维度不一致、导致检索报错的隐患);
+    3. 元数据完整性检查:抽样检查每个文档的元数据是否包含约定的必需字段
+       (比如source、chapter),缺失关键元数据会导致相关的过滤检索场景失效;
+    4. 重复内容检查:是否存在"内容完全相同但ID不同"的重复文档
+       (通常是知识库更新脚本重复运行、或者去重逻辑没有生效导致的)。
+
+    运行方式:
+        python scripts/vectorstore_health_check.py --collection hainatuo_xj500_manual
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from collections import Counter
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app.services.vectorstore.chroma_store import ChromaVectorStore
+from app.services.vectorstore.config import vector_store_settings
+
+
+class IssueSeverity(str, Enum):
+    INFO = "info"
+    WARNING = "warning"
+    CRITICAL = "critical"
+
+
+@dataclass
+class VectorStoreIssue:
+    severity: IssueSeverity
+    category: str
+    description: str
+
+
+@dataclass
+class VectorStoreHealthReport:
+    collection_name: str
+    total_documents: int
+    sampled_documents: int
+    issues: List[VectorStoreIssue] = field(default_factory=list)
+
+    @property
+    def critical_count(self) -> int:
+        return sum(1 for issue in self.issues if issue.severity == IssueSeverity.CRITICAL)
+
+    @property
+    def warning_count(self) -> int:
+        return sum(1 for issue in self.issues if issue.severity == IssueSeverity.WARNING)
+
+    @property
+    def is_healthy(self) -> bool:
+        return self.critical_count == 0
+
+    def to_text_summary(self) -> str:
+        lines = [
+            "=" * 60,
+            f"苍穹向量数据库健康检查报告(Collection: {self.collection_name})",
+            "=" * 60,
+            f"文档总数:{self.total_documents}  本次抽样检查文档数:{self.sampled_documents}",
+            f"整体状态:{'健康' if self.is_healthy else '存在严重问题,需要关注'}",
+            f"问题统计:严重{self.critical_count}条 / 警告{self.warning_count}条 / 共{len(self.issues)}条",
+            "-" * 60,
+        ]
+        if not self.issues:
+            lines.append("未发现任何异常项。")
+        for issue in self.issues:
+            lines.append(f"[{issue.severity.value.upper():8s}] ({issue.category}) {issue.description}")
+        lines.append("=" * 60)
+        return "\n".join(lines)
+
+
+class VectorStoreHealthChecker:
+    """
+    向量数据库健康检查器主体。
+
+    刻意直接复用`ChromaVectorStore`这层封装,而不是绕开它直接操作底层的
+    chromadb客户端——这样这份健康检查工具本身,也遵守"业务代码不应该绕开
+    统一封装层直接访问具体向量数据库实现细节"这条今天下午课堂反复强调的原则,
+    即使它是一个运维工具,也应该尽量遵守同样的架构约束。
+    """
+
+    def __init__(
+        self,
+        collection_name: str,
+        required_metadata_fields: Optional[List[str]] = None,
+        sample_size: int = 200,
+    ) -> None:
+        self._store = ChromaVectorStore(collection_name=collection_name)
+        self._collection_name = collection_name
+        self._required_metadata_fields = required_metadata_fields or ["source"]
+        self._sample_size = sample_size
+
+    def run(self) -> VectorStoreHealthReport:
+        total_documents = self._store.count()
+        issues: List[VectorStoreIssue] = []
+
+        if total_documents == 0:
+            issues.append(
+                VectorStoreIssue(
+                    severity=IssueSeverity.WARNING,
+                    category="容量规模",
+                    description="该Collection当前没有任何文档,可能是尚未构建知识库,也可能是知识库被意外清空。",
+                )
+            )
+            return VectorStoreHealthReport(
+                collection_name=self._collection_name,
+                total_documents=0,
+                sampled_documents=0,
+                issues=issues,
+            )
+
+        all_ids = self._store.get_all_ids()
+        sample_ids = all_ids[: self._sample_size]
+        sampled_data = self._store.get_by_ids(sample_ids)
+
+        documents = sampled_data.get("documents", []) or []
+        metadatas = sampled_data.get("metadatas", []) or []
+
+        issues.extend(self._check_metadata_completeness(sample_ids, metadatas))
+        issues.extend(self._check_duplicate_content(sample_ids, documents))
+        issues.extend(self._check_id_uniqueness(all_ids))
+
+        return VectorStoreHealthReport(
+            collection_name=self._collection_name,
+            total_documents=total_documents,
+            sampled_documents=len(sample_ids),
+            issues=issues,
+        )
+
+    def _check_metadata_completeness(
+        self, sample_ids: List[str], metadatas: List[Dict[str, Any]]
+    ) -> List[VectorStoreIssue]:
+        issues: List[VectorStoreIssue] = []
+        missing_field_counts: Counter = Counter()
+
+        for metadata in metadatas:
+            metadata = metadata or {}
+            for field_name in self._required_metadata_fields:
+                if field_name not in metadata or metadata[field_name] in (None, ""):
+                    missing_field_counts[field_name] += 1
+
+        for field_name, missing_count in missing_field_counts.items():
+            if missing_count == 0:
+                continue
+            missing_ratio = missing_count / len(sample_ids) if sample_ids else 0
+            severity = IssueSeverity.CRITICAL if missing_ratio > 0.5 else IssueSeverity.WARNING
+            issues.append(
+                VectorStoreIssue(
+                    severity=severity,
+                    category="元数据完整性",
+                    description=(
+                        f"抽样的{len(sample_ids)}份文档中,有{missing_count}份缺少必需元数据字段"
+                        f"'{field_name}'(占比{missing_ratio:.1%}),可能影响依赖该字段的过滤检索场景。"
+                    ),
+                )
+            )
+        return issues
+
+    def _check_duplicate_content(
+        self, sample_ids: List[str], documents: List[str]
+    ) -> List[VectorStoreIssue]:
+        issues: List[VectorStoreIssue] = []
+        content_to_ids: Dict[str, List[str]] = {}
+        for doc_id, content in zip(sample_ids, documents):
+            content_to_ids.setdefault(content, []).append(doc_id)
+
+        duplicate_groups = {content: ids for content, ids in content_to_ids.items() if len(ids) > 1}
+        if duplicate_groups:
+            total_duplicate_docs = sum(len(ids) for ids in duplicate_groups.values())
+            issues.append(
+                VectorStoreIssue(
+                    severity=IssueSeverity.WARNING,
+                    category="内容重复",
+                    description=(
+                        f"抽样范围内发现{len(duplicate_groups)}组内容完全相同、但ID不同的重复文档,"
+                        f"共涉及{total_duplicate_docs}条记录,建议检查知识库更新脚本是否存在重复写入的问题。"
+                    ),
+                )
+            )
+        return issues
+
+    def _check_id_uniqueness(self, all_ids: List[str]) -> List[VectorStoreIssue]:
+        issues: List[VectorStoreIssue] = []
+        if len(all_ids) != len(set(all_ids)):
+            duplicated_count = len(all_ids) - len(set(all_ids))
+            issues.append(
+                VectorStoreIssue(
+                    severity=IssueSeverity.CRITICAL,
+                    category="数据一致性",
+                    description=(
+                        f"检测到{duplicated_count}个重复的文档ID,理论上向量数据库的ID应当全局唯一,"
+                        "出现重复ID可能意味着底层存储机制异常或存在绕过统一封装层的直接写入操作。"
+                    ),
+                )
+            )
+        return issues
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="苍穹向量数据库健康检查工具")
+    parser.add_argument("--collection", type=str, required=True, help="要检查的Chroma Collection名称")
+    parser.add_argument(
+        "--required-fields",
+        type=str,
+        nargs="*",
+        default=["source"],
+        help="必须存在的元数据字段列表,空格分隔,默认只检查source字段",
+    )
+    parser.add_argument("--sample-size", type=int, default=200, help="抽样检查的文档数量上限")
+    parser.add_argument(
+        "--fail-on-warning",
+        action="store_true",
+        help="加上此参数后,只要存在WARNING级别以上的问题,脚本就以非零状态码退出",
+    )
+    return parser
+
+
+def main() -> None:
+    args = build_arg_parser().parse_args()
+    checker = VectorStoreHealthChecker(
+        collection_name=args.collection,
+        required_metadata_fields=args.required_fields,
+        sample_size=args.sample_size,
+    )
+    report = checker.run()
+    print(report.to_text_summary())
+
+    if not report.is_healthy:
+        sys.exit(2)
+    if args.fail_on_warning and report.warning_count > 0:
+        sys.exit(1)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+配套测试文件`backend/tests/test_vectorstore_health_check.py`,覆盖了空Collection触发警告、健康Collection无严重问题、缺失必需元数据字段触发对应级别的问题、全部文档都缺失必需字段时升级为严重问题、重复内容触发警告(但不影响整体健康判定)、文本报告包含关键信息段落这六个场景:
+
+```python
+"""
+backend/tests/test_vectorstore_health_check.py
+===============================
+向量数据库健康检查工具的测试套件,覆盖空Collection、健康Collection、
+元数据缺失、内容重复等典型场景,均使用FakeEmbeddingProvider离线运行。
+"""
+
+import shutil
+import tempfile
+
+import pytest
+
+from app.services.vectorstore.chroma_store import ChromaVectorStore
+from scripts.vectorstore_health_check import IssueSeverity, VectorStoreHealthChecker
+
+
+@pytest.fixture()
+def temp_persist_dir():
+    temp_dir = tempfile.mkdtemp(prefix="vs_health_test_")
+
+    import app.services.vectorstore.config as config_module
+    original_dir = config_module.vector_store_settings.chroma.persist_directory
+    config_module.vector_store_settings.chroma.persist_directory = temp_dir
+
+    yield temp_dir
+
+    config_module.vector_store_settings.chroma.persist_directory = original_dir
+    shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_empty_collection_triggers_warning(temp_persist_dir):
+    ChromaVectorStore(collection_name="empty_collection", use_fake_embedding=True)
+
+    checker = VectorStoreHealthChecker(collection_name="empty_collection")
+    report = checker.run()
+
+    assert report.total_documents == 0
+    warnings = [i for i in report.issues if i.severity == IssueSeverity.WARNING]
+    assert len(warnings) == 1
+    assert "没有任何文档" in warnings[0].description
+
+
+def test_healthy_collection_has_no_critical_issues(temp_persist_dir):
+    store = ChromaVectorStore(collection_name="healthy_collection", use_fake_embedding=True)
+    store.add_documents(
+        ids=["h1", "h2", "h3"],
+        texts=["内容一", "内容二", "内容三"],
+        metadatas=[{"source": "doc1.pdf"}, {"source": "doc1.pdf"}, {"source": "doc2.pdf"}],
+    )
+
+    checker = VectorStoreHealthChecker(collection_name="healthy_collection")
+    report = checker.run()
+
+    assert report.total_documents == 3
+    assert report.is_healthy
+
+
+def test_missing_required_field_triggers_issue(temp_persist_dir):
+    store = ChromaVectorStore(collection_name="missing_field_collection", use_fake_embedding=True)
+    store.add_documents(
+        ids=["m1", "m2"],
+        texts=["内容一", "内容二"],
+        metadatas=[{"source": "doc1.pdf"}, {"chapter": "第1章"}],  # 第二条缺少source字段
+    )
+
+    checker = VectorStoreHealthChecker(
+        collection_name="missing_field_collection", required_metadata_fields=["source"]
+    )
+    report = checker.run()
+
+    metadata_issues = [i for i in report.issues if i.category == "元数据完整性"]
+    assert len(metadata_issues) == 1
+    assert "source" in metadata_issues[0].description
+
+
+def test_all_missing_required_field_is_critical(temp_persist_dir):
+    store = ChromaVectorStore(collection_name="all_missing_collection", use_fake_embedding=True)
+    store.add_documents(
+        ids=["a1", "a2"],
+        texts=["内容一", "内容二"],
+        metadatas=[{"chapter": "第1章"}, {"chapter": "第2章"}],  # 全部缺少source字段
+    )
+
+    checker = VectorStoreHealthChecker(
+        collection_name="all_missing_collection", required_metadata_fields=["source"]
+    )
+    report = checker.run()
+
+    metadata_issues = [i for i in report.issues if i.category == "元数据完整性"]
+    assert len(metadata_issues) == 1
+    assert metadata_issues[0].severity == IssueSeverity.CRITICAL
+    assert not report.is_healthy
+
+
+def test_duplicate_content_triggers_warning(temp_persist_dir):
+    store = ChromaVectorStore(collection_name="duplicate_content_collection", use_fake_embedding=True)
+    store.add_documents(
+        ids=["dup1", "dup2", "dup3"],
+        texts=["完全相同的内容", "完全相同的内容", "独一无二的内容"],
+        metadatas=[{"source": "s"}, {"source": "s"}, {"source": "s"}],
+    )
+
+    checker = VectorStoreHealthChecker(collection_name="duplicate_content_collection")
+    report = checker.run()
+
+    duplicate_issues = [i for i in report.issues if i.category == "内容重复"]
+    assert len(duplicate_issues) == 1
+    assert report.is_healthy  # 重复内容只是WARNING,不影响整体健康判定
+
+
+def test_text_summary_contains_key_sections(temp_persist_dir):
+    store = ChromaVectorStore(collection_name="summary_test_collection", use_fake_embedding=True)
+    store.add_documents(ids=["s1"], texts=["内容"], metadatas=[{"source": "doc.pdf"}])
+
+    checker = VectorStoreHealthChecker(collection_name="summary_test_collection")
+    report = checker.run()
+    text = report.to_text_summary()
+
+    assert "苍穹向量数据库健康检查报告" in text
+    assert "整体状态" in text
+    assert "问题统计" in text
+```
+
+陈铭把这个脚本和Day27的记忆库健康检查工具一起加进了运维值班手册,备注了一句:"这两个巡检脚本的设计思路几乎一模一样——都是先定义'问题严重程度分级',再逐项检查、汇总成一份可读报告,最后按'是否存在CRITICAL问题'决定退出码,方便接入自动化告警。以后不管是记忆库还是向量库,再往后如果还有新的存储层需要巡检,直接照着这个模板写就行,不需要每次都重新设计一套报告结构。"
+
 ---
 
 ## 今日复盘
