@@ -2719,6 +2719,1603 @@ if __name__ == "__main__":
 
 跑完这个成本计算器,团队算出了一个挺有意思的数字:如果团队每月内部研发需要用到的 GPU 时长稳定在 100 小时左右,自购一张 RTX 4090 大约 5 个多月就能回本,之后的使用基本就是"净赚"。这个结论直接影响了王振宇后续的一个决定——团队自己出钱采购了两张消费级显卡放在办公室,作为日常做技术验证、跑课堂案例的"自留地",真正面向客户交付的正式训练任务,依然按项目预算走云端租用,两条腿走路,把成本控制在最合理的区间。
 
+算完成本账,陈铭又提出了新的问题:"我们今天定的是'要不要微调、用哪种范式微调、去哪儿租机器',但真正动手训练之前,还有两个环节容易被低估——数据集格式对不对、LoRA 的秩(rank)和目标模块怎么选。这两个环节一旦出错,前面算的显存、算的成本全都是白费。"于是团队又补了几个配套工具,把从"决策"到"数据准备"再到"训练配置生成"的链路打通。
+
+### 脚本八:训练数据集格式校验与转换工具(`dataset_format_validator.py`)
+
+微调用的数据集常见有两种主流格式——Alpaca 格式(`instruction` / `input` / `output` 三段式)和 ShareGPT 格式(`conversations` 多轮对话列表)。不同微调框架、不同训练脚本对格式的要求不完全一致,御风金融项目的数据是由业务团队整理的 Excel 表格导出的,格式五花八门,经常出现字段缺失、编码错误、超长样本混入的问题。这个工具的作用是在真正提交训练任务之前,先把数据集"过一遍筛子"。
+
+```python
+# -*- coding: utf-8 -*-
+"""
+dataset_format_validator.py
+训练数据集格式校验与转换工具 —— 第51天课堂配套工具
+
+背景：
+    御风金融项目的微调数据来自多个业务团队，格式并不统一，
+    有的是 Alpaca 三段式，有的是 ShareGPT 多轮对话式，还有一部分
+    是从 Excel 直接导出的中间格式（列名不规范、存在空值、
+    存在超长文本）。如果不做校验就直接扔给训练脚本，往往会在
+    训练跑到几个小时后才因为个别脏数据报错中断，浪费大量算力时间。
+
+    本工具的核心职责：
+    1. 自动识别输入文件属于哪种已知格式（Alpaca / ShareGPT / 未知）。
+    2. 校验必填字段是否缺失、类型是否正确、文本是否为空。
+    3. 统计样本长度分布，标记出明显超长（可能是脏数据拼接错误）
+       和明显过短（可能是无效样本）的记录。
+    4. 提供 Alpaca -> ShareGPT 的双向格式转换，方便适配不同训练框架。
+    5. 输出一份可读的校验报告，校验不通过的样本给出具体原因，
+       方便业务团队回头去修数据，而不是让工程师去猜。
+
+作者：陈铭（蓬远科技 · 苍穹项目组）
+日期：Day51
+"""
+
+import json
+import statistics
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+
+class DatasetFormat(str, Enum):
+    """已支持的数据集格式类型"""
+
+    ALPACA = "alpaca"          # {"instruction": "...", "input": "...", "output": "..."}
+    SHAREGPT = "sharegpt"      # {"conversations": [{"from": "human", "value": "..."}, ...]}
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class ValidationIssue:
+    """单条校验问题记录"""
+
+    sample_index: int
+    severity: str              # "error"（必须修复）或 "warning"（建议关注）
+    reason: str
+    raw_snippet: str = ""       # 出问题样本的内容片段，方便定位
+
+
+@dataclass
+class ValidationReport:
+    """整个数据集的校验汇总报告"""
+
+    total_samples: int
+    detected_format: DatasetFormat
+    valid_sample_count: int
+    issues: List[ValidationIssue] = field(default_factory=list)
+    length_stats: Dict[str, float] = field(default_factory=dict)
+
+    @property
+    def error_count(self) -> int:
+        return len([i for i in self.issues if i.severity == "error"])
+
+    @property
+    def warning_count(self) -> int:
+        return len([i for i in self.issues if i.severity == "warning"])
+
+    @property
+    def pass_rate(self) -> float:
+        if self.total_samples == 0:
+            return 0.0
+        return self.valid_sample_count / self.total_samples
+
+
+# 明显过短/过长的经验阈值，具体项目可以根据模型上下文窗口再调整
+MIN_REASONABLE_OUTPUT_CHARS = 5
+MAX_REASONABLE_TOTAL_CHARS = 8000
+
+
+def detect_format(samples: List[Dict[str, Any]]) -> DatasetFormat:
+    """
+    根据前几条样本的字段结构，自动推断数据集格式。
+
+    只抽样看前 min(20, len) 条，是因为真实数据集可能上万条，
+    没必要全量扫描才能判断格式，抽样判断的准确性在实践中已经足够。
+    """
+    if not samples:
+        return DatasetFormat.UNKNOWN
+
+    sample_pool = samples[: min(20, len(samples))]
+    alpaca_like = sum(1 for s in sample_pool if "instruction" in s and "output" in s)
+    sharegpt_like = sum(1 for s in sample_pool if "conversations" in s and isinstance(s.get("conversations"), list))
+
+    if sharegpt_like >= alpaca_like and sharegpt_like > 0:
+        return DatasetFormat.SHAREGPT
+    if alpaca_like > 0:
+        return DatasetFormat.ALPACA
+    return DatasetFormat.UNKNOWN
+
+
+def validate_alpaca_sample(index: int, sample: Dict[str, Any]) -> List[ValidationIssue]:
+    """校验单条 Alpaca 格式样本，返回发现的问题列表"""
+    issues: List[ValidationIssue] = []
+
+    instruction = sample.get("instruction")
+    output = sample.get("output")
+
+    if not isinstance(instruction, str) or not instruction.strip():
+        issues.append(
+            ValidationIssue(index, "error", "instruction 字段为空或不是字符串类型", str(sample)[:80])
+        )
+    if not isinstance(output, str) or not output.strip():
+        issues.append(
+            ValidationIssue(index, "error", "output 字段为空或不是字符串类型", str(sample)[:80])
+        )
+    elif len(output.strip()) < MIN_REASONABLE_OUTPUT_CHARS:
+        issues.append(
+            ValidationIssue(
+                index, "warning", f"output 长度仅{len(output.strip())}字符，疑似无效样本或截断数据", output
+            )
+        )
+
+    total_chars = len(str(instruction or "")) + len(str(sample.get("input") or "")) + len(str(output or ""))
+    if total_chars > MAX_REASONABLE_TOTAL_CHARS:
+        issues.append(
+            ValidationIssue(
+                index, "warning", f"样本总长度{total_chars}字符，超过经验阈值，训练时可能被截断或占用过多显存", ""
+            )
+        )
+
+    return issues
+
+
+def validate_sharegpt_sample(index: int, sample: Dict[str, Any]) -> List[ValidationIssue]:
+    """校验单条 ShareGPT 格式样本，返回发现的问题列表"""
+    issues: List[ValidationIssue] = []
+
+    conversations = sample.get("conversations")
+    if not isinstance(conversations, list) or len(conversations) == 0:
+        issues.append(ValidationIssue(index, "error", "conversations 字段为空或不是列表类型"))
+        return issues
+
+    total_chars = 0
+    has_human_turn = False
+    has_gpt_turn = False
+    for turn_idx, turn in enumerate(conversations):
+        role = turn.get("from")
+        value = turn.get("value")
+        if role not in ("human", "gpt", "system", "function_call", "observation"):
+            issues.append(
+                ValidationIssue(index, "warning", f"第{turn_idx}轮的 from 字段取值异常: {role!r}")
+            )
+        if role == "human":
+            has_human_turn = True
+        if role == "gpt":
+            has_gpt_turn = True
+        if not isinstance(value, str) or not value.strip():
+            issues.append(ValidationIssue(index, "error", f"第{turn_idx}轮的 value 字段为空"))
+        else:
+            total_chars += len(value)
+
+    if not has_human_turn or not has_gpt_turn:
+        issues.append(
+            ValidationIssue(index, "error", "多轮对话中缺少 human 或 gpt 角色，无法构成一次完整的问答训练样本")
+        )
+    if total_chars > MAX_REASONABLE_TOTAL_CHARS:
+        issues.append(
+            ValidationIssue(index, "warning", f"整段对话总长度{total_chars}字符，超过经验阈值")
+        )
+
+    return issues
+
+
+def validate_dataset(samples: List[Dict[str, Any]]) -> ValidationReport:
+    """对整个数据集执行格式校验，返回汇总报告"""
+    detected_format = detect_format(samples)
+    all_issues: List[ValidationIssue] = []
+    sample_lengths: List[int] = []
+
+    for idx, sample in enumerate(samples):
+        if detected_format == DatasetFormat.ALPACA:
+            sample_issues = validate_alpaca_sample(idx, sample)
+            sample_lengths.append(len(str(sample.get("instruction", ""))) + len(str(sample.get("output", ""))))
+        elif detected_format == DatasetFormat.SHAREGPT:
+            sample_issues = validate_sharegpt_sample(idx, sample)
+            conv_text = "".join(t.get("value", "") for t in sample.get("conversations", []) if isinstance(t, dict))
+            sample_lengths.append(len(conv_text))
+        else:
+            sample_issues = [ValidationIssue(idx, "error", "无法识别的数据格式，既不是Alpaca也不是ShareGPT")]
+        all_issues.extend(sample_issues)
+
+    error_sample_indices = {i.sample_index for i in all_issues if i.severity == "error"}
+    valid_count = len(samples) - len(error_sample_indices)
+
+    length_stats: Dict[str, float] = {}
+    if sample_lengths:
+        length_stats = {
+            "最小长度": min(sample_lengths),
+            "最大长度": max(sample_lengths),
+            "平均长度": round(statistics.mean(sample_lengths), 1),
+            "中位数长度": statistics.median(sample_lengths),
+        }
+
+    return ValidationReport(
+        total_samples=len(samples),
+        detected_format=detected_format,
+        valid_sample_count=valid_count,
+        issues=all_issues,
+        length_stats=length_stats,
+    )
+
+
+def convert_alpaca_to_sharegpt(alpaca_samples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    将 Alpaca 三段式格式转换为 ShareGPT 多轮对话格式。
+
+    转换规则：如果 input 字段非空，将其拼接到 instruction 后面作为完整的用户问题
+    （这是业界通用的处理方式，因为 ShareGPT 格式没有单独的 input 槽位）；
+    如果数据集中存在 system 字段，转换为对话开头的 system 角色轮次。
+    """
+    converted = []
+    for sample in alpaca_samples:
+        instruction = sample.get("instruction", "").strip()
+        extra_input = sample.get("input", "").strip()
+        output = sample.get("output", "").strip()
+
+        human_content = f"{instruction}\n{extra_input}" if extra_input else instruction
+
+        conversations = []
+        system_prompt = sample.get("system", "").strip()
+        if system_prompt:
+            conversations.append({"from": "system", "value": system_prompt})
+        conversations.append({"from": "human", "value": human_content})
+        conversations.append({"from": "gpt", "value": output})
+
+        converted.append({"conversations": conversations})
+    return converted
+
+
+def convert_sharegpt_to_alpaca(sharegpt_samples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    将 ShareGPT 多轮对话格式"降维"转换为 Alpaca 三段式。
+
+    注意：这种转换只适用于单轮对话（一问一答），如果对话里有多轮
+    human/gpt 交替，会把除最后一轮之外的历史全部拼接进 instruction，
+    这是一种有损转换，仅用于兼容某些只支持 Alpaca 格式的老旧训练脚本，
+    正式训练多轮对话数据时应优先直接使用 ShareGPT 格式，不建议降维。
+    """
+    converted = []
+    for sample in sharegpt_samples:
+        conversations = sample.get("conversations", [])
+        if len(conversations) < 2:
+            continue
+
+        history_text_parts = []
+        last_gpt_value = ""
+        for turn in conversations[:-1]:
+            role_label = "问" if turn.get("from") == "human" else "答"
+            history_text_parts.append(f"[{role_label}] {turn.get('value', '')}")
+        last_turn = conversations[-1]
+        if last_turn.get("from") == "gpt":
+            last_gpt_value = last_turn.get("value", "")
+
+        converted.append(
+            {
+                "instruction": "\n".join(history_text_parts) if history_text_parts else "",
+                "input": "",
+                "output": last_gpt_value,
+            }
+        )
+    return converted
+
+
+def load_jsonl_or_json(file_path: str) -> List[Dict[str, Any]]:
+    """兼容加载 .json（整体数组）和 .jsonl（逐行 JSON）两种常见文件格式"""
+    path = Path(file_path)
+    content = path.read_text(encoding="utf-8")
+    if path.suffix == ".jsonl":
+        return [json.loads(line) for line in content.splitlines() if line.strip()]
+    parsed = json.loads(content)
+    if isinstance(parsed, list):
+        return parsed
+    raise ValueError("JSON 文件顶层结构必须是数组，每个元素是一条训练样本")
+
+
+def render_validation_report(report: ValidationReport) -> str:
+    """将校验报告渲染为易读的文本，供数据整理人员查看"""
+    lines = []
+    lines.append("=" * 60)
+    lines.append("训练数据集格式校验报告")
+    lines.append("=" * 60)
+    lines.append(f"检测到的格式: {report.detected_format.value}")
+    lines.append(f"样本总数: {report.total_samples}")
+    lines.append(f"通过校验的样本数: {report.valid_sample_count}")
+    lines.append(f"通过率: {report.pass_rate:.1%}")
+    lines.append(f"错误数(必须修复): {report.error_count}")
+    lines.append(f"警告数(建议关注): {report.warning_count}")
+
+    if report.length_stats:
+        lines.append("\n样本长度分布(字符数):")
+        for k, v in report.length_stats.items():
+            lines.append(f"  {k}: {v}")
+
+    if report.issues:
+        lines.append("\n问题明细(最多展示前30条):")
+        for issue in report.issues[:30]:
+            snippet = f"  片段: {issue.raw_snippet[:50]}" if issue.raw_snippet else ""
+            lines.append(f"  [{issue.severity.upper()}] 样本#{issue.sample_index}: {issue.reason}{snippet}")
+        if len(report.issues) > 30:
+            lines.append(f"  ...(还有{len(report.issues) - 30}条问题未展示)")
+
+    lines.append("=" * 60)
+    return "\n".join(lines)
+
+
+def demo_run() -> None:
+    """演示：构造一批带有典型脏数据的样本，跑一遍校验与转换流程"""
+    alpaca_samples = [
+        {"instruction": "客户询问逾期利率如何计算", "input": "", "output": "根据合同约定，逾期利率为基准利率上浮30%..."},
+        {"instruction": "", "input": "", "output": "这条会因为instruction为空报错"},
+        {"instruction": "解释一下什么是LPR", "input": "", "output": "好"},  # output过短，触发warning
+        {"instruction": "介绍产品条款", "input": "补充说明", "output": "详细条款内容..." * 500},  # 超长，触发warning
+    ]
+
+    report = validate_dataset(alpaca_samples)
+    print(render_validation_report(report))
+
+    sharegpt_converted = convert_alpaca_to_sharegpt(alpaca_samples)
+    print(f"\n转换为ShareGPT格式后的第一条样本:\n{json.dumps(sharegpt_converted[0], ensure_ascii=False, indent=2)}")
+
+
+if __name__ == "__main__":
+    demo_run()
+```
+
+### 脚本九:LoRA 秩(rank)与目标模块选择决策辅助工具(`lora_config_advisor.py`)
+
+LoRA 的核心超参数——秩 `r`、缩放系数 `alpha`、以及作用在哪些线性层(`target_modules`)——直接决定了微调效果和显存开销的平衡点。这几个参数没有万能的"标准答案",需要结合任务类型(是学知识、还是学风格、还是学格式)、数据量、显存预算来综合判断。陈铭把团队这段时间踩过的经验整理成了一套决策规则,做成工具,避免每次都要重新翻论文、猜参数。
+
+```python
+# -*- coding: utf-8 -*-
+"""
+lora_config_advisor.py
+LoRA 秩与目标模块选择决策辅助工具 —— 第51天课堂配套工具
+
+设计说明：
+    这不是一个能给出"唯一正确答案"的自动化调参工具，而是把团队
+    在多个项目里积累的经验规则结构化成代码，目的是：
+    1. 避免每次做新项目都要从零讨论"LoRA该配多大的rank"。
+    2. 给出的建议附带明确的理由，方便工程师理解取舍逻辑，
+       而不是死记硬背几个数字。
+    3. 后续如果实测效果与建议不符，可以在此基础上快速调整规则，
+       把"新踩的坑"也沉淀成规则的一部分。
+
+作者：陈铭（蓬远科技 · 苍穹项目组）
+日期：Day51
+"""
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import List
+
+
+class FineTuneGoal(str, Enum):
+    """微调的主要目标类型，决定了模型需要学习"知识"还是"行为模式" """
+
+    KNOWLEDGE_INJECTION = "知识注入"       # 让模型记住领域专有的事实/术语
+    STYLE_AND_FORMAT = "风格与格式对齐"     # 让模型按固定格式、固定语气输出
+    INSTRUCTION_FOLLOWING = "指令遵循增强"   # 提升模型对复杂指令的服从度
+    REASONING_ENHANCEMENT = "推理能力增强"   # 提升多步推理、工具调用等复杂能力
+
+
+class BudgetTier(str, Enum):
+    """显存与算力预算档位"""
+
+    TIGHT = "紧张(单卡消费级显卡，<=24GB显存)"
+    MODERATE = "适中(单卡专业级显卡，24-48GB显存)"
+    AMPLE = "充足(多卡或高端专业卡，>=48GB显存)"
+
+
+@dataclass
+class LoraRecommendation:
+    """一份完整的LoRA配置建议，附带每一项参数选择的理由"""
+
+    recommended_rank: int
+    recommended_alpha: int
+    recommended_dropout: float
+    target_modules: List[str]
+    rationale: List[str]
+    estimated_trainable_param_ratio: str
+
+
+# 不同目标类型对应的基础秩建议区间，数值来自团队过往项目的实测经验总结
+_GOAL_BASE_RANK = {
+    FineTuneGoal.KNOWLEDGE_INJECTION: 32,
+    FineTuneGoal.STYLE_AND_FORMAT: 8,
+    FineTuneGoal.INSTRUCTION_FOLLOWING: 16,
+    FineTuneGoal.REASONING_ENHANCEMENT: 64,
+}
+
+# 不同目标类型建议覆盖的目标模块范围，覆盖范围越大，可学习的模式越丰富，
+# 但训练参数量和过拟合风险也越高
+_GOAL_TARGET_MODULES = {
+    FineTuneGoal.KNOWLEDGE_INJECTION: ["q_proj", "v_proj", "down_proj"],
+    FineTuneGoal.STYLE_AND_FORMAT: ["q_proj", "v_proj"],
+    FineTuneGoal.INSTRUCTION_FOLLOWING: ["q_proj", "k_proj", "v_proj", "o_proj"],
+    FineTuneGoal.REASONING_ENHANCEMENT: [
+        "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",
+    ],
+}
+
+_BUDGET_RANK_MULTIPLIER = {
+    BudgetTier.TIGHT: 0.5,
+    BudgetTier.MODERATE: 1.0,
+    BudgetTier.AMPLE: 1.5,
+}
+
+
+def recommend_lora_config(
+    goal: FineTuneGoal,
+    budget: BudgetTier,
+    dataset_size: int,
+    num_epochs_planned: int = 3,
+) -> LoraRecommendation:
+    """
+    根据微调目标、预算档位、数据规模，给出一份LoRA配置建议。
+
+    参数:
+        goal: 微调的主要目标类型
+        budget: 显存预算档位
+        dataset_size: 训练样本数量，用于判断是否存在过拟合风险
+        num_epochs_planned: 计划训练的轮数
+    """
+    base_rank = _GOAL_BASE_RANK[goal]
+    multiplier = _BUDGET_RANK_MULTIPLIER[budget]
+    adjusted_rank = max(4, int(base_rank * multiplier))
+    # 秩通常取2的幂或者常见的偶数，向下取整到最近的合理档位，
+    # 避免出现17、23这类不常见的数字
+    common_rank_options = [4, 8, 16, 32, 64, 128]
+    recommended_rank = min(common_rank_options, key=lambda x: abs(x - adjusted_rank))
+
+    rationale = [
+        f"目标类型为'{goal.value}',经验基础秩为{base_rank}",
+        f"预算档位为'{budget.value}',调整系数为{multiplier}，调整后取最接近的常用档位{recommended_rank}",
+    ]
+
+    target_modules = list(_GOAL_TARGET_MODULES[goal])
+
+    # 小数据量场景下，即使预算充足也建议收窄目标模块范围，降低过拟合风险
+    if dataset_size < 500:
+        if len(target_modules) > 2:
+            target_modules = target_modules[:2]
+            rationale.append(
+                f"数据量仅{dataset_size}条，样本较少，为降低过拟合风险，收窄目标模块至{target_modules}"
+            )
+        if recommended_rank > 16:
+            recommended_rank = 16
+            rationale.append("数据量较小，秩上限调整为16，避免可训练参数量超过数据信息量")
+
+    # alpha通常取rank的1-2倍，这里采用业界常见的"alpha = 2 * rank"经验公式作为默认值
+    recommended_alpha = recommended_rank * 2
+    rationale.append(f"alpha按经验公式取秩的2倍，即{recommended_alpha}，有助于让LoRA分支的更新幅度适中")
+
+    # 训练轮数较多时，适度提高dropout防止过拟合
+    recommended_dropout = 0.05 if num_epochs_planned <= 3 else 0.1
+    rationale.append(
+        f"计划训练{num_epochs_planned}轮，dropout设置为{recommended_dropout}"
+        + ("(轮数较多，适度提高防止过拟合)" if num_epochs_planned > 3 else "")
+    )
+
+    trainable_ratio_estimate = {
+        4: "约0.02%-0.05%", 8: "约0.05%-0.1%", 16: "约0.1%-0.2%",
+        32: "约0.2%-0.4%", 64: "约0.4%-0.8%", 128: "约0.8%-1.5%",
+    }.get(recommended_rank, "未知")
+
+    return LoraRecommendation(
+        recommended_rank=recommended_rank,
+        recommended_alpha=recommended_alpha,
+        recommended_dropout=recommended_dropout,
+        target_modules=target_modules,
+        rationale=rationale,
+        estimated_trainable_param_ratio=trainable_ratio_estimate,
+    )
+
+
+def render_recommendation_report(rec: LoraRecommendation) -> str:
+    """将LoRA配置建议渲染为可读的文本报告"""
+    lines = []
+    lines.append("=" * 50)
+    lines.append("LoRA 配置建议报告")
+    lines.append("=" * 50)
+    lines.append(f"建议秩(r): {rec.recommended_rank}")
+    lines.append(f"建议alpha: {rec.recommended_alpha}")
+    lines.append(f"建议dropout: {rec.recommended_dropout}")
+    lines.append(f"建议目标模块: {', '.join(rec.target_modules)}")
+    lines.append(f"预估可训练参数占比: {rec.estimated_trainable_param_ratio}")
+    lines.append("\n决策依据:")
+    for idx, reason in enumerate(rec.rationale, 1):
+        lines.append(f"  {idx}. {reason}")
+    lines.append("=" * 50)
+    return "\n".join(lines)
+
+
+def demo_run() -> None:
+    """演示：为御风金融项目的两个不同子场景分别生成LoRA配置建议"""
+    print("场景一：客服问答知识注入，数据量3000条，预算适中")
+    rec1 = recommend_lora_config(
+        goal=FineTuneGoal.KNOWLEDGE_INJECTION,
+        budget=BudgetTier.MODERATE,
+        dataset_size=3000,
+        num_epochs_planned=3,
+    )
+    print(render_recommendation_report(rec1))
+
+    print("\n场景二：仅300条小样本的风格对齐微调，显存紧张")
+    rec2 = recommend_lora_config(
+        goal=FineTuneGoal.STYLE_AND_FORMAT,
+        budget=BudgetTier.TIGHT,
+        dataset_size=300,
+        num_epochs_planned=5,
+    )
+    print(render_recommendation_report(rec2))
+
+
+if __name__ == "__main__":
+    demo_run()
+```
+
+### 脚本十:分布式训练策略选择器(`distributed_strategy_selector.py`)
+
+如果御风金融后期需要做全量微调,或者 LoRA 训练的模型规模进一步扩大到单卡显存放不下,团队就需要在 DDP(数据并行)、DeepSpeed ZeRO(Stage 1/2/3)、FSDP 之间做选择。这几种策略的选择逻辑高度依赖于"模型大小 vs 单卡显存 vs 卡数",王振宇要求把这套判断逻辑也沉淀成工具,避免每次都要重新翻资料决策。
+
+```python
+# -*- coding: utf-8 -*-
+"""
+distributed_strategy_selector.py
+分布式训练策略选择器 —— 第51天课堂配套工具
+
+背景：
+    单卡显存装不下模型 + 优化器状态 + 梯度时，就需要引入分布式训练策略。
+    常见的几种策略适用场景不同：
+      - 单卡训练：模型能放进单卡显存，最简单，无需分布式。
+      - DDP(数据并行)：每张卡都放一份完整模型副本，只是切分数据，
+        适合模型本身能放进单卡显存、只是想加速训练的场景。
+      - DeepSpeed ZeRO Stage 1：优化器状态分片，显存节省有限，通信开销最小。
+      - DeepSpeed ZeRO Stage 2：优化器状态+梯度分片，显存节省更多，
+        通信开销适中，是目前性价比较高的默认选择。
+      - DeepSpeed ZeRO Stage 3：优化器状态+梯度+模型参数全部分片，
+        显存节省最多，但通信开销最大，适合模型大到单卡完全放不下的场景。
+      - FSDP：与ZeRO-3思路类似，是PyTorch原生的全切分方案。
+
+    本工具根据模型参数量、单卡显存、可用卡数、是否使用LoRA等输入，
+    给出策略建议和预估的显存占用估算。
+
+作者：陈铭（蓬远科技 · 苍穹项目组）
+日期：Day51
+"""
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import List, Optional
+
+
+class DistributedStrategy(str, Enum):
+    SINGLE_GPU = "单卡训练"
+    DDP = "DDP数据并行"
+    DEEPSPEED_ZERO1 = "DeepSpeed ZeRO Stage 1"
+    DEEPSPEED_ZERO2 = "DeepSpeed ZeRO Stage 2"
+    DEEPSPEED_ZERO3 = "DeepSpeed ZeRO Stage 3"
+    FSDP_FULL_SHARD = "PyTorch FSDP 全切分"
+
+
+@dataclass
+class StrategyRecommendation:
+    strategy: DistributedStrategy
+    reasoning: List[str]
+    estimated_per_gpu_memory_gb: float
+    warnings: List[str]
+
+
+BYTES_PER_PARAM_BF16 = 2
+BYTES_PER_PARAM_ADAM_STATE_FP32 = 8  # 一阶动量+二阶矩，各占4字节
+BYTES_PER_PARAM_GRADIENT_FP32 = 4
+BYTES_PER_PARAM_MASTER_WEIGHT_FP32 = 4
+
+
+def _estimate_full_finetune_memory_gb(num_params_billion: float) -> float:
+    """全量微调场景下，单卡需要承担的理论显存总量（不分片时）"""
+    num_params = num_params_billion * 1e9
+    total_bytes = num_params * (
+        BYTES_PER_PARAM_BF16
+        + BYTES_PER_PARAM_ADAM_STATE_FP32
+        + BYTES_PER_PARAM_GRADIENT_FP32
+        + BYTES_PER_PARAM_MASTER_WEIGHT_FP32
+    )
+    return total_bytes / (1024 ** 3)
+
+
+def select_distributed_strategy(
+    num_params_billion: float,
+    per_gpu_memory_gb: float,
+    num_gpus: int,
+    use_lora: bool = True,
+    prefer_minimal_communication: bool = False,
+) -> StrategyRecommendation:
+    """
+    核心决策函数：根据模型规模、单卡显存、卡数、是否使用LoRA，给出分布式策略建议。
+
+    决策逻辑简述：
+        1. 如果使用LoRA且模型本身能塞进单卡显存的推理占用，通常DDP甚至单卡就够用，
+           因为LoRA训练的可训练参数量很小，优化器状态占用可以忽略。
+        2. 如果是全量微调，先估算"不分片情况下单卡需要多少显存"，
+           再对比"单卡显存 x 卡数"能否覆盖，来判断是否必须引入ZeRO分片。
+        3. 卡数越多，ZeRO分片能摊薄的显存越多，但通信开销也越高，
+           如果客户明确要求"尽量减少多机通信"（比如网络环境不稳定），
+           优先选择分片程度较轻的策略。
+    """
+    reasoning: List[str] = []
+    warnings: List[str] = []
+
+    if use_lora:
+        # LoRA场景下可训练参数量通常只占总参数量的0.1%-1%，
+        # 优化器状态、梯度的显存占用可以近似忽略，主要占用是基座模型本身的推理显存
+        base_inference_memory = num_params_billion * 1e9 * BYTES_PER_PARAM_BF16 / (1024 ** 3)
+        activation_overhead_factor = 1.3  # 预留30%给激活值和LoRA分支
+        estimated_single_gpu_need = base_inference_memory * activation_overhead_factor
+
+        reasoning.append(
+            f"检测到使用LoRA微调，可训练参数占比极小，主要显存占用来自基座模型本身（约{base_inference_memory:.1f}GB）"
+        )
+
+        if estimated_single_gpu_need <= per_gpu_memory_gb:
+            if num_gpus <= 1:
+                strategy = DistributedStrategy.SINGLE_GPU
+                reasoning.append("单卡显存足够容纳，且只有1张卡可用，直接单卡训练即可")
+            else:
+                strategy = DistributedStrategy.DDP
+                reasoning.append(f"单卡显存足够容纳，且有{num_gpus}张卡可用，使用DDP做数据并行加速训练即可，无需引入分片")
+            return StrategyRecommendation(
+                strategy=strategy,
+                reasoning=reasoning,
+                estimated_per_gpu_memory_gb=round(estimated_single_gpu_need, 1),
+                warnings=warnings,
+            )
+        else:
+            reasoning.append(
+                f"单卡显存({per_gpu_memory_gb}GB)不足以容纳基座模型本身的显存需求({estimated_single_gpu_need:.1f}GB)，"
+                "即使使用LoRA也需要引入分片策略"
+            )
+            if num_gpus < 2:
+                warnings.append("当前仅有1张卡可用，但显存不足，建议改用QLoRA降低精度，或更换更大显存的显卡，分布式无法在单卡场景下生效")
+            strategy = DistributedStrategy.DEEPSPEED_ZERO3
+            reasoning.append("模型本身显存占用已超单卡上限，选择ZeRO Stage 3做参数分片，最大限度节省单卡显存")
+            estimated_need = estimated_single_gpu_need / max(num_gpus, 1)
+            return StrategyRecommendation(strategy, reasoning, round(estimated_need, 1), warnings)
+
+    # 全量微调场景
+    full_finetune_need = _estimate_full_finetune_memory_gb(num_params_billion)
+    reasoning.append(f"全量微调场景，理论上不分片时单卡需要约{full_finetune_need:.1f}GB显存")
+
+    if full_finetune_need <= per_gpu_memory_gb:
+        strategy = DistributedStrategy.DDP if num_gpus > 1 else DistributedStrategy.SINGLE_GPU
+        reasoning.append("单卡显存足够容纳全量微调的显存需求，无需分片，用DDP加速即可")
+        return StrategyRecommendation(strategy, reasoning, round(full_finetune_need, 1), warnings)
+
+    total_cluster_memory = per_gpu_memory_gb * num_gpus
+    if num_gpus <= 1:
+        warnings.append("单卡显存不足以支撑全量微调，且只有1张卡，无法通过分布式分片解决，必须改用LoRA/QLoRA或增加显卡")
+        strategy = DistributedStrategy.DEEPSPEED_ZERO3
+        reasoning.append("即使选择最激进的ZeRO-3分片策略，单卡场景下也无法真正分摊显存，此建议仅供参考，实际应更换方案")
+    elif full_finetune_need / num_gpus <= per_gpu_memory_gb * 0.5:
+        # 分摊后显存占用远低于单卡上限，说明轻量分片即可满足
+        strategy = DistributedStrategy.DEEPSPEED_ZERO1
+        reasoning.append("按卡数分摊后显存需求远低于单卡上限，选择通信开销最小的ZeRO Stage 1即可")
+    elif full_finetune_need / num_gpus <= per_gpu_memory_gb * 0.85:
+        strategy = DistributedStrategy.DEEPSPEED_ZERO2
+        reasoning.append("按卡数分摊后显存需求接近单卡上限的中间地带，选择ZeRO Stage 2平衡显存节省与通信开销")
+    else:
+        if prefer_minimal_communication:
+            strategy = DistributedStrategy.FSDP_FULL_SHARD
+            reasoning.append("显存缺口较大且客户要求尽量减少通信开销的额外调优复杂度，选择PyTorch原生FSDP全切分方案")
+        else:
+            strategy = DistributedStrategy.DEEPSPEED_ZERO3
+            reasoning.append("显存缺口较大，必须采用最激进的ZeRO Stage 3全分片策略才能覆盖显存需求")
+
+    if total_cluster_memory < full_finetune_need:
+        warnings.append(
+            f"警告：即使把{num_gpus}张卡的显存全部加起来({total_cluster_memory:.1f}GB)，"
+            f"仍不足以覆盖全量微调理论显存需求({full_finetune_need:.1f}GB)，建议改用LoRA或增加卡数"
+        )
+
+    estimated_per_gpu = min(full_finetune_need / num_gpus, per_gpu_memory_gb)
+    return StrategyRecommendation(strategy, reasoning, round(estimated_per_gpu, 1), warnings)
+
+
+def render_strategy_report(rec: StrategyRecommendation) -> str:
+    lines = []
+    lines.append("=" * 50)
+    lines.append("分布式训练策略建议报告")
+    lines.append("=" * 50)
+    lines.append(f"建议策略: {rec.strategy.value}")
+    lines.append(f"预估单卡显存占用: {rec.estimated_per_gpu_memory_gb}GB")
+    lines.append("\n决策依据:")
+    for idx, r in enumerate(rec.reasoning, 1):
+        lines.append(f"  {idx}. {r}")
+    if rec.warnings:
+        lines.append("\n警告:")
+        for w in rec.warnings:
+            lines.append(f"  ⚠ {w}")
+    lines.append("=" * 50)
+    return "\n".join(lines)
+
+
+def demo_run() -> None:
+    print("场景一：7B模型，LoRA微调，单卡24GB显存，共2张卡")
+    rec1 = select_distributed_strategy(
+        num_params_billion=7, per_gpu_memory_gb=24, num_gpus=2, use_lora=True
+    )
+    print(render_strategy_report(rec1))
+
+    print("\n场景二：7B模型，全量微调，单卡24GB显存，共4张卡")
+    rec2 = select_distributed_strategy(
+        num_params_billion=7, per_gpu_memory_gb=24, num_gpus=4, use_lora=False
+    )
+    print(render_strategy_report(rec2))
+
+    print("\n场景三：70B模型，全量微调，单卡80GB显存，共8张卡，要求尽量减少通信复杂度")
+    rec3 = select_distributed_strategy(
+        num_params_billion=70,
+        per_gpu_memory_gb=80,
+        num_gpus=8,
+        use_lora=False,
+        prefer_minimal_communication=True,
+    )
+    print(render_strategy_report(rec3))
+
+
+if __name__ == "__main__":
+    demo_run()
+```
+
+### 脚本十一:训练配置文件生成器(`training_config_generator.py`)
+
+前面的三个工具分别给出了"数据集是否合格""LoRA参数怎么配""分布式策略怎么选"三方面的建议,林悦提出一个想法:能不能把这三份建议直接拼装成一份可以直接喂给 LLaMA-Factory 的训练配置 YAML,减少人工誊写参数时出错的概率。这个生成器就是把前面几个工具的输出结果,自动转换为标准的训练配置文件。
+
+```python
+# -*- coding: utf-8 -*-
+"""
+training_config_generator.py
+训练配置文件生成器 —— 第51天课堂配套工具
+
+作用：
+    整合 lora_config_advisor.py 和 distributed_strategy_selector.py
+    的建议输出，自动生成一份可以直接交给 LLaMA-Factory 使用的
+    训练配置 YAML 文本，减少人工誊写参数时的出错概率（比如
+    抄错秩的数字、抄错目标模块名称等低级错误）。
+
+作者：林悦（蓬远科技 · 苍穹项目组）
+日期：Day51
+"""
+
+from dataclasses import dataclass
+from typing import List, Optional
+
+from lora_config_advisor import LoraRecommendation
+from distributed_strategy_selector import StrategyRecommendation, DistributedStrategy
+
+
+@dataclass
+class TrainingConfigInputs:
+    """生成配置文件所需的全部输入信息"""
+
+    model_name_or_path: str
+    dataset_name: str
+    output_dir: str
+    lora_recommendation: LoraRecommendation
+    strategy_recommendation: StrategyRecommendation
+    learning_rate: float = 1e-4
+    num_train_epochs: int = 3
+    per_device_batch_size: int = 2
+    gradient_accumulation_steps: int = 8
+
+
+_STRATEGY_TO_DEEPSPEED_CONFIG_FILE = {
+    DistributedStrategy.DEEPSPEED_ZERO1: "ds_z1_config.json",
+    DistributedStrategy.DEEPSPEED_ZERO2: "ds_z2_config.json",
+    DistributedStrategy.DEEPSPEED_ZERO3: "ds_z3_config.json",
+}
+
+
+def generate_llamafactory_yaml(inputs: TrainingConfigInputs) -> str:
+    """
+    生成 LLaMA-Factory 训练配置 YAML 文本。
+
+    这里手工拼接字符串而不是用 yaml.dump，是为了保留字段的注释和
+    分组顺序，方便工程师直接阅读，yaml.dump 生成的文件虽然语法正确，
+    但字段顺序和注释都会丢失，可读性较差，对于需要人工复核的训练配置
+    文件，可读性优先于生成代码的简洁性。
+    """
+    lora = inputs.lora_recommendation
+    strategy = inputs.strategy_recommendation
+
+    lines: List[str] = []
+    lines.append("### model")
+    lines.append(f"model_name_or_path: {inputs.model_name_or_path}")
+    lines.append("")
+    lines.append("### method")
+    lines.append("stage: sft")
+    lines.append("do_train: true")
+    if strategy.strategy == DistributedStrategy.DEEPSPEED_ZERO3 or lora.recommended_rank == 0:
+        lines.append("finetuning_type: full")
+    else:
+        lines.append("finetuning_type: lora")
+        lines.append(f"lora_rank: {lora.recommended_rank}")
+        lines.append(f"lora_alpha: {lora.recommended_alpha}")
+        lines.append(f"lora_dropout: {lora.recommended_dropout}")
+        lines.append(f"lora_target: {','.join(lora.target_modules)}")
+    lines.append("")
+    lines.append("### dataset")
+    lines.append(f"dataset: {inputs.dataset_name}")
+    lines.append("template: qwen")
+    lines.append("cutoff_len: 2048")
+    lines.append("overwrite_cache: true")
+    lines.append("preprocessing_num_workers: 8")
+    lines.append("")
+    lines.append("### output")
+    lines.append(f"output_dir: {inputs.output_dir}")
+    lines.append("logging_steps: 10")
+    lines.append("save_steps: 200")
+    lines.append("plot_loss: true")
+    lines.append("overwrite_output_dir: true")
+    lines.append("")
+    lines.append("### train")
+    lines.append(f"per_device_train_batch_size: {inputs.per_device_batch_size}")
+    lines.append(f"gradient_accumulation_steps: {inputs.gradient_accumulation_steps}")
+    lines.append(f"learning_rate: {inputs.learning_rate}")
+    lines.append(f"num_train_epochs: {inputs.num_train_epochs}")
+    lines.append("lr_scheduler_type: cosine")
+    lines.append("warmup_ratio: 0.1")
+    lines.append("bf16: true")
+
+    deepspeed_config = _STRATEGY_TO_DEEPSPEED_CONFIG_FILE.get(strategy.strategy)
+    if deepspeed_config:
+        lines.append(f"deepspeed: examples/deepspeed/{deepspeed_config}")
+        lines.append(f"# 分布式策略: {strategy.strategy.value}(自动生成配置时选定)")
+    elif strategy.strategy == DistributedStrategy.FSDP_FULL_SHARD:
+        lines.append("# 分布式策略: PyTorch FSDP全切分，需配合 accelerate config 单独设置FSDP参数")
+    else:
+        lines.append(f"# 分布式策略: {strategy.strategy.value}")
+
+    lines.append("")
+    lines.append("### eval")
+    lines.append("val_size: 0.05")
+    lines.append("per_device_eval_batch_size: 2")
+    lines.append("eval_strategy: steps")
+    lines.append("eval_steps: 200")
+    lines.append("")
+    lines.append("# ---- 以下为自动生成的决策依据摘要，仅供人工复核，不影响实际训练 ----")
+    for reason in lora.rationale:
+        lines.append(f"# LoRA决策依据: {reason}")
+    for reason in strategy.reasoning:
+        lines.append(f"# 分布式策略决策依据: {reason}")
+    for warning in strategy.warnings:
+        lines.append(f"# ⚠ 警告: {warning}")
+
+    return "\n".join(lines)
+
+
+def demo_run() -> None:
+    from lora_config_advisor import recommend_lora_config, FineTuneGoal, BudgetTier
+    from distributed_strategy_selector import select_distributed_strategy
+
+    lora_rec = recommend_lora_config(
+        goal=FineTuneGoal.KNOWLEDGE_INJECTION, budget=BudgetTier.MODERATE, dataset_size=3000
+    )
+    strategy_rec = select_distributed_strategy(
+        num_params_billion=7, per_gpu_memory_gb=24, num_gpus=2, use_lora=True
+    )
+
+    inputs = TrainingConfigInputs(
+        model_name_or_path="Qwen/Qwen2.5-7B-Instruct",
+        dataset_name="yufeng_finance_sft_v1",
+        output_dir="./saves/qwen2_5_7b_yufeng_lora",
+        lora_recommendation=lora_rec,
+        strategy_recommendation=strategy_rec,
+    )
+
+    yaml_text = generate_llamafactory_yaml(inputs)
+    print(yaml_text)
+
+
+if __name__ == "__main__":
+    demo_run()
+```
+
+### 脚本十二:单元测试补充(`test_dataset_and_lora_advisor.py`)
+
+新增的三个决策/校验工具都涉及不少边界判断逻辑,团队按照惯例给关键分支补上单元测试,尤其是格式校验工具里"识别脏数据"的部分和分布式策略选择器里"显存不够怎么办"的部分,这些正是最容易被后续维护者不小心改坏的地方。
+
+```python
+# -*- coding: utf-8 -*-
+"""
+test_dataset_and_lora_advisor.py
+针对 dataset_format_validator.py、lora_config_advisor.py、
+distributed_strategy_selector.py 的补充单元测试。
+
+作者：陈铭（蓬远科技 · 苍穹项目组）
+日期：Day51
+"""
+
+import pytest
+
+from dataset_format_validator import (
+    detect_format,
+    validate_dataset,
+    convert_alpaca_to_sharegpt,
+    convert_sharegpt_to_alpaca,
+    DatasetFormat,
+)
+from lora_config_advisor import recommend_lora_config, FineTuneGoal, BudgetTier
+from distributed_strategy_selector import select_distributed_strategy, DistributedStrategy
+
+
+class TestDatasetFormatDetection:
+    def test_detect_alpaca_format(self):
+        samples = [{"instruction": "问题", "output": "答案"}]
+        assert detect_format(samples) == DatasetFormat.ALPACA
+
+    def test_detect_sharegpt_format(self):
+        samples = [{"conversations": [{"from": "human", "value": "问题"}, {"from": "gpt", "value": "答案"}]}]
+        assert detect_format(samples) == DatasetFormat.SHAREGPT
+
+    def test_detect_unknown_format(self):
+        samples = [{"foo": "bar"}]
+        assert detect_format(samples) == DatasetFormat.UNKNOWN
+
+    def test_detect_empty_dataset(self):
+        assert detect_format([]) == DatasetFormat.UNKNOWN
+
+
+class TestAlpacaValidation:
+    def test_valid_sample_passes(self):
+        samples = [{"instruction": "问题", "output": "这是一个足够长的正常答案"}]
+        report = validate_dataset(samples)
+        assert report.error_count == 0
+        assert report.valid_sample_count == 1
+
+    def test_empty_instruction_is_error(self):
+        samples = [{"instruction": "", "output": "答案"}]
+        report = validate_dataset(samples)
+        assert report.error_count == 1
+        assert report.valid_sample_count == 0
+
+    def test_short_output_is_warning_not_error(self):
+        samples = [{"instruction": "问题", "output": "好"}]
+        report = validate_dataset(samples)
+        assert report.error_count == 0
+        assert report.warning_count == 1
+        assert report.valid_sample_count == 1, "警告不应影响样本被判定为有效"
+
+
+class TestShareGPTValidation:
+    def test_missing_gpt_turn_is_error(self):
+        samples = [{"conversations": [{"from": "human", "value": "问题1"}, {"from": "human", "value": "问题2"}]}]
+        report = validate_dataset(samples)
+        assert report.error_count >= 1
+
+    def test_complete_conversation_passes(self):
+        samples = [
+            {
+                "conversations": [
+                    {"from": "human", "value": "什么是LPR？"},
+                    {"from": "gpt", "value": "LPR是贷款市场报价利率..."},
+                ]
+            }
+        ]
+        report = validate_dataset(samples)
+        assert report.error_count == 0
+
+
+class TestFormatConversion:
+    def test_alpaca_to_sharegpt_roundtrip_structure(self):
+        alpaca_samples = [{"instruction": "问题", "input": "补充", "output": "答案"}]
+        converted = convert_alpaca_to_sharegpt(alpaca_samples)
+        assert len(converted) == 1
+        conv = converted[0]["conversations"]
+        assert conv[0]["from"] == "human"
+        assert "问题" in conv[0]["value"] and "补充" in conv[0]["value"]
+        assert conv[1]["from"] == "gpt"
+        assert conv[1]["value"] == "答案"
+
+    def test_sharegpt_to_alpaca_uses_last_gpt_turn_as_output(self):
+        sharegpt_samples = [
+            {
+                "conversations": [
+                    {"from": "human", "value": "第一个问题"},
+                    {"from": "gpt", "value": "第一个答案"},
+                    {"from": "human", "value": "第二个问题"},
+                    {"from": "gpt", "value": "第二个答案"},
+                ]
+            }
+        ]
+        converted = convert_sharegpt_to_alpaca(sharegpt_samples)
+        assert converted[0]["output"] == "第二个答案"
+        assert "第一个问题" in converted[0]["instruction"]
+
+
+class TestLoraConfigAdvisor:
+    def test_small_dataset_narrows_target_modules(self):
+        rec = recommend_lora_config(
+            goal=FineTuneGoal.REASONING_ENHANCEMENT, budget=BudgetTier.AMPLE, dataset_size=100
+        )
+        assert len(rec.target_modules) <= 2
+        assert rec.recommended_rank <= 16
+
+    def test_tight_budget_lowers_rank(self):
+        rec_tight = recommend_lora_config(
+            goal=FineTuneGoal.KNOWLEDGE_INJECTION, budget=BudgetTier.TIGHT, dataset_size=5000
+        )
+        rec_ample = recommend_lora_config(
+            goal=FineTuneGoal.KNOWLEDGE_INJECTION, budget=BudgetTier.AMPLE, dataset_size=5000
+        )
+        assert rec_tight.recommended_rank <= rec_ample.recommended_rank
+
+    def test_alpha_is_twice_rank(self):
+        rec = recommend_lora_config(
+            goal=FineTuneGoal.STYLE_AND_FORMAT, budget=BudgetTier.MODERATE, dataset_size=2000
+        )
+        assert rec.recommended_alpha == rec.recommended_rank * 2
+
+
+class TestDistributedStrategySelector:
+    def test_lora_with_sufficient_memory_uses_ddp_or_single(self):
+        rec = select_distributed_strategy(
+            num_params_billion=7, per_gpu_memory_gb=48, num_gpus=2, use_lora=True
+        )
+        assert rec.strategy in (DistributedStrategy.DDP, DistributedStrategy.SINGLE_GPU)
+
+    def test_full_finetune_large_model_requires_sharding(self):
+        rec = select_distributed_strategy(
+            num_params_billion=70, per_gpu_memory_gb=24, num_gpus=8, use_lora=False
+        )
+        assert rec.strategy in (
+            DistributedStrategy.DEEPSPEED_ZERO2,
+            DistributedStrategy.DEEPSPEED_ZERO3,
+            DistributedStrategy.FSDP_FULL_SHARD,
+        )
+
+    def test_single_gpu_insufficient_memory_produces_warning(self):
+        rec = select_distributed_strategy(
+            num_params_billion=70, per_gpu_memory_gb=24, num_gpus=1, use_lora=False
+        )
+        assert len(rec.warnings) > 0, "单卡显存明显不足时应给出警告，而不是静默给出一个不可行的建议"
+
+    def test_prefer_minimal_communication_switches_to_fsdp(self):
+        rec = select_distributed_strategy(
+            num_params_billion=70,
+            per_gpu_memory_gb=80,
+            num_gpus=8,
+            use_lora=False,
+            prefer_minimal_communication=True,
+        )
+        assert rec.strategy == DistributedStrategy.FSDP_FULL_SHARD
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+```
+
+跑完这一整套工具链,林悦感慨了一句:"以前觉得微调是'调参炼丹',现在发现真正靠谱的团队,是把'炼丹的经验'变成了可复用、可测试的代码。"陈铭补了一句:"这也是咱们区别于单纯会调 Prompt 的团队的地方——遇到复杂系统性的工程问题,咱们的第一反应是写工具、写测试,把经验固化下来,而不是每次都靠人脑重新推一遍。"
+
+### 脚本十三:训练耗时预估与进度ETA计算器(`training_eta_estimator.py`)
+
+工具链搭好之后,王振宇又提了一个很实际的问题:"给客户报排期的时候,'大概需要多久训练完'这句话,我们现在是靠拍脑袋估的,能不能也做成可计算的东西?"训练耗时估算比显存估算更复杂一些,因为要综合考虑数据量、序列长度、GPU算力、通信开销等多个因素,但可以先用一个简化的经验模型给出量级上靠得住的估算,再结合实际训练过程中的日志数据做动态修正。
+
+```python
+# -*- coding: utf-8 -*-
+"""
+training_eta_estimator.py
+训练耗时预估与进度ETA计算器 —— 第51天课堂配套工具
+
+背景：
+    客户经常会问"这次微调大概要多久能出结果"，这个问题如果只凭经验
+    拍脑袋回答，容易出现两种后果：估得过于乐观导致延期被动挨骂，
+    或者估得过于保守导致客户觉得团队效率低。
+
+    本工具采用"理论吞吐量估算 + 实际训练日志动态修正"两阶段策略：
+    1. 训练开始前，基于模型规模、序列长度、GPU算力等参数，
+       给出一个粗略的理论耗时区间，用于向客户报排期的初步预期。
+    2. 训练开始后，读取真实的训练日志（每一步的耗时），
+       用滑动窗口平均值动态修正ETA，随着训练推进，估算会越来越准。
+
+作者：陈铭（蓬远科技 · 苍穹项目组）
+日期：Day51
+"""
+
+from dataclasses import dataclass, field
+from typing import List, Optional
+import statistics
+
+
+# 不同GPU型号的经验算力系数（相对于A100的训练吞吐量倍数），
+# 用于粗略换算不同硬件下的训练速度差异，实际数值会因框架优化程度、
+# 序列长度、batch size等因素浮动，这里取的是团队实测的中位数经验值
+_GPU_THROUGHPUT_FACTOR_RELATIVE_TO_A100 = {
+    "A100": 1.0,
+    "H100": 1.8,
+    "A800": 0.95,
+    "RTX4090": 0.55,
+    "RTX3090": 0.35,
+    "V100": 0.4,
+}
+
+# 基准吞吐量：在A100单卡上，7B模型、LoRA微调、序列长度2048时，
+# 每秒能处理的样本数（经验值，来自团队过往项目的实测记录）
+_BASELINE_SAMPLES_PER_SECOND_7B_LORA_SEQ2048 = 1.8
+
+
+@dataclass
+class EtaEstimate:
+    """训练耗时估算结果"""
+
+    estimated_total_hours: float
+    estimated_hours_range: str
+    throughput_samples_per_second: float
+    total_steps: int
+    assumptions: List[str] = field(default_factory=list)
+
+
+def estimate_training_eta(
+    num_params_billion: float,
+    dataset_size: int,
+    num_epochs: int,
+    sequence_length: int,
+    gpu_model: str,
+    num_gpus: int,
+    per_device_batch_size: int,
+    gradient_accumulation_steps: int,
+    use_lora: bool = True,
+) -> EtaEstimate:
+    """
+    基于经验模型估算训练总耗时。
+
+    核心思路：
+        1. 以"7B模型+LoRA+序列长度2048+A100单卡"为基准场景，
+           按参数量、序列长度、GPU型号、卡数做比例换算。
+        2. 全量微调场景下反向传播的计算量显著增加，简化处理为
+           在LoRA基准吞吐量基础上打一个折扣系数。
+        3. 序列长度增加会带来超线性的计算量增长（注意力机制的
+           计算复杂度是序列长度的平方关系），这里做简化的近线性估算，
+           实际项目中序列长度差异较大时建议用小批量实测数据校准。
+    """
+    assumptions: List[str] = []
+
+    gpu_factor = _GPU_THROUGHPUT_FACTOR_RELATIVE_TO_A100.get(gpu_model, 1.0)
+    if gpu_model not in _GPU_THROUGHPUT_FACTOR_RELATIVE_TO_A100:
+        assumptions.append(f"未收录GPU型号'{gpu_model}'的经验系数，默认按A100同等算力估算，建议实测校准")
+
+    param_scale_factor = 7.0 / max(num_params_billion, 0.1)
+    seq_scale_factor = 2048.0 / max(sequence_length, 128)
+
+    base_throughput = _BASELINE_SAMPLES_PER_SECOND_7B_LORA_SEQ2048
+    adjusted_throughput_single_gpu = base_throughput * gpu_factor * param_scale_factor * seq_scale_factor
+
+    if not use_lora:
+        full_finetune_discount = 0.4  # 全量微调反向传播计算量更大，简化打4折
+        adjusted_throughput_single_gpu *= full_finetune_discount
+        assumptions.append("全量微调场景，在LoRA基准吞吐量基础上打4折估算(经验系数，实际以训练日志校准为准)")
+
+    # 多卡并行加速并非线性，考虑通信开销，按经验打个"并行效率"折扣
+    parallel_efficiency = 0.85 if num_gpus > 1 else 1.0
+    total_throughput = adjusted_throughput_single_gpu * num_gpus * parallel_efficiency
+    if num_gpus > 1:
+        assumptions.append(f"多卡并行效率按{parallel_efficiency:.0%}估算(通信开销导致无法线性加速)")
+
+    total_samples_to_process = dataset_size * num_epochs
+    effective_batch_size = per_device_batch_size * gradient_accumulation_steps * num_gpus
+    total_steps = max(1, total_samples_to_process // effective_batch_size)
+
+    estimated_seconds = total_samples_to_process / max(total_throughput, 0.01)
+    estimated_hours = estimated_seconds / 3600
+
+    # 给出一个±30%的区间，作为向客户报排期时更稳妥的表达方式，
+    # 避免用一个"精确到小数点"的数字给客户制造不切实际的确定性预期
+    low_bound = estimated_hours * 0.7
+    high_bound = estimated_hours * 1.3
+    range_text = f"{low_bound:.1f} - {high_bound:.1f} 小时"
+
+    assumptions.append(f"基准场景：7B模型+LoRA+序列长度2048+A100单卡，吞吐量约{base_throughput}样本/秒")
+    assumptions.append("以上为理论估算，训练开始后应结合实际日志动态修正，本估算仅用于排期初步沟通")
+
+    return EtaEstimate(
+        estimated_total_hours=round(estimated_hours, 1),
+        estimated_hours_range=range_text,
+        throughput_samples_per_second=round(total_throughput, 2),
+        total_steps=int(total_steps),
+        assumptions=assumptions,
+    )
+
+
+class TrainingProgressTracker:
+    """
+    训练进行中的实时ETA动态修正器。
+
+    使用方式：训练脚本每完成一个step，调用一次 record_step_duration，
+    工具内部维护一个滑动窗口，用最近若干步的平均耗时来预测剩余时间，
+    这样即使训练初期因为显存分配、CUDA预热等原因耗时偏高，
+    随着训练推进，ETA估算会自动收敛到更准确的数值。
+    """
+
+    def __init__(self, total_steps: int, window_size: int = 50) -> None:
+        self.total_steps = total_steps
+        self.window_size = window_size
+        self.completed_steps = 0
+        self._recent_step_durations: List[float] = []
+
+    def record_step_duration(self, duration_seconds: float) -> None:
+        self.completed_steps += 1
+        self._recent_step_durations.append(duration_seconds)
+        if len(self._recent_step_durations) > self.window_size:
+            self._recent_step_durations.pop(0)
+
+    def get_current_eta(self) -> Optional[dict]:
+        """返回当前基于滑动窗口的剩余时间估算，训练尚未开始时返回None"""
+        if not self._recent_step_durations:
+            return None
+
+        avg_step_duration = statistics.mean(self._recent_step_durations)
+        remaining_steps = max(0, self.total_steps - self.completed_steps)
+        remaining_seconds = remaining_steps * avg_step_duration
+
+        return {
+            "已完成步数": self.completed_steps,
+            "总步数": self.total_steps,
+            "完成进度": f"{self.completed_steps / max(self.total_steps, 1):.1%}",
+            "近期平均单步耗时(秒)": round(avg_step_duration, 2),
+            "预估剩余时间(小时)": round(remaining_seconds / 3600, 2),
+        }
+
+
+def render_eta_report(estimate: EtaEstimate) -> str:
+    lines = []
+    lines.append("=" * 50)
+    lines.append("训练耗时预估报告")
+    lines.append("=" * 50)
+    lines.append(f"预估总耗时: {estimate.estimated_total_hours} 小时")
+    lines.append(f"稳妥区间(±30%): {estimate.estimated_hours_range}")
+    lines.append(f"预估吞吐量: {estimate.throughput_samples_per_second} 样本/秒")
+    lines.append(f"预估总步数: {estimate.total_steps}")
+    lines.append("\n估算假设与说明:")
+    for a in estimate.assumptions:
+        lines.append(f"  - {a}")
+    lines.append("=" * 50)
+    return "\n".join(lines)
+
+
+def demo_run() -> None:
+    print("场景：为御风金融客服问答微调任务估算训练耗时")
+    estimate = estimate_training_eta(
+        num_params_billion=7,
+        dataset_size=5000,
+        num_epochs=3,
+        sequence_length=2048,
+        gpu_model="A800",
+        num_gpus=2,
+        per_device_batch_size=2,
+        gradient_accumulation_steps=8,
+        use_lora=True,
+    )
+    print(render_eta_report(estimate))
+
+    print("\n模拟训练进行中的实时ETA动态修正:")
+    tracker = TrainingProgressTracker(total_steps=estimate.total_steps, window_size=20)
+    simulated_step_durations = [12.5, 11.8, 12.1, 10.9, 11.5] * 4  # 模拟前20步的真实耗时数据
+    for duration in simulated_step_durations:
+        tracker.record_step_duration(duration)
+    current_status = tracker.get_current_eta()
+    for k, v in current_status.items():
+        print(f"  {k}: {v}")
+
+
+if __name__ == "__main__":
+    demo_run()
+```
+
+### 脚本十四:训练耗时估算器单元测试(`test_training_eta_estimator.py`)
+
+耗时估算工具直接影响到团队向客户报出去的排期承诺,王振宇特别强调"这个工具算错了比不算还麻烦",所以团队给关键的比例换算逻辑和滑动窗口ETA修正逻辑都补上了单元测试。
+
+```python
+# -*- coding: utf-8 -*-
+"""
+test_training_eta_estimator.py
+针对 training_eta_estimator.py 的单元测试。
+
+作者：陈铭（蓬远科技 · 苍穹项目组）
+日期：Day51
+"""
+
+import pytest
+
+from training_eta_estimator import (
+    estimate_training_eta,
+    TrainingProgressTracker,
+)
+
+
+class TestEstimateTrainingEta:
+    def test_larger_model_takes_longer(self):
+        small_model_estimate = estimate_training_eta(
+            num_params_billion=7,
+            dataset_size=3000,
+            num_epochs=3,
+            sequence_length=2048,
+            gpu_model="A100",
+            num_gpus=1,
+            per_device_batch_size=2,
+            gradient_accumulation_steps=8,
+            use_lora=True,
+        )
+        large_model_estimate = estimate_training_eta(
+            num_params_billion=70,
+            dataset_size=3000,
+            num_epochs=3,
+            sequence_length=2048,
+            gpu_model="A100",
+            num_gpus=1,
+            per_device_batch_size=2,
+            gradient_accumulation_steps=8,
+            use_lora=True,
+        )
+        assert large_model_estimate.estimated_total_hours > small_model_estimate.estimated_total_hours, (
+            "参数量更大的模型，理论训练耗时应该更长"
+        )
+
+    def test_more_gpus_reduces_estimated_time(self):
+        single_gpu = estimate_training_eta(
+            num_params_billion=7,
+            dataset_size=5000,
+            num_epochs=3,
+            sequence_length=2048,
+            gpu_model="A100",
+            num_gpus=1,
+            per_device_batch_size=2,
+            gradient_accumulation_steps=8,
+            use_lora=True,
+        )
+        multi_gpu = estimate_training_eta(
+            num_params_billion=7,
+            dataset_size=5000,
+            num_epochs=3,
+            sequence_length=2048,
+            gpu_model="A100",
+            num_gpus=4,
+            per_device_batch_size=2,
+            gradient_accumulation_steps=8,
+            use_lora=True,
+        )
+        assert multi_gpu.estimated_total_hours < single_gpu.estimated_total_hours, (
+            "更多卡数应该显著缩短预估耗时(即使考虑并行效率折扣)"
+        )
+
+    def test_full_finetune_slower_than_lora(self):
+        lora_estimate = estimate_training_eta(
+            num_params_billion=7,
+            dataset_size=3000,
+            num_epochs=3,
+            sequence_length=2048,
+            gpu_model="A100",
+            num_gpus=1,
+            per_device_batch_size=2,
+            gradient_accumulation_steps=8,
+            use_lora=True,
+        )
+        full_estimate = estimate_training_eta(
+            num_params_billion=7,
+            dataset_size=3000,
+            num_epochs=3,
+            sequence_length=2048,
+            gpu_model="A100",
+            num_gpus=1,
+            per_device_batch_size=2,
+            gradient_accumulation_steps=8,
+            use_lora=False,
+        )
+        assert full_estimate.estimated_total_hours > lora_estimate.estimated_total_hours, (
+            "全量微调的计算量显著高于LoRA，预估耗时应该更长"
+        )
+
+    def test_unknown_gpu_model_adds_assumption_note(self):
+        estimate = estimate_training_eta(
+            num_params_billion=7,
+            dataset_size=1000,
+            num_epochs=1,
+            sequence_length=2048,
+            gpu_model="未知型号XYZ",
+            num_gpus=1,
+            per_device_batch_size=2,
+            gradient_accumulation_steps=8,
+            use_lora=True,
+        )
+        assert any("未收录GPU型号" in note for note in estimate.assumptions), (
+            "遇到未收录的GPU型号时，应该在假设说明里明确提示，而不是默默按默认系数计算"
+        )
+
+    def test_range_bounds_are_reasonable(self):
+        estimate = estimate_training_eta(
+            num_params_billion=7,
+            dataset_size=3000,
+            num_epochs=3,
+            sequence_length=2048,
+            gpu_model="A100",
+            num_gpus=1,
+            per_device_batch_size=2,
+            gradient_accumulation_steps=8,
+            use_lora=True,
+        )
+        assert "-" in estimate.estimated_hours_range
+        assert "小时" in estimate.estimated_hours_range
+
+
+class TestTrainingProgressTracker:
+    def test_eta_is_none_before_any_step_recorded(self):
+        tracker = TrainingProgressTracker(total_steps=100)
+        assert tracker.get_current_eta() is None
+
+    def test_progress_percentage_calculated_correctly(self):
+        tracker = TrainingProgressTracker(total_steps=100)
+        for _ in range(25):
+            tracker.record_step_duration(10.0)
+        status = tracker.get_current_eta()
+        assert status["完成进度"] == "25.0%"
+        assert status["已完成步数"] == 25
+
+    def test_sliding_window_limits_history_size(self):
+        tracker = TrainingProgressTracker(total_steps=1000, window_size=10)
+        for i in range(50):
+            tracker.record_step_duration(float(i))
+        assert len(tracker._recent_step_durations) == 10, "滑动窗口应该只保留最近window_size条记录"
+
+    def test_eta_recalculates_based_on_recent_average(self):
+        tracker = TrainingProgressTracker(total_steps=100, window_size=5)
+        # 先模拟前期耗时较长的几步(比如CUDA预热阶段)
+        for _ in range(5):
+            tracker.record_step_duration(20.0)
+        early_eta = tracker.get_current_eta()["预估剩余时间(小时)"]
+
+        # 后续训练稳定后，单步耗时明显下降
+        for _ in range(5):
+            tracker.record_step_duration(5.0)
+        later_eta = tracker.get_current_eta()["预估剩余时间(小时)"]
+
+        assert later_eta < early_eta, "滑动窗口应该让ETA随着实际训练速度变化而动态修正，不能停留在早期偏高的估算上"
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+```
+
+跑完这一整套测试,团队把这几个工具打包放进了内部的"微调项目启动检查清单"里——任何一个新项目开工前,先跑数据校验,再跑LoRA配置建议,再跑分布式策略选择,最后生成训练配置文件和耗时预估,整个流程从"凭经验判断"变成了"工具辅助决策",这也是陈铭反复强调的"把经验代码化"的一次完整实践。
+
+### 脚本十五:微调项目启动检查清单一键执行入口(`finetune_project_starter.py`)
+
+最后,林悦把前面几个工具串联成一个统一的命令行入口,新项目开工时只需要跑一条命令,就能依次拿到数据校验报告、LoRA配置建议、分布式策略建议和最终的训练配置文件,不用再手动依次调用各个脚本。
+
+```python
+# -*- coding: utf-8 -*-
+"""
+finetune_project_starter.py
+微调项目启动检查清单一键执行入口 —— 第51天课堂配套工具
+
+作用：
+    把 dataset_format_validator、lora_config_advisor、
+    distributed_strategy_selector、training_config_generator、
+    training_eta_estimator 五个工具串联成一条流水线，新项目开工时
+    一键跑完全部前置检查，输出一份完整的启动评估报告。
+
+作者：林悦（蓬远科技 · 苍穹项目组）
+日期：Day51
+"""
+
+from dataclasses import dataclass
+from typing import List
+
+from dataset_format_validator import validate_dataset, render_validation_report
+from lora_config_advisor import recommend_lora_config, render_recommendation_report, FineTuneGoal, BudgetTier
+from distributed_strategy_selector import select_distributed_strategy, render_strategy_report
+from training_config_generator import TrainingConfigInputs, generate_llamafactory_yaml
+from training_eta_estimator import estimate_training_eta, render_eta_report
+
+
+@dataclass
+class ProjectStartInputs:
+    """启动一个新微调项目所需的全部原始输入"""
+
+    raw_samples: List[dict]
+    model_name_or_path: str
+    num_params_billion: float
+    goal: FineTuneGoal
+    budget: BudgetTier
+    per_gpu_memory_gb: float
+    num_gpus: int
+    gpu_model: str
+    output_dir: str
+    dataset_name: str
+
+
+def run_project_start_checklist(inputs: ProjectStartInputs) -> str:
+    """依次执行五个前置检查工具，汇总输出一份完整报告"""
+    report_sections: List[str] = []
+
+    validation_report = validate_dataset(inputs.raw_samples)
+    report_sections.append("【第一步：数据集格式校验】\n" + render_validation_report(validation_report))
+
+    if validation_report.error_count > 0:
+        report_sections.append(
+            f"\n⚠ 数据集存在{validation_report.error_count}处必须修复的错误，"
+            "建议先修复数据再继续后续步骤，以下步骤仍会执行以供参考。"
+        )
+
+    lora_rec = recommend_lora_config(
+        goal=inputs.goal, budget=inputs.budget, dataset_size=len(inputs.raw_samples)
+    )
+    report_sections.append("\n【第二步：LoRA配置建议】\n" + render_recommendation_report(lora_rec))
+
+    strategy_rec = select_distributed_strategy(
+        num_params_billion=inputs.num_params_billion,
+        per_gpu_memory_gb=inputs.per_gpu_memory_gb,
+        num_gpus=inputs.num_gpus,
+        use_lora=True,
+    )
+    report_sections.append("\n【第三步：分布式训练策略建议】\n" + render_strategy_report(strategy_rec))
+
+    config_inputs = TrainingConfigInputs(
+        model_name_or_path=inputs.model_name_or_path,
+        dataset_name=inputs.dataset_name,
+        output_dir=inputs.output_dir,
+        lora_recommendation=lora_rec,
+        strategy_recommendation=strategy_rec,
+    )
+    yaml_text = generate_llamafactory_yaml(config_inputs)
+    report_sections.append("\n【第四步：自动生成的训练配置文件】\n" + yaml_text)
+
+    eta_estimate = estimate_training_eta(
+        num_params_billion=inputs.num_params_billion,
+        dataset_size=len(inputs.raw_samples),
+        num_epochs=config_inputs.num_train_epochs,
+        sequence_length=2048,
+        gpu_model=inputs.gpu_model,
+        num_gpus=inputs.num_gpus,
+        per_device_batch_size=config_inputs.per_device_batch_size,
+        gradient_accumulation_steps=config_inputs.gradient_accumulation_steps,
+        use_lora=True,
+    )
+    report_sections.append("\n【第五步：训练耗时预估】\n" + render_eta_report(eta_estimate))
+
+    return "\n".join(report_sections)
+
+
+def demo_run() -> None:
+    sample_data = [
+        {"instruction": "客户询问逾期利率如何计算", "input": "", "output": "根据合同约定，逾期利率为基准利率上浮30%，按日计息..."}
+        for _ in range(3000)
+    ]
+
+    inputs = ProjectStartInputs(
+        raw_samples=sample_data,
+        model_name_or_path="Qwen/Qwen2.5-7B-Instruct",
+        num_params_billion=7,
+        goal=FineTuneGoal.KNOWLEDGE_INJECTION,
+        budget=BudgetTier.MODERATE,
+        per_gpu_memory_gb=24,
+        num_gpus=2,
+        gpu_model="A800",
+        output_dir="./saves/qwen2_5_7b_yufeng_lora",
+        dataset_name="yufeng_finance_sft_v1",
+    )
+
+    full_report = run_project_start_checklist(inputs)
+    print(full_report)
+
+
+if __name__ == "__main__":
+    demo_run()
+```
+
+有了这套"一键启动检查清单",团队后续每接一个新的微调项目,第一件事就是跑这个脚本,五分钟内就能拿到一份包含数据质量、参数配置、算力方案、排期预估的完整评估报告,交给客户过目也显得专业可信,这也成了蓬远科技在多个微调项目交付前的标准动作之一。
+
 ---
 
 ## 今日复盘
