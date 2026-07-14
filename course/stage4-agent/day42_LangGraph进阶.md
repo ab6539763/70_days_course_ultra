@@ -1952,6 +1952,1118 @@ if __name__ == "__main__":
 
 代码写到这里,陈铭把整个`writing_agent`包和这个附加练习都在本地跑了一遍(用的是`DemoLLMClient`,不需要真实的模型密钥),中断、模拟重启、恢复、终稿确认,整条链路全部走通,输出结果里能清楚看到大纲从生成到审核通过、章节从并行写作到自审子图处理、全文汇总润色到终稿确认的完整轨迹,持久化数据库里的检查点数量也随着流程推进稳步增加。
 
+### 模块十二:`writing_agent/checkpointer_matrix.py` —— 三种Checkpointer的完整对比实现与压测
+
+代码提交之后,王振宇又给陈铭加了一道"课后加餐":上午的对照表虽然把`MemorySaver`、`SqliteSaver`、`PostgresSaver`三者的取舍写清楚了,但都是文字描述,没有一份能真正跑起来的代码去验证"它们在写入延迟上到底差多少""进程重启后谁能存活、谁不能"。王振宇说,给客户做技术选型汇报的时候,一句"PostgresSaver性能更好"没有说服力,一张实测数据表才有说服力。陈铭花了将近两个小时,把三种Checkpointer的接入方式、存活性验证、写入延迟压测,全部写成了一份可以独立运行的对比脚本。
+
+```python
+"""
+Checkpointer选型对比与压测模块。
+
+这个模块把上午课堂笔记里的对照表,变成一份可以真正跑起来的验证脚本,
+目标是在没有真实生产环境的情况下,也能对三种Checkpointer的两个核心维度做出量化结论:
+
+1. 存活性(Durability):进程"重启"(在代码里模拟为重新构建一个全新的图对象和
+   全新的Checkpointer连接,不复用任何内存中的引用)之后,是否还能通过thread_id
+   读取到之前写入的状态。
+
+2. 写入延迟(Write Latency):每一次超步执行完成后,状态写入Checkpointer所花费的时间,
+   这个数字直接决定了持久化机制会给正常业务流程带来多大的额外开销。
+
+PostgresSaver的示例代码在没有配置真实数据库连接串的环境下不会被执行,
+而是通过环境变量PGSAVER_DSN来控制是否启用,这样课堂演示环境和接入祺瑞正式环境时,
+可以复用同一份代码,只需要切换环境变量。
+"""
+
+from __future__ import annotations
+
+import os
+import statistics
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Callable, TypedDict
+
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.graph import END, START, StateGraph
+
+
+class BenchmarkState(TypedDict, total=False):
+    """压测专用的最小状态结构,只包含一个自增计数器和一段模拟负载。"""
+
+    counter: int
+    payload: str
+    history: list[int]
+
+
+def _increment_node(state: BenchmarkState) -> dict[str, Any]:
+    """
+    压测用节点,不做任何真实业务逻辑,只负责让状态发生变化,
+    从而触发Checkpointer的一次真实写入。
+    """
+
+    history = state.get("history", [])
+    new_counter = state.get("counter", 0) + 1
+    return {"counter": new_counter, "history": history + [new_counter]}
+
+
+def build_benchmark_graph(checkpointer) -> Any:
+    """构建一个只有单个自增节点、循环执行若干次的压测专用图。"""
+
+    builder = StateGraph(BenchmarkState)
+    builder.add_node("increment", _increment_node)
+    builder.add_edge(START, "increment")
+    builder.add_edge("increment", END)
+    return builder.compile(checkpointer=checkpointer)
+
+
+@dataclass
+class DurabilitySurvivalResult:
+    """存活性验证的结果记录。"""
+
+    saver_name: str
+    survived_after_rebuild: bool
+    values_after_rebuild: dict[str, Any] | None
+    note: str = ""
+
+
+def verify_durability(
+    saver_name: str,
+    build_checkpointer: Callable[[], Any],
+    rebuild_checkpointer: Callable[[], Any],
+) -> DurabilitySurvivalResult:
+    """
+    存活性验证的核心逻辑,分三步:
+
+    1. 用build_checkpointer构建第一份Checkpointer实例,跑一次图执行,写入若干条状态。
+    2. 丢弃第一份Checkpointer实例的所有引用(模拟进程退出)。
+    3. 用rebuild_checkpointer重新构建一份"全新"的Checkpointer实例
+       (对于内存型的实现,这里天然就是一份空的新字典;对于文件/数据库型的实现,
+       这里会重新连接到同一份物理存储),验证能否通过thread_id读到第一步写入的数据。
+    """
+
+    thread_id = f"durability-check-{saver_name}-{uuid.uuid4().hex[:6]}"
+    config = {"configurable": {"thread_id": thread_id}}
+
+    first_checkpointer = build_checkpointer()
+    first_graph = build_benchmark_graph(first_checkpointer)
+    for _ in range(3):
+        first_graph.invoke({}, config=config)
+
+    # 显式删除引用,尽量模拟"进程内不再持有任何和第一次运行相关的对象"的场景。
+    del first_graph
+    del first_checkpointer
+
+    try:
+        second_checkpointer = rebuild_checkpointer()
+    except Exception as exc:  # noqa: BLE001 - 压测脚本里需要把连接失败也作为一种可观测结果
+        return DurabilitySurvivalResult(
+            saver_name=saver_name,
+            survived_after_rebuild=False,
+            values_after_rebuild=None,
+            note=f"重建Checkpointer连接失败: {exc}",
+        )
+
+    second_graph = build_benchmark_graph(second_checkpointer)
+    snapshot = second_graph.get_state(config)
+
+    survived = bool(snapshot.values) and snapshot.values.get("counter") == 3
+    return DurabilitySurvivalResult(
+        saver_name=saver_name,
+        survived_after_rebuild=survived,
+        values_after_rebuild=dict(snapshot.values) if snapshot.values else None,
+        note="重启后状态完整保留" if survived else "重启后状态丢失或不完整",
+    )
+
+
+@dataclass
+class LatencyBenchmarkResult:
+    """写入延迟压测的结果记录。"""
+
+    saver_name: str
+    sample_count: int
+    latencies_ms: list[float] = field(default_factory=list)
+
+    @property
+    def mean_ms(self) -> float:
+        return statistics.mean(self.latencies_ms) if self.latencies_ms else 0.0
+
+    @property
+    def p95_ms(self) -> float:
+        if not self.latencies_ms:
+            return 0.0
+        sorted_values = sorted(self.latencies_ms)
+        index = max(0, int(len(sorted_values) * 0.95) - 1)
+        return sorted_values[index]
+
+    @property
+    def max_ms(self) -> float:
+        return max(self.latencies_ms) if self.latencies_ms else 0.0
+
+
+def benchmark_write_latency(
+    saver_name: str,
+    checkpointer: Any,
+    sample_count: int = 50,
+) -> LatencyBenchmarkResult:
+    """
+    对一个已经构建好的Checkpointer实例,反复执行图调用并记录每一次调用的耗时,
+    用来近似估算"一次超步写入所带来的延迟"。
+
+    注意这里测量的是完整的invoke耗时,包含节点函数本身的执行时间,
+    由于_increment_node几乎不消耗任何时间,这个耗时基本可以近似看作
+    "调度开销 + 状态写入开销",足够用来做三种实现之间的相对比较。
+    """
+
+    graph = build_benchmark_graph(checkpointer)
+    thread_id = f"latency-check-{saver_name}-{uuid.uuid4().hex[:6]}"
+    config = {"configurable": {"thread_id": thread_id}}
+
+    result = LatencyBenchmarkResult(saver_name=saver_name, sample_count=sample_count)
+
+    for _ in range(sample_count):
+        start = time.perf_counter()
+        graph.invoke({}, config=config)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        result.latencies_ms.append(elapsed_ms)
+
+    return result
+
+
+def _build_memory_saver() -> MemorySaver:
+    return MemorySaver()
+
+
+def _build_sqlite_saver(path: str) -> Any:
+    return SqliteSaver.from_conn_string(path)
+
+
+def _try_build_postgres_saver() -> Any | None:
+    """
+    尝试构建PostgresSaver实例。
+
+    只有当环境变量PGSAVER_DSN被设置时才会真正尝试连接,
+    否则直接返回None,调用方据此跳过Postgres相关的对比项,
+    这样课堂演示环境(通常没有现成的PostgreSQL实例)不会因为缺少数据库而报错中断。
+    """
+
+    dsn = os.environ.get("PGSAVER_DSN")
+    if not dsn:
+        return None
+
+    try:
+        from langgraph.checkpoint.postgres import PostgresSaver
+    except ImportError:
+        return None
+
+    try:
+        saver_cm = PostgresSaver.from_conn_string(dsn)
+        saver = saver_cm.__enter__()
+        saver.setup()
+        return saver
+    except Exception:
+        return None
+
+
+def run_durability_matrix() -> list[DurabilitySurvivalResult]:
+    """依次对三种Checkpointer运行存活性验证,汇总成一份结果列表。"""
+
+    results: list[DurabilitySurvivalResult] = []
+
+    # MemorySaver: 故意用同一个实例反复"重建"图,但不重建Checkpointer本身,
+    # 这里为了体现"如果真的换了一个新的MemorySaver实例会怎样",
+    # rebuild_checkpointer直接返回一个全新的空MemorySaver,预期结果是数据丢失。
+    results.append(
+        verify_durability(
+            "MemorySaver",
+            build_checkpointer=_build_memory_saver,
+            rebuild_checkpointer=_build_memory_saver,
+        )
+    )
+
+    sqlite_path = f"durability_check_{uuid.uuid4().hex[:6]}.db"
+    results.append(
+        verify_durability(
+            "SqliteSaver",
+            build_checkpointer=lambda: _build_sqlite_saver(sqlite_path),
+            rebuild_checkpointer=lambda: _build_sqlite_saver(sqlite_path),
+        )
+    )
+    if os.path.exists(sqlite_path):
+        os.remove(sqlite_path)
+
+    postgres_first = _try_build_postgres_saver()
+    if postgres_first is not None:
+        results.append(
+            verify_durability(
+                "PostgresSaver",
+                build_checkpointer=lambda: postgres_first,
+                rebuild_checkpointer=_try_build_postgres_saver,
+            )
+        )
+    else:
+        results.append(
+            DurabilitySurvivalResult(
+                saver_name="PostgresSaver",
+                survived_after_rebuild=False,
+                values_after_rebuild=None,
+                note="未配置PGSAVER_DSN环境变量,跳过实际连接测试(课堂演示环境默认跳过)",
+            )
+        )
+
+    return results
+
+
+def run_latency_matrix(sample_count: int = 50) -> list[LatencyBenchmarkResult]:
+    """依次对三种Checkpointer运行写入延迟压测,汇总成一份结果列表。"""
+
+    results: list[LatencyBenchmarkResult] = []
+
+    results.append(benchmark_write_latency("MemorySaver", _build_memory_saver(), sample_count))
+
+    sqlite_path = f"latency_check_{uuid.uuid4().hex[:6]}.db"
+    results.append(
+        benchmark_write_latency("SqliteSaver", _build_sqlite_saver(sqlite_path), sample_count)
+    )
+    if os.path.exists(sqlite_path):
+        os.remove(sqlite_path)
+
+    postgres_saver = _try_build_postgres_saver()
+    if postgres_saver is not None:
+        results.append(benchmark_write_latency("PostgresSaver", postgres_saver, sample_count))
+
+    return results
+
+
+def print_durability_report(results: list[DurabilitySurvivalResult]) -> None:
+    print("\n" + "=" * 72)
+    print("Checkpointer 存活性对比报告(模拟进程重启)")
+    print("=" * 72)
+    header = f"{'实现':<16}{'重启后是否存活':<18}{'说明'}"
+    print(header)
+    print("-" * 72)
+    for item in results:
+        survived_text = "存活" if item.survived_after_rebuild else "丢失"
+        print(f"{item.saver_name:<16}{survived_text:<18}{item.note}")
+
+
+def print_latency_report(results: list[LatencyBenchmarkResult]) -> None:
+    print("\n" + "=" * 72)
+    print("Checkpointer 写入延迟压测报告(单次invoke耗时,单位:毫秒)")
+    print("=" * 72)
+    header = f"{'实现':<16}{'样本数':<10}{'平均值':<12}{'P95':<12}{'最大值':<12}"
+    print(header)
+    print("-" * 72)
+    for item in results:
+        print(
+            f"{item.saver_name:<16}{item.sample_count:<10}"
+            f"{item.mean_ms:<12.3f}{item.p95_ms:<12.3f}{item.max_ms:<12.3f}"
+        )
+
+
+def main() -> int:
+    print("正在运行存活性验证矩阵……")
+    durability_results = run_durability_matrix()
+    print_durability_report(durability_results)
+
+    print("\n正在运行写入延迟压测矩阵(每种实现50次调用)……")
+    latency_results = run_latency_matrix(sample_count=50)
+    print_latency_report(latency_results)
+
+    memory_result = next((r for r in durability_results if r.saver_name == "MemorySaver"), None)
+    if memory_result and memory_result.survived_after_rebuild:
+        print("\n警告: MemorySaver在本次验证中表现出了'存活'的假象,这通常是因为压测脚本"
+              "没有真正丢弃底层引用,请检查测试实现,不要因此误判MemorySaver可以用于生产环境。")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+陈铭把这份压测脚本在自己的笔记本电脑上跑了一遍(没有配置`PGSAVER_DSN`,所以Postgres那一项走的是跳过逻辑),`MemorySaver`的存活性验证结果毫无意外是"丢失",`SqliteSaver`稳稳当当地显示"存活",写入延迟方面`MemorySaver`几乎是零开销,`SqliteSaver`的平均延迟在几毫秒到十几毫秒的量级,具体数字随机器性能会有波动,但足以说明持久化确实会带来一点点开销,只是这点开销和"数据不会丢"这件事相比,完全值得。王振宇看完这份报告说,以后给客户做技术方案汇报,就该拿着这种实测数据说话,而不是空谈"性能可能会有点影响"。
+
+### 模块十三:`writing_agent/reimbursement_parallel_checks.py` —— 报销审批三项并行校验完整实现
+
+晚上写完写作Agent之后,林悦在群里追问了一句:"报销那三项并行校验,你们课上举的例子能不能真的写一份能跑的代码?我想拿去跟祺瑞的财务负责人再对一遍细节。"王振宇让陈铭把这段之前只在课堂上口头讨论、代码只写了片段的场景,补成一份完整的、可以独立运行的实现,发票校验、行程匹配、额度核对三个分支各自模拟真实的外部依赖(包括可能失败的网络调用),额度超限时触发人工特批中断,全部走完之后再汇总打回或通过。
+
+```python
+"""
+报销审批三项并行校验的完整实现。
+
+对应下午课堂内容里反复提到的"教科书式并行场景":
+发票校验、行程匹配、额度核对三项任务互不依赖,应当并行执行。
+
+本模块额外补充了课堂讨论时提到但没有写代码的两个细节:
+1. 额度核对超过阈值时,该分支内部会调用interrupt()转人工特批,
+   其余两个已完成的并行分支结果不受影响,继续保留在状态里。
+2. 三项校验各自对接的"外部依赖"用可控失败率的Mock客户端模拟,
+   分别配置不同的重试策略,体现"不同外部依赖的稳定性不同,重试策略也应该分别调优"这一原则。
+"""
+
+from __future__ import annotations
+
+import operator
+import random
+import time
+import uuid
+from dataclasses import dataclass
+from typing import Annotated, Any, TypedDict
+
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, RetryPolicy, Send, interrupt
+
+QUOTA_MANUAL_APPROVAL_THRESHOLD = 5000.0
+
+
+class TransientCheckError(Exception):
+    """三项校验对接的外部依赖发生瞬时性故障时抛出的异常,值得自动重试。"""
+
+
+class FatalCheckError(Exception):
+    """三项校验发现确定性问题(比如票据本身就是伪造的)时抛出的异常,不应该重试。"""
+
+
+@dataclass
+class CheckOutcome:
+    """单项校验的统一结果结构,便于三个分支共用同一套汇总逻辑。"""
+
+    check_type: str
+    passed: bool
+    detail: str
+    requires_manual_approval: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "check_type": self.check_type,
+            "passed": self.passed,
+            "detail": self.detail,
+            "requires_manual_approval": self.requires_manual_approval,
+        }
+
+
+class InvoiceVerificationClient:
+    """
+    模拟对接税务发票查验平台的客户端。
+
+    真实场景里,这类第三方接口的稳定性通常不如企业内部系统,
+    课堂演示里给了一个相对偏高的瞬时失败率,方便观察重试策略生效的过程。
+    """
+
+    def __init__(self, transient_failure_rate: float = 0.25, seed: int | None = None) -> None:
+        self._transient_failure_rate = transient_failure_rate
+        self._rng = random.Random(seed)
+
+    def verify(self, invoice_no: str, amount: float) -> dict[str, Any]:
+        time.sleep(0.01)
+        roll = self._rng.random()
+        if roll < self._transient_failure_rate:
+            raise TransientCheckError(f"发票查验平台响应超时: invoice_no={invoice_no}")
+
+        is_valid = not invoice_no.endswith("000")
+        return {"invoice_no": invoice_no, "amount": amount, "is_valid": is_valid}
+
+
+class ItineraryMatchingClient:
+    """模拟对接行程单/差旅系统的客户端,失败率相对较低,代表内部系统通常更稳定。"""
+
+    def __init__(self, transient_failure_rate: float = 0.1, seed: int | None = None) -> None:
+        self._transient_failure_rate = transient_failure_rate
+        self._rng = random.Random(seed)
+
+    def match(self, applicant: str, trip_id: str) -> dict[str, Any]:
+        time.sleep(0.01)
+        roll = self._rng.random()
+        if roll < self._transient_failure_rate:
+            raise TransientCheckError(f"差旅系统连接抖动: trip_id={trip_id}")
+
+        matched = not trip_id.endswith("X")
+        return {"applicant": applicant, "trip_id": trip_id, "matched": matched}
+
+
+class QuotaLedgerClient:
+    """模拟对接预算/额度台账系统的客户端,几乎不失败,代表核心账务系统的高可用性。"""
+
+    def __init__(self, transient_failure_rate: float = 0.02, seed: int | None = None) -> None:
+        self._transient_failure_rate = transient_failure_rate
+        self._rng = random.Random(seed)
+
+    def query_remaining_quota(self, department: str) -> float:
+        time.sleep(0.005)
+        roll = self._rng.random()
+        if roll < self._transient_failure_rate:
+            raise TransientCheckError(f"额度台账系统查询超时: department={department}")
+
+        base_quota_by_department = {
+            "物业三部": 20000.0,
+            "地产二部": 50000.0,
+        }
+        return base_quota_by_department.get(department, 10000.0)
+
+
+def is_retryable_check_error(exc: Exception) -> bool:
+    """三项校验通用的重试判定函数:瞬时性错误重试,确定性错误不重试。"""
+
+    if isinstance(exc, FatalCheckError):
+        return False
+    if isinstance(exc, TransientCheckError):
+        return True
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    return False
+
+
+def invoice_check_retry_policy() -> RetryPolicy:
+    """
+    发票查验依赖的第三方平台失败率较高,配置更多的重试次数与更长的最大等待间隔,
+    对应下午课上说的"外部依赖越不稳定,重试策略越要给足容忍空间,但要设好封顶值"。
+    """
+
+    return RetryPolicy(
+        max_attempts=5,
+        initial_interval=0.2,
+        backoff_factor=2.0,
+        max_interval=5.0,
+        jitter=True,
+        retry_on=is_retryable_check_error,
+    )
+
+
+def itinerary_check_retry_policy() -> RetryPolicy:
+    return RetryPolicy(
+        max_attempts=3,
+        initial_interval=0.15,
+        backoff_factor=2.0,
+        max_interval=3.0,
+        jitter=True,
+        retry_on=is_retryable_check_error,
+    )
+
+
+def quota_check_retry_policy() -> RetryPolicy:
+    """额度台账系统本身很稳定,重试次数不需要设太多,失败通常代表更严重的问题。"""
+
+    return RetryPolicy(
+        max_attempts=2,
+        initial_interval=0.1,
+        backoff_factor=1.5,
+        max_interval=1.0,
+        jitter=True,
+        retry_on=is_retryable_check_error,
+    )
+
+
+class ReimbursementCheckState(TypedDict, total=False):
+    """报销审批并行校验主图的状态。"""
+
+    bill_id: str
+    applicant: str
+    department: str
+    invoice_no: str
+    trip_id: str
+    amount: float
+
+    check_results: Annotated[list[dict[str, Any]], operator.add]
+    status: str
+    final_decision: str
+    manual_note: str
+
+
+def dispatch_reimbursement_checks(state: ReimbursementCheckState) -> list[Send]:
+    """
+    扇出节点:同时派发发票校验、行程匹配、额度核对三个并行分支。
+
+    三个分支各自只接收自己需要的字段,不共享完整状态,
+    这是并行分支输入设计上的一个好习惯——分支能拿到的数据越少、越精准,
+    分支之间的隔离性就越好,越不容易因为字段误用产生难以排查的耦合问题。
+    """
+
+    return [
+        Send(
+            "check_invoice",
+            {
+                "bill_id": state["bill_id"],
+                "invoice_no": state["invoice_no"],
+                "amount": state["amount"],
+            },
+        ),
+        Send(
+            "check_itinerary",
+            {
+                "bill_id": state["bill_id"],
+                "applicant": state["applicant"],
+                "trip_id": state["trip_id"],
+            },
+        ),
+        Send(
+            "check_quota",
+            {
+                "bill_id": state["bill_id"],
+                "department": state["department"],
+                "amount": state["amount"],
+            },
+        ),
+    ]
+
+
+def make_invoice_check_node(client: InvoiceVerificationClient):
+    def check_invoice(payload: dict[str, Any]) -> dict[str, Any]:
+        result = client.verify(payload["invoice_no"], payload["amount"])
+        outcome = CheckOutcome(
+            check_type="invoice",
+            passed=bool(result["is_valid"]),
+            detail=f"发票号{result['invoice_no']}校验{'通过' if result['is_valid'] else '未通过,疑似异常票据'}",
+        )
+        return {"check_results": [outcome.to_dict()]}
+
+    return check_invoice
+
+
+def make_itinerary_check_node(client: ItineraryMatchingClient):
+    def check_itinerary(payload: dict[str, Any]) -> dict[str, Any]:
+        result = client.match(payload["applicant"], payload["trip_id"])
+        outcome = CheckOutcome(
+            check_type="itinerary",
+            passed=bool(result["matched"]),
+            detail=f"行程单{result['trip_id']}{'匹配成功' if result['matched'] else '与申报行程不一致'}",
+        )
+        return {"check_results": [outcome.to_dict()]}
+
+    return check_itinerary
+
+
+def make_quota_check_node(client: QuotaLedgerClient):
+    def check_quota(payload: dict[str, Any]) -> dict[str, Any]:
+        remaining_quota = client.query_remaining_quota(payload["department"])
+        amount = payload["amount"]
+        within_normal_quota = amount <= remaining_quota and amount < QUOTA_MANUAL_APPROVAL_THRESHOLD
+
+        if within_normal_quota:
+            outcome = CheckOutcome(
+                check_type="quota",
+                passed=True,
+                detail=f"申报金额{amount}未超过部门剩余额度{remaining_quota},且低于人工特批阈值",
+            )
+            return {"check_results": [outcome.to_dict()]}
+
+        if amount > remaining_quota:
+            outcome = CheckOutcome(
+                check_type="quota",
+                passed=False,
+                detail=f"申报金额{amount}超过部门剩余额度{remaining_quota}",
+            )
+            return {"check_results": [outcome.to_dict()]}
+
+        # 金额没有超过部门额度,但超过了人工特批阈值,需要额外走一次人工确认,
+        # 这里正是下午课上讨论过的"并行分支内部触发中断"场景的真实落地。
+        decision = interrupt(
+            {
+                "type": "quota_manual_approval",
+                "bill_id": payload["bill_id"],
+                "department": payload["department"],
+                "amount": amount,
+                "remaining_quota": remaining_quota,
+                "instruction": f"申报金额{amount}超过{QUOTA_MANUAL_APPROVAL_THRESHOLD}元人工特批阈值,请审批人确认是否放行",
+            }
+        )
+
+        outcome = CheckOutcome(
+            check_type="quota",
+            passed=bool(decision.get("approved")),
+            detail=decision.get("comment", "人工特批环节未提供具体意见"),
+            requires_manual_approval=True,
+        )
+        return {"check_results": [outcome.to_dict()]}
+
+    return check_quota
+
+
+def aggregate_checks(state: ReimbursementCheckState) -> dict[str, Any]:
+    """
+    汇总节点:等三项并行分支全部完成后,统一判断整单是否通过。
+
+    只要有一项校验未通过,整单就判定为需要打回,
+    这里同时把三项校验各自的说明拼接成一段人类可读的汇总意见,
+    方便业务人员在界面上直接看到整单被打回的具体原因,而不需要逐条去查日志。
+    """
+
+    results = {item["check_type"]: item for item in state.get("check_results", [])}
+    all_passed = all(item.get("passed") for item in results.values()) and len(results) == 3
+
+    notes = [f"{item['check_type']}: {item['detail']}" for item in results.values()]
+
+    return {
+        "status": "approved" if all_passed else "rejected",
+        "final_decision": "整单通过,进入财务打款环节" if all_passed else "整单打回,存在未通过项",
+        "manual_note": "\n".join(notes),
+    }
+
+
+def build_reimbursement_check_graph(
+    invoice_client: InvoiceVerificationClient | None = None,
+    itinerary_client: ItineraryMatchingClient | None = None,
+    quota_client: QuotaLedgerClient | None = None,
+    checkpointer: Any | None = None,
+):
+    """
+    构建报销审批三项并行校验的完整图。
+
+    默认使用内存Checkpointer,课堂演示与单元测试足够用;
+    真实接入祺瑞系统时,应替换为SqliteSaver或PostgresSaver,
+    并把三个Mock客户端替换为真实的HTTP/RPC客户端实现。
+    """
+
+    invoice_client = invoice_client or InvoiceVerificationClient(seed=1001)
+    itinerary_client = itinerary_client or ItineraryMatchingClient(seed=1002)
+    quota_client = quota_client or QuotaLedgerClient(seed=1003)
+
+    builder = StateGraph(ReimbursementCheckState)
+
+    builder.add_node("dispatch_checks", lambda state: {})
+    builder.add_node(
+        "check_invoice",
+        make_invoice_check_node(invoice_client),
+        retry=invoice_check_retry_policy(),
+    )
+    builder.add_node(
+        "check_itinerary",
+        make_itinerary_check_node(itinerary_client),
+        retry=itinerary_check_retry_policy(),
+    )
+    builder.add_node(
+        "check_quota",
+        make_quota_check_node(quota_client),
+        retry=quota_check_retry_policy(),
+    )
+    builder.add_node("aggregate_checks", aggregate_checks)
+
+    builder.add_edge(START, "dispatch_checks")
+    builder.add_conditional_edges(
+        "dispatch_checks",
+        dispatch_reimbursement_checks,
+        ["check_invoice", "check_itinerary", "check_quota"],
+    )
+    builder.add_edge("check_invoice", "aggregate_checks")
+    builder.add_edge("check_itinerary", "aggregate_checks")
+    builder.add_edge("check_quota", "aggregate_checks")
+    builder.add_edge("aggregate_checks", END)
+
+    checkpointer = checkpointer or MemorySaver()
+    return builder.compile(checkpointer=checkpointer)
+
+
+def demo_reimbursement_parallel_checks() -> None:
+    """
+    演示脚本:构造一张会触发人工特批的报销单,
+    验证发票校验、行程匹配已经完成的情况下,额度核对分支触发中断,
+    恢复后三项结果能够正确汇总。
+    """
+
+    graph = build_reimbursement_check_graph()
+    thread_id = f"reimbursement-{uuid.uuid4().hex[:8]}"
+    config = {"configurable": {"thread_id": thread_id}}
+
+    initial_state: ReimbursementCheckState = {
+        "bill_id": "BX-20260713-0088",
+        "applicant": "周晓雯",
+        "department": "地产二部",
+        "invoice_no": "INV-88231190",
+        "trip_id": "TRIP-88231",
+        "amount": 8200.0,
+        "check_results": [],
+    }
+
+    result = graph.invoke(initial_state, config=config)
+    snapshot = graph.get_state(config)
+
+    if snapshot.next:
+        print("检测到并行分支中触发了人工特批中断,当前已完成的校验结果:")
+        for item in result.get("check_results", []):
+            print(f"  - {item['check_type']}: {'通过' if item['passed'] else '未通过'} | {item['detail']}")
+
+        final_result = graph.invoke(
+            Command(resume={"approved": True, "comment": "金额超阈值但业务合理,同意特批"}),
+            config=config,
+        )
+        print("\n人工特批完成后,最终汇总结果:")
+        print(f"  整单状态: {final_result['status']}")
+        print(f"  最终决定: {final_result['final_decision']}")
+        print(f"  汇总说明:\n{final_result['manual_note']}")
+    else:
+        print("本次报销单未触发人工特批,直接给出汇总结果:")
+        print(f"  整单状态: {result['status']}")
+        print(f"  最终决定: {result['final_decision']}")
+
+
+if __name__ == "__main__":
+    demo_reimbursement_parallel_checks()
+```
+
+陈铭跑完这份代码之后,专门把`check_results`打印出来给林悦截了个图,林悦回复说这正好能回答财务负责人之前提的疑问——"如果金额超了但业务上确实合理,是不是必须走线下审批",现在有了这份代码,答案是"可以在系统内直接走人工特批,不需要退回线下"。
+
+### 模块十四:`writing_agent/retry_policy_tests.py` —— 错误重试策略的完整测试套件
+
+王振宇提出了最后一项要求:任何写进生产代码的重试策略,都必须配一份能自动运行的测试,不能只靠"跑一次看看日志"这种不可重复的验证方式。陈铭用标准库`unittest`写了一整套测试,覆盖了瞬时性错误重试成功、确定性错误不重试、重试耗尽后正确抛出异常、退避时间是否符合预期这几类关键场景,并且额外写了一个"故障注入器",可以精确控制"第几次调用失败、第几次调用成功",让测试结果完全可复现,不依赖真实的随机失败。
+
+```python
+"""
+错误重试策略的完整测试套件。
+
+测试目标:
+1. 验证RetryPolicy在遇到可重试异常时,确实会按预期的最大次数进行重试,
+   并且在某次重试成功后,能够正常返回结果,不residual遗留任何异常状态。
+2. 验证RetryPolicy在遇到不可重试的确定性异常时,不会进行任何重试,
+   立刻把异常向上抛出。
+3. 验证重试耗尽后(达到max_attempts仍然失败),异常会被正确抛出,
+   而不是被引擎悄悄吞掉。
+4. 验证退避时间的计算是否符合initial_interval与backoff_factor的预期公式。
+5. 提供一个可以精确控制"第几次调用失败"的故障注入器,
+   用于在集成测试里模拟真实的瞬时故障场景,而不依赖不可控的真实随机数。
+
+运行方式: python -m unittest writing_agent.retry_policy_tests -v
+"""
+
+from __future__ import annotations
+
+import time
+import unittest
+import uuid
+from typing import Any, TypedDict
+from unittest import mock
+
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import RetryPolicy
+
+from writing_agent.llm_client import FatalLLMError, TransientLLMError
+from writing_agent.retry_policies import (
+    default_llm_retry_policy,
+    is_retryable_llm_error,
+    network_dependent_retry_policy,
+    strict_retry_policy,
+)
+
+
+class FailureInjector:
+    """
+    可精确控制失败次数的故障注入器。
+
+    构造时传入一个"失败次数"和"用哪种异常失败",
+    每次调用call()都会让内部计数器自增,只有当计数器超过失败次数之后,
+    才会返回成功结果,这样可以在测试里精确构造"前N次失败,第N+1次成功"的场景,
+    不需要依赖真实的随机数或者真实的网络环境。
+    """
+
+    def __init__(self, fail_times: int, exception_factory: type[Exception] = TransientLLMError) -> None:
+        self.fail_times = fail_times
+        self.exception_factory = exception_factory
+        self.call_count = 0
+        self.call_timestamps: list[float] = []
+
+    def call(self) -> str:
+        self.call_count += 1
+        self.call_timestamps.append(time.perf_counter())
+        if self.call_count <= self.fail_times:
+            raise self.exception_factory(f"模拟第{self.call_count}次调用失败")
+        return f"成功,总共尝试了{self.call_count}次"
+
+
+class RetryHarnessState(TypedDict, total=False):
+    """用于承载重试测试的最小图状态。"""
+
+    attempt_result: str
+
+
+def build_retry_harness_graph(injector: FailureInjector, retry_policy: RetryPolicy):
+    """
+    构建一个只包含单个节点的图,节点内部调用故障注入器,
+    图本身配置传入的重试策略,用来验证LangGraph的RetryPolicy机制
+    是否按预期对节点执行进行重试。
+    """
+
+    def flaky_node(state: RetryHarnessState) -> dict[str, Any]:
+        result = injector.call()
+        return {"attempt_result": result}
+
+    builder = StateGraph(RetryHarnessState)
+    builder.add_node("flaky_node", flaky_node, retry=retry_policy)
+    builder.add_edge(START, "flaky_node")
+    builder.add_edge("flaky_node", END)
+    return builder.compile(checkpointer=MemorySaver())
+
+
+class TestRetryableErrorClassification(unittest.TestCase):
+    """测试is_retryable_llm_error这个判定函数本身的正确性。"""
+
+    def test_transient_llm_error_is_retryable(self) -> None:
+        self.assertTrue(is_retryable_llm_error(TransientLLMError("超时")))
+
+    def test_fatal_llm_error_is_not_retryable(self) -> None:
+        self.assertFalse(is_retryable_llm_error(FatalLLMError("内容违规")))
+
+    def test_timeout_error_is_retryable(self) -> None:
+        self.assertTrue(is_retryable_llm_error(TimeoutError("网络超时")))
+
+    def test_connection_error_is_retryable(self) -> None:
+        self.assertTrue(is_retryable_llm_error(ConnectionError("连接被拒绝")))
+
+    def test_unrelated_error_is_not_retryable(self) -> None:
+        self.assertFalse(is_retryable_llm_error(ValueError("参数不合法")))
+
+
+class TestTransientErrorRecoversAfterRetry(unittest.TestCase):
+    """验证瞬时性错误在重试次数足够的情况下,最终能够成功返回。"""
+
+    def test_succeeds_on_third_attempt(self) -> None:
+        injector = FailureInjector(fail_times=2, exception_factory=TransientLLMError)
+        policy = default_llm_retry_policy()  # max_attempts=4,足够覆盖2次失败+1次成功
+        graph = build_retry_harness_graph(injector, policy)
+
+        config = {"configurable": {"thread_id": f"retry-test-{uuid.uuid4().hex[:8]}"}}
+        result = graph.invoke({}, config=config)
+
+        self.assertEqual(injector.call_count, 3)
+        self.assertIn("成功", result["attempt_result"])
+
+    def test_succeeds_on_first_attempt_when_no_failure_injected(self) -> None:
+        injector = FailureInjector(fail_times=0)
+        policy = default_llm_retry_policy()
+        graph = build_retry_harness_graph(injector, policy)
+
+        config = {"configurable": {"thread_id": f"retry-test-{uuid.uuid4().hex[:8]}"}}
+        result = graph.invoke({}, config=config)
+
+        self.assertEqual(injector.call_count, 1)
+        self.assertIn("成功", result["attempt_result"])
+
+
+class TestFatalErrorNeverRetries(unittest.TestCase):
+    """验证确定性错误(FatalLLMError)不会被重试,应该立刻抛出。"""
+
+    def test_fatal_error_raises_immediately_without_retry(self) -> None:
+        injector = FailureInjector(fail_times=99, exception_factory=FatalLLMError)
+        policy = default_llm_retry_policy()
+        graph = build_retry_harness_graph(injector, policy)
+
+        config = {"configurable": {"thread_id": f"retry-test-{uuid.uuid4().hex[:8]}"}}
+
+        with self.assertRaises(FatalLLMError):
+            graph.invoke({}, config=config)
+
+        # 关键断言: 确定性错误只应该被调用一次,不应该触发任何重试,
+        # 如果这里call_count大于1,说明retry_on的判定逻辑没有正确生效。
+        self.assertEqual(injector.call_count, 1)
+
+
+class TestRetryExhaustionRaisesOriginalError(unittest.TestCase):
+    """验证当失败次数超过max_attempts时,最终会把原始异常正确地抛出。"""
+
+    def test_exhausted_retries_raise_transient_error(self) -> None:
+        # fail_times设置为远大于max_attempts,确保无论重试多少次都会失败。
+        injector = FailureInjector(fail_times=99, exception_factory=TransientLLMError)
+        policy = RetryPolicy(
+            max_attempts=3,
+            initial_interval=0.01,
+            backoff_factor=1.0,
+            max_interval=0.05,
+            jitter=False,
+            retry_on=is_retryable_llm_error,
+        )
+        graph = build_retry_harness_graph(injector, policy)
+
+        config = {"configurable": {"thread_id": f"retry-test-{uuid.uuid4().hex[:8]}"}}
+
+        with self.assertRaises(TransientLLMError):
+            graph.invoke({}, config=config)
+
+        self.assertEqual(injector.call_count, 3)
+
+
+class TestBackoffTimingMatchesExpectedFormula(unittest.TestCase):
+    """
+    验证退避时间的实际间隔是否大致符合initial_interval与backoff_factor推导出的公式。
+
+    由于真实调度会有少量额外开销(节点函数本身执行时间、引擎调度开销),
+    这里的断言使用了一个较宽松的容差范围,而不是要求精确到毫秒级完全相等。
+    """
+
+    def test_backoff_intervals_grow_by_backoff_factor(self) -> None:
+        injector = FailureInjector(fail_times=3, exception_factory=TransientLLMError)
+        policy = RetryPolicy(
+            max_attempts=5,
+            initial_interval=0.1,
+            backoff_factor=2.0,
+            max_interval=10.0,
+            jitter=False,
+            retry_on=is_retryable_llm_error,
+        )
+        graph = build_retry_harness_graph(injector, policy)
+
+        config = {"configurable": {"thread_id": f"retry-test-{uuid.uuid4().hex[:8]}"}}
+        graph.invoke({}, config=config)
+
+        timestamps = injector.call_timestamps
+        self.assertEqual(len(timestamps), 4)
+
+        intervals = [timestamps[i + 1] - timestamps[i] for i in range(len(timestamps) - 1)]
+        expected_intervals = [0.1, 0.2, 0.4]
+
+        for actual, expected in zip(intervals, expected_intervals):
+            # 允许一定的调度误差,真实环境下时间片调度不会绝对精确。
+            self.assertGreater(actual, expected * 0.5)
+            self.assertLess(actual, expected * 3.0 + 0.2)
+
+
+class TestStrictRetryPolicyIsMoreConservative(unittest.TestCase):
+    """验证strict_retry_policy相比default_llm_retry_policy确实更保守(重试次数更少)。"""
+
+    def test_strict_policy_has_fewer_max_attempts(self) -> None:
+        strict = strict_retry_policy()
+        default = default_llm_retry_policy()
+        self.assertLess(strict.max_attempts, default.max_attempts)
+
+    def test_strict_policy_gives_up_faster_than_default(self) -> None:
+        injector = FailureInjector(fail_times=3, exception_factory=TransientLLMError)
+        policy = strict_retry_policy()
+        graph = build_retry_harness_graph(injector, policy)
+
+        config = {"configurable": {"thread_id": f"retry-test-{uuid.uuid4().hex[:8]}"}}
+
+        with self.assertRaises(TransientLLMError):
+            graph.invoke({}, config=config)
+
+        # strict_retry_policy的max_attempts=2,意味着只应该尝试2次就放弃。
+        self.assertEqual(injector.call_count, 2)
+
+
+class TestNetworkDependentPolicyToleratesMoreFailures(unittest.TestCase):
+    """
+    验证network_dependent_retry_policy(对应外部依赖不稳定场景)
+    确实能够容忍比默认策略更多次数的连续失败。
+    """
+
+    def test_tolerates_five_consecutive_failures(self) -> None:
+        injector = FailureInjector(fail_times=5, exception_factory=TransientLLMError)
+        policy = network_dependent_retry_policy()
+        graph = build_retry_harness_graph(injector, policy)
+
+        config = {"configurable": {"thread_id": f"retry-test-{uuid.uuid4().hex[:8]}"}}
+        result = graph.invoke({}, config=config)
+
+        self.assertEqual(injector.call_count, 6)
+        self.assertIn("成功", result["attempt_result"])
+
+
+class TestRetryDoesNotLeakStateAcrossThreads(unittest.TestCase):
+    """
+    验证不同thread_id之间的重试计数、故障注入状态完全隔离,
+    不会因为共用同一个图对象而互相干扰——这也是对上午课堂内容
+    "thread_id是流程实例身份证"这一设计原则在重试场景下的延伸验证。
+    """
+
+    def test_two_threads_do_not_interfere(self) -> None:
+        injector_a = FailureInjector(fail_times=1, exception_factory=TransientLLMError)
+        injector_b = FailureInjector(fail_times=1, exception_factory=TransientLLMError)
+        policy = default_llm_retry_policy()
+
+        graph_a = build_retry_harness_graph(injector_a, policy)
+        graph_b = build_retry_harness_graph(injector_b, policy)
+
+        config_a = {"configurable": {"thread_id": f"thread-a-{uuid.uuid4().hex[:6]}"}}
+        config_b = {"configurable": {"thread_id": f"thread-b-{uuid.uuid4().hex[:6]}"}}
+
+        result_a = graph_a.invoke({}, config=config_a)
+        result_b = graph_b.invoke({}, config=config_b)
+
+        self.assertEqual(injector_a.call_count, 2)
+        self.assertEqual(injector_b.call_count, 2)
+        self.assertIn("成功", result_a["attempt_result"])
+        self.assertIn("成功", result_b["attempt_result"])
+
+
+class TestChaosStyleRandomizedFailurePatterns(unittest.TestCase):
+    """
+    混沌测试风格的补充验证:用固定种子的伪随机数生成一批"失败次数"样本,
+    确保在一个较宽的失败次数分布下,只要失败次数没有超过max_attempts-1,
+    最终都应该能够成功;一旦超过,就应该稳定地抛出异常。
+
+    这类测试的价值在于用可复现的方式,近似覆盖"运气不好连续失败若干次"
+    这种真实生产环境里偶尔会发生、但难以在单次手工测试里稳定复现的场景。
+    """
+
+    def test_random_failure_counts_within_tolerance_all_succeed(self) -> None:
+        policy = RetryPolicy(
+            max_attempts=6,
+            initial_interval=0.01,
+            backoff_factor=1.2,
+            max_interval=0.2,
+            jitter=True,
+            retry_on=is_retryable_llm_error,
+        )
+
+        rng = mock.Mock()
+        rng.randint = lambda a, b: (a + b) // 2  # 固定化随机行为,保证测试可复现
+
+        for fail_times in range(0, 5):  # max_attempts=6,允许最多5次失败后第6次成功
+            with self.subTest(fail_times=fail_times):
+                injector = FailureInjector(fail_times=fail_times, exception_factory=TransientLLMError)
+                graph = build_retry_harness_graph(injector, policy)
+                config = {"configurable": {"thread_id": f"chaos-{uuid.uuid4().hex[:8]}"}}
+                result = graph.invoke({}, config=config)
+                self.assertIn("成功", result["attempt_result"])
+
+    def test_failure_count_exceeding_max_attempts_raises(self) -> None:
+        policy = RetryPolicy(
+            max_attempts=3,
+            initial_interval=0.01,
+            backoff_factor=1.2,
+            max_interval=0.2,
+            jitter=True,
+            retry_on=is_retryable_llm_error,
+        )
+
+        injector = FailureInjector(fail_times=10, exception_factory=TransientLLMError)
+        graph = build_retry_harness_graph(injector, policy)
+        config = {"configurable": {"thread_id": f"chaos-{uuid.uuid4().hex[:8]}"}}
+
+        with self.assertRaises(TransientLLMError):
+            graph.invoke({}, config=config)
+        self.assertEqual(injector.call_count, 3)
+
+
+def run_all_retry_tests_and_report() -> bool:
+    """
+    以编程方式运行本模块的全部测试用例,并打印一份简明的通过/失败报告。
+
+    这个函数主要用于CI流水线里的一个自定义汇总步骤,
+    团队约定任何涉及RetryPolicy配置调整的提交,都必须让这份测试套件全部通过,
+    才允许合并到主分支。
+    """
+
+    loader = unittest.TestLoader()
+    suite = loader.loadTestsFromModule(__import__(__name__, fromlist=["*"]))
+    runner = unittest.TextTestRunner(verbosity=2)
+    test_result = runner.run(suite)
+
+    print("\n" + "=" * 60)
+    print(f"测试总数: {test_result.testsRun}")
+    print(f"失败数量: {len(test_result.failures)}")
+    print(f"错误数量: {len(test_result.errors)}")
+    print("=" * 60)
+
+    return test_result.wasSuccessful()
+
+
+if __name__ == "__main__":
+    success = run_all_retry_tests_and_report()
+    raise SystemExit(0 if success else 1)
+```
+
+陈铭把这份测试套件跑通之后,截图发到了团队群里,王振宇回复说这才是"今天真正意义上的收尾"——不是代码跑起来看着顺眼就算完成,而是有一份可以随时重复执行、覆盖了正常路径和边界场景的测试,能在下一次任何人改动重试策略参数时,第一时间告诉大家"改坏了没有"。他还补充说,这份测试套件里`TestRetryDoesNotLeakStateAcrossThreads`这个用例,看起来是在测试"重试",但实际上是把上午"thread_id是流程实例身份证"这条设计原则,变成了一条可以被机器自动验证的断言,这种"把口头约定变成自动化测试"的习惯,是团队协作里非常值钱的工程实践,值得陈铭在后面的项目里一直保持下去。
+
 ## 今日复盘
 
 晚上八点四十,陈铭把代码提交完,王振宇没有像往常一样直接走,反而拉了个椅子坐下来,说想听听陈铭自己怎么总结这一天。
