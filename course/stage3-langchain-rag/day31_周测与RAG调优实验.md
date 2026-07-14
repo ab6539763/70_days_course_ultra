@@ -637,7 +637,7 @@ chunk_size=800这一组测完之后,四人的命中率普遍都有提升,韩露�
 
 ## 代码实战
 
-> 以下是《海纳制造集团RAG问答系统 · 效果调优实验》的完整自动化脚本,共8个文件。整套脚本严格遵循控制变量原则,支持"分步对照实验"和"全量参数网格"两种运行模式,能够自动完成重新入库、批量检索、命中判定、结果汇总、报告生成的全流程,不需要人工手动重复操作。为保持知识范围的严谨性,本项目综合运用了Day25(LangChain基础组件)、Day26(LCEL链式编排)、Day28(文档加载与分割)、Day29(向量数据库与Retriever接口)、Day30(RAG完整链路)的知识点。所有函数均配中文docstring,关键业务逻辑均有行内注释解释设计意图。真实执行入库和检索需要配置`.env`中的`DASHSCOPE_API_KEY`(用于text-embedding-v3)以及本地可用的bge-large-zh-v1.5模型;离线自检脚本`selfcheck_experiment.py`不依赖真实的Embedding API调用,可独立运行验证核心逻辑(命中判定、结果汇总、报告生成)。
+> 以下是《海纳制造集团RAG问答系统 · 效果调优实验》的完整自动化脚本,共13个文件(前9个是下午实验时完成的分步对照实验核心框架,后4个是晚自习补充的"批量网格测试框架"扩展部分)。整套脚本严格遵循控制变量原则,支持"分步对照实验"和"全量参数网格"两种运行模式,能够自动完成重新入库、批量检索、命中判定、结果汇总、报告生成、可视化导出的全流程,并具备断点续跑、限流重试的工程健壮性,不需要人工手动重复操作。为保持知识范围的严谨性,本项目综合运用了Day16-17(错误处理与重试机制)、Day25(LangChain基础组件)、Day26(LCEL链式编排)、Day28(文档加载与分割)、Day29(向量数据库与Retriever接口)、Day30(RAG完整链路)的知识点。所有函数均配中文docstring,关键业务逻辑均有行内注释解释设计意图。真实执行入库和检索需要配置`.env`中的`DASHSCOPE_API_KEY`(用于text-embedding-v3)以及本地可用的bge-large-zh-v1.5模型;离线自检脚本`selfcheck_experiment.py`与pytest单元测试`test_experiment_framework.py`均不依赖真实的Embedding API调用,可独立运行验证核心逻辑(命中判定、结果汇总、报告生成、断点续跑、可视化图表)。
 
 ### 文件1:`experiment_config.py` —— 实验参数配置与组合生成
 
@@ -2005,6 +2005,870 @@ def run_all_checks():
 
 if __name__ == "__main__":
     run_all_checks()
+```
+
+老王在下午实验收尾前,又多提了一个要求:"今天写的这9个文件,已经能完整跑通‘基线→A→B→C’这套分步对照实验,但我希望你们再补一套更完整的‘批量网格测试框架’——不是简单地把chunk_size、top_k、Embedding模型三个变量的候选值多列几个,而是要考虑真实项目里更常见的情况:候选值可能有十几二十个组合,跑一次全量网格可能要几十分钟甚至更久,中途机器重启、网络抖动、API限流,这些意外都可能发生。如果没有断点续跑的能力,一次实验失败就要从头再来,团队根本扛不住这种重复劳动。"陈铭听完之后,当天晚自习又补充了四个文件,分别解决"更大规模参数网格"、"断点续跑与限流重试"、"结果可视化"、"框架级单元测试"这四个问题,晚上23点左右才最终提交,他在提交记录里写了一句注释:"今天补的这套东西,不是为了应付作业,是真的会在下周甚至后面的项目验收里被复用。"
+
+### 文件10:`extended_param_space.py` —— 扩展参数候选空间与批量组合生成
+
+```python
+"""
+文件名:extended_param_space.py
+作者:陈铭
+说明:
+    在experiment_config.py的基础上,进一步扩展参数候选空间,
+    支持更细粒度、更大规模的批量测试需求。
+
+    背景:
+    下午的分步对照实验里,chunk_size只测了300/500/800三个值,
+    top_k只测了3/5/8三个值,老王在复盘时明确提出担忧——
+    真正的最优值可能落在这些候选值之间(比如600、700),
+    今天用有限的几个候选值只是"摸清趋势方向",还不足以
+    真正锁定最优参数。这个文件把候选空间扩展得更密,
+    并提供更灵活的组合生成器,支持"等差扩展""指定区间细化"
+    "自定义候选值列表"三种扩展方式,为后续更严谨的调优
+    工作(以及Sprint3甚至正式项目验收阶段的效果评估)打好基础。
+"""
+
+import itertools
+
+import experiment_config as cfg
+
+# ============================================================
+# 扩展后的参数候选空间(比experiment_config.py里的原始候选值更密)
+# ============================================================
+
+# chunk_size在300-1200之间,按100为步长扩展,覆盖了老王和陈铭
+# 讨论时提到的"500和800之间是否存在更优值"这个疑问。
+EXTENDED_CHUNK_SIZE_CANDIDATES = list(range(300, 1201, 100))
+
+# top_k在1到20之间,分段设置更细的取值:小范围内(1-8)每隔1个值测试,
+# 大范围内(10-20)每隔5个值测试,因为过大的top_k大概率已经进入
+# "边际收益递减"区间,没必要每个值都精细测试,合理分配实验预算。
+EXTENDED_TOP_K_CANDIDATES = list(range(1, 9)) + [10, 15, 20]
+
+# Embedding模型候选,在原有两个基础上,预留了未来可能接入的
+# 第三方模型标识占位(教学场景下暂不强制要求真实可用,
+# 用于演示"候选空间设计要为未来扩展留出空间"这一设计原则)。
+EXTENDED_EMBEDDING_MODEL_CANDIDATES = [
+    "bge-large-zh-v1.5",
+    "text-embedding-v3",
+]
+
+
+def build_dense_chunk_size_range(start, stop, step):
+    """
+    生成一个等差数列形式的chunk_size候选值列表,用于在某个已知
+    效果较好的区间内做更细粒度的补充实验。
+
+    :param start: 起始值(包含)
+    :param stop: 结束值(包含)
+    :param step: 步长
+    :return: chunk_size候选值列表
+    :raises ValueError: 当参数不合法时抛出(比如step<=0、start>stop)
+    """
+    if step <= 0:
+        raise ValueError("step必须为正整数")
+    if start > stop:
+        raise ValueError("start不能大于stop")
+    return list(range(start, stop + 1, step))
+
+
+def refine_around_best_value(best_value, spread, step):
+    """
+    以已知的"当前最优值"为中心,向两侧各扩展spread的范围,
+    生成一组更细粒度的候选值,用于陈铭和老王讨论时提到的
+    "在500和800之间补测600、700这类值"的具体实现。
+
+    :param best_value: 此前实验得出的当前最优参数取值
+    :param spread: 向两侧扩展的范围
+    :param step: 细化后的步长
+    :return: 细化后的候选值列表(已去重、已排序,且保证非负)
+    """
+    low = max(best_value - spread, step)
+    high = best_value + spread
+    candidates = list(range(low, high + 1, step))
+    # 确保原始最优值本身也在候选列表里,避免因为步长设置不当,
+    # 反而把已知最优值排除在细化范围之外。
+    if best_value not in candidates:
+        candidates.append(best_value)
+    return sorted(set(candidates))
+
+
+def build_extended_full_grid(
+    chunk_sizes=None, top_ks=None, embedding_models=None
+):
+    """
+    构建扩展后的全量参数网格,支持传入自定义候选值列表
+    (未传入时使用模块内定义的扩展候选值)。
+
+    设计意图:
+        这个函数是experiment_config.build_full_grid_combinations()
+        的一个更通用版本——原函数只能使用全局配置好的三个候选列表,
+        这个函数允许在调用时灵活传入任意候选值组合,便于团队在
+        分步对照实验结束后,针对某个"看起来还有提升空间"的区间,
+        单独跑一次更细粒度的补充网格搜索,而不需要重新跑全部候选值。
+    :param chunk_sizes: 自定义chunk_size候选值列表,默认使用扩展候选值
+    :param top_ks: 自定义top_k候选值列表,默认使用扩展候选值
+    :param embedding_models: 自定义Embedding模型候选值列表
+    :return: 参数组合列表
+    """
+    chunk_sizes = chunk_sizes or EXTENDED_CHUNK_SIZE_CANDIDATES
+    top_ks = top_ks or EXTENDED_TOP_K_CANDIDATES
+    embedding_models = embedding_models or EXTENDED_EMBEDDING_MODEL_CANDIDATES
+
+    combinations = []
+    for chunk_size, top_k, embedding_model in itertools.product(
+        chunk_sizes, top_ks, embedding_models
+    ):
+        combinations.append({
+            "chunk_size": chunk_size,
+            "top_k": top_k,
+            "embedding_model": embedding_model,
+            "group": "extended_grid",
+        })
+    return combinations
+
+
+def estimate_grid_cost(combinations, seconds_per_ingest=45, seconds_per_query=0.3, question_count=10):
+    """
+    估算一次批量网格测试大致需要消耗的时间,帮助团队在动手跑
+    实验之前,先评估一下"这套参数网格,今天下午的时间够不够跑完"。
+
+    设计意图:
+        呼应《RAG效果调优实验方案》里"执行效率"这条非功能需求——
+        脚本不应该让人盲目地点下"开始运行"之后才发现要跑几个小时,
+        而应该先给出一个大致的时间预估,便于团队提前决策
+        "要不要缩减候选值范围"或"要不要分批次执行"。
+    :param combinations: 参数组合列表
+    :param seconds_per_ingest: 单次入库操作的预估耗时(秒)
+    :param seconds_per_query: 单次检索的预估耗时(秒)
+    :param question_count: 每组参数组合需要测试的问题数量
+    :return: 包含预估总耗时、去重后入库次数、检索次数的统计字典
+    """
+    # 入库只受chunk_size和embedding_model影响,不受top_k影响,
+    # 这里统计"去重后的入库组合数量",避免把同一个入库操作
+    # 重复计入耗时估算,这是对ingest.py里缓存机制的呼应。
+    unique_ingest_keys = set()
+    for combo in combinations:
+        unique_ingest_keys.add((combo["chunk_size"], combo["embedding_model"]))
+
+    ingest_count = len(unique_ingest_keys)
+    query_count = len(combinations) * question_count
+
+    total_seconds = (
+        ingest_count * seconds_per_ingest + query_count * seconds_per_query
+    )
+
+    return {
+        "combination_count": len(combinations),
+        "unique_ingest_count": ingest_count,
+        "total_query_count": query_count,
+        "estimated_total_seconds": round(total_seconds, 1),
+        "estimated_total_minutes": round(total_seconds / 60, 1),
+    }
+
+
+def split_into_batches(combinations, batch_size):
+    """
+    把一个较大的参数组合列表,切分成多个较小的批次,
+    用于支持"分批次执行、每批次结束后可以安全暂停"的需求。
+    :param combinations: 参数组合列表
+    :param batch_size: 每批次包含的组合数量
+    :return: 批次列表,每个元素是一个组合子列表
+    :raises ValueError: 当batch_size不是正整数时抛出
+    """
+    if batch_size <= 0:
+        raise ValueError("batch_size必须为正整数")
+    return [
+        combinations[i:i + batch_size]
+        for i in range(0, len(combinations), batch_size)
+    ]
+```
+
+### 文件11:`resumable_batch_runner.py` —— 断点续跑与限流重试的批量测试执行器
+
+```python
+"""
+文件名:resumable_batch_runner.py
+作者:陈铭
+说明:
+    支持断点续跑(checkpoint/resume)、失败重试、简单限流退避的
+    批量参数网格测试执行器,解决老王提出的"中途机器重启、网络抖动、
+    API限流,不能让实验从头再跑"这个真实工程痛点。
+
+    知识点回顾:
+    - Day16-17学过的错误处理与重试机制,在这里被应用到"调用
+      Embedding API可能因为限流失败"这个具体场景。
+    - Day6-7学的文件读写与JSON序列化,在这里用于实现"检查点"
+      (checkpoint)持久化,即把已经跑完的组合记录写入磁盘文件,
+      重启进程之后先读取这个文件,跳过已经跑过的组合。
+"""
+
+import json
+import os
+import time
+import traceback
+
+import experiment_config as cfg
+from evaluate import evaluate_combo
+
+
+class RateLimitError(Exception):
+    """模拟Embedding API限流异常,真实项目里通常对应厂商SDK抛出的429错误。"""
+
+
+class BatchRunnerCheckpoint:
+    """
+    检查点管理器,负责把"已经成功跑完的参数组合及其结果"持久化到
+    磁盘上的JSON文件,并在下次启动时读取这个文件,过滤掉已经跑过的组合。
+
+    这样即便实验中途因为任何原因(断电、手动中断、API报错次数过多)
+    被打断,重新执行同一个脚本时,已经跑完的部分不需要重复计算,
+    只需要从上次中断的地方继续。
+    """
+
+    def __init__(self, checkpoint_path=None):
+        """
+        初始化检查点管理器。
+        :param checkpoint_path: 检查点文件路径,默认放在实验输出目录下
+        """
+        self.checkpoint_path = checkpoint_path or os.path.join(
+            cfg.EXPERIMENT_OUTPUT_DIR, "batch_checkpoint.json"
+        )
+        self._completed = self._load()
+
+    def _load(self):
+        """
+        从磁盘加载已有的检查点数据,文件不存在或内容损坏时,
+        返回一个空字典,不让脚本因为检查点文件问题而直接崩溃。
+        :return: {组合唯一标识: 该组合的评估结果} 字典
+        """
+        if not os.path.exists(self.checkpoint_path):
+            return {}
+        try:
+            with open(self.checkpoint_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            print(f"警告:检查点文件 {self.checkpoint_path} 读取失败或已损坏,将视为空检查点重新开始。")
+            return {}
+
+    def _persist(self):
+        """把当前内存中的检查点数据,完整写回磁盘文件。"""
+        with open(self.checkpoint_path, "w", encoding="utf-8") as f:
+            json.dump(self._completed, f, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def combo_key(combo):
+        """
+        为一个参数组合生成唯一标识字符串,用作检查点字典的key。
+        :param combo: 参数组合字典
+        :return: 唯一标识字符串
+        """
+        return f"cs{combo['chunk_size']}_k{combo['top_k']}_{combo['embedding_model']}"
+
+    def has_completed(self, combo):
+        """判断某个参数组合是否已经在检查点里记录为"已完成"。"""
+        return self.combo_key(combo) in self._completed
+
+    def mark_completed(self, combo, result):
+        """
+        将某个参数组合标记为已完成,并立即持久化到磁盘。
+
+        设计意图:每完成一组就立即写盘,而不是等全部跑完再统一写入,
+        这样即便脚本在跑到第50组时意外崩溃,前面49组的结果依然
+        安全地保存在磁盘上,不会因为"还没来得及保存"而丢失。
+        :param combo: 参数组合字典
+        :param result: 该组合的评估结果
+        """
+        self._completed[self.combo_key(combo)] = result
+        self._persist()
+
+    def get_completed_result(self, combo):
+        """获取某个已完成组合的历史结果,用于断点续跑时直接复用,不重新计算。"""
+        return self._completed.get(self.combo_key(combo))
+
+    def completed_count(self):
+        """返回当前检查点中已完成的组合数量。"""
+        return len(self._completed)
+
+    def all_completed_results(self):
+        """返回全部已完成组合的结果列表(用于最终汇总报告)。"""
+        return list(self._completed.values())
+
+
+def _evaluate_with_retry(combo, max_retries=3, base_backoff_seconds=2):
+    """
+    对单组参数组合执行评估,内置简单的指数退避重试机制,
+    应对Embedding API可能出现的限流或临时性网络异常。
+
+    :param combo: 参数组合字典
+    :param max_retries: 最大重试次数
+    :param base_backoff_seconds: 首次重试的等待秒数,每次重试翻倍
+    :return: 评估结果字典
+    :raises RuntimeError: 当重试次数耗尽仍然失败时抛出,携带原始异常信息
+    """
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return evaluate_combo(
+                chunk_size=combo["chunk_size"],
+                top_k=combo["top_k"],
+                embedding_model=combo["embedding_model"],
+            )
+        except RateLimitError as exc:
+            last_error = exc
+            backoff = base_backoff_seconds * (2 ** (attempt - 1))
+            print(f"  [限流重试] 第{attempt}次尝试失败(限流),{backoff}秒后重试……")
+            time.sleep(backoff)
+        except Exception as exc:  # noqa: BLE001 - 批量任务需要兼容各类底层异常,统一记录后重试
+            last_error = exc
+            backoff = base_backoff_seconds * (2 ** (attempt - 1))
+            print(f"  [异常重试] 第{attempt}次尝试失败:{exc},{backoff}秒后重试……")
+            print(f"  异常详情:\n{traceback.format_exc(limit=2)}")
+            time.sleep(backoff)
+
+    raise RuntimeError(
+        f"参数组合{combo}在重试{max_retries}次后仍然失败,最后一次异常:{last_error}"
+    )
+
+
+def run_resumable_batch(combinations, checkpoint_path=None, max_retries=3):
+    """
+    执行支持断点续跑的批量参数组合测试。
+
+    执行逻辑:
+        1. 加载检查点,过滤出尚未完成的组合。
+        2. 依次执行每一组尚未完成的组合(带重试机制)。
+        3. 每完成一组,立即写入检查点文件持久化。
+        4. 全部组合执行完毕后,返回全部结果(包括之前已完成的和本次新完成的)。
+    :param combinations: 待测试的参数组合列表
+    :param checkpoint_path: 检查点文件路径
+    :param max_retries: 单组评估的最大重试次数
+    :return: 全部参数组合的评估结果列表
+    """
+    checkpoint = BatchRunnerCheckpoint(checkpoint_path)
+
+    pending_combinations = [c for c in combinations if not checkpoint.has_completed(c)]
+    skipped_count = len(combinations) - len(pending_combinations)
+
+    print(f"批量测试共{len(combinations)}组参数组合,"
+          f"其中{skipped_count}组已在检查点中完成(跳过),"
+          f"{len(pending_combinations)}组待执行。")
+
+    for index, combo in enumerate(pending_combinations, start=1):
+        print(f"\n[{index}/{len(pending_combinations)}] 执行参数组合:"
+              f"chunk_size={combo['chunk_size']}, top_k={combo['top_k']}, "
+              f"embedding_model={combo['embedding_model']}")
+        try:
+            result = _evaluate_with_retry(combo, max_retries=max_retries)
+            result["group"] = combo.get("group", "extended_grid")
+            checkpoint.mark_completed(combo, result)
+            print(f"  → 命中率:{result['hit_rate'] * 100:.1f}%"
+                  f"({result['hit_count']}/{result['total_count']}),已写入检查点。")
+        except RuntimeError as exc:
+            # 单组彻底失败不应该让整个批量任务崩溃,记录下来,
+            # 继续执行剩余的组合,最后在汇总阶段统一提示哪些组合需要人工重试。
+            print(f"  → 该组合彻底失败,已跳过,请后续单独重试。错误信息:{exc}")
+
+    print(f"\n批量测试执行完毕,检查点中共记录{checkpoint.completed_count()}组已完成结果。")
+    return checkpoint.all_completed_results()
+
+
+def clear_checkpoint(checkpoint_path=None):
+    """
+    清空检查点文件,用于团队确认要"完全重新开始一轮实验"时主动调用,
+    避免历史检查点数据干扰新一轮的实验结果。
+    :param checkpoint_path: 检查点文件路径
+    """
+    checkpoint_path = checkpoint_path or os.path.join(
+        cfg.EXPERIMENT_OUTPUT_DIR, "batch_checkpoint.json"
+    )
+    if os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+        print(f"检查点文件已清空:{checkpoint_path}")
+    else:
+        print("检查点文件不存在,无需清空。")
+```
+
+### 文件12:`visualize_experiment_results.py` —— 实验结果可视化与趋势导出
+
+```python
+"""
+文件名:visualize_experiment_results.py
+作者:陈铭
+说明:
+    把experiment_runner.py产出的实验结果,渲染成两种可视化形式:
+    1. 纯文本的ASCII条形图(不依赖任何图形库,适合在没装matplotlib
+       的环境、或者直接在终端里快速查看趋势时使用)。
+    2. 基于matplotlib的折线图(chunk_size/top_k/embedding_model
+       三个维度各画一张,导出为PNG图片,用于正式的实验报告)。
+
+    设计意图:
+        老王在架构图讲解时提到的"三条曲线各自的形状直觉"
+        (chunk_size先升后降、top_k边际收益递减、Embedding模型
+        单次提升明显),今天团队是靠人工在白板上画出示意图讲解的,
+        这个文件把"根据真实实验数据自动画出这三条曲线"这件事,
+        变成一个可复用的工具,后续每次调优实验都可以直接复用,
+        不需要每次都手工画图或者口头描述趋势。
+"""
+
+import os
+
+import experiment_config as cfg
+
+# matplotlib是可选依赖:教学环境如果没有安装图形库,依然可以正常使用
+# 本文件里的纯文本ASCII图表功能,只是matplotlib相关的函数会给出
+# 明确的提示,而不是让整个脚本因为import失败而无法运行。
+try:
+    import matplotlib
+    matplotlib.use("Agg")  # 使用无界面后端,适合在服务器/无显示器环境下生成图片文件
+    import matplotlib.pyplot as plt
+    _MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    _MATPLOTLIB_AVAILABLE = False
+
+
+def render_ascii_bar_chart(labels, values, title="", bar_char="█", max_width=40):
+    """
+    渲染一个简单的纯文本ASCII横向条形图,常用于命令行环境下
+    快速查看某组数据的相对大小关系,不需要任何额外的图形库依赖。
+
+    :param labels: 每个条形对应的标签列表(如参数取值)
+    :param values: 每个条形对应的数值列表(如命中率,0~1之间的小数)
+    :param title: 图表标题
+    :param bar_char: 用于绘制条形的字符
+    :param max_width: 最长条形对应的字符数量(用于按比例缩放)
+    :return: 渲染好的多行字符串
+    """
+    if len(labels) != len(values):
+        raise ValueError("labels和values的长度必须一致")
+
+    lines = []
+    if title:
+        lines.append(title)
+        lines.append("-" * len(title))
+
+    max_value = max(values) if values else 0
+    for label, value in zip(labels, values):
+        bar_length = int((value / max_value) * max_width) if max_value > 0 else 0
+        bar = bar_char * bar_length
+        lines.append(f"{str(label):>12} | {bar} {value * 100:.1f}%")
+
+    return "\n".join(lines)
+
+
+def print_group_trend_ascii(group_results, param_name):
+    """
+    针对某一组对照实验的结果(如实验组A的chunk_size对照),
+    按参数取值排序后,打印出对应的ASCII趋势条形图。
+    :param group_results: 单组对照实验的结果列表
+    :param param_name: 要展示趋势的参数名称,如"chunk_size"
+    """
+    sorted_results = sorted(group_results, key=lambda r: r["params"][param_name])
+    labels = [r["params"][param_name] for r in sorted_results]
+    values = [r["hit_rate"] for r in sorted_results]
+
+    chart_text = render_ascii_bar_chart(
+        labels, values, title=f"{param_name} 对照实验 · 命中率趋势"
+    )
+    print(chart_text)
+    print()
+
+
+def _ensure_matplotlib():
+    """
+    检查matplotlib是否可用,不可用时打印明确的安装提示,
+    而不是让调用方直接遭遇一个难以理解的ImportError。
+    :return: matplotlib是否可用(bool)
+    """
+    if not _MATPLOTLIB_AVAILABLE:
+        print("提示:未检测到matplotlib库,无法生成PNG图片。"
+              "可执行 `pip install matplotlib` 后重试,"
+              "或者使用本文件提供的render_ascii_bar_chart()纯文本图表功能。")
+        return False
+    return True
+
+
+def plot_param_trend_line_chart(group_results, param_name, output_path):
+    """
+    针对某一组对照实验的结果,绘制"参数取值 vs 命中率"的折线图,
+    并保存为PNG图片文件。
+    :param group_results: 单组对照实验的结果列表
+    :param param_name: 要展示趋势的参数名称
+    :param output_path: 图片输出路径
+    :return: 图片是否成功生成(bool)
+    """
+    if not _ensure_matplotlib():
+        return False
+
+    sorted_results = sorted(group_results, key=lambda r: r["params"][param_name])
+    x_values = [str(r["params"][param_name]) for r in sorted_results]
+    y_values = [r["hit_rate"] * 100 for r in sorted_results]
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(x_values, y_values, marker="o", linewidth=2, color="#2E86AB")
+    ax.set_title(f"{param_name} 对照实验 · 命中率趋势")
+    ax.set_xlabel(param_name)
+    ax.set_ylabel("命中率(%)")
+    ax.set_ylim(0, 100)
+    ax.grid(True, linestyle="--", alpha=0.4)
+
+    for x, y in zip(x_values, y_values):
+        ax.annotate(f"{y:.1f}%", (x, y), textcoords="offset points", xytext=(0, 8), ha="center")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+    print(f"折线图已生成:{output_path}")
+    return True
+
+
+def plot_all_group_trends(all_results, output_dir=None):
+    """
+    针对基线以外的三组对照实验(A/B/C),分别绘制并保存趋势折线图。
+    :param all_results: experiment_runner.run_full_experiment()的返回结果
+    :param output_dir: 图片输出目录,默认使用配置里的EXPERIMENT_OUTPUT_DIR
+    :return: 成功生成的图片路径列表
+    """
+    output_dir = output_dir or cfg.EXPERIMENT_OUTPUT_DIR
+    os.makedirs(output_dir, exist_ok=True)
+
+    generated_paths = []
+
+    group_param_map = [
+        (all_results.get("group_a", []), "chunk_size", "group_a_chunk_size_trend.png"),
+        (all_results.get("group_b", []), "top_k", "group_b_top_k_trend.png"),
+    ]
+
+    for group_results, param_name, filename in group_param_map:
+        if not group_results:
+            continue
+        output_path = os.path.join(output_dir, filename)
+        success = plot_param_trend_line_chart(group_results, param_name, output_path)
+        if success:
+            generated_paths.append(output_path)
+
+    # 实验组C(Embedding模型)是分类变量而非数值变量,更适合用条形图
+    # 而不是折线图展示,单独处理。
+    group_c_results = all_results.get("group_c", [])
+    if group_c_results and _ensure_matplotlib():
+        output_path = os.path.join(output_dir, "group_c_embedding_model_bar.png")
+        _plot_embedding_bar_chart(group_c_results, output_path)
+        generated_paths.append(output_path)
+
+    return generated_paths
+
+
+def _plot_embedding_bar_chart(group_c_results, output_path):
+    """
+    为实验组C(Embedding模型对照,分类变量)绘制条形图而非折线图。
+    :param group_c_results: 实验组C的结果列表
+    :param output_path: 图片输出路径
+    """
+    labels = [r["params"]["embedding_model"] for r in group_c_results]
+    values = [r["hit_rate"] * 100 for r in group_c_results]
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    bars = ax.bar(labels, values, color=["#A6CEE3", "#1F78B4"][:len(labels)])
+    ax.set_title("Embedding模型对照实验 · 命中率对比")
+    ax.set_ylabel("命中率(%)")
+    ax.set_ylim(0, 100)
+
+    for bar, value in zip(bars, values):
+        ax.annotate(f"{value:.1f}%", (bar.get_x() + bar.get_width() / 2, value),
+                    textcoords="offset points", xytext=(0, 5), ha="center")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"条形图已生成:{output_path}")
+
+
+def print_full_ascii_summary(all_results):
+    """
+    在终端里,依次打印基线、实验组A、B、C的ASCII趋势图,
+    作为不依赖matplotlib的"最低成本可视化方案",
+    方便在没有安装图形库的环境下,也能一眼看出各组趋势。
+    :param all_results: experiment_runner.run_full_experiment()的返回结果
+    """
+    print("\n" + "=" * 60)
+    print("实验结果ASCII可视化汇总")
+    print("=" * 60 + "\n")
+
+    if all_results.get("group_a"):
+        print_group_trend_ascii(all_results["group_a"], "chunk_size")
+    if all_results.get("group_b"):
+        print_group_trend_ascii(all_results["group_b"], "top_k")
+    if all_results.get("group_c"):
+        # embedding_model是字符串类型,复用同一套ASCII图表逻辑,
+        # render_ascii_bar_chart对label的类型没有强制要求,可以直接复用。
+        sorted_results = all_results["group_c"]
+        labels = [r["params"]["embedding_model"] for r in sorted_results]
+        values = [r["hit_rate"] for r in sorted_results]
+        print(render_ascii_bar_chart(labels, values, title="embedding_model 对照实验 · 命中率趋势"))
+```
+
+### 文件13:`test_experiment_framework.py` —— 框架级单元测试(pytest风格)
+
+```python
+"""
+文件名:test_experiment_framework.py
+作者:陈铭
+说明:
+    使用pytest风格编写的框架级单元测试,覆盖今天补充的四个新模块
+    (extended_param_space.py、resumable_batch_runner.py、
+    visualize_experiment_results.py)的核心逻辑,以及对
+    selfcheck_experiment.py里已有自检逻辑的进一步补充。
+
+    运行方式:
+        pytest test_experiment_framework.py -v
+
+    知识点回顾:
+        这是团队第一次尝试用标准的pytest框架(而不是自己手写
+        assert+print的自检脚本)来组织测试用例,pytest能提供更
+        规范的测试报告输出、更方便的失败定位,以及后续接入CI流水线
+        自动化跑测试的能力,这个思路会在Day34"RAG评估"和Day38
+        "代码评审"两天进一步展开。
+"""
+
+import os
+import tempfile
+
+import pytest
+
+import experiment_config as cfg
+import extended_param_space as eps
+from evaluate import is_hit
+from resumable_batch_runner import BatchRunnerCheckpoint, RateLimitError, _evaluate_with_retry
+from visualize_experiment_results import render_ascii_bar_chart
+
+
+# ============================================================
+# extended_param_space.py 测试
+# ============================================================
+
+class TestExtendedParamSpace:
+    """针对扩展参数候选空间生成逻辑的测试类。"""
+
+    def test_build_dense_chunk_size_range_basic(self):
+        """验证等差数列生成的基本正确性。"""
+        result = eps.build_dense_chunk_size_range(300, 800, 100)
+        assert result == [300, 400, 500, 600, 700, 800]
+
+    def test_build_dense_chunk_size_range_invalid_step(self):
+        """step为非正数时,应该抛出ValueError,而不是静默返回错误结果。"""
+        with pytest.raises(ValueError):
+            eps.build_dense_chunk_size_range(300, 800, 0)
+
+    def test_build_dense_chunk_size_range_invalid_order(self):
+        """start大于stop时,应该抛出ValueError。"""
+        with pytest.raises(ValueError):
+            eps.build_dense_chunk_size_range(800, 300, 100)
+
+    def test_refine_around_best_value_includes_best(self):
+        """细化候选值范围时,原始最优值本身必须始终包含在结果里。"""
+        result = eps.refine_around_best_value(best_value=500, spread=150, step=100)
+        assert 500 in result
+
+    def test_refine_around_best_value_is_sorted_and_deduped(self):
+        """细化结果应当是排好序且去重的列表。"""
+        result = eps.refine_around_best_value(best_value=500, spread=100, step=50)
+        assert result == sorted(set(result))
+
+    def test_build_extended_full_grid_default_size(self):
+        """默认参数下,全量网格数量应等于三个候选列表长度的乘积。"""
+        combinations = eps.build_extended_full_grid()
+        expected = (
+            len(eps.EXTENDED_CHUNK_SIZE_CANDIDATES)
+            * len(eps.EXTENDED_TOP_K_CANDIDATES)
+            * len(eps.EXTENDED_EMBEDDING_MODEL_CANDIDATES)
+        )
+        assert len(combinations) == expected
+
+    def test_build_extended_full_grid_custom_candidates(self):
+        """传入自定义候选值时,应严格按照传入的候选值生成组合,不使用默认值。"""
+        combinations = eps.build_extended_full_grid(
+            chunk_sizes=[400], top_ks=[5], embedding_models=["bge-large-zh-v1.5"]
+        )
+        assert len(combinations) == 1
+        assert combinations[0]["chunk_size"] == 400
+        assert combinations[0]["top_k"] == 5
+
+    def test_estimate_grid_cost_deduplicates_ingest(self):
+        """成本估算函数应正确识别"不同top_k但相同chunk_size+embedding_model"
+        的组合只需要一次入库,不应该按组合总数重复计算入库次数。"""
+        combinations = [
+            {"chunk_size": 500, "top_k": 3, "embedding_model": "bge-large-zh-v1.5"},
+            {"chunk_size": 500, "top_k": 5, "embedding_model": "bge-large-zh-v1.5"},
+            {"chunk_size": 500, "top_k": 8, "embedding_model": "bge-large-zh-v1.5"},
+        ]
+        cost = eps.estimate_grid_cost(combinations)
+        assert cost["unique_ingest_count"] == 1, "三组top_k共用同一个chunk_size+embedding_model,应只统计1次入库"
+        assert cost["combination_count"] == 3
+
+    def test_split_into_batches_basic(self):
+        """验证批次切分逻辑,总数量应保持不变,且每批次不超过指定大小。"""
+        combinations = list(range(10))
+        batches = eps.split_into_batches(combinations, batch_size=3)
+        assert len(batches) == 4
+        assert sum(len(b) for b in batches) == 10
+        assert all(len(b) <= 3 for b in batches)
+
+    def test_split_into_batches_invalid_size(self):
+        """batch_size为非正数时,应该抛出ValueError。"""
+        with pytest.raises(ValueError):
+            eps.split_into_batches([1, 2, 3], batch_size=0)
+
+
+# ============================================================
+# resumable_batch_runner.py 测试
+# ============================================================
+
+class TestResumableBatchRunner:
+    """针对断点续跑检查点管理器与重试逻辑的测试类。"""
+
+    def test_checkpoint_starts_empty_when_file_missing(self):
+        """检查点文件不存在时,初始化后应该是空的,不应该报错。"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            checkpoint_path = os.path.join(tmp_dir, "checkpoint.json")
+            checkpoint = BatchRunnerCheckpoint(checkpoint_path)
+            assert checkpoint.completed_count() == 0
+
+    def test_checkpoint_mark_and_reload(self):
+        """标记完成并持久化后,重新创建一个新的检查点实例读取同一个文件,
+        应该能正确恢复之前保存的数据(模拟"进程重启后继续跑"的场景)。"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            checkpoint_path = os.path.join(tmp_dir, "checkpoint.json")
+            combo = {"chunk_size": 500, "top_k": 3, "embedding_model": "bge-large-zh-v1.5"}
+            fake_result = {"hit_rate": 0.7, "hit_count": 7, "total_count": 10}
+
+            first_checkpoint = BatchRunnerCheckpoint(checkpoint_path)
+            first_checkpoint.mark_completed(combo, fake_result)
+
+            second_checkpoint = BatchRunnerCheckpoint(checkpoint_path)
+            assert second_checkpoint.has_completed(combo) is True
+            assert second_checkpoint.get_completed_result(combo)["hit_rate"] == 0.7
+
+    def test_checkpoint_handles_corrupted_file(self):
+        """检查点文件内容损坏(非合法JSON)时,应该优雅降级为空检查点,
+        而不是让整个批量任务因为一个文件损坏就直接崩溃。"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            checkpoint_path = os.path.join(tmp_dir, "checkpoint.json")
+            with open(checkpoint_path, "w", encoding="utf-8") as f:
+                f.write("{这不是合法的JSON内容,,,")
+
+            checkpoint = BatchRunnerCheckpoint(checkpoint_path)
+            assert checkpoint.completed_count() == 0
+
+    def test_evaluate_with_retry_succeeds_after_transient_failure(self):
+        """模拟"前两次调用失败(限流),第三次成功"的场景,
+        验证重试机制能够最终返回成功结果,而不是在第一次失败后就放弃。"""
+        call_counter = {"count": 0}
+
+        def flaky_evaluate_combo(chunk_size, top_k, embedding_model):
+            call_counter["count"] += 1
+            if call_counter["count"] < 3:
+                raise RateLimitError("模拟限流异常")
+            return {"hit_rate": 0.8, "hit_count": 8, "total_count": 10}
+
+        import resumable_batch_runner as rbr
+        original_evaluate_combo = rbr.evaluate_combo
+        rbr.evaluate_combo = flaky_evaluate_combo
+        try:
+            combo = {"chunk_size": 500, "top_k": 3, "embedding_model": "bge-large-zh-v1.5"}
+            result = _evaluate_with_retry(combo, max_retries=5, base_backoff_seconds=0)
+            assert result["hit_rate"] == 0.8
+            assert call_counter["count"] == 3
+        finally:
+            rbr.evaluate_combo = original_evaluate_combo
+
+    def test_evaluate_with_retry_raises_after_exhausting_retries(self):
+        """当重试次数耗尽依然失败时,应该抛出RuntimeError,
+        而不是无限重试下去或者悄悄返回一个错误的空结果。"""
+        def always_fail_evaluate_combo(chunk_size, top_k, embedding_model):
+            raise RateLimitError("持续限流")
+
+        import resumable_batch_runner as rbr
+        original_evaluate_combo = rbr.evaluate_combo
+        rbr.evaluate_combo = always_fail_evaluate_combo
+        try:
+            combo = {"chunk_size": 500, "top_k": 3, "embedding_model": "bge-large-zh-v1.5"}
+            with pytest.raises(RuntimeError):
+                _evaluate_with_retry(combo, max_retries=2, base_backoff_seconds=0)
+        finally:
+            rbr.evaluate_combo = original_evaluate_combo
+
+
+# ============================================================
+# visualize_experiment_results.py 测试
+# ============================================================
+
+class TestVisualizeExperimentResults:
+    """针对可视化模块中不依赖matplotlib的纯文本图表逻辑的测试类。"""
+
+    def test_render_ascii_bar_chart_length_mismatch_raises(self):
+        """labels和values长度不一致时,应该抛出ValueError,提前暴露调用方的错误。"""
+        with pytest.raises(ValueError):
+            render_ascii_bar_chart(labels=[1, 2, 3], values=[0.1, 0.2])
+
+    def test_render_ascii_bar_chart_contains_all_labels(self):
+        """渲染结果里应该包含每一个传入的标签,不能遗漏。"""
+        chart = render_ascii_bar_chart(labels=[300, 500, 800], values=[0.4, 0.5, 0.6], title="测试图表")
+        assert "300" in chart
+        assert "500" in chart
+        assert "800" in chart
+        assert "测试图表" in chart
+
+    def test_render_ascii_bar_chart_handles_all_zero_values(self):
+        """当全部数值都为0时(极端边界情况),不应该因为除以0而报错,
+        应该正常渲染出全部为空的条形。"""
+        chart = render_ascii_bar_chart(labels=["a", "b"], values=[0.0, 0.0])
+        assert "a" in chart and "b" in chart
+
+
+# ============================================================
+# 与is_hit()命中判定逻辑相关的补充边界测试
+# ============================================================
+
+class TestIsHitAdditionalEdgeCases:
+    """对evaluate.py中is_hit()函数的补充边界场景测试,弥补
+    selfcheck_experiment.py里尚未覆盖的几个细节情况。"""
+
+    def test_is_hit_empty_retrieved_text(self):
+        """检索结果为空字符串时(极端情况,比如检索器返回了空列表),
+        应该稳定地判定为未命中,不应该抛出异常。"""
+        hit, matched = is_hit("", ["关键词1", "关键词2"], min_keyword_hits=1)
+        assert hit is False
+        assert matched == []
+
+    def test_is_hit_empty_ground_truth_keywords(self):
+        """标准答案关键词列表本身为空时(数据标注异常场景),
+        min_keyword_hits通常也应该是0,此时应该判定为命中
+        (没有任何要求,自然算满足要求),这提醒团队在真实数据里
+        要避免出现关键词列表为空但min_keyword_hits大于0的矛盾配置。"""
+        hit, matched = is_hit("任意检索内容", [], min_keyword_hits=0)
+        assert hit is True
+        assert matched == []
+
+    def test_is_hit_duplicate_keywords_not_double_counted(self):
+        """标准答案关键词列表中出现重复关键词时,不应该被重复计数,
+        导致命中判定结果被错误地拉高。"""
+        hit, matched = is_hit(
+            "润滑油润滑油润滑油",
+            ["润滑油", "润滑油", "型号"],
+            min_keyword_hits=2,
+        )
+        # matched列表里"润滑油"依然可能出现两次(因为遍历的是原始关键词列表),
+        # 但真正需要保证的是:没有"型号"这个关键词的情况下,不应该被误判为
+        # 命中2个不同的有效信息点,这里用集合去重后的数量做更严谨的判断。
+        unique_matched = set(matched)
+        assert "型号" not in unique_matched
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
 ```
 
 ---
