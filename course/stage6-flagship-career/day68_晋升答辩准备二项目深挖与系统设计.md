@@ -2138,6 +2138,1471 @@ class KnowledgeBaseUser(HttpUser):
 
 以上所有代码晚上会由苏梦补充单元测试、韩露补充压测报告脚注、张凡负责整理成文档一并归档,作为陈铭明天全真模拟答辩时,回答系统设计题"深入细节"环节可以随手调用的技术底料——老王的原话是:"你能不能讲清楚,和你能不能真的写出来,是两件事,评委问细节的时候,能不能瞬间说出实现思路,直接暴露你是不是真懂。"
 
+### 四、容灾降级方案实现:熔断器与多层级降级链
+
+> 对应上午追问"如果Milvus集群整体挂了,系统的降级方案是什么"这一环节。陈铭当时坦白承认"故障发生时系统没有优雅降级,是事后才补的",晚上他把这套"事后补的"降级方案,落成了一份可以直接复用的通用组件,准备写进《项目深挖问答记录》的证据链附件里。
+
+```python
+"""
+circuit_breaker.py
+熔断器(Circuit Breaker)通用实现,用于保护下游依赖(Milvus、大模型API、ES等)
+在持续失败时,避免请求继续堆积到一个已经"病入膏肓"的下游,造成雪崩式的级联故障。
+
+三态模型:
+- CLOSED(闭合,正常放行):请求正常发往下游,统计失败率;
+- OPEN(打开,熔断中):失败率超过阈值后进入该态,在冷却时间内直接拒绝请求,不再打下游;
+- HALF_OPEN(半开,试探恢复):冷却时间结束后放行少量"探针请求",
+  如果探针请求成功率达标,回到CLOSED;否则重新回到OPEN,继续等待下一轮冷却。
+
+这是老王反复强调的"为最坏情况设计"的工程习惯里,最经典、最通用的一个落地组件。
+"""
+
+import threading
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable, Optional, TypeVar
+
+T = TypeVar("T")
+
+
+class CircuitState(Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
+@dataclass
+class CircuitBreakerConfig:
+    failure_rate_threshold: float = 0.5       # 失败率超过该阈值触发熔断
+    minimum_request_count: int = 20           # 统计窗口内至少要有这么多请求才判断失败率,避免样本太少误判
+    rolling_window_seconds: float = 30.0      # 滚动统计窗口长度
+    open_state_cooldown_seconds: float = 15.0  # 熔断打开后,多久进入半开状态试探
+    half_open_probe_count: int = 5            # 半开状态允许放行的探针请求数
+    half_open_success_rate_to_close: float = 0.8  # 探针成功率达到该值才认为下游恢复
+
+
+@dataclass
+class _RollingCounter:
+    """滑动窗口内的请求结果统计,用秒级分桶实现,避免无限增长的列表"""
+
+    window_seconds: float
+    bucket_seconds: float = 1.0
+    buckets: dict = field(default_factory=dict)  # bucket_index -> (success, failure)
+
+    def _bucket_index(self, ts: float) -> int:
+        return int(ts // self.bucket_seconds)
+
+    def record(self, ts: float, success: bool) -> None:
+        idx = self._bucket_index(ts)
+        success_count, failure_count = self.buckets.get(idx, (0, 0))
+        if success:
+            success_count += 1
+        else:
+            failure_count += 1
+        self.buckets[idx] = (success_count, failure_count)
+        self._evict_expired(ts)
+
+    def _evict_expired(self, now_ts: float) -> None:
+        boundary = self._bucket_index(now_ts - self.window_seconds)
+        expired_keys = [k for k in self.buckets if k < boundary]
+        for k in expired_keys:
+            del self.buckets[k]
+
+    def snapshot(self, now_ts: float) -> tuple[int, int]:
+        self._evict_expired(now_ts)
+        total_success = sum(s for s, _ in self.buckets.values())
+        total_failure = sum(f for _, f in self.buckets.values())
+        return total_success, total_failure
+
+
+class CircuitBreakerOpenError(RuntimeError):
+    """当熔断器处于OPEN状态时,调用方应捕获该异常并走降级路径"""
+
+
+class CircuitBreaker:
+    """
+    单个下游依赖对应一个熔断器实例。
+    典型用法:Milvus检索、大模型API调用、ES检索各自持有独立的熔断器实例,
+    避免"一个依赖出问题,连带影响对其他依赖健康状况的判断"。
+    """
+
+    def __init__(self, name: str, config: Optional[CircuitBreakerConfig] = None):
+        self.name = name
+        self._config = config or CircuitBreakerConfig()
+        self._state = CircuitState.CLOSED
+        self._lock = threading.Lock()
+        self._counter = _RollingCounter(window_seconds=self._config.rolling_window_seconds)
+        self._opened_at: Optional[float] = None
+        self._half_open_results: list[bool] = []
+
+    @property
+    def state(self) -> CircuitState:
+        with self._lock:
+            self._maybe_transition_to_half_open()
+            return self._state
+
+    def _maybe_transition_to_half_open(self) -> None:
+        if self._state == CircuitState.OPEN and self._opened_at is not None:
+            elapsed = time.monotonic() - self._opened_at
+            if elapsed >= self._config.open_state_cooldown_seconds:
+                self._state = CircuitState.HALF_OPEN
+                self._half_open_results = []
+
+    def _record_result(self, success: bool) -> None:
+        now = time.monotonic()
+        with self._lock:
+            if self._state == CircuitState.HALF_OPEN:
+                self._half_open_results.append(success)
+                if len(self._half_open_results) >= self._config.half_open_probe_count:
+                    success_rate = sum(self._half_open_results) / len(self._half_open_results)
+                    if success_rate >= self._config.half_open_success_rate_to_close:
+                        self._state = CircuitState.CLOSED
+                        self._counter = _RollingCounter(window_seconds=self._config.rolling_window_seconds)
+                    else:
+                        self._state = CircuitState.OPEN
+                        self._opened_at = time.monotonic()
+                return
+
+            self._counter.record(now, success)
+            success_count, failure_count = self._counter.snapshot(now)
+            total = success_count + failure_count
+            if total >= self._config.minimum_request_count:
+                failure_rate = failure_count / total
+                if failure_rate >= self._config.failure_rate_threshold:
+                    self._state = CircuitState.OPEN
+                    self._opened_at = time.monotonic()
+
+    def _can_pass(self) -> bool:
+        with self._lock:
+            self._maybe_transition_to_half_open()
+            if self._state == CircuitState.CLOSED:
+                return True
+            if self._state == CircuitState.HALF_OPEN:
+                return len(self._half_open_results) < self._config.half_open_probe_count
+            return False  # OPEN
+
+    def call(self, fn: Callable[[], T]) -> T:
+        """
+        用熔断器包裹一次下游调用。
+        调用方需要在外层捕获 CircuitBreakerOpenError,并执行自己的降级逻辑
+        (比如切换到全文检索、走兜底话术等),熔断器本身只负责"该不该放行",
+        不负责"放行失败之后具体怎么办"。
+        """
+        if not self._can_pass():
+            raise CircuitBreakerOpenError(f"熔断器[{self.name}]当前处于{self._state.value}状态,拒绝调用")
+
+        try:
+            result = fn()
+        except Exception:
+            self._record_result(success=False)
+            raise
+        else:
+            self._record_result(success=True)
+            return result
+
+
+class FallbackChain:
+    """
+    多层级降级链:按优先级依次尝试一组"处理器",
+    前一个失败(或被熔断)才尝试下一个,直到全部失败为止返回最终的兜底结果。
+
+    对应上午陈铭讲的三层降级方案:
+    第一层:向量检索(Milvus)不可用 -> 第二层:降级到全文检索(ES) -> 第三层:兜底话术+人工客服转接。
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+        self._stages: list[tuple[str, Callable[[dict], dict]]] = []
+
+    def add_stage(self, stage_name: str, handler: Callable[[dict], dict]) -> "FallbackChain":
+        self._stages.append((stage_name, handler))
+        return self
+
+    def execute(self, request: dict) -> dict:
+        last_error: Optional[BaseException] = None
+        attempted_stages: list[str] = []
+        for stage_name, handler in self._stages:
+            attempted_stages.append(stage_name)
+            try:
+                result = handler(request)
+                result["_fallback_chain"] = {
+                    "name": self.name,
+                    "succeeded_stage": stage_name,
+                    "attempted_stages": attempted_stages,
+                }
+                return result
+            except (CircuitBreakerOpenError, Exception) as exc:  # noqa: BLE001
+                last_error = exc
+                continue
+
+        return {
+            "answer": None,
+            "degraded": True,
+            "message": "系统暂时无法处理您的请求,已为您转接人工客服",
+            "_fallback_chain": {
+                "name": self.name,
+                "succeeded_stage": None,
+                "attempted_stages": attempted_stages,
+                "last_error": str(last_error) if last_error else None,
+            },
+        }
+
+
+def build_qa_fallback_chain(
+    vector_search_breaker: CircuitBreaker,
+    fulltext_search_breaker: CircuitBreaker,
+    vector_search_fn: Callable[[dict], dict],
+    fulltext_search_fn: Callable[[dict], dict],
+    human_handoff_fn: Callable[[dict], dict],
+) -> FallbackChain:
+    """
+    组装一条问答服务专用的降级链,三层依次是:
+    向量检索(主路径) -> 全文检索(降级路径) -> 人工客服转接(兜底路径)。
+    """
+    chain = FallbackChain(name="qa_retrieval_fallback")
+
+    def _stage_vector(req: dict) -> dict:
+        return vector_search_breaker.call(lambda: vector_search_fn(req))
+
+    def _stage_fulltext(req: dict) -> dict:
+        result = fulltext_search_breaker.call(lambda: fulltext_search_fn(req))
+        result["degraded"] = True
+        result["degraded_reason"] = "向量检索不可用,已降级为全文关键词检索,精度可能下降"
+        return result
+
+    def _stage_human(req: dict) -> dict:
+        return human_handoff_fn(req)
+
+    chain.add_stage("vector_search", _stage_vector)
+    chain.add_stage("fulltext_search", _stage_fulltext)
+    chain.add_stage("human_handoff", _stage_human)
+    return chain
+
+
+if __name__ == "__main__":
+    breaker_config = CircuitBreakerConfig(
+        failure_rate_threshold=0.5,
+        minimum_request_count=5,
+        rolling_window_seconds=10,
+        open_state_cooldown_seconds=3,
+        half_open_probe_count=3,
+    )
+    vector_breaker = CircuitBreaker("milvus_vector_search", breaker_config)
+    fulltext_breaker = CircuitBreaker("es_fulltext_search", breaker_config)
+
+    call_count = {"vector": 0}
+
+    def _fake_vector_search(_req: dict) -> dict:
+        call_count["vector"] += 1
+        # 模拟前8次调用Milvus全部失败(集群故障场景)
+        if call_count["vector"] <= 8:
+            raise ConnectionError("Milvus集群连接超时")
+        return {"answer": "向量检索命中的答案", "source": "vector"}
+
+    def _fake_fulltext_search(_req: dict) -> dict:
+        return {"answer": "全文检索命中的答案(关键词匹配)", "source": "fulltext"}
+
+    def _fake_human_handoff(_req: dict) -> dict:
+        return {"answer": None, "message": "已转接人工客服", "source": "human"}
+
+    chain = build_qa_fallback_chain(
+        vector_breaker, fulltext_breaker,
+        _fake_vector_search, _fake_fulltext_search, _fake_human_handoff,
+    )
+
+    for i in range(12):
+        outcome = chain.execute({"question": "减速机异响的原因", "request_id": i})
+        print(f"第{i+1}次请求 -> succeeded_stage={outcome['_fallback_chain']['succeeded_stage']}")
+        if i == 4:
+            time.sleep(3.2)  # 等待熔断器冷却,进入半开状态试探
+```
+
+```python
+"""
+milvus_failover_manager.py
+Milvus多副本健康检查与自动切换实现。
+对应陈铭在上午追问中提到的改进方案:"给Milvus增加跨机房多副本部署,
+并且在应用层加了健康检查和自动切换逻辑"。
+
+设计要点:
+1. 定期对每个副本组做健康探测(而不是等到业务请求失败才发现副本挂了);
+2. 主副本组不可用时,自动切换到健康的备用副本组,并记录切换事件供事后复盘;
+3. 切换决策要有"抖动抑制"(防止副本组在健康边缘反复抖动导致频繁切换),
+   引入连续失败次数和连续成功次数的双阈值判断。
+"""
+
+import logging
+import threading
+import time
+from dataclasses import dataclass
+from enum import Enum
+from typing import Callable, Optional
+
+logger = logging.getLogger("milvus_failover")
+
+
+class ReplicaHealth(Enum):
+    HEALTHY = "healthy"
+    SUSPECTED = "suspected"   # 检测到异常但还没达到判定不健康的连续次数阈值
+    UNHEALTHY = "unhealthy"
+
+
+@dataclass
+class ReplicaGroup:
+    name: str                 # 副本组名称,如 "primary_bj", "standby_sh"
+    endpoint: str
+    priority: int             # 数值越小优先级越高,故障切换时按优先级顺序选取
+    health: ReplicaHealth = ReplicaHealth.HEALTHY
+    consecutive_failures: int = 0
+    consecutive_successes: int = 0
+    last_checked_at: float = 0.0
+
+
+class MilvusFailoverManager:
+    """
+    多副本组健康检查与自动切换管理器。
+    应用服务层通过 get_active_endpoint() 获取当前应该使用的Milvus连接地址,
+    完全屏蔽掉底层"到底连的是主副本组还是备用副本组"这个细节。
+    """
+
+    def __init__(
+        self,
+        replica_groups: list[ReplicaGroup],
+        health_check_fn: Callable[[str], bool],
+        failure_threshold: int = 3,
+        recovery_threshold: int = 3,
+        check_interval_seconds: float = 5.0,
+    ):
+        # 按优先级排序,数值小的排前面,默认作为主副本组
+        self._replica_groups = sorted(replica_groups, key=lambda g: g.priority)
+        self._health_check_fn = health_check_fn
+        self._failure_threshold = failure_threshold
+        self._recovery_threshold = recovery_threshold
+        self._check_interval = check_interval_seconds
+        self._lock = threading.Lock()
+        self._active_group_name: str = self._replica_groups[0].name
+        self._switch_history: list[dict] = []
+        self._stop_flag = threading.Event()
+        self._checker_thread: Optional[threading.Thread] = None
+
+    def _find_group(self, name: str) -> ReplicaGroup:
+        for group in self._replica_groups:
+            if group.name == name:
+                return group
+        raise KeyError(f"未找到副本组: {name}")
+
+    def _check_one_group(self, group: ReplicaGroup) -> None:
+        now = time.monotonic()
+        try:
+            ok = self._health_check_fn(group.endpoint)
+        except Exception:  # noqa: BLE001 - 健康检查本身异常也视为不健康
+            ok = False
+
+        with self._lock:
+            group.last_checked_at = now
+            if ok:
+                group.consecutive_successes += 1
+                group.consecutive_failures = 0
+                if (
+                    group.health != ReplicaHealth.HEALTHY
+                    and group.consecutive_successes >= self._recovery_threshold
+                ):
+                    logger.info("副本组[%s]连续%d次探测成功,恢复为健康状态", group.name, group.consecutive_successes)
+                    group.health = ReplicaHealth.HEALTHY
+            else:
+                group.consecutive_failures += 1
+                group.consecutive_successes = 0
+                if group.consecutive_failures >= self._failure_threshold:
+                    if group.health != ReplicaHealth.UNHEALTHY:
+                        logger.warning("副本组[%s]连续%d次探测失败,标记为不健康", group.name, group.consecutive_failures)
+                    group.health = ReplicaHealth.UNHEALTHY
+                else:
+                    group.health = ReplicaHealth.SUSPECTED
+
+    def _reevaluate_active_group(self) -> None:
+        with self._lock:
+            current_active = self._find_group(self._active_group_name)
+            if current_active.health == ReplicaHealth.HEALTHY:
+                return  # 当前主用副本组健康,不需要切换
+
+            # 当前主用副本组不健康,按优先级找第一个健康的副本组切过去
+            for candidate in self._replica_groups:
+                if candidate.health == ReplicaHealth.HEALTHY:
+                    if candidate.name != self._active_group_name:
+                        self._switch_history.append({
+                            "from": self._active_group_name,
+                            "to": candidate.name,
+                            "switched_at": time.time(),
+                            "reason": f"{self._active_group_name}连续{current_active.consecutive_failures}次探测失败",
+                        })
+                        logger.error(
+                            "触发自动切换: %s -> %s (原因: 主用副本组不健康)",
+                            self._active_group_name, candidate.name,
+                        )
+                        self._active_group_name = candidate.name
+                    return
+
+            logger.critical("所有Milvus副本组均不健康!系统应触发全文检索降级路径")
+
+    def run_check_cycle(self) -> None:
+        for group in self._replica_groups:
+            self._check_one_group(group)
+        self._reevaluate_active_group()
+
+    def start_background_checking(self) -> None:
+        def _loop():
+            while not self._stop_flag.is_set():
+                self.run_check_cycle()
+                self._stop_flag.wait(self._check_interval)
+
+        self._checker_thread = threading.Thread(target=_loop, daemon=True)
+        self._checker_thread.start()
+
+    def stop(self) -> None:
+        self._stop_flag.set()
+        if self._checker_thread is not None:
+            self._checker_thread.join(timeout=self._check_interval + 1)
+
+    def get_active_endpoint(self) -> str:
+        with self._lock:
+            return self._find_group(self._active_group_name).endpoint
+
+    def get_status_report(self) -> dict:
+        with self._lock:
+            return {
+                "active_group": self._active_group_name,
+                "groups": [
+                    {
+                        "name": g.name,
+                        "endpoint": g.endpoint,
+                        "health": g.health.value,
+                        "consecutive_failures": g.consecutive_failures,
+                    }
+                    for g in self._replica_groups
+                ],
+                "switch_history": list(self._switch_history),
+            }
+
+
+if __name__ == "__main__":
+    groups = [
+        ReplicaGroup(name="primary_bj", endpoint="milvus-bj.internal:19530", priority=0),
+        ReplicaGroup(name="standby_sh", endpoint="milvus-sh.internal:19530", priority=1),
+    ]
+
+    # 模拟:主机房从第3次检查开始持续故障
+    check_round = {"n": 0}
+
+    def _fake_health_check(endpoint: str) -> bool:
+        check_round["n"] += 1
+        if "bj" in endpoint and check_round["n"] >= 3:
+            return False
+        return True
+
+    manager = MilvusFailoverManager(
+        groups, _fake_health_check,
+        failure_threshold=2, recovery_threshold=2, check_interval_seconds=0.1,
+    )
+
+    for _ in range(8):
+        manager.run_check_cycle()
+        time.sleep(0.05)
+
+    import json
+    print(json.dumps(manager.get_status_report(), ensure_ascii=False, indent=2))
+```
+
+### 五、跨知识库联合检索实现(对应课后作业六方案落地)
+
+> 这段代码是陈铭在完成作业六之后,顺手把设计方案落成的可运行原型,他在《项目深挖问答记录》里备注了一句:"这道附加题如果答辩现场被问到,光讲方案说服力有限,能直接说出关键代码结构,说服力会强很多。"
+
+```python
+"""
+cross_kb_retriever.py
+跨知识库联合检索实现:支持一次问答请求同时检索多个知识库(Collection),
+并在结果聚合阶段做"检索结果级别"的权限过滤,而不是"知识库入口级别"的粗粒度过滤。
+
+核心设计对应作业六给出的方案:
+1. 检索增强层支持多Collection并行检索(scatter-gather模式);
+2. 权限模型下沉到每一条候选片段,而不是整个知识库;
+3. 生成阶段标注每条引用来源所属的知识库,便于可信度展示和权限审计;
+4. 权限校验结果做短TTL缓存,兼顾性能和权限变更的及时性。
+"""
+
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from typing import Callable, Optional
+
+
+@dataclass
+class RetrievedChunk:
+    """单条检索候选片段"""
+    chunk_id: str
+    knowledge_base_id: str
+    document_id: str
+    content: str
+    score: float
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class PermissionCacheEntry:
+    allowed: bool
+    cached_at: float
+
+
+class PermissionAwareFilter:
+    """
+    权限过滤器:对每一条候选片段做"用户-文档"粒度的权限校验。
+    引入短TTL缓存,避免每次检索都要重新走一遍完整的权限系统调用链路,
+    同时TTL足够短(默认30秒),保证权限变更后能较快生效。
+    """
+
+    def __init__(
+        self,
+        permission_check_fn: Callable[[str, str], bool],
+        cache_ttl_seconds: float = 30.0,
+    ):
+        self._permission_check_fn = permission_check_fn
+        self._cache_ttl = cache_ttl_seconds
+        self._cache: dict[tuple[str, str], PermissionCacheEntry] = {}
+
+    def _is_cache_valid(self, entry: PermissionCacheEntry) -> bool:
+        return (time.time() - entry.cached_at) < self._cache_ttl
+
+    def check(self, user_id: str, document_id: str) -> bool:
+        key = (user_id, document_id)
+        cached = self._cache.get(key)
+        if cached is not None and self._is_cache_valid(cached):
+            return cached.allowed
+
+        allowed = self._permission_check_fn(user_id, document_id)
+        self._cache[key] = PermissionCacheEntry(allowed=allowed, cached_at=time.time())
+        return allowed
+
+    def filter_chunks(self, user_id: str, chunks: list[RetrievedChunk]) -> list[RetrievedChunk]:
+        """对一批候选片段做权限过滤,只保留用户有权限访问的部分"""
+        allowed_chunks = []
+        for chunk in chunks:
+            if self.check(user_id, chunk.document_id):
+                allowed_chunks.append(chunk)
+        return allowed_chunks
+
+
+class KnowledgeBaseSearchAdapter:
+    """
+    单个知识库(Milvus Collection)的检索适配器接口。
+    生产环境中,每个知识库可能对应不同的Collection、甚至不同的Embedding模型版本,
+    适配器负责屏蔽这些差异,统一返回 RetrievedChunk 列表。
+    """
+
+    def __init__(self, kb_id: str, search_fn: Callable[[str, int], list[RetrievedChunk]]):
+        self.kb_id = kb_id
+        self._search_fn = search_fn
+
+    def search(self, query: str, top_k: int) -> list[RetrievedChunk]:
+        return self._search_fn(query, top_k)
+
+
+class CrossKnowledgeBaseRetriever:
+    """
+    跨知识库联合检索器,负责:
+    1. 并行向多个知识库适配器发起检索(scatter);
+    2. 汇总所有结果并按分数统一排序(gather);
+    3. 用 PermissionAwareFilter 做逐条权限过滤;
+    4. 返回过滤后、按分数排序、并标注来源知识库的最终候选集。
+    """
+
+    def __init__(
+        self,
+        adapters: list[KnowledgeBaseSearchAdapter],
+        permission_filter: PermissionAwareFilter,
+        max_workers: int = 4,
+    ):
+        self._adapters = adapters
+        self._permission_filter = permission_filter
+        self._max_workers = max_workers
+
+    def retrieve(
+        self,
+        user_id: str,
+        query: str,
+        top_k_per_kb: int = 10,
+        final_top_k: int = 10,
+        target_kb_ids: Optional[list[str]] = None,
+    ) -> dict:
+        """
+        执行一次跨知识库联合检索。
+        target_kb_ids 为空表示检索全部已注册知识库,否则只检索指定的知识库子集
+        (比如用户在前端手动勾选了"只在技术文档知识库+财务制度知识库中搜索")。
+        """
+        active_adapters = [
+            a for a in self._adapters
+            if target_kb_ids is None or a.kb_id in target_kb_ids
+        ]
+
+        all_chunks: list[RetrievedChunk] = []
+        per_kb_stats: dict[str, dict] = {}
+
+        with ThreadPoolExecutor(max_workers=self._max_workers) as executor:
+            future_to_kb = {
+                executor.submit(adapter.search, query, top_k_per_kb): adapter.kb_id
+                for adapter in active_adapters
+            }
+            for future in as_completed(future_to_kb):
+                kb_id = future_to_kb[future]
+                try:
+                    chunks = future.result()
+                    per_kb_stats[kb_id] = {"retrieved_count": len(chunks), "error": None}
+                    all_chunks.extend(chunks)
+                except Exception as exc:  # noqa: BLE001 - 单个知识库检索失败不应影响其他知识库
+                    per_kb_stats[kb_id] = {"retrieved_count": 0, "error": str(exc)}
+
+        # 关键点:权限过滤发生在"结果级别",而不是"知识库入口级别"。
+        # 即使用户勾选了某个知识库进行检索,该知识库内单条文档的权限依然要逐一校验。
+        allowed_chunks = self._permission_filter.filter_chunks(user_id, all_chunks)
+
+        # 按分数降序排序,取最终 top_k
+        allowed_chunks.sort(key=lambda c: c.score, reverse=True)
+        final_chunks = allowed_chunks[:final_top_k]
+
+        filtered_out_count = len(all_chunks) - len(allowed_chunks)
+
+        return {
+            "chunks": final_chunks,
+            "sources_summary": self._summarize_sources(final_chunks),
+            "per_kb_stats": per_kb_stats,
+            "total_retrieved_before_permission_filter": len(all_chunks),
+            "filtered_out_by_permission": filtered_out_count,
+        }
+
+    @staticmethod
+    def _summarize_sources(chunks: list[RetrievedChunk]) -> list[dict]:
+        """按知识库汇总最终返回结果的来源分布,用于答案生成阶段的引用标注和权限审计"""
+        summary: dict[str, int] = {}
+        for chunk in chunks:
+            summary[chunk.knowledge_base_id] = summary.get(chunk.knowledge_base_id, 0) + 1
+        return [{"knowledge_base_id": kb, "chunk_count": count} for kb, count in summary.items()]
+
+
+if __name__ == "__main__":
+    # 模拟场景:技术文档知识库(tech_kb) + 财务制度知识库(finance_kb)
+    def _tech_kb_search(query: str, top_k: int) -> list[RetrievedChunk]:
+        return [
+            RetrievedChunk("tech_c1", "tech_kb", "doc_tech_001", "减速机异响处理流程...", score=0.91),
+            RetrievedChunk("tech_c2", "tech_kb", "doc_tech_002", "设备保养周期表...", score=0.78),
+        ][:top_k]
+
+    def _finance_kb_search(query: str, top_k: int) -> list[RetrievedChunk]:
+        return [
+            RetrievedChunk("fin_c1", "finance_kb", "doc_fin_001", "设备维修报销标准...", score=0.85),
+            RetrievedChunk("fin_c2", "finance_kb", "doc_fin_002", "固定资产折旧制度...", score=0.60),
+        ][:top_k]
+
+    # 模拟权限系统:该用户对财务知识库的 doc_fin_002 没有权限
+    def _fake_permission_check(user_id: str, document_id: str) -> bool:
+        no_access_map = {"user_zhangfan": {"doc_fin_002"}}
+        return document_id not in no_access_map.get(user_id, set())
+
+    adapters = [
+        KnowledgeBaseSearchAdapter("tech_kb", _tech_kb_search),
+        KnowledgeBaseSearchAdapter("finance_kb", _finance_kb_search),
+    ]
+    permission_filter = PermissionAwareFilter(_fake_permission_check, cache_ttl_seconds=30)
+    retriever = CrossKnowledgeBaseRetriever(adapters, permission_filter)
+
+    result = retriever.retrieve(
+        user_id="user_zhangfan",
+        query="设备维修相关的处理和报销流程是什么",
+        target_kb_ids=["tech_kb", "finance_kb"],
+    )
+    print(f"最终返回 {len(result['chunks'])} 条片段,权限过滤掉 {result['filtered_out_by_permission']} 条")
+    print("来源分布:", result["sources_summary"])
+```
+
+### 六、语义切片实现(对应"固定长度切片翻车"的复盘落地)
+
+> 陈铭在上午被追问"哪个决定是错的"时,提到早期固定长度切片导致表格和步骤被硬生生切断的教训。晚上他把后来改进的"基于文档结构的语义切片"方案写成了可运行代码,准备作为这条反思的"证据链"附件。
+
+```python
+"""
+semantic_chunker.py
+基于文档结构的语义切片实现,替代早期"固定长度硬切"的方案。
+
+核心思路:
+1. 先解析出文档的结构化元素(标题、段落、表格、列表),而不是把文档当成一坨纯文本;
+2. 切片时尽量保证一个"完整语义单元"(如一个小节、一张表格)不被切断;
+3. 对于超长段落,再按句子边界做二次切分,并保留重叠窗口避免上下文断裂;
+4. 每个切片附带结构化元数据(所属章节、页码),用于检索后的结果溯源和展示。
+"""
+
+import re
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
+
+
+class ElementType(Enum):
+    HEADING = "heading"
+    PARAGRAPH = "paragraph"
+    TABLE = "table"
+    LIST_ITEM = "list_item"
+
+
+@dataclass
+class StructuredElement:
+    """文档解析后得到的结构化元素,由上游的文档解析服务(PDF/Word解析器)产出"""
+    element_type: ElementType
+    text: str
+    heading_level: int = 0     # 仅HEADING类型有意义,1表示一级标题
+    page_number: int = 0
+
+
+@dataclass
+class SemanticChunk:
+    chunk_id: str
+    text: str
+    chapter_path: list[str] = field(default_factory=list)  # 例如 ["第三章 液压系统", "3.2 常见故障"]
+    page_number: int = 0
+    element_types: list[str] = field(default_factory=list)
+    char_count: int = 0
+
+
+class SemanticChunker:
+    """
+    语义切片器。
+    max_chunk_chars: 单个切片的最大字符数上限(超过会被二次切分,但会尽量在句子边界切开);
+    overlap_chars: 二次切分时的重叠字符数,避免上下文断裂导致语义丢失;
+    min_chunk_chars: 切片过小时(比如一个只有几个字的标题独占一片),会尝试和相邻内容合并。
+    """
+
+    SENTENCE_BOUNDARY_PATTERN = re.compile(r"(?<=[。!?；\n])")
+
+    def __init__(
+        self,
+        max_chunk_chars: int = 500,
+        overlap_chars: int = 60,
+        min_chunk_chars: int = 30,
+    ):
+        self._max_chunk_chars = max_chunk_chars
+        self._overlap_chars = overlap_chars
+        self._min_chunk_chars = min_chunk_chars
+
+    def chunk_document(self, elements: list[StructuredElement], document_id: str) -> list[SemanticChunk]:
+        heading_stack: list[tuple[int, str]] = []  # (level, text)
+        raw_groups: list[dict] = []
+        current_group: Optional[dict] = None
+
+        for element in elements:
+            if element.element_type == ElementType.HEADING:
+                # 遇到新标题时,先把当前累积的分组收尾
+                if current_group is not None:
+                    raw_groups.append(current_group)
+                    current_group = None
+                # 维护标题栈:弹出所有层级 >= 当前标题层级的旧标题,再压入新标题
+                while heading_stack and heading_stack[-1][0] >= element.heading_level:
+                    heading_stack.pop()
+                heading_stack.append((element.heading_level, element.text))
+                continue
+
+            if element.element_type == ElementType.TABLE:
+                # 表格作为一个独立的、不可切分的语义单元,单独成组
+                if current_group is not None:
+                    raw_groups.append(current_group)
+                    current_group = None
+                raw_groups.append({
+                    "chapter_path": [h[1] for h in heading_stack],
+                    "text": element.text,
+                    "page_number": element.page_number,
+                    "element_types": {ElementType.TABLE.value},
+                    "is_atomic": True,  # 标记为原子单元,不会被二次切分
+                })
+                continue
+
+            # 段落/列表项:累积到当前分组,直到超过长度上限或遇到新标题/表格
+            if current_group is None:
+                current_group = {
+                    "chapter_path": [h[1] for h in heading_stack],
+                    "text": element.text,
+                    "page_number": element.page_number,
+                    "element_types": {element.element_type.value},
+                    "is_atomic": False,
+                }
+            else:
+                current_group["text"] += "\n" + element.text
+                current_group["element_types"].add(element.element_type.value)
+
+            if len(current_group["text"]) >= self._max_chunk_chars:
+                raw_groups.append(current_group)
+                current_group = None
+
+        if current_group is not None:
+            raw_groups.append(current_group)
+
+        return self._finalize_chunks(raw_groups, document_id)
+
+    def _finalize_chunks(self, raw_groups: list[dict], document_id: str) -> list[SemanticChunk]:
+        chunks: list[SemanticChunk] = []
+        chunk_seq = 0
+
+        for group in raw_groups:
+            if group.get("is_atomic") or len(group["text"]) <= self._max_chunk_chars:
+                chunk_seq += 1
+                chunks.append(SemanticChunk(
+                    chunk_id=f"{document_id}_chunk_{chunk_seq:04d}",
+                    text=group["text"],
+                    chapter_path=list(group["chapter_path"]),
+                    page_number=group["page_number"],
+                    element_types=sorted(group["element_types"]),
+                    char_count=len(group["text"]),
+                ))
+                continue
+
+            # 超长的非原子分组,按句子边界二次切分,并保留重叠窗口
+            for sub_text in self._split_with_overlap(group["text"]):
+                chunk_seq += 1
+                chunks.append(SemanticChunk(
+                    chunk_id=f"{document_id}_chunk_{chunk_seq:04d}",
+                    text=sub_text,
+                    chapter_path=list(group["chapter_path"]),
+                    page_number=group["page_number"],
+                    element_types=sorted(group["element_types"]),
+                    char_count=len(sub_text),
+                ))
+
+        return self._merge_undersized_chunks(chunks)
+
+    def _split_with_overlap(self, text: str) -> list[str]:
+        sentences = [s for s in self.SENTENCE_BOUNDARY_PATTERN.split(text) if s.strip()]
+        pieces: list[str] = []
+        current = ""
+        for sentence in sentences:
+            if len(current) + len(sentence) <= self._max_chunk_chars:
+                current += sentence
+            else:
+                if current:
+                    pieces.append(current)
+                # 从上一片的末尾截取overlap长度,作为新片开头,保留上下文连续性
+                overlap_part = current[-self._overlap_chars:] if current else ""
+                current = overlap_part + sentence
+        if current:
+            pieces.append(current)
+        return pieces
+
+    def _merge_undersized_chunks(self, chunks: list[SemanticChunk]) -> list[SemanticChunk]:
+        """把过小的切片(比如独立成片的短标题)与后一个切片合并,避免检索时召回过多碎片"""
+        merged: list[SemanticChunk] = []
+        pending: Optional[SemanticChunk] = None
+
+        for chunk in chunks:
+            if pending is None:
+                pending = chunk
+                continue
+            if pending.char_count < self._min_chunk_chars:
+                pending = SemanticChunk(
+                    chunk_id=pending.chunk_id,
+                    text=pending.text + "\n" + chunk.text,
+                    chapter_path=pending.chapter_path,
+                    page_number=pending.page_number,
+                    element_types=sorted(set(pending.element_types) | set(chunk.element_types)),
+                    char_count=pending.char_count + chunk.char_count,
+                )
+            else:
+                merged.append(pending)
+                pending = chunk
+
+        if pending is not None:
+            merged.append(pending)
+        return merged
+
+
+if __name__ == "__main__":
+    demo_elements = [
+        StructuredElement(ElementType.HEADING, "第三章 液压系统故障处理", heading_level=1, page_number=21),
+        StructuredElement(ElementType.HEADING, "3.2 常见故障与排查步骤", heading_level=2, page_number=22),
+        StructuredElement(ElementType.PARAGRAPH, "液压系统压力异常通常由三种原因引起:油泵磨损、密封件老化、管路堵塞。", page_number=22),
+        StructuredElement(ElementType.PARAGRAPH, "排查步骤如下:第一步检查油位是否正常;第二步检查油泵出口压力表读数;第三步检查管路是否存在明显泄漏点。", page_number=22),
+        StructuredElement(ElementType.TABLE, "[表格] 故障代码对照表: E01-油位低 E02-压力异常 E03-油温过高", page_number=23),
+        StructuredElement(ElementType.HEADING, "3.3 预防性维护建议", heading_level=2, page_number=24),
+        StructuredElement(ElementType.PARAGRAPH, "建议每三个月更换一次液压油滤芯,每年检测一次密封件老化程度。", page_number=24),
+    ]
+
+    chunker = SemanticChunker(max_chunk_chars=80, overlap_chars=10, min_chunk_chars=15)
+    result_chunks = chunker.chunk_document(demo_elements, document_id="doc_hydraulic_manual")
+    for c in result_chunks:
+        print(f"[{c.chunk_id}] 章节路径={c.chapter_path} 页码={c.page_number} 类型={c.element_types}")
+        print(f"    内容: {c.text[:60]}...")
+```
+
+### 七、成本归因引擎实现(对应张凡模块讨论的落地)
+
+> 下午两两模拟中,韩露追问张凡"降级重试导致的隐性成本浪费有没有单独统计过",张凡当场承认这是一个观测盲区。晚上他把这个新增的统计维度补到了成本归因引擎的代码里,作为下午模拟的"回去就改"的实际行动。
+
+```python
+"""
+cost_attribution_engine.py
+成本归因引擎:按租户、按调用类型汇总实际发生的成本,
+并新增"降级重试导致的额外成本"这一统计维度(对应下午模拟面试中韩露的追问)。
+"""
+
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
+
+
+class CallType(Enum):
+    LLM_PRIMARY = "llm_primary"       # 主力大模型调用
+    LLM_FALLBACK = "llm_fallback"     # 降级切换到备用模型的调用
+    VECTOR_SEARCH = "vector_search"
+    RERANK = "rerank"
+    EMBEDDING = "embedding"
+
+
+@dataclass
+class CallRecord:
+    """单次调用的成本记录,由各个服务在调用完成后统一上报"""
+    tenant_id: str
+    call_type: CallType
+    cost_amount: float          # 本次调用产生的实际费用(元)
+    latency_ms: float
+    is_degraded_retry: bool = False  # 标记该次调用是否是"因限流/超时降级后的重试调用"
+    request_id: str = ""
+    timestamp: float = field(default_factory=time.time)
+
+
+class CostAttributionEngine:
+    """
+    成本归因引擎。
+    核心能力:
+    1. 按天、按租户、按调用类型汇总成本;
+    2. 单独统计"因降级重试产生的额外成本占比"——这是判断限流阈值是否设置合理的重要信号,
+       如果这个占比持续偏高,说明主力模型的限流阈值可能设置得过于保守,
+       导致大量本可以由主力模型处理的请求被误判为需要降级,反而增加了总成本(因为一次请求触发了两次计费调用)。
+    """
+
+    def __init__(self):
+        self._records: list[CallRecord] = []
+
+    def record_call(self, record: CallRecord) -> None:
+        self._records.append(record)
+
+    def _filter_by_date(self, date_str: str) -> list[CallRecord]:
+        return [
+            r for r in self._records
+            if time.strftime("%Y-%m-%d", time.localtime(r.timestamp)) == date_str
+        ]
+
+    def daily_report_by_tenant(self, date_str: str) -> dict:
+        records = self._filter_by_date(date_str)
+        tenant_costs: dict[str, float] = defaultdict(float)
+        tenant_degraded_extra_costs: dict[str, float] = defaultdict(float)
+
+        for r in records:
+            tenant_costs[r.tenant_id] += r.cost_amount
+            if r.is_degraded_retry:
+                tenant_degraded_extra_costs[r.tenant_id] += r.cost_amount
+
+        report = {}
+        for tenant_id, total_cost in tenant_costs.items():
+            degraded_extra = tenant_degraded_extra_costs.get(tenant_id, 0.0)
+            report[tenant_id] = {
+                "total_cost": round(total_cost, 4),
+                "degraded_retry_extra_cost": round(degraded_extra, 4),
+                "degraded_retry_cost_ratio": round(degraded_extra / total_cost, 4) if total_cost > 0 else 0.0,
+            }
+        return report
+
+    def daily_report_by_call_type(self, date_str: str) -> dict:
+        records = self._filter_by_date(date_str)
+        type_costs: dict[str, float] = defaultdict(float)
+        type_counts: dict[str, int] = defaultdict(int)
+
+        for r in records:
+            type_costs[r.call_type.value] += r.cost_amount
+            type_counts[r.call_type.value] += 1
+
+        return {
+            call_type: {
+                "total_cost": round(type_costs[call_type], 4),
+                "call_count": type_counts[call_type],
+                "avg_cost_per_call": round(type_costs[call_type] / type_counts[call_type], 6),
+            }
+            for call_type in type_costs
+        }
+
+    def degradation_cost_alert_check(self, date_str: str, threshold_ratio: float = 0.05) -> list[dict]:
+        """
+        检测哪些租户的"降级重试额外成本占比"超过了预警阈值,
+        超过阈值意味着限流策略可能存在误伤主力模型可用容量的问题,值得回去复核限流阈值设置。
+        """
+        report = self.daily_report_by_tenant(date_str)
+        alerts = []
+        for tenant_id, stats in report.items():
+            if stats["degraded_retry_cost_ratio"] > threshold_ratio:
+                alerts.append({
+                    "tenant_id": tenant_id,
+                    "degraded_retry_cost_ratio": stats["degraded_retry_cost_ratio"],
+                    "suggestion": "建议复核该租户的限流阈值配置,当前降级重试比例偏高,可能存在主力模型容量误判",
+                })
+        return alerts
+
+    def cost_saving_estimation(
+        self,
+        date_str: str,
+        cheaper_model_discount: float = 0.3,
+        eligible_call_types: Optional[list[CallType]] = None,
+    ) -> dict:
+        """
+        成本优化估算:如果把指定调用类型的一部分请求路由到更便宜的模型/组件,
+        估算能节省多少成本(用于回答"如果老板要求预算砍一半,你会怎么砍"这类问题时,
+        给出具体的、可计算的数字支撑,而不是空口承诺)。
+        """
+        eligible_call_types = eligible_call_types or [CallType.LLM_PRIMARY]
+        records = self._filter_by_date(date_str)
+        eligible_cost = sum(
+            r.cost_amount for r in records
+            if r.call_type in eligible_call_types and not r.is_degraded_retry
+        )
+        estimated_saving = eligible_cost * cheaper_model_discount
+        return {
+            "eligible_original_cost": round(eligible_cost, 4),
+            "estimated_saving": round(estimated_saving, 4),
+            "estimated_saving_ratio_of_eligible": cheaper_model_discount,
+        }
+
+
+if __name__ == "__main__":
+    engine = CostAttributionEngine()
+    today = time.strftime("%Y-%m-%d")
+
+    # 模拟一批正常的主力模型调用
+    for i in range(100):
+        engine.record_call(CallRecord(
+            tenant_id="tenant_huanyu_hq",
+            call_type=CallType.LLM_PRIMARY,
+            cost_amount=0.08,
+            latency_ms=1200,
+            request_id=f"req_{i}",
+        ))
+
+    # 模拟一批因限流触发降级、又重试调用备用模型的请求(这部分是隐性额外成本)
+    for i in range(30):
+        engine.record_call(CallRecord(
+            tenant_id="tenant_huanyu_hq",
+            call_type=CallType.LLM_PRIMARY,
+            cost_amount=0.08,
+            latency_ms=3000,
+            is_degraded_retry=False,  # 第一次调用本身不算"降级重试"
+            request_id=f"req_degraded_{i}_primary_attempt",
+        ))
+        engine.record_call(CallRecord(
+            tenant_id="tenant_huanyu_hq",
+            call_type=CallType.LLM_FALLBACK,
+            cost_amount=0.05,
+            latency_ms=1500,
+            is_degraded_retry=True,
+            request_id=f"req_degraded_{i}_fallback_attempt",
+        ))
+
+    tenant_report = engine.daily_report_by_tenant(today)
+    print("按租户汇总:", tenant_report)
+
+    alerts = engine.degradation_cost_alert_check(today, threshold_ratio=0.05)
+    print("降级成本预警:", alerts)
+
+    saving = engine.cost_saving_estimation(today, cheaper_model_discount=0.35)
+    print("成本优化估算(如果把主力模型的部分请求切到更便宜的模型):", saving)
+```
+
+### 八、单元测试:验证以上关键组件的正常/边界/故障场景
+
+> 苏梦晚上按照老王在Day63、Day67反复强调的"三层测试思路"(正常场景、边界场景、并发/故障场景),为今天新增的四块代码写了一份配套的单元测试,今天连带作业一起归档到项目代码仓库。
+
+```python
+"""
+test_day68_system_design_components.py
+针对Day68新增的四个系统设计关键组件的单元测试:
+熔断器与降级链、Milvus故障切换管理器、跨知识库联合检索、语义切片器、成本归因引擎。
+覆盖正常场景、边界场景、并发/故障注入场景。
+"""
+
+import time
+
+import pytest
+
+from circuit_breaker import (
+    CircuitBreaker,
+    CircuitBreakerConfig,
+    CircuitBreakerOpenError,
+    CircuitState,
+    FallbackChain,
+    build_qa_fallback_chain,
+)
+from milvus_failover_manager import MilvusFailoverManager, ReplicaGroup, ReplicaHealth
+from cross_kb_retriever import (
+    CrossKnowledgeBaseRetriever,
+    KnowledgeBaseSearchAdapter,
+    PermissionAwareFilter,
+    RetrievedChunk,
+)
+from semantic_chunker import ElementType, SemanticChunker, StructuredElement
+from cost_attribution_engine import CallRecord, CallType, CostAttributionEngine
+
+
+# ------------------------- 熔断器与降级链 -------------------------
+
+class TestCircuitBreaker:
+    def _make_breaker(self, **overrides) -> CircuitBreaker:
+        config = CircuitBreakerConfig(
+            failure_rate_threshold=0.5,
+            minimum_request_count=4,
+            rolling_window_seconds=5,
+            open_state_cooldown_seconds=0.3,
+            half_open_probe_count=2,
+            half_open_success_rate_to_close=0.5,
+        )
+        for key, value in overrides.items():
+            setattr(config, key, value)
+        return CircuitBreaker("test_dep", config)
+
+    def test_normal_path_all_success_stays_closed(self):
+        """正常场景:全部调用成功,熔断器应一直保持CLOSED"""
+        breaker = self._make_breaker()
+        for _ in range(10):
+            result = breaker.call(lambda: "ok")
+            assert result == "ok"
+        assert breaker.state == CircuitState.CLOSED
+
+    def test_opens_after_failure_rate_exceeds_threshold(self):
+        """边界场景:失败率超过阈值应触发OPEN"""
+        breaker = self._make_breaker()
+
+        def _fail():
+            raise ConnectionError("下游超时")
+
+        for _ in range(4):
+            with pytest.raises(ConnectionError):
+                breaker.call(_fail)
+
+        assert breaker.state == CircuitState.OPEN
+
+    def test_open_state_rejects_without_calling_downstream(self):
+        """OPEN状态下应直接拒绝,不应该真正调用下游函数"""
+        breaker = self._make_breaker()
+        call_counter = {"n": 0}
+
+        def _fail():
+            call_counter["n"] += 1
+            raise ConnectionError("下游超时")
+
+        for _ in range(4):
+            with pytest.raises(ConnectionError):
+                breaker.call(_fail)
+        assert breaker.state == CircuitState.OPEN
+
+        with pytest.raises(CircuitBreakerOpenError):
+            breaker.call(_fail)
+        # 熔断打开后,不应该再真正调用下游,call_counter不应增加
+        assert call_counter["n"] == 4
+
+    def test_half_open_recovers_to_closed_on_success(self):
+        """故障恢复场景:冷却时间结束后进入半开状态,探针成功应恢复为CLOSED"""
+        breaker = self._make_breaker()
+
+        def _fail():
+            raise ConnectionError("下游超时")
+
+        for _ in range(4):
+            with pytest.raises(ConnectionError):
+                breaker.call(_fail)
+        assert breaker.state == CircuitState.OPEN
+
+        time.sleep(0.35)  # 等待超过 open_state_cooldown_seconds
+        assert breaker.state == CircuitState.HALF_OPEN
+
+        breaker.call(lambda: "recovered")
+        breaker.call(lambda: "recovered")
+        assert breaker.state == CircuitState.CLOSED
+
+    def test_fallback_chain_falls_through_to_human_handoff(self):
+        """降级链场景:向量检索和全文检索都失败时,应该走到人工转接兜底"""
+        vector_breaker = self._make_breaker()
+        fulltext_breaker = self._make_breaker()
+
+        def _vector_fail(_req):
+            raise ConnectionError("Milvus不可用")
+
+        def _fulltext_fail(_req):
+            raise ConnectionError("ES也不可用")
+
+        def _human_handoff(_req):
+            return {"message": "已转人工"}
+
+        chain = build_qa_fallback_chain(
+            vector_breaker, fulltext_breaker, _vector_fail, _fulltext_fail, _human_handoff,
+        )
+        result = chain.execute({"question": "测试问题"})
+        assert result["_fallback_chain"]["succeeded_stage"] == "human_handoff"
+        assert "vector_search" in result["_fallback_chain"]["attempted_stages"]
+
+    def test_fallback_chain_succeeds_at_first_stage(self):
+        """正常场景:第一层向量检索就成功,不应该进入后续降级层"""
+        vector_breaker = self._make_breaker()
+        fulltext_breaker = self._make_breaker()
+
+        chain = build_qa_fallback_chain(
+            vector_breaker, fulltext_breaker,
+            lambda _req: {"answer": "向量检索结果"},
+            lambda _req: pytest.fail("不应该走到全文检索这一层"),
+            lambda _req: pytest.fail("不应该走到人工转接这一层"),
+        )
+        result = chain.execute({"question": "测试问题"})
+        assert result["_fallback_chain"]["succeeded_stage"] == "vector_search"
+
+
+# ------------------------- Milvus故障切换管理器 -------------------------
+
+class TestMilvusFailoverManager:
+    def test_stays_on_primary_when_healthy(self):
+        """正常场景:主副本组一直健康,不应该发生切换"""
+        groups = [
+            ReplicaGroup(name="primary", endpoint="primary:19530", priority=0),
+            ReplicaGroup(name="standby", endpoint="standby:19530", priority=1),
+        ]
+        manager = MilvusFailoverManager(groups, lambda ep: True, failure_threshold=2, recovery_threshold=2)
+        for _ in range(5):
+            manager.run_check_cycle()
+        assert manager.get_active_endpoint() == "primary:19530"
+
+    def test_switches_to_standby_when_primary_unhealthy(self):
+        """故障场景:主副本组连续失败达到阈值后,应自动切换到备用副本组"""
+        groups = [
+            ReplicaGroup(name="primary", endpoint="primary:19530", priority=0),
+            ReplicaGroup(name="standby", endpoint="standby:19530", priority=1),
+        ]
+
+        def _health_check(endpoint: str) -> bool:
+            return "primary" not in endpoint  # primary恒定不健康,standby恒定健康
+
+        manager = MilvusFailoverManager(groups, _health_check, failure_threshold=2, recovery_threshold=2)
+        for _ in range(3):
+            manager.run_check_cycle()
+
+        assert manager.get_active_endpoint() == "standby:19530"
+        report = manager.get_status_report()
+        assert len(report["switch_history"]) == 1
+        assert report["switch_history"][0]["to"] == "standby"
+
+    def test_all_unhealthy_keeps_last_active_without_crash(self):
+        """极端边界场景:所有副本组都不健康时,不应该抛异常,应该保持当前活跃组不变并记录日志"""
+        groups = [
+            ReplicaGroup(name="primary", endpoint="primary:19530", priority=0),
+            ReplicaGroup(name="standby", endpoint="standby:19530", priority=1),
+        ]
+        manager = MilvusFailoverManager(groups, lambda ep: False, failure_threshold=1, recovery_threshold=1)
+        for _ in range(3):
+            manager.run_check_cycle()  # 不应抛异常
+
+        report = manager.get_status_report()
+        assert all(g["health"] == ReplicaHealth.UNHEALTHY.value for g in report["groups"])
+
+
+# ------------------------- 跨知识库联合检索 -------------------------
+
+class TestCrossKnowledgeBaseRetriever:
+    def _build_retriever(self, permission_check_fn) -> CrossKnowledgeBaseRetriever:
+        def _tech_search(_query, top_k):
+            return [
+                RetrievedChunk("t1", "tech_kb", "doc_t1", "技术内容1", score=0.9),
+                RetrievedChunk("t2", "tech_kb", "doc_t2", "技术内容2", score=0.7),
+            ][:top_k]
+
+        def _finance_search(_query, top_k):
+            return [
+                RetrievedChunk("f1", "finance_kb", "doc_f1", "财务内容1", score=0.85),
+                RetrievedChunk("f2", "finance_kb", "doc_f2", "财务内容2", score=0.5),
+            ][:top_k]
+
+        adapters = [
+            KnowledgeBaseSearchAdapter("tech_kb", _tech_search),
+            KnowledgeBaseSearchAdapter("finance_kb", _finance_search),
+        ]
+        permission_filter = PermissionAwareFilter(permission_check_fn, cache_ttl_seconds=30)
+        return CrossKnowledgeBaseRetriever(adapters, permission_filter)
+
+    def test_normal_case_returns_sorted_merged_results(self):
+        """正常场景:两个知识库都返回结果,应按分数统一排序后合并返回"""
+        retriever = self._build_retriever(lambda user_id, doc_id: True)
+        result = retriever.retrieve(user_id="u1", query="测试查询")
+        scores = [c.score for c in result["chunks"]]
+        assert scores == sorted(scores, reverse=True)
+        assert result["filtered_out_by_permission"] == 0
+
+    def test_permission_filter_removes_unauthorized_chunks(self):
+        """权限边界场景:对无权限的文档应该在结果级别被剔除,而不是整个知识库被剔除"""
+        def _permission_check(user_id, doc_id):
+            return doc_id != "doc_f2"  # 只对 doc_f2 无权限,同知识库的doc_f1仍然可访问
+
+        retriever = self._build_retriever(_permission_check)
+        result = retriever.retrieve(user_id="u1", query="测试查询")
+
+        returned_doc_ids = {c.chunk_id for c in result["chunks"]}
+        assert "f2" not in returned_doc_ids
+        assert "f1" in returned_doc_ids  # 同知识库的其他文档不受影响
+        assert result["filtered_out_by_permission"] == 1
+
+    def test_single_kb_search_failure_does_not_affect_other_kb(self):
+        """故障场景:一个知识库检索失败,不应影响其他知识库正常返回结果"""
+        def _tech_search_fail(_query, _top_k):
+            raise ConnectionError("tech_kb Milvus超时")
+
+        def _finance_search_ok(_query, top_k):
+            return [RetrievedChunk("f1", "finance_kb", "doc_f1", "财务内容", score=0.8)][:top_k]
+
+        adapters = [
+            KnowledgeBaseSearchAdapter("tech_kb", _tech_search_fail),
+            KnowledgeBaseSearchAdapter("finance_kb", _finance_search_ok),
+        ]
+        permission_filter = PermissionAwareFilter(lambda u, d: True)
+        retriever = CrossKnowledgeBaseRetriever(adapters, permission_filter)
+
+        result = retriever.retrieve(user_id="u1", query="测试查询")
+        assert len(result["chunks"]) == 1
+        assert result["per_kb_stats"]["tech_kb"]["error"] is not None
+        assert result["per_kb_stats"]["finance_kb"]["error"] is None
+
+    def test_target_kb_ids_restricts_search_scope(self):
+        """边界场景:指定target_kb_ids时,应只检索指定的知识库子集"""
+        retriever = self._build_retriever(lambda u, d: True)
+        result = retriever.retrieve(user_id="u1", query="测试查询", target_kb_ids=["tech_kb"])
+        assert "finance_kb" not in result["per_kb_stats"]
+
+
+# ------------------------- 语义切片器 -------------------------
+
+class TestSemanticChunker:
+    def test_table_element_is_never_split(self):
+        """边界场景:表格元素应始终作为原子单元,不应被切分成多片"""
+        elements = [
+            StructuredElement(ElementType.HEADING, "第一章", heading_level=1),
+            StructuredElement(
+                ElementType.TABLE,
+                "表格内容" * 200,  # 故意制造一个超长表格内容
+                page_number=5,
+            ),
+        ]
+        chunker = SemanticChunker(max_chunk_chars=50)
+        chunks = chunker.chunk_document(elements, document_id="doc_x")
+        table_chunks = [c for c in chunks if "table" in c.element_types]
+        assert len(table_chunks) == 1
+
+    def test_heading_hierarchy_is_recorded_in_chapter_path(self):
+        """正常场景:切片的chapter_path应正确反映多级标题的层级关系"""
+        elements = [
+            StructuredElement(ElementType.HEADING, "第一章 概述", heading_level=1),
+            StructuredElement(ElementType.HEADING, "1.1 背景", heading_level=2),
+            StructuredElement(ElementType.PARAGRAPH, "这是背景段落内容,用于测试章节路径记录是否正确。"),
+        ]
+        chunker = SemanticChunker(max_chunk_chars=200)
+        chunks = chunker.chunk_document(elements, document_id="doc_y")
+        assert any(
+            c.chapter_path == ["第一章 概述", "1.1 背景"] for c in chunks
+        )
+
+    def test_long_paragraph_is_split_with_overlap(self):
+        """边界场景:超长段落应被二次切分,且相邻切片之间应存在重叠内容"""
+        long_text = "这是一句用于测试的句子。" * 30
+        elements = [StructuredElement(ElementType.PARAGRAPH, long_text)]
+        chunker = SemanticChunker(max_chunk_chars=60, overlap_chars=10, min_chunk_chars=5)
+        chunks = chunker.chunk_document(elements, document_id="doc_z")
+        assert len(chunks) > 1
+        for c in chunks:
+            assert c.char_count <= 60 + 10  # 允许重叠部分带来的少量超出
+
+    def test_heading_returning_to_shallower_level_pops_deeper_headings(self):
+        """边界场景:标题层级从深到浅跳转时,应正确弹出更深层级的标题,不残留在chapter_path里"""
+        elements = [
+            StructuredElement(ElementType.HEADING, "第一章", heading_level=1),
+            StructuredElement(ElementType.HEADING, "1.1 小节", heading_level=2),
+            StructuredElement(ElementType.HEADING, "第二章", heading_level=1),  # 跳回一级标题
+            StructuredElement(ElementType.PARAGRAPH, "第二章下的段落内容测试文本。"),
+        ]
+        chunker = SemanticChunker(max_chunk_chars=200)
+        chunks = chunker.chunk_document(elements, document_id="doc_w")
+        matched = [c for c in chunks if "第二章下的段落内容测试文本。" in c.text]
+        assert matched
+        assert matched[0].chapter_path == ["第二章"]  # 不应该残留 "1.1 小节"
+
+
+# ------------------------- 成本归因引擎 -------------------------
+
+class TestCostAttributionEngine:
+    def test_normal_case_total_cost_matches_sum_of_records(self):
+        """正常场景:租户总成本应等于该租户所有调用记录成本之和"""
+        engine = CostAttributionEngine()
+        today = time.strftime("%Y-%m-%d")
+        for _ in range(5):
+            engine.record_call(CallRecord("tenant_a", CallType.LLM_PRIMARY, cost_amount=0.1, latency_ms=1000))
+
+        report = engine.daily_report_by_tenant(today)
+        assert report["tenant_a"]["total_cost"] == pytest.approx(0.5)
+        assert report["tenant_a"]["degraded_retry_cost_ratio"] == 0.0
+
+    def test_degraded_retry_cost_ratio_calculated_correctly(self):
+        """边界场景:降级重试成本占比计算应准确反映降级调用带来的额外成本"""
+        engine = CostAttributionEngine()
+        today = time.strftime("%Y-%m-%d")
+        engine.record_call(CallRecord("tenant_b", CallType.LLM_PRIMARY, cost_amount=0.8, latency_ms=1000))
+        engine.record_call(CallRecord(
+            "tenant_b", CallType.LLM_FALLBACK, cost_amount=0.2, latency_ms=1500, is_degraded_retry=True,
+        ))
+
+        report = engine.daily_report_by_tenant(today)
+        assert report["tenant_b"]["total_cost"] == pytest.approx(1.0)
+        assert report["tenant_b"]["degraded_retry_cost_ratio"] == pytest.approx(0.2)
+
+    def test_alert_triggered_when_ratio_exceeds_threshold(self):
+        """告警场景:降级成本占比超过阈值时,应触发预警并附带处理建议"""
+        engine = CostAttributionEngine()
+        today = time.strftime("%Y-%m-%d")
+        engine.record_call(CallRecord("tenant_c", CallType.LLM_PRIMARY, cost_amount=0.5, latency_ms=1000))
+        engine.record_call(CallRecord(
+            "tenant_c", CallType.LLM_FALLBACK, cost_amount=0.5, latency_ms=1500, is_degraded_retry=True,
+        ))
+
+        alerts = engine.degradation_cost_alert_check(today, threshold_ratio=0.3)
+        assert len(alerts) == 1
+        assert alerts[0]["tenant_id"] == "tenant_c"
+        assert "建议复核" in alerts[0]["suggestion"]
+
+    def test_no_alert_when_no_records_for_date(self):
+        """边界场景:某天完全没有调用记录时,不应该产生预警,也不应该抛异常"""
+        engine = CostAttributionEngine()
+        alerts = engine.degradation_cost_alert_check("2000-01-01", threshold_ratio=0.1)
+        assert alerts == []
+
+    def test_cost_saving_estimation_excludes_degraded_calls(self):
+        """正常场景:成本优化估算应只针对非降级的常规调用计算,避免虚报节省空间"""
+        engine = CostAttributionEngine()
+        today = time.strftime("%Y-%m-%d")
+        engine.record_call(CallRecord("tenant_d", CallType.LLM_PRIMARY, cost_amount=1.0, latency_ms=1000))
+        engine.record_call(CallRecord(
+            "tenant_d", CallType.LLM_FALLBACK, cost_amount=1.0, latency_ms=1500, is_degraded_retry=True,
+        ))
+
+        saving = engine.cost_saving_estimation(today, cheaper_model_discount=0.4, eligible_call_types=[CallType.LLM_PRIMARY])
+        assert saving["eligible_original_cost"] == pytest.approx(1.0)
+        assert saving["estimated_saving"] == pytest.approx(0.4)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+```
+
 ---
 
 ## 今日复盘
