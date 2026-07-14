@@ -2608,6 +2608,1577 @@ CQ_APP_HOST=0.0.0.0
 CQ_APP_PORT=8000
 ```
 
+> 说明:苍穹0.1版正式上线之后的第二天,老王在晨会上补了一句:"今天晚上上线只是'跑起来了',离'能放心交给别人维护'还差一截——日志、限流、测试、迁移脚本、部署清单,这些都是接下来几天要陆续补上的东西。"陈铭趁着联调后的余温,当晚趴在工位上把接下来几天要用到的这批基础设施代码提前写了骨架,下面这些文件就是那晚的产出,后续几天的课程会在这些骨架上继续填充细节。
+
+### 文件14:`middleware_logging.py` —— 请求日志与耗时监控中间件
+
+```python
+"""
+middleware_logging.py
+请求日志与耗时监控中间件
+
+背景:陈铭在联调阶段发现,浏览器控制台报错的时候,后端日志只有uvicorn
+自带的access log,信息太简单——只能看到"200 OK"或"500 Internal Server
+Error",看不到这次请求具体处理了多久、请求体是什么、是不是命中了数据库
+查询异常。老王建议他补一个自定义的日志中间件,把这些信息结构化记录下来,
+方便后续排查问题,也为将来接入日志采集系统(如ELK)打好基础。
+"""
+
+import json
+import logging
+import time
+import uuid
+from typing import Callable
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
+
+logger = logging.getLogger("cangqiong.request")
+logger.setLevel(logging.INFO)
+
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        fmt='{"time": "%(asctime)s", "level": "%(levelname)s", "message": %(message)s}'
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+
+# 请求体日志记录时,超过该长度的内容会被截断,避免流式聊天场景下
+# 一次请求体过大导致日志文件被撑爆
+MAX_LOGGED_BODY_LENGTH = 500
+
+# 敏感字段名单,记录请求体时这些字段会被替换为掩码,不落地明文日志
+SENSITIVE_FIELD_NAMES = {"api_key", "password", "token", "authorization"}
+
+
+def _mask_sensitive_fields(data: dict) -> dict:
+    """递归地把敏感字段替换为掩码,保留结构方便排查但不泄露真实值。"""
+    if not isinstance(data, dict):
+        return data
+    masked = {}
+    for key, value in data.items():
+        if key.lower() in SENSITIVE_FIELD_NAMES:
+            masked[key] = "***MASKED***"
+        elif isinstance(value, dict):
+            masked[key] = _mask_sensitive_fields(value)
+        else:
+            masked[key] = value
+    return masked
+
+
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    """
+    统一请求日志中间件。为每一次请求生成一个唯一的request_id,
+    并将其写入响应头`X-Request-ID`,前端如果在控制台看到某次请求异常,
+    可以直接把这个ID贴给后端同事,后端凭这个ID在日志里精确定位。
+    """
+
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        request_id = str(uuid.uuid4())[:8]
+        start_time = time.time()
+
+        body_preview = ""
+        if request.method in ("POST", "PUT", "PATCH"):
+            try:
+                raw_body = await request.body()
+                if raw_body:
+                    try:
+                        parsed = json.loads(raw_body)
+                        masked = _mask_sensitive_fields(parsed) if isinstance(parsed, dict) else parsed
+                        body_preview = json.dumps(masked, ensure_ascii=False)[:MAX_LOGGED_BODY_LENGTH]
+                    except json.JSONDecodeError:
+                        body_preview = raw_body.decode("utf-8", errors="ignore")[:MAX_LOGGED_BODY_LENGTH]
+            except Exception:  # noqa: BLE001
+                body_preview = "(读取请求体失败)"
+
+        log_entry_start = {
+            "request_id": request_id,
+            "event": "request_started",
+            "method": request.method,
+            "path": request.url.path,
+            "query": str(request.url.query),
+            "body_preview": body_preview,
+            "client_ip": request.client.host if request.client else "unknown",
+        }
+        logger.info(json.dumps(log_entry_start, ensure_ascii=False))
+
+        try:
+            response = await call_next(request)
+        except Exception as exc:  # noqa: BLE001
+            elapsed_ms = round((time.time() - start_time) * 1000, 2)
+            log_entry_error = {
+                "request_id": request_id,
+                "event": "request_failed",
+                "path": request.url.path,
+                "elapsed_ms": elapsed_ms,
+                "error": str(exc),
+            }
+            logger.error(json.dumps(log_entry_error, ensure_ascii=False))
+            raise
+
+        elapsed_ms = round((time.time() - start_time) * 1000, 2)
+        response.headers["X-Request-ID"] = request_id
+
+        log_entry_end = {
+            "request_id": request_id,
+            "event": "request_completed",
+            "path": request.url.path,
+            "status_code": response.status_code,
+            "elapsed_ms": elapsed_ms,
+        }
+        level = logging.INFO if response.status_code < 400 else logging.WARNING
+        logger.log(level, json.dumps(log_entry_end, ensure_ascii=False))
+
+        if elapsed_ms > 3000:
+            logger.warning(json.dumps({
+                "request_id": request_id,
+                "event": "slow_request_detected",
+                "path": request.url.path,
+                "elapsed_ms": elapsed_ms,
+                "note": "该请求耗时超过3秒阈值,建议关注是否存在数据库慢查询或模型调用超时",
+            }, ensure_ascii=False))
+
+        return response
+
+
+def register_logging_middleware(app) -> None:
+    """在main.py中调用该函数即可挂载日志中间件,保持main.py的整洁。"""
+    app.add_middleware(RequestLoggingMiddleware)
+```
+
+### 文件15:`rate_limiter.py` —— 滑动窗口限流中间件
+
+```python
+"""
+rate_limiter.py
+基于滑动窗口算法的简单限流中间件
+
+背景:联调当晚,韩露拿着刚发的内网地址,在自己电脑上手快地连续点了十几次
+"发送"按钮测试打字机效果,陈铭这边后端瞬间收到了一堆并发的流式请求,
+虽然没有真的崩溃,但老王事后提醒:"内部体验环境人少还好,真要接外部用户,
+必须有限流,不然一个人手快点几十次,或者恶意脚本刷接口,后端资源
+很容易被打爆。"这个中间件就是当晚补上的第一版简单限流方案。
+"""
+
+import time
+from collections import defaultdict, deque
+from typing import Callable, Deque, Dict
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response, JSONResponse
+
+
+class SlidingWindowRateLimiter:
+    """
+    滑动窗口限流器核心逻辑:为每个客户端(按IP区分)维护一个时间戳队列,
+    每次请求到来时,先把队列中超出窗口时间的旧时间戳清理掉,
+    再判断当前队列长度是否超过限流阈值。
+    """
+
+    def __init__(self, max_requests: int, window_seconds: float):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._records: Dict[str, Deque[float]] = defaultdict(deque)
+
+    def is_allowed(self, client_key: str) -> tuple:
+        now = time.time()
+        window = self._records[client_key]
+
+        while window and window[0] <= now - self.window_seconds:
+            window.popleft()
+
+        if len(window) >= self.max_requests:
+            retry_after = round(self.window_seconds - (now - window[0]), 2)
+            return False, retry_after
+
+        window.append(now)
+        return True, 0.0
+
+    def current_load(self, client_key: str) -> int:
+        return len(self._records.get(client_key, []))
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """
+    限流中间件。对不同路径设置不同的限流规则——流式对话接口的限流
+    要比普通的对话列表查询接口更严格,因为流式接口消耗的后端资源
+    (大模型调用配额、长连接占用)远大于一次简单的数据库查询。
+    """
+
+    def __init__(self, app, default_max_requests: int = 60, default_window_seconds: float = 60.0):
+        super().__init__(app)
+        self._default_limiter = SlidingWindowRateLimiter(default_max_requests, default_window_seconds)
+        # 针对流式对话接口单独配置更严格的限流:每个IP每分钟最多10次请求
+        self._stream_limiter = SlidingWindowRateLimiter(max_requests=10, window_seconds=60.0)
+
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        client_ip = request.client.host if request.client else "unknown"
+
+        if request.url.path.startswith("/api/v1/chat/stream"):
+            allowed, retry_after = self._stream_limiter.is_allowed(client_ip)
+            limiter_name = "流式对话接口"
+        else:
+            allowed, retry_after = self._default_limiter.is_allowed(client_ip)
+            limiter_name = "常规接口"
+
+        if not allowed:
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "error": "请求过于频繁,请稍后再试",
+                    "limiter": limiter_name,
+                    "retry_after_seconds": retry_after,
+                },
+                headers={"Retry-After": str(int(retry_after) + 1)},
+            )
+
+        response = await call_next(request)
+        return response
+
+
+def register_rate_limit_middleware(app, max_requests: int = 60, window_seconds: float = 60.0) -> None:
+    app.add_middleware(
+        RateLimitMiddleware,
+        default_max_requests=max_requests,
+        default_window_seconds=window_seconds,
+    )
+```
+
+### 文件16:`pagination.py` —— 对话列表分页与关键词搜索扩展
+
+```python
+"""
+pagination.py
+对话列表分页查询与关键词搜索
+
+背景:苍穹0.1版今晚上线时,对话列表接口是"一次性把所有对话全部返回",
+林悦在验收的时候就已经提醒过:"现在数据量小看不出问题,但等公司同事
+用上一两周,对话记录攒到几百条,列表接口一次性全返回,前端渲染会
+明显变慢。"这里补上分页与关键词搜索的能力,后续接口只需要替换调用方式
+即可接入,不需要改动数据库表结构。
+"""
+
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+
+from sqlalchemy import select, func, or_
+from sqlalchemy.orm import Session
+
+from models import Conversation, Message
+
+
+@dataclass
+class PageRequest:
+    page: int = 1
+    page_size: int = 20
+    keyword: Optional[str] = None
+
+    def __post_init__(self):
+        if self.page < 1:
+            self.page = 1
+        if self.page_size < 1:
+            self.page_size = 1
+        if self.page_size > 100:
+            # 防止前端传入一个极大的page_size导致一次性查询过多数据,
+            # 这是分页接口设计里一个容易被忽略但很重要的防御性细节
+            self.page_size = 100
+
+    @property
+    def offset(self) -> int:
+        return (self.page - 1) * self.page_size
+
+
+@dataclass
+class PageResult:
+    items: List[Conversation]
+    total_count: int
+    page: int
+    page_size: int
+
+    @property
+    def total_pages(self) -> int:
+        if self.page_size == 0:
+            return 0
+        return (self.total_count + self.page_size - 1) // self.page_size
+
+    @property
+    def has_next(self) -> bool:
+        return self.page < self.total_pages
+
+    @property
+    def has_prev(self) -> bool:
+        return self.page > 1
+
+
+def query_conversations_paginated(db: Session, page_request: PageRequest) -> PageResult:
+    """
+    分页查询对话列表,支持按标题关键词模糊搜索。
+    使用两次查询——一次统计总数,一次取当前页数据——而不是先把全部
+    数据取出来再在Python层面切片,这样才能真正发挥数据库分页的性能优势,
+    避免"分页接口名不副实,实际上还是全量查询"的常见错误实现。
+    """
+    base_query = select(Conversation)
+
+    if page_request.keyword:
+        keyword_pattern = f"%{page_request.keyword}%"
+        base_query = base_query.where(
+            or_(
+                Conversation.title.like(keyword_pattern),
+            )
+        )
+
+    count_query = select(func.count()).select_from(base_query.subquery())
+    total_count = db.execute(count_query).scalar_one()
+
+    items_query = (
+        base_query
+        .order_by(Conversation.updated_at.desc())
+        .offset(page_request.offset)
+        .limit(page_request.page_size)
+    )
+    items = db.execute(items_query).scalars().all()
+
+    return PageResult(
+        items=list(items),
+        total_count=total_count,
+        page=page_request.page,
+        page_size=page_request.page_size,
+    )
+
+
+def search_messages_by_keyword(db: Session, keyword: str, limit: int = 50) -> List[Message]:
+    """
+    跨对话搜索消息内容,用于将来可能出现的"我记得之前问过类似问题,
+    帮我找出来"这类需求。今天不接前端,先把数据访问层的能力预先补齐。
+    """
+    if not keyword or not keyword.strip():
+        return []
+
+    keyword_pattern = f"%{keyword.strip()}%"
+    query = (
+        select(Message)
+        .where(Message.content.like(keyword_pattern))
+        .order_by(Message.created_at.desc())
+        .limit(limit)
+    )
+    return list(db.execute(query).scalars().all())
+
+
+def render_page_result_as_dict(result: PageResult) -> dict:
+    """把PageResult转换成适合直接作为API响应体的字典结构。"""
+    return {
+        "items": [
+            {"id": c.id, "title": c.title, "updated_at": c.updated_at.isoformat() if c.updated_at else None}
+            for c in result.items
+        ],
+        "pagination": {
+            "page": result.page,
+            "page_size": result.page_size,
+            "total_count": result.total_count,
+            "total_pages": result.total_pages,
+            "has_next": result.has_next,
+            "has_prev": result.has_prev,
+        },
+    }
+```
+
+### 文件17:Alembic数据库迁移配置(为未来表结构变更做准备)
+
+> 老王提醒陈铭:"今天用`Base.metadata.create_all()`一把梭直接建表没问题,但以后表结构要改字段、加索引,不能靠删库重建,得学会用迁移工具。今天先把Alembic的骨架搭起来,以后每次改动模型,都记得生成一个迁移脚本。"
+
+```python
+# alembic/env.py
+"""
+Alembic迁移环境配置文件
+用途:连接项目里的SQLAlchemy模型定义,让`alembic revision --autogenerate`
+能够自动侦测模型变化并生成迁移脚本,而不需要每次手写迁移SQL
+"""
+
+import os
+import sys
+from logging.config import fileConfig
+
+from sqlalchemy import engine_from_config, pool
+from alembic import context
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from database import Base  # noqa: E402
+import models  # noqa: E402,F401  # 确保所有模型类都被导入,Alembic才能侦测到它们
+
+config = context.config
+
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+target_metadata = Base.metadata
+
+
+def get_database_url() -> str:
+    return os.environ.get("CQ_DATABASE_URL", "sqlite:///./cangqiong.db")
+
+
+def run_migrations_offline() -> None:
+    url = get_database_url()
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+    )
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def run_migrations_online() -> None:
+    configuration = config.get_section(config.config_ini_section) or {}
+    configuration["sqlalchemy.url"] = get_database_url()
+
+    connectable = engine_from_config(configuration, prefix="sqlalchemy.", poolclass=pool.NullPool)
+
+    with connectable.connect() as connection:
+        context.configure(connection=connection, target_metadata=target_metadata)
+        with context.begin_transaction():
+            context.run_migrations()
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+```
+
+```python
+# alembic/versions/0001_initial_schema.py
+"""初始schema迁移脚本:创建conversations和messages两张表
+
+Revision ID: 0001_initial_schema
+Revises:
+Create Date: 2024-XX-XX
+"""
+
+from alembic import op
+import sqlalchemy as sa
+
+revision = "0001_initial_schema"
+down_revision = None
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    op.create_table(
+        "conversations",
+        sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
+        sa.Column("title", sa.String(length=200), nullable=False, server_default="新对话"),
+        sa.Column("created_at", sa.DateTime(), nullable=False, server_default=sa.func.now()),
+        sa.Column("updated_at", sa.DateTime(), nullable=False, server_default=sa.func.now()),
+    )
+
+    op.create_table(
+        "messages",
+        sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
+        sa.Column("conversation_id", sa.Integer(), sa.ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False),
+        sa.Column("role", sa.String(length=20), nullable=False),
+        sa.Column("content", sa.Text(), nullable=False),
+        sa.Column("created_at", sa.DateTime(), nullable=False, server_default=sa.func.now()),
+    )
+
+    op.create_index("ix_messages_conversation_id", "messages", ["conversation_id"])
+    op.create_index("ix_conversations_updated_at", "conversations", ["updated_at"])
+
+
+def downgrade() -> None:
+    op.drop_index("ix_conversations_updated_at", table_name="conversations")
+    op.drop_index("ix_messages_conversation_id", table_name="messages")
+    op.drop_table("messages")
+    op.drop_table("conversations")
+```
+
+```python
+# alembic/versions/0002_add_message_token_count.py
+"""为messages表新增token_count字段,用于统计每条消息的token消耗
+
+背景:老王在预告Sprint2内容时提到,后续要做用量统计和成本核算,
+这个字段今天先加上,即便暂时不写入真实数据,也比之后再补字段
+省事——表结构变更总是越早做越便宜。
+
+Revision ID: 0002_add_message_token_count
+Revises: 0001_initial_schema
+Create Date: 2024-XX-XX
+"""
+
+from alembic import op
+import sqlalchemy as sa
+
+revision = "0002_add_message_token_count"
+down_revision = "0001_initial_schema"
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    op.add_column("messages", sa.Column("token_count", sa.Integer(), nullable=True))
+
+
+def downgrade() -> None:
+    op.drop_column("messages", "token_count")
+```
+
+### 文件18:`test_api.py` —— pytest集成测试套件
+
+```python
+"""
+test_api.py
+苍穹0.1版后端集成测试套件
+运行方式: pytest test_api.py -v
+
+设计说明:使用FastAPI自带的TestClient,配合一个独立的、
+每次测试会话都会重新创建的内存SQLite数据库,保证测试之间互不干扰,
+不会污染开发环境正在使用的cangqiong.db文件。
+"""
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.pool import StaticPool
+
+from database import Base
+from main import app, get_db
+
+
+TEST_DATABASE_URL = "sqlite:///:memory:"
+
+engine = create_engine(
+    TEST_DATABASE_URL,
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+def override_get_db():
+    db: Session = TestingSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+app.dependency_overrides[get_db] = override_get_db
+
+
+@pytest.fixture(autouse=True)
+def setup_and_teardown_database():
+    Base.metadata.create_all(bind=engine)
+    yield
+    Base.metadata.drop_all(bind=engine)
+
+
+@pytest.fixture
+def client():
+    return TestClient(app)
+
+
+class TestConversationEndpoints:
+    """对话创建、列表查询相关接口的集成测试"""
+
+    def test_create_conversation_returns_default_title(self, client):
+        response = client.post("/api/v1/conversations", json={})
+        assert response.status_code == 200
+        data = response.json()
+        assert "id" in data
+        assert data["title"] == "新对话"
+
+    def test_list_conversations_empty_initially(self, client):
+        response = client.get("/api/v1/conversations")
+        assert response.status_code == 200
+        data = response.json()
+        assert data == [] or data.get("items", []) == []
+
+    def test_list_conversations_after_creation(self, client):
+        client.post("/api/v1/conversations", json={})
+        client.post("/api/v1/conversations", json={})
+        response = client.get("/api/v1/conversations")
+        assert response.status_code == 200
+
+    def test_get_nonexistent_conversation_returns_404(self, client):
+        response = client.get("/api/v1/conversations/9999")
+        assert response.status_code == 404
+
+    def test_delete_conversation_cascades_messages(self, client):
+        create_resp = client.post("/api/v1/conversations", json={})
+        conv_id = create_resp.json()["id"]
+
+        client.post(f"/api/v1/conversations/{conv_id}/messages", json={
+            "role": "user", "content": "你好"
+        })
+
+        delete_resp = client.delete(f"/api/v1/conversations/{conv_id}")
+        assert delete_resp.status_code in (200, 204)
+
+        get_resp = client.get(f"/api/v1/conversations/{conv_id}")
+        assert get_resp.status_code == 404
+
+
+class TestChatNonStreamEndpoint:
+    """非流式对话接口(向下兼容版本)的集成测试"""
+
+    def test_chat_endpoint_requires_message_field(self, client):
+        response = client.post("/api/v1/chat", json={})
+        assert response.status_code == 422  # Pydantic校验失败应返回422
+
+    def test_chat_endpoint_rejects_empty_message(self, client):
+        response = client.post("/api/v1/chat", json={"message": ""})
+        assert response.status_code in (422, 400)
+
+
+class TestCORSConfiguration:
+    """验证CORS中间件配置是否按预期生效"""
+
+    def test_cors_preflight_request_allowed_origin(self, client):
+        response = client.options(
+            "/api/v1/conversations",
+            headers={
+                "Origin": "http://127.0.0.1:5500",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        assert response.status_code in (200, 204)
+        assert "access-control-allow-origin" in {k.lower() for k in response.headers.keys()}
+
+
+class TestPaginationLogic:
+    """分页逻辑的边界条件测试(不依赖真实HTTP请求,直接测试pagination模块)"""
+
+    def test_page_request_normalizes_invalid_page(self):
+        from pagination import PageRequest
+        req = PageRequest(page=-5, page_size=20)
+        assert req.page == 1
+
+    def test_page_request_caps_oversized_page_size(self):
+        from pagination import PageRequest
+        req = PageRequest(page=1, page_size=99999)
+        assert req.page_size == 100
+
+    def test_page_result_total_pages_calculation(self):
+        from pagination import PageResult
+        result = PageResult(items=[], total_count=45, page=1, page_size=20)
+        assert result.total_pages == 3
+        assert result.has_next is True
+        assert result.has_prev is False
+
+
+class TestRateLimiter:
+    """滑动窗口限流器的核心逻辑单元测试"""
+
+    def test_allows_requests_within_limit(self):
+        from rate_limiter import SlidingWindowRateLimiter
+        limiter = SlidingWindowRateLimiter(max_requests=3, window_seconds=10)
+        for _ in range(3):
+            allowed, _ = limiter.is_allowed("client-a")
+            assert allowed is True
+
+    def test_rejects_requests_exceeding_limit(self):
+        from rate_limiter import SlidingWindowRateLimiter
+        limiter = SlidingWindowRateLimiter(max_requests=2, window_seconds=10)
+        limiter.is_allowed("client-b")
+        limiter.is_allowed("client-b")
+        allowed, retry_after = limiter.is_allowed("client-b")
+        assert allowed is False
+        assert retry_after > 0
+
+    def test_different_clients_have_independent_limits(self):
+        from rate_limiter import SlidingWindowRateLimiter
+        limiter = SlidingWindowRateLimiter(max_requests=1, window_seconds=10)
+        allowed_a, _ = limiter.is_allowed("client-c")
+        allowed_b, _ = limiter.is_allowed("client-d")
+        assert allowed_a is True
+        assert allowed_b is True
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+```
+
+### 文件19:`Dockerfile` 与 `docker-compose.yml` —— 内部体验环境容器化部署
+
+> 今晚是直接在训练机房的Ubuntu服务器上用`uvicorn`裸跑起来的,老王提前打了招呼:"这只是应急的上线方式,明天开始要逐步把它装进容器里,不然下次换一台机器部署,又要从头装一遍Python环境和依赖,费时费力还容易出现'我这边能跑,你那边跑不起来'的环境差异问题。"
+
+```dockerfile
+# Dockerfile
+# 苍穹0.1版后端容器化镜像
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+RUN mkdir -p /app/data
+
+ENV CQ_DATABASE_URL=sqlite:////app/data/cangqiong.db
+ENV CQ_APP_HOST=0.0.0.0
+ENV CQ_APP_PORT=8000
+
+EXPOSE 8000
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+```yaml
+# docker-compose.yml
+version: "3.9"
+
+services:
+  cangqiong-backend:
+    build: .
+    container_name: cangqiong-0.1-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - CQ_DEMO_PROVIDER=deepseek
+      - CQ_DATABASE_URL=sqlite:////app/data/cangqiong.db
+      - CQ_CORS_ORIGINS=http://127.0.0.1:5500,http://localhost:5500
+    env_file:
+      - .env
+    volumes:
+      - cangqiong-data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  cangqiong-data:
+    driver: local
+```
+
+### 文件20:`admin_tools.py` —— 内部运维辅助脚本
+
+> 上线当晚同事们陆续开始试用,陈铭担心的问题是"万一有人乱输、刷了一堆垃圾对话,数据库里堆满脏数据怎么清理",于是顺手写了一个简单的运维工具脚本,方便日常查看使用情况和清理旧数据。
+
+```python
+"""
+admin_tools.py
+苍穹0.1版内部运维辅助脚本
+
+用途:
+1. 统计当前数据库里的对话数量、消息数量、按天分布的使用趋势;
+2. 清理指定天数之前且消息数为0的"空对话"(用户点开但没聊天的记录);
+3. 导出指定对话的完整历史记录为JSON文件,便于人工核查或备份。
+
+使用方式: python admin_tools.py <子命令> [参数]
+"""
+
+import argparse
+import json
+import sys
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+from sqlalchemy import select, func
+
+from database import SessionLocal
+from models import Conversation, Message
+
+
+def print_usage_stats():
+    db = SessionLocal()
+    try:
+        total_conversations = db.execute(select(func.count()).select_from(Conversation)).scalar_one()
+        total_messages = db.execute(select(func.count()).select_from(Message)).scalar_one()
+
+        print("===== 苍穹0.1版使用情况统计 =====")
+        print(f"总对话数: {total_conversations}")
+        print(f"总消息数: {total_messages}")
+
+        if total_conversations > 0:
+            avg_messages = total_messages / total_conversations
+            print(f"平均每个对话消息数: {avg_messages:.1f}")
+
+        recent_conversations = db.execute(
+            select(Conversation).order_by(Conversation.created_at.desc()).limit(1000)
+        ).scalars().all()
+
+        daily_counts = defaultdict(int)
+        for conv in recent_conversations:
+            if conv.created_at:
+                day_key = conv.created_at.strftime("%Y-%m-%d")
+                daily_counts[day_key] += 1
+
+        print("\n按天分布的新建对话数量:")
+        for day, count in sorted(daily_counts.items()):
+            print(f"  {day}: {'█' * count} ({count})")
+    finally:
+        db.close()
+
+
+def cleanup_empty_conversations(older_than_days: int, dry_run: bool = True):
+    db = SessionLocal()
+    try:
+        cutoff = datetime.now() - timedelta(days=older_than_days)
+
+        candidates = db.execute(
+            select(Conversation).where(Conversation.created_at < cutoff)
+        ).scalars().all()
+
+        empty_conversations = []
+        for conv in candidates:
+            message_count = db.execute(
+                select(func.count()).select_from(Message).where(Message.conversation_id == conv.id)
+            ).scalar_one()
+            if message_count == 0:
+                empty_conversations.append(conv)
+
+        print(f"发现 {len(empty_conversations)} 个超过{older_than_days}天且无消息记录的空对话")
+
+        if dry_run:
+            print("[dry_run模式] 仅列出待清理对话,不会真正删除:")
+            for conv in empty_conversations:
+                print(f"  ID={conv.id}, 创建时间={conv.created_at}")
+            print("\n如需真正执行清理,请添加 --execute 参数")
+            return
+
+        for conv in empty_conversations:
+            db.delete(conv)
+        db.commit()
+        print(f"已清理 {len(empty_conversations)} 个空对话")
+    finally:
+        db.close()
+
+
+def export_conversation(conversation_id: int, output_path: str):
+    db = SessionLocal()
+    try:
+        conv = db.get(Conversation, conversation_id)
+        if conv is None:
+            print(f"错误: 未找到对话 ID={conversation_id}")
+            sys.exit(1)
+
+        messages = db.execute(
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at.asc())
+        ).scalars().all()
+
+        export_data = {
+            "conversation_id": conv.id,
+            "title": conv.title,
+            "created_at": conv.created_at.isoformat() if conv.created_at else None,
+            "messages": [
+                {
+                    "role": msg.role,
+                    "content": msg.content,
+                    "created_at": msg.created_at.isoformat() if msg.created_at else None,
+                }
+                for msg in messages
+            ],
+        }
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(export_data, f, ensure_ascii=False, indent=2)
+
+        print(f"已导出对话 ID={conversation_id} 到: {output_path}")
+        print(f"共 {len(messages)} 条消息")
+    finally:
+        db.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="苍穹0.1版内部运维辅助脚本")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("stats", help="打印使用情况统计")
+
+    cleanup_parser = subparsers.add_parser("cleanup", help="清理空对话")
+    cleanup_parser.add_argument("--older-than-days", type=int, default=7)
+    cleanup_parser.add_argument("--execute", action="store_true", help="真正执行删除,不加则为dry_run预览模式")
+
+    export_parser = subparsers.add_parser("export", help="导出指定对话历史")
+    export_parser.add_argument("--conversation-id", type=int, required=True)
+    export_parser.add_argument("--output", type=str, default="conversation_export.json")
+
+    args = parser.parse_args()
+
+    if args.command == "stats":
+        print_usage_stats()
+    elif args.command == "cleanup":
+        cleanup_empty_conversations(args.older_than_days, dry_run=not args.execute)
+    elif args.command == "export":
+        export_conversation(args.conversation_id, args.output)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 文件21:`websocket_alternative.py` —— WebSocket实现方式对比示例(教学扩展)
+
+> 老王在联调结束后随口提了一句:"你们今天用SSE做流式推送,以后遇到需要双向通信的场景(比如用户中途想打断模型的生成),SSE就不够用了,得换WebSocket。今天不展开讲,但你们可以业余时间看看这个对比实现,理解一下两者的本质区别。"陈铭当晚把这个对比示例写完,存进了仓库的`extras`目录里,作为课后自学材料。
+
+```python
+"""
+websocket_alternative.py
+WebSocket实现流式对话的对比示例(教学扩展,不在苍穹0.1版正式接口范围内)
+
+核心区别说明:
+- SSE(本篇正式使用的方案)是单向的:服务器持续向客户端推送数据,
+  客户端不能在同一条连接上向服务器发送新消息,每次新提问都要发起
+  一次新的HTTP请求。SSE基于普通HTTP协议,兼容性好,实现简单,
+  浏览器的EventSource原生支持自动重连。
+- WebSocket是双向的:一旦连接建立,客户端和服务器都可以随时向对方
+  发送消息,天然适合"用户中途想打断模型生成"这类需要双向交互的场景,
+  但协议本身更复杂,需要额外处理连接管理、心跳保活、断线重连逻辑
+  (不像EventSource自带重连机制),这些工作WebSocket都需要手动实现。
+"""
+
+import asyncio
+import json
+from typing import Dict
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+
+app_ws_demo = FastAPI(title="WebSocket对比示例(教学用,不参与正式部署)")
+
+
+class ConnectionManager:
+    """
+    简单的WebSocket连接管理器,维护当前所有活跃连接,
+    并支持按连接ID主动推送消息或主动断开连接
+    (这正是SSE场景下服务器很难做到的"主动打断"能力)。
+    """
+
+    def __init__(self):
+        self.active_connections: Dict[str, WebSocket] = {}
+
+    async def connect(self, connection_id: str, websocket: WebSocket) -> None:
+        await websocket.accept()
+        self.active_connections[connection_id] = websocket
+
+    def disconnect(self, connection_id: str) -> None:
+        self.active_connections.pop(connection_id, None)
+
+    async def send_json(self, connection_id: str, data: dict) -> None:
+        websocket = self.active_connections.get(connection_id)
+        if websocket:
+            await websocket.send_text(json.dumps(data, ensure_ascii=False))
+
+
+manager = ConnectionManager()
+
+
+async def _mock_stream_generation(prompt: str, interrupt_event: asyncio.Event):
+    """
+    模拟大模型的逐字生成过程。与SSE版本最大的区别是,这里额外传入了
+    一个interrupt_event,生成过程中每输出一个字符都会检查该事件是否
+    被设置,一旦客户端主动发来"打断"指令,生成过程可以立即终止——
+    这正是WebSocket双向通信带来的能力,SSE场景下客户端无法做到这一点。
+    """
+    mock_response = f"针对'{prompt}'的模拟回答内容,这是一段用于演示打断能力的较长文本……"
+    for char in mock_response:
+        if interrupt_event.is_set():
+            yield None  # None表示生成被主动打断
+            return
+        yield char
+        await asyncio.sleep(0.05)
+
+
+@app_ws_demo.websocket("/ws/chat/{connection_id}")
+async def websocket_chat_endpoint(websocket: WebSocket, connection_id: str):
+    await manager.connect(connection_id, websocket)
+    interrupt_event = asyncio.Event()
+    generation_task = None
+
+    try:
+        while True:
+            raw_message = await websocket.receive_text()
+            message = json.loads(raw_message)
+            action = message.get("action")
+
+            if action == "ask":
+                interrupt_event.clear()
+                prompt = message.get("prompt", "")
+
+                async def run_generation():
+                    async for char in _mock_stream_generation(prompt, interrupt_event):
+                        if char is None:
+                            await manager.send_json(connection_id, {"event": "interrupted"})
+                            return
+                        await manager.send_json(connection_id, {"event": "delta", "content": char})
+                    await manager.send_json(connection_id, {"event": "done"})
+
+                generation_task = asyncio.create_task(run_generation())
+
+            elif action == "interrupt":
+                # 客户端主动发送打断指令,这是SSE架构下无法原生支持的能力
+                interrupt_event.set()
+                if generation_task:
+                    await manager.send_json(connection_id, {"event": "interrupt_acknowledged"})
+
+    except WebSocketDisconnect:
+        manager.disconnect(connection_id)
+        if generation_task and not generation_task.done():
+            interrupt_event.set()
+
+
+def compare_sse_vs_websocket() -> str:
+    """以文本形式总结SSE与WebSocket的核心差异,供教学参考。"""
+    return """
+    ===== SSE vs WebSocket 核心差异对比 =====
+
+    | 维度 | SSE(苍穹0.1版采用) | WebSocket |
+    |---|---|---|
+    | 通信方向 | 单向(服务器→客户端) | 双向 |
+    | 底层协议 | 普通HTTP | 独立的ws协议(HTTP升级而来) |
+    | 浏览器原生重连 | 支持(EventSource自动重连) | 不支持,需手动实现 |
+    | 中途打断生成 | 不支持,需发起新请求覆盖 | 支持,天然适合 |
+    | 实现复杂度 | 较低 | 较高(需管理连接生命周期) |
+    | 适用场景 | 单向数据流推送(如本篇的对话流式输出) | 需要双向实时交互(如协作编辑、游戏对战) |
+
+    结论:苍穹0.1版当前的对话场景以"服务器生成、客户端展示"为主,
+    暂时没有强烈的双向交互需求,SSE的简单性和浏览器原生重连支持
+    使其是更合适的选择。但当产品迭代到需要支持"用户中途打断模型
+    生成"这类交互体验时,应考虑引入WebSocket作为补充方案,
+    而不是勉强用SSE去模拟双向通信。
+    """
+
+
+if __name__ == "__main__":
+    print(compare_sse_vs_websocket())
+```
+
+### 文件22:`token_budget.py` —— 对话历史裁剪与Token预算管理(完整实现)
+
+> 课堂笔记里提到"对话历史裁剪与token预算的简化处理",今晚陈铭把这部分的简化版本补成了一个可以直接复用的完整模块——虽然苍穹0.1版今天暂时用不上特别精细的token计算(消息量还很少),但老王提醒他:"这个模块迟早要用,现在数据量小看不出差别,但等对话历史攒到几十轮,不做裁剪,直接把全部历史丢给模型,一是超过上下文窗口会报错,二是白白浪费token预算,不如今天顺手写完。"
+
+```python
+"""
+token_budget.py
+对话历史裁剪与Token预算管理
+
+功能定位:
+1. 提供一个简化但可用的token数量估算函数(不依赖真实tokenizer,
+   适合教学场景快速理解裁剪逻辑,生产环境建议替换为tiktoken等
+   真实分词库以获得精确计数);
+2. 根据设定的token预算,从最新的消息开始向前保留历史,
+   一旦累计token数超过预算,停止继续向前保留(即"优先保留最近的对话");
+3. 始终保留system消息(如果存在),因为system消息通常承载着
+   角色设定和行为约束,裁剪时不能被误删。
+"""
+
+from dataclasses import dataclass
+from typing import List, Dict
+
+
+@dataclass
+class TokenBudgetConfig:
+    max_context_tokens: int = 4000          # 分配给历史对话的token预算上限
+    reserved_for_response_tokens: int = 1000  # 预留给模型生成回答的token空间
+    min_keep_recent_turns: int = 2            # 无论token预算是否够用,至少保留最近N轮对话
+
+
+def estimate_tokens(text: str) -> int:
+    """
+    简化的token数量估算函数。中文字符按照约0.7个token估算,
+    英文按照约4个字符1个token估算,这不是精确值,但足以支撑
+    "裁剪策略是否合理"这个教学层面的验证目的。
+    """
+    if not text:
+        return 0
+    chinese_chars = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    other_chars = len(text) - chinese_chars
+    return max(int(chinese_chars * 0.7 + other_chars / 4), 1)
+
+
+def estimate_message_tokens(message: Dict[str, str]) -> int:
+    """单条消息的token估算,额外加上一个固定的角色/格式开销常量。"""
+    content_tokens = estimate_tokens(message.get("content", ""))
+    role_overhead = 4  # 模拟每条消息在拼装成prompt时,角色标记本身占用的少量token
+    return content_tokens + role_overhead
+
+
+def trim_history_by_token_budget(
+    messages: List[Dict[str, str]],
+    config: TokenBudgetConfig,
+) -> List[Dict[str, str]]:
+    """
+    核心裁剪函数。从messages列表的末尾(最新消息)开始向前累加token数,
+    直到达到预算上限。system消息(如果存在且位于列表开头)始终保留。
+    """
+    if not messages:
+        return []
+
+    system_message = None
+    conversation_messages = messages
+    if messages[0].get("role") == "system":
+        system_message = messages[0]
+        conversation_messages = messages[1:]
+
+    system_tokens = estimate_message_tokens(system_message) if system_message else 0
+    available_budget = config.max_context_tokens - system_tokens
+
+    kept_messages: List[Dict[str, str]] = []
+    accumulated_tokens = 0
+
+    for message in reversed(conversation_messages):
+        message_tokens = estimate_message_tokens(message)
+
+        if accumulated_tokens + message_tokens > available_budget:
+            if len(kept_messages) < config.min_keep_recent_turns * 2:
+                # 即便超出预算,也保证至少保留设定的最少轮次,
+                # 避免因为某一轮消息特别长,导致模型完全"失忆"当前对话
+                kept_messages.insert(0, message)
+                accumulated_tokens += message_tokens
+                continue
+            break
+
+        kept_messages.insert(0, message)
+        accumulated_tokens += message_tokens
+
+    result = ([system_message] if system_message else []) + kept_messages
+    return result
+
+
+def summarize_trimming_result(original: List[Dict], trimmed: List[Dict]) -> dict:
+    """生成一份裁剪前后的对比摘要,方便日志记录或调试时快速了解裁剪效果。"""
+    original_tokens = sum(estimate_message_tokens(m) for m in original)
+    trimmed_tokens = sum(estimate_message_tokens(m) for m in trimmed)
+
+    return {
+        "original_message_count": len(original),
+        "trimmed_message_count": len(trimmed),
+        "original_estimated_tokens": original_tokens,
+        "trimmed_estimated_tokens": trimmed_tokens,
+        "messages_dropped": len(original) - len(trimmed),
+        "tokens_saved": original_tokens - trimmed_tokens,
+    }
+
+
+def demo_run():
+    config = TokenBudgetConfig(max_context_tokens=200, min_keep_recent_turns=2)
+
+    messages = [
+        {"role": "system", "content": "你是苍穹智能助手,请友好、专业地回答用户问题。"},
+    ]
+    for i in range(10):
+        messages.append({"role": "user", "content": f"这是第{i}轮用户提问,内容稍微长一点用于占用更多token预算。" * 2})
+        messages.append({"role": "assistant", "content": f"这是对第{i}轮问题的回答,同样占用一定的token空间。" * 2})
+
+    trimmed = trim_history_by_token_budget(messages, config)
+    summary = summarize_trimming_result(messages, trimmed)
+
+    print("===== Token预算裁剪结果 =====")
+    for key, value in summary.items():
+        print(f"  {key}: {value}")
+
+    print(f"\n裁剪后保留的消息角色顺序: {[m['role'] for m in trimmed]}")
+    assert trimmed[0]["role"] == "system", "system消息必须被保留在裁剪结果的最前面"
+    print("\n验证通过: system消息在裁剪后依然被完整保留")
+
+
+if __name__ == "__main__":
+    demo_run()
+```
+
+### 文件23:`event_source_reconnect_guard.py` —— EventSource自动重连行为的服务端配合处理
+
+> 课堂笔记里提到的"EventSource的自动重连机制:今天必须主动规避的一个'默认行为'"——浏览器的EventSource在连接异常断开后会自动重新发起连接,如果服务端对这个行为没有任何感知,同一个用户的一次提问,可能会因为网络抖动被浏览器"贴心地"重新发送了好几遍,导致同一个问题在数据库里被记录多次、模型被重复调用多次。这个模块就是当晚补上的服务端配合处理逻辑。
+
+```python
+"""
+event_source_reconnect_guard.py
+EventSource自动重连场景下的服务端去重与幂等处理
+
+问题背景:
+浏览器EventSource一旦检测到连接异常(网络抖动、代理超时等),会按照
+协议规范自动重新发起GET请求连接同一个SSE端点,这个行为浏览器原生
+支持、无法在前端简单关闭。如果服务端对这类"重连请求"缺乏识别能力,
+会导致:
+1. 同一次用户提问,可能因为一次网络抖动被处理两次甚至更多次;
+2. 每次重复处理都会重复调用大模型API,产生额外且不必要的费用;
+3. 数据库里可能出现内容完全相同的重复消息记录。
+
+解决思路:利用EventSource协议本身支持的Last-Event-ID机制——服务端
+在每次推送数据时附带一个自增的事件ID,浏览器重连时会在请求头
+Last-Event-ID中带上最后收到的事件ID,服务端据此判断"这是一次
+断线重连,而不是一次全新的提问",从而实现幂等处理而非重复生成。
+"""
+
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Dict, Optional
+
+
+@dataclass
+class StreamSession:
+    """记录单次流式生成会话的状态,支持基于Last-Event-ID的断点续传判断。"""
+    session_token: str
+    prompt: str
+    generated_content: str = ""
+    last_event_id: int = 0
+    is_completed: bool = False
+    created_at: float = field(default_factory=time.time)
+
+
+class ReconnectAwareStreamRegistry:
+    """
+    流式会话注册中心。核心能力:
+    1. 为每一次全新提问创建一个session_token,并通过某种约定
+       (比如查询参数)传递给客户端,浏览器重连时带上该token;
+    2. 根据Last-Event-ID判断是否为断线重连,如果是,直接从
+       已生成内容的断点位置继续推送,而不是重新调用大模型从头生成;
+    3. 定期清理过期的会话状态,避免内存无限增长。
+    """
+
+    SESSION_EXPIRE_SECONDS = 300  # 会话状态超过5分钟未完成也未被访问,视为过期
+
+    def __init__(self):
+        self._sessions: Dict[str, StreamSession] = {}
+
+    def create_session(self, prompt: str) -> StreamSession:
+        session_token = str(uuid.uuid4())
+        session = StreamSession(session_token=session_token, prompt=prompt)
+        self._sessions[session_token] = session
+        return session
+
+    def get_session(self, session_token: str) -> Optional[StreamSession]:
+        self._evict_expired_sessions()
+        return self._sessions.get(session_token)
+
+    def append_chunk(self, session_token: str, chunk: str) -> int:
+        session = self._sessions.get(session_token)
+        if session is None:
+            raise KeyError(f"未找到会话: {session_token}")
+        session.generated_content += chunk
+        session.last_event_id += 1
+        return session.last_event_id
+
+    def mark_completed(self, session_token: str) -> None:
+        session = self._sessions.get(session_token)
+        if session:
+            session.is_completed = True
+
+    def resolve_reconnect(self, session_token: str, last_event_id_header: Optional[str]) -> dict:
+        """
+        处理一次可能是重连的请求。返回结果中的resume_from_content字段
+        表示浏览器已经收到过的内容,服务端不应该重复推送这部分内容,
+        只需要从这个断点继续推送新内容(如果生成任务当时还没结束的话)。
+        """
+        session = self.get_session(session_token)
+        if session is None:
+            return {"is_reconnect": False, "reason": "会话不存在或已过期,应当作为全新请求处理"}
+
+        if last_event_id_header is None:
+            return {"is_reconnect": False, "reason": "未携带Last-Event-ID,视为首次连接"}
+
+        try:
+            client_last_event_id = int(last_event_id_header)
+        except ValueError:
+            return {"is_reconnect": False, "reason": "Last-Event-ID格式异常,回退为全新请求处理"}
+
+        if client_last_event_id >= session.last_event_id:
+            return {
+                "is_reconnect": True,
+                "session": session,
+                "resume_from_content": session.generated_content,
+                "is_completed": session.is_completed,
+                "note": "客户端已收到全部当前已生成内容,如未完成则继续等待后续推送,不重新调用模型",
+            }
+
+        return {
+            "is_reconnect": True,
+            "session": session,
+            "resume_from_content": session.generated_content,
+            "is_completed": session.is_completed,
+            "note": "检测到断线重连,已从断点恢复,避免重复调用大模型API",
+        }
+
+    def _evict_expired_sessions(self) -> None:
+        now = time.time()
+        expired_tokens = [
+            token for token, session in self._sessions.items()
+            if (now - session.created_at) > self.SESSION_EXPIRE_SECONDS and session.is_completed
+        ]
+        for token in expired_tokens:
+            del self._sessions[token]
+
+
+def demo_run():
+    registry = ReconnectAwareStreamRegistry()
+
+    session = registry.create_session(prompt="请介绍一下苍穹智能助手的核心能力")
+    print(f"创建新会话: {session.session_token}")
+
+    for chunk in ["苍穹", "智能助手", "具备", "多轮对话", "能力"]:
+        event_id = registry.append_chunk(session.session_token, chunk)
+        print(f"  推送分片: '{chunk}', 当前event_id={event_id}")
+
+    print("\n模拟网络抖动,浏览器EventSource自动重连,携带Last-Event-ID=3")
+    reconnect_result = registry.resolve_reconnect(session.session_token, last_event_id_header="3")
+    print(f"  是否判定为重连: {reconnect_result['is_reconnect']}")
+    print(f"  已生成内容(避免重复推送): {reconnect_result['resume_from_content']}")
+    print(f"  说明: {reconnect_result['note']}")
+
+    registry.append_chunk(session.session_token, "完整")
+    registry.mark_completed(session.session_token)
+    print(f"\n生成完成,最终内容: {registry.get_session(session.session_token).generated_content}")
+
+
+if __name__ == "__main__":
+    demo_run()
+```
+
+### 文件24:`n_plus_one_detector.py` —— relationship懒加载与N+1查询问题检测工具
+
+> 课堂笔记补充讨论环节提到的"relationship的懒加载与N+1查询问题",陈铭当晚意识到,自己在写对话列表接口的时候,如果不小心在循环里访问了`conversation.messages`这个关系属性,SQLAlchemy的懒加载机制会为每一个对话单独发起一次查询消息的SQL,对话数量一多,查询次数会线性增长,这就是经典的"N+1查询问题"。他写了这个小工具,用来在开发阶段主动检测这类隐患。
+
+```python
+"""
+n_plus_one_detector.py
+SQLAlchemy懒加载N+1查询问题检测工具
+
+原理说明:
+通过监听SQLAlchemy的Engine级别的"before_cursor_execute"事件,
+统计在某一段代码块执行期间总共发出了多少条SQL语句。如果处理一批
+数据(比如渲染对话列表)时发出的SQL语句数量,和数据条数呈明显的
+线性关系(比如返回20个对话,却发出了21条SQL——1条查列表+20条
+分别查每个对话的消息),就说明存在懒加载导致的N+1查询问题,
+应该改用SQLAlchemy的`selectinload`或`joinedload`做预加载优化。
+"""
+
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import List
+
+from sqlalchemy import event
+from sqlalchemy.engine import Engine
+
+
+@dataclass
+class QueryLogEntry:
+    statement: str
+    duration_ms: float
+
+
+class QueryCounter:
+    """
+    SQL查询计数器。使用方式:
+    with QueryCounter(engine) as counter:
+        # 执行一段可能触发N+1查询问题的代码
+        ...
+    print(counter.query_count)
+    """
+
+    def __init__(self, engine: Engine):
+        self.engine = engine
+        self.entries: List[QueryLogEntry] = []
+        self._start_times: dict = {}
+
+    def _before_cursor_execute(self, conn, cursor, statement, parameters, context, executemany):
+        self._start_times[id(cursor)] = time.time()
+
+    def _after_cursor_execute(self, conn, cursor, statement, parameters, context, executemany):
+        start_time = self._start_times.pop(id(cursor), time.time())
+        duration_ms = (time.time() - start_time) * 1000
+        self.entries.append(QueryLogEntry(statement=statement.strip(), duration_ms=round(duration_ms, 2)))
+
+    def __enter__(self):
+        event.listen(self.engine, "before_cursor_execute", self._before_cursor_execute)
+        event.listen(self.engine, "after_cursor_execute", self._after_cursor_execute)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        event.remove(self.engine, "before_cursor_execute", self._before_cursor_execute)
+        event.remove(self.engine, "after_cursor_execute", self._after_cursor_execute)
+
+    @property
+    def query_count(self) -> int:
+        return len(self.entries)
+
+    def detect_potential_n_plus_one(self, expected_item_count: int, tolerance: int = 1) -> dict:
+        """
+        简单的启发式检测:如果实际发出的查询数量,大约等于
+        "1条主查询 + N条item数量对应的查询",就高度怀疑存在N+1问题。
+        """
+        suspected_n_plus_one = self.query_count >= (expected_item_count + 1 - tolerance)
+        return {
+            "actual_query_count": self.query_count,
+            "expected_item_count": expected_item_count,
+            "suspected_n_plus_one": suspected_n_plus_one,
+            "recommendation": (
+                "疑似存在N+1查询问题,建议在查询语句中使用selectinload()或"
+                "joinedload()对relationship字段做预加载"
+                if suspected_n_plus_one else
+                "查询数量正常,未发现明显的N+1模式"
+            ),
+        }
+
+    def print_report(self) -> None:
+        print(f"共发出 {self.query_count} 条SQL语句:")
+        for idx, entry in enumerate(self.entries, start=1):
+            preview = entry.statement.replace("\n", " ")[:80]
+            print(f"  [{idx}] ({entry.duration_ms}ms) {preview}...")
+
+
+@contextmanager
+def count_queries(engine: Engine):
+    counter = QueryCounter(engine)
+    with counter:
+        yield counter
+
+
+def demo_bad_pattern_explanation() -> str:
+    """
+    用文字说明N+1问题的典型触发代码模式,配合上面的检测工具一起理解。
+    这里不直接执行真实数据库操作(避免依赖具体的数据库文件状态),
+    而是把典型的"错误写法"和"正确写法"并排展示,方便对照学习。
+    """
+    return '''
+    ===== N+1查询问题典型场景对照 =====
+
+    【错误写法,会触发N+1查询】
+    conversations = db.execute(select(Conversation)).scalars().all()
+    for conv in conversations:
+        print(conv.title, len(conv.messages))  # 每次访问conv.messages都会
+                                                  # 触发一次懒加载查询!
+
+    如果conversations有20条记录,上面的循环会产生:
+      1条查询conversations列表 + 20条分别查询每个conversation的messages
+      = 共21条SQL语句,这就是"N+1"问题里的N+1。
+
+    【正确写法,使用selectinload预加载,避免N+1】
+    from sqlalchemy.orm import selectinload
+
+    conversations = db.execute(
+        select(Conversation).options(selectinload(Conversation.messages))
+    ).scalars().all()
+    for conv in conversations:
+        print(conv.title, len(conv.messages))  # messages已经被预先加载,
+                                                  # 这里不会再触发额外查询
+
+    使用selectinload之后,不管conversations有多少条记录,
+    总共只会发出2条SQL语句(1条查conversations + 1条用IN子句批量查所有
+    相关messages),查询数量不再随数据量线性增长,这才是可以放心
+    在生产环境使用的写法。
+    '''
+
+
+if __name__ == "__main__":
+    print(demo_bad_pattern_explanation())
+```
+
+### 文件25:`test_token_budget_and_reconnect.py` —— 补充单元测试
+
+> 陈铭把当晚新写的token预算裁剪和EventSource重连去重这两块逻辑,单独补了一套单元测试,他记得老王说过的一句话:"没有测试保护的代码,过几天你自己都不敢随便改。"
+
+```python
+"""
+test_token_budget_and_reconnect.py
+Token预算裁剪与EventSource重连去重逻辑的单元测试
+运行方式: pytest test_token_budget_and_reconnect.py -v
+"""
+
+import pytest
+
+
+class TestTokenBudget:
+    def setup_method(self):
+        from token_budget import TokenBudgetConfig, trim_history_by_token_budget, estimate_tokens
+        self.TokenBudgetConfig = TokenBudgetConfig
+        self.trim_history_by_token_budget = trim_history_by_token_budget
+        self.estimate_tokens = estimate_tokens
+
+    def test_estimate_tokens_nonzero_for_nonempty_text(self):
+        assert self.estimate_tokens("你好世界") > 0
+
+    def test_estimate_tokens_zero_for_empty_text(self):
+        assert self.estimate_tokens("") == 0
+
+    def test_system_message_always_preserved(self):
+        config = self.TokenBudgetConfig(max_context_tokens=10, min_keep_recent_turns=1)
+        messages = [
+            {"role": "system", "content": "你是苍穹智能助手"},
+            {"role": "user", "content": "第一个问题" * 20},
+            {"role": "assistant", "content": "第一个回答" * 20},
+        ]
+        trimmed = self.trim_history_by_token_budget(messages, config)
+        assert trimmed[0]["role"] == "system"
+
+    def test_recent_messages_prioritized_over_old_ones(self):
+        config = self.TokenBudgetConfig(max_context_tokens=50, min_keep_recent_turns=1)
+        messages = [
+            {"role": "user", "content": "很久以前的问题" * 10},
+            {"role": "assistant", "content": "很久以前的回答" * 10},
+            {"role": "user", "content": "最近的问题"},
+            {"role": "assistant", "content": "最近的回答"},
+        ]
+        trimmed = self.trim_history_by_token_budget(messages, config)
+        trimmed_contents = [m["content"] for m in trimmed]
+        assert "最近的问题" in trimmed_contents
+
+    def test_min_keep_recent_turns_respected_even_over_budget(self):
+        config = self.TokenBudgetConfig(max_context_tokens=1, min_keep_recent_turns=1)
+        messages = [
+            {"role": "user", "content": "一个很长很长的问题" * 50},
+            {"role": "assistant", "content": "一个很长很长的回答" * 50},
+        ]
+        trimmed = self.trim_history_by_token_budget(messages, config)
+        assert len(trimmed) >= 2
+
+
+class TestReconnectGuard:
+    def setup_method(self):
+        from event_source_reconnect_guard import ReconnectAwareStreamRegistry
+        self.registry = ReconnectAwareStreamRegistry()
+
+    def test_create_session_returns_unique_token(self):
+        session_a = self.registry.create_session("问题A")
+        session_b = self.registry.create_session("问题B")
+        assert session_a.session_token != session_b.session_token
+
+    def test_append_chunk_increments_event_id(self):
+        session = self.registry.create_session("测试问题")
+        event_id_1 = self.registry.append_chunk(session.session_token, "第一片")
+        event_id_2 = self.registry.append_chunk(session.session_token, "第二片")
+        assert event_id_2 == event_id_1 + 1
+
+    def test_reconnect_without_last_event_id_treated_as_new(self):
+        session = self.registry.create_session("测试问题")
+        result = self.registry.resolve_reconnect(session.session_token, last_event_id_header=None)
+        assert result["is_reconnect"] is False
+
+    def test_reconnect_with_valid_last_event_id_resumes_content(self):
+        session = self.registry.create_session("测试问题")
+        self.registry.append_chunk(session.session_token, "内容A")
+        self.registry.append_chunk(session.session_token, "内容B")
+
+        result = self.registry.resolve_reconnect(session.session_token, last_event_id_header="1")
+        assert result["is_reconnect"] is True
+        assert result["resume_from_content"] == "内容A内容B"
+
+    def test_reconnect_unknown_session_returns_not_reconnect(self):
+        result = self.registry.resolve_reconnect("不存在的token", last_event_id_header="1")
+        assert result["is_reconnect"] is False
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+```
+
 ---
 
 ## 今日复盘
