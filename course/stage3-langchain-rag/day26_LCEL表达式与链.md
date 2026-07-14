@@ -512,6 +512,12 @@ LangChain里实现条件路由,常见有两种方式:
 
 "规整是规整,但`RunnableBranch`适合条件比较简单、分支数量不多的场景;如果你的路由逻辑本身就很复杂——比如要综合好几个条件、要做一些前置的数据清洗和判断——硬塞进`RunnableBranch`的条件函数里,反而会让代码变得难读。这种情况下,老老实实写一个普通函数,用`RunnableLambda`包装,往往更清晰、更好维护,这也是我早上说的那句话的另一种体现——不要为了'看起来用了框架的高级特性'而牺牲可读性,普通函数配合`RunnableLambda`,同样是'地道'的LCEL写法,不比`RunnableBranch`'低级'。今天代码实战里,这两种方式我都会让你各写一遍,亲身感受一下两者的适用边界。"
 
+**4. 一个提前埋下的伏笔:协议的"最小实现"与"可测试性"**
+
+下午快结束的时候,老王多说了两句,算是给晚上收尾的加练打个预告:"你今天用的`RunnableLambda`,本质上是官方帮你把'一个普通函数包装成Runnable'这件事做好了,你不需要关心背后具体怎么实现。但Runnable本身是一个抽象基类,协议要求的东西并不多——核心就是一个`invoke`方法。等你晚上写完主线任务,如果时间允许,我会让你直接继承`Runnable`,不借助`RunnableLambda`,自己实现一个真正的Runnable组件,你会发现,这件事没有想象中那么复杂,但意义不小——以后遇到官方组件覆盖不到的定制需求,你就知道该怎么下手,而不是卡在'这个框架好像做不到我想要的效果'这个误区里。"
+
+"另外一件事,"老王补充,"你今天`test_chain.py`里的测试,全都是直接调真实的大模型接口,这样的测试放进CI流水线,迟早会因为网络问题、接口限流而出现'不是代码的问题,但测试就是失败了'的情况。晚上如果你写容错逻辑相关的测试,我希望你用'依赖注入'的思路——让被测函数能够接收一个'替代实现',测试的时候传入完全不发起网络请求的假对象,这样测试才能做到又快又稳,这个思路以后写更复杂的RAG测试、Agent测试,都会反复用到。"
+
 这就是今天下午课堂笔记的全部理论内容。接下来,陈铭要正式动手,把上午和下午学到的全部知识点,拼进今天真正要交付的产出——"翻译-润色-摘要"三级链,以及配套的对比示例代码。
 
 ---
@@ -867,11 +873,16 @@ def demo_json_parser_with_malformed_output() -> None:
     parser = JsonOutputParser()
 
     # 模拟模型"不听话",在JSON前后加了客套话,且用markdown代码块包裹
+    # 注意:这里故意用 chr(96) * 3 拼出三个反引号,而不是在源码里直接写字面的
+    # 三重反引号——因为本文件本身也会被作为Markdown代码块展示,如果直接在
+    # 字符串里写三个连续的反引号,会把外层Markdown的代码围栏提前"戳穿",
+    # 这是陈铭在整理今天讲义时,老王专门提醒过的一个格式陷阱。
+    code_fence = chr(96) * 3
     malformed_output = (
         "好的,以下是分析结果:\n"
-        "```json\n"
+        f"{code_fence}json\n"
         '{"sentiment": "消极", "key_points": ["物流慢"], "needs_followup": true}\n'
-        "```\n"
+        f"{code_fence}\n"
         "如需更多分析,请告诉我。"
     )
 
@@ -1886,7 +1897,743 @@ if __name__ == "__main__":
     run_all_tests()
 ```
 
-跑完这份测试脚本,除了两个不依赖真实模型调用的纯逻辑测试瞬间通过,其余几个依赖模型调用的测试也都陆续跑通。陈铭把今天的八个文件整理进`feature/lcel-chains`分支,写了一份清晰的提交说明,提交前又对着白板上午画的三张图,把自己写的每一段代码在心里又对了一遍,确认没有哪一处是"看起来能跑但自己也说不清楚为什么能跑"的代码。
+跑完这份测试脚本,除了两个不依赖真实模型调用的纯逻辑测试瞬间通过,其余几个依赖模型调用的测试也都陆续跑通。陈铭正准备把今天的文件整理进`feature/lcel-chains`分支,老王却把他叫住了:"先别急着提交。你回头看看今天下午写的作业六参考答案——'某一级失败了,能不能保留前面已经成功的结果',这个问题,你今天在`three_stage_chain.py`里其实完全没有处理,链条只要中间报错,就是直接抛异常、整条链崩掉。既然你已经想清楚了方案,不如今天就把它落地,而不是只停留在'参考答案'这几行文字上。另外,我还想让你亲手写一个完全不借助`RunnableLambda`、直接继承`Runnable`基类实现的组件——你今天所有的自定义逻辑,都是用`RunnableLambda`包一层现成的Python函数,这当然是最常见、最省事的做法,但我希望你也知道,如果有一天`RunnableLambda`满足不了你的定制需求(比如你想在组件内部维护一些状态、想插入更复杂的横切逻辑),你要知道怎么从协议本身出发,自己写一个真正的Runnable。"
+
+陈铭想了想:"所以是要在今天原有的三级链基础上,再加一层'生产级加固'?"
+
+"算是收尾阶段的加练。"老王说,"今天主线任务已经达标了,这两块内容,一是巩固你对Runnable协议'最小实现方式'的理解,二是把作业六停留在纸面上的方案,变成能跑、能测的代码——工程师做设计方案,最怕的就是方案写得很漂亮,但从来没有验证过它到底能不能落地。而且这两块东西,写完之后要配一份不依赖真实模型调用的单元测试,你今天`test_chain.py`里的测试,几乎全部依赖真实的大模型接口调用,这在CI流水线里是个隐患——网络抖动、接口限流,都可能导致测试结果不稳定,不是代码本身的问题,却会让人误以为代码坏了。今天补的这份测试,我要求你用依赖注入的方式,把大模型调用完全隔离掉。"
+
+### 九、自定义Runnable组件与生产级容错强化(重试 + 结构化日志)
+
+```python
+"""
+custom_runnable_and_resilience.py
+
+苍穹平台 · LCEL链式改造技术验证 · 模块九(自定义Runnable组件 + 生产级容错强化)
+
+背景:
+    模块六(three_stage_chain.py)交付的三级链,已经满足了"翻译->润色->
+    摘要"三级链的基础功能验收标准——原文、译文、润色稿、摘要四个字段
+    全部完整保留,不会因为链式组合而丢失中间结果。但老王在收尾评审时
+    提出了三点更高的要求,分别对应课后作业六(异常兜底)以及需求文档
+    F7(基础异常处理与日志)条款:
+
+    1. 任意一级模型调用失败时,应该有指数退避的自动重试,而不是第一次
+       失败就直接判定整条链失败——大模型接口偶发超时、限流是常见情况,
+       一次瞬时性失败不应该让整条处理流程直接报废;
+    2. 每一级的输入、输出、耗时,都应该有结构化日志留痕,方便线上问题
+       排查,而不是只能靠零散的 print 语句;
+    3. 即便某一级最终重试耗尽仍然失败,也应该返回"已经成功的前几级结果
+       + 明确的失败定位信息",而不是让整条链直接抛出异常、用户什么都
+       拿不到,这正是作业六里陈铭自己设计的方案,今天把它变成真正能跑
+       的代码。
+
+    此外,老王要求陈铭亲手实现一个"完全自定义"的 Runnable 组件——不是
+    用 RunnableLambda 简单包装一个函数,而是直接继承 Runnable 抽象基类、
+    重写 invoke 方法。这么做的目的,是让陈铭彻底搞懂 Runnable 协议本身
+    "最小需要实现哪些东西",而不是永远停留在"会用官方现成的包装器"这个
+    层面——只有理解了协议的最小实现方式,以后遇到官方组件无法满足的
+    定制需求(比如这里"给任意一个Runnable自动包一层日志和耗时统计"的
+    横切关注点),才知道该怎么从协议层面自己动手扩展。
+
+编写人:陈铭
+评审人:王振宇
+飞书任务号:CQ-107(苍穹0.5版 · 三级链容错强化与自定义Runnable组件)
+"""
+
+import logging
+import random
+import time
+from dataclasses import dataclass, field
+from functools import wraps
+from typing import Any, Callable, Dict, List, Optional, TypeVar
+
+from langchain_core.runnables import Runnable, RunnableConfig
+
+from three_stage_chain import (
+    build_polishing_stage,
+    build_summary_stage_with_pydantic_parser,
+    build_translation_stage,
+)
+
+# ---------------------------------------------------------------------------
+# 第一部分:统一的结构化日志配置
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger("cangqiong.lcel.three_stage_chain")
+if not logger.handlers:
+    # 苍穹平台约定:业务模块不直接调用 logging.basicConfig(),避免覆盖
+    # 上层应用(比如 FastAPI 服务)自己的日志配置,而是给自己的 logger
+    # 单独挂一个 handler,格式里带上时间、级别、模块名,方便排查时定位
+    # 这条日志到底是哪个模块打出来的。
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter(
+            fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
+
+
+# ---------------------------------------------------------------------------
+# 第二部分:自定义异常类型 + 通用的指数退避重试装饰器
+# ---------------------------------------------------------------------------
+
+T = TypeVar("T")
+
+
+class StageExecutionError(RuntimeError):
+    """
+    自定义异常:标识"三级链中某一具体阶段"执行失败,而不是笼统的运行时错误。
+
+    苍穹平台约定:任何跨越多个处理阶段的复合流程,失败时都应该抛出能够
+    标注"哪个阶段"的专用异常类型,而不是让调用方只能看到一句语义模糊的
+    "运行时错误",这也是老王早上反复强调的"可观测性"在异常设计上的
+    具体体现——报错信息本身,也是可观测性的一部分。
+    """
+
+    def __init__(self, stage_name: str, original_exception: Exception):
+        self.stage_name = stage_name
+        self.original_exception = original_exception
+        super().__init__(
+            f"阶段[{stage_name}]执行失败,原始异常类型:"
+            f"{type(original_exception).__name__},信息:{original_exception}"
+        )
+
+
+def retry_with_exponential_backoff(
+    max_attempts: int = 3,
+    base_delay_seconds: float = 0.5,
+    max_delay_seconds: float = 8.0,
+    retriable_exceptions: tuple = (Exception,),
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """
+    通用重试装饰器:指数退避 + 随机抖动(jitter),避免"重试风暴"。
+
+    参数:
+        max_attempts: 最大尝试次数(包含第一次),默认3次;
+        base_delay_seconds: 首次重试前的基础等待时间;
+        max_delay_seconds: 单次等待时间的上限,避免指数增长失控;
+        retriable_exceptions: 允许触发重试的异常类型元组,默认所有异常都
+            重试。真实生产环境里,更建议只对"网络超时""限流"这类瞬时性
+            错误重试,对"参数错误""权限不足"这类确定性错误重试没有意义,
+            只会浪费时间和调用配额,今天为了保持示例的通用性,先用最宽松
+            的默认值,后续接入真实业务时,应该按需收窄这个范围。
+
+    为什么不直接引入第三方库(比如tenacity)?
+        苍穹平台目前的依赖清单里还没有引入tenacity,老王的意见是:在没有
+        更复杂重试策略需求(比如熔断、限流联动)之前,自己实现一个几十行
+        的轻量重试装饰器完全够用,避免过早引入额外依赖,这也是"够用就好,
+        不过度设计"这条工程原则的一次具体体现。
+    """
+
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> T:
+            last_exception: Optional[Exception] = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return func(*args, **kwargs)
+                except retriable_exceptions as exc:  # noqa: BLE001
+                    last_exception = exc
+                    if attempt == max_attempts:
+                        logger.error(
+                            "函数[%s]已重试%d次仍失败,不再继续重试,原始异常:%s",
+                            func.__name__,
+                            attempt,
+                            exc,
+                        )
+                        raise
+                    delay = min(base_delay_seconds * (2 ** (attempt - 1)), max_delay_seconds)
+                    # 加入0到delay的10%作为随机抖动,避免多个并发请求
+                    # 在完全相同的时间点集体发起重试,给下游服务造成瞬时压力。
+                    jitter = random.uniform(0, delay * 0.1)
+                    total_wait = delay + jitter
+                    logger.warning(
+                        "函数[%s]第%d次调用失败(异常:%s),将在%.2f秒后进行第%d次重试。",
+                        func.__name__,
+                        attempt,
+                        exc,
+                        total_wait,
+                        attempt + 1,
+                    )
+                    time.sleep(total_wait)
+            # 理论上不会走到这里,兜底抛出最后一次捕获的异常
+            if last_exception is not None:
+                raise last_exception
+            raise RuntimeError("重试逻辑异常终止,且未捕获到任何异常,请检查实现")
+
+        return wrapper
+
+    return decorator
+
+
+# ---------------------------------------------------------------------------
+# 第三部分:自定义Runnable组件——完全手写实现,不借助RunnableLambda
+# ---------------------------------------------------------------------------
+
+
+class LoggingRunnable(Runnable):
+    """
+    完全自定义的Runnable组件:在真正执行内部逻辑的前后,自动记录结构化日志,
+    并统计执行耗时,任意内部异常统一包装为携带阶段名称的StageExecutionError。
+
+    这个类没有借助RunnableLambda,而是直接继承langchain_core.runnables.Runnable
+    这个抽象基类,重写它要求的核心方法。这么做的目的,是让陈铭真正理解
+    Runnable协议"最小需要实现哪些东西"——Runnable基类要求子类至少实现
+    invoke方法(同步调用的核心逻辑),其余的batch、stream等方法,如果
+    不重写,会使用基类提供的默认实现(默认实现通常基于invoke简单地循环
+    或转发,不一定是最优的,但保证了协议的完整性,这也是Runnable协议
+    设计上的一个重要考量——子类只需要保证"最小实现",其余能力可以先用
+    默认版本兜底,以后有性能或功能上的特殊需求,再逐步重写batch、stream
+    等方法)。
+    """
+
+    def __init__(self, inner: Runnable, stage_name: str):
+        """
+        参数:
+            inner: 真正执行业务逻辑的Runnable(可以是一条子链,也可以是
+                另一个自定义Runnable,体现组合模式"整体与部分同构"的特性);
+            stage_name: 这一层日志包装对应的阶段名称,用于日志和异常定位。
+        """
+        self.inner = inner
+        self.stage_name = stage_name
+
+    def invoke(self, input: Any, config: Optional[RunnableConfig] = None, **kwargs: Any) -> Any:
+        """
+        Runnable协议要求的核心方法:接收一份输入,返回一份输出。
+
+        这里在真正调用self.inner.invoke()前后,插入了计时和结构化日志,
+        并且把内部抛出的任意异常,统一包装成StageExecutionError,
+        确保上层调用者拿到的异常信息里,一定带有明确的阶段名称,不会
+        再出现"链执行失败"这种查不到根的笼统报错。
+        """
+        started_at = time.perf_counter()
+        logger.info("[阶段开始] %s | 输入摘要:%s", self.stage_name, _summarize_for_log(input))
+        try:
+            output = self.inner.invoke(input, config=config, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - 这里故意兜底所有异常,统一包装
+            elapsed = time.perf_counter() - started_at
+            logger.error(
+                "[阶段失败] %s | 耗时:%.2f秒 | 异常:%s", self.stage_name, elapsed, exc
+            )
+            raise StageExecutionError(self.stage_name, exc) from exc
+        elapsed = time.perf_counter() - started_at
+        logger.info(
+            "[阶段完成] %s | 耗时:%.2f秒 | 输出摘要:%s",
+            self.stage_name,
+            elapsed,
+            _summarize_for_log(output),
+        )
+        return output
+
+
+def _summarize_for_log(value: Any, max_length: int = 80) -> str:
+    """
+    把任意类型的输入/输出,截断成一段适合写进日志的摘要文本。
+
+    生产环境的日志系统通常对单条日志长度、日志总量都有成本考量,
+    完整打印一大段模型输出既没有必要,也可能拖慢日志检索速度,
+    因此统一在这里做截断处理,这是苍穹平台日志规范里的通用做法。
+    """
+    text = str(value)
+    text = text.replace("\n", " ")
+    if len(text) <= max_length:
+        return text
+    return text[:max_length] + f"...(已截断,原始长度{len(text)}字符)"
+
+
+# ---------------------------------------------------------------------------
+# 第四部分:带重试的单阶段调用封装
+# ---------------------------------------------------------------------------
+
+
+@retry_with_exponential_backoff(max_attempts=3, base_delay_seconds=0.5)
+def _invoke_stage_with_retry(stage_runnable: Runnable, data: Dict[str, Any]) -> Any:
+    """
+    对单个阶段的Runnable调用,套上重试装饰器。
+
+    单独抽出这个函数(而不是把重试逻辑直接写在run_resilient_three_stage_chain
+    内部),是为了让"重试"这个横切关注点,和"三级链具体怎么组装"这个业务
+    逻辑解耦——以后如果要给某个阶段单独定制重试参数(比如摘要阶段因为涉及
+    JSON解析,失败率可能更高,需要更多重试次数),可以很方便地单独包一层,
+    而不影响其它阶段的调用方式。
+    """
+    return stage_runnable.invoke(data)
+
+
+# ---------------------------------------------------------------------------
+# 第五部分:兼具"重试 + 日志 + 部分结果兜底"的加固版三级链执行器
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StageOutcome:
+    """记录单个阶段的执行结果,便于最终统一汇总成结构化的返回值。"""
+
+    stage_name: str
+    succeeded: bool
+    output: Any = None
+    error_message: Optional[str] = None
+
+
+@dataclass
+class ResilientChainResult:
+    """
+    加固版三级链的最终返回结构。
+
+    即便中途某一级失败,这个结构依然会把"已经跑完的阶段结果"和
+    "具体在哪一级失败、失败原因是什么"都完整地带出来,呼应作业六
+    的兜底要求,也呼应需求文档F7对"异常定位"的具体验收标准。
+    """
+
+    original_text: str
+    stage_outcomes: List[StageOutcome] = field(default_factory=list)
+    failed_stage: Optional[str] = None
+    is_fully_successful: bool = True
+
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为普通字典,便于直接序列化为JSON返回给前端或写入日志。"""
+        return {
+            "original_text": self.original_text,
+            "is_fully_successful": self.is_fully_successful,
+            "failed_stage": self.failed_stage,
+            "stages": [
+                {
+                    "stage_name": outcome.stage_name,
+                    "succeeded": outcome.succeeded,
+                    "output": _serialize_stage_output(outcome.output),
+                    "error_message": outcome.error_message,
+                }
+                for outcome in self.stage_outcomes
+            ],
+        }
+
+
+def _serialize_stage_output(output: Any) -> Any:
+    """
+    把阶段输出统一转换为可以安全JSON序列化的形式。
+
+    三级链里的摘要阶段返回的是Pydantic对象(DocumentSummary实例),
+    不能直接塞进普通字典再json.dumps,这里统一做一次转换,避免
+    调用方各自处理这个细节,减少重复代码。
+    """
+    if output is None:
+        return None
+    if hasattr(output, "model_dump"):
+        # Pydantic v2 的模型实例(或任何提供了model_dump方法的对象),
+        # 统一转换为字典,方便直接JSON序列化。
+        return output.model_dump()
+    return output
+
+
+def run_resilient_three_stage_chain(
+    original_text: str,
+    stage_overrides: Optional[Dict[str, Runnable]] = None,
+) -> ResilientChainResult:
+    """
+    加固版三级链的核心执行函数:依次执行翻译、润色、摘要三个阶段,
+    每个阶段都套用重试与结构化日志,任意阶段最终仍然失败时,
+    立即停止后续阶段,返回"已完成阶段结果 + 失败定位信息"。
+
+    参数:
+        original_text: 待处理的中文原文;
+        stage_overrides: 可选的阶段替换字典,键为"translation"/"polishing"/
+            "summary",值为用来替换对应阶段真实实现的Runnable。这不是为了
+            应付业务需求专门加的参数,而是一处刻意的可测试性设计——有了
+            这个"依赖注入"的口子,今天配套的单元测试(模块十)才能够用
+            完全不依赖真实模型调用的假Runnable,对这个函数的容错逻辑做
+            确定性验证,而不需要真的连一次网。
+
+    这是三级链完整实现的"生产就绪"版本,对应模块六(three_stage_chain.py)
+    的功能升级——模块六证明了"链能不能搭出来、中间结果会不会丢失",
+    这里进一步证明"链在真实网络环境不稳定的情况下,能不能扛得住,
+    扛不住的时候,能不能体面地退出而不是直接崩溃"。
+    """
+    logger.info("===== 加固版三级链开始执行 | 原文长度:%d字符 =====", len(original_text))
+
+    stage_overrides = stage_overrides or {}
+    result = ResilientChainResult(original_text=original_text)
+    data: Dict[str, Any] = {"original_text": original_text}
+
+    translation_runnable = stage_overrides.get("translation") or build_translation_stage()
+    polishing_runnable = stage_overrides.get("polishing") or build_polishing_stage()
+    summary_runnable = stage_overrides.get("summary") or build_summary_stage_with_pydantic_parser()
+
+    stage_definitions = [
+        ("translation", LoggingRunnable(translation_runnable, "翻译阶段"), "translated"),
+        ("polishing", LoggingRunnable(polishing_runnable, "润色阶段"), "polished"),
+        ("summary", LoggingRunnable(summary_runnable, "摘要阶段"), "summary_result"),
+    ]
+
+    for stage_key, stage_runnable, output_field in stage_definitions:
+        try:
+            stage_output = _invoke_stage_with_retry(stage_runnable, data)
+            data[output_field] = stage_output
+            result.stage_outcomes.append(
+                StageOutcome(stage_name=stage_key, succeeded=True, output=stage_output)
+            )
+        except StageExecutionError as exc:
+            # 阶段最终失败(重试耗尽),记录失败信息,立即停止后续阶段,
+            # 不再继续尝试后面几级——已经明确知道结果无法继续推导下去了,
+            # 强行往下跑只会浪费一次调用配额,而且拿到的输入本身也是不完整的。
+            result.stage_outcomes.append(
+                StageOutcome(
+                    stage_name=stage_key,
+                    succeeded=False,
+                    error_message=str(exc),
+                )
+            )
+            result.failed_stage = stage_key
+            result.is_fully_successful = False
+            logger.error(
+                "===== 加固版三级链在阶段[%s]处终止,已保留前面阶段的成功结果 =====",
+                stage_key,
+            )
+            return result
+
+    logger.info("===== 加固版三级链全部阶段执行成功 =====")
+    return result
+
+
+def demo_resilient_chain_happy_path() -> None:
+    """演示加固版三级链在正常情况下(不注入任何故障)的完整执行过程。"""
+    print("\n===== 加固版三级链演示:正常路径 =====")
+    sample_text = (
+        "苍穹平台的知识库问答系统,计划在下一阶段支持多语言设备手册的"
+        "自动标准化处理,今天的三级链就是这项能力的技术原型。"
+    )
+    outcome = run_resilient_three_stage_chain(sample_text)
+    print(f"是否完全成功:{outcome.is_fully_successful}")
+    for stage in outcome.stage_outcomes:
+        print(f"  阶段[{stage.stage_name}] 成功={stage.succeeded}")
+    print(f"最终摘要阶段输出:{outcome.to_dict()['stages'][-1]['output']}")
+
+
+def demo_resilient_chain_with_injected_failure() -> None:
+    """
+    演示加固版三级链在"润色阶段始终失败"的情况下的行为:
+    通过 stage_overrides 注入一个必定抛异常的假Runnable替换掉润色阶段,
+    验证:
+    1. 翻译阶段已经成功的结果会被完整保留;
+    2. 最终返回的结构里,能明确看到是"polishing"阶段失败,以及具体的
+       失败原因;
+    3. 摘要阶段不会被继续执行(避免浪费一次本就注定无意义的调用)。
+
+    这里刻意不去真实触发一次网络超时(那样会让演示的耗时和可复现性
+    变得不可控),而是复用run_resilient_three_stage_chain本身提供的
+    stage_overrides依赖注入口子,这也说明了"为可测试性做设计"这件事,
+    不仅仅是对单元测试有好处,对日常调试、演示同样有直接的价值。
+    """
+    print("\n===== 加固版三级链演示:注入故障路径 =====")
+
+    class AlwaysFailingRunnable(Runnable):
+        """演示专用的假Runnable,invoke时必定抛异常,模拟外部依赖故障。"""
+
+        def invoke(self, input: Any, config: Optional[RunnableConfig] = None, **kwargs: Any) -> Any:
+            raise ConnectionError("模拟场景:润色阶段依赖的模型接口连接超时")
+
+    outcome = run_resilient_three_stage_chain(
+        "这是一段用于验证故障注入路径的示例文本。",
+        stage_overrides={"polishing": AlwaysFailingRunnable()},
+    )
+
+    print(f"是否完全成功:{outcome.is_fully_successful}")
+    print(f"失败阶段:{outcome.failed_stage}")
+    for stage in outcome.stage_outcomes:
+        status = "成功" if stage.succeeded else f"失败({stage.error_message})"
+        print(f"  阶段[{stage.stage_name}]:{status}")
+    print(
+        "结论:即便润色阶段始终失败,翻译阶段已经成功的结果依然被完整保留,"
+        "调用方可以清楚知道具体是哪一级出了问题、原因是什么,而不是收到"
+        "一个笼统的500错误。"
+    )
+
+
+def run_all_demos() -> None:
+    """依次运行本文件中的两组演示。"""
+    demo_resilient_chain_happy_path()
+    demo_resilient_chain_with_injected_failure()
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+写完这个文件,陈铭先跑了一遍`demo_resilient_chain_with_injected_failure`,盯着终端里打印出来的`失败阶段:polishing`和翻译阶段依然完整保留的结果,想起了下午自己写的作业六参考答案——原来那份"方案"从文字变成代码,中间还有这么多细节要落实,比如"重试次数用完之后要不要继续往下跑""子链的输出要不要考虑Pydantic对象的序列化"。老王看完之后评价:"这才是完整的一次闭环——发现问题(林悦提到的翻译质量场景背后隐含的可靠性要求)、提出方案(作业六的文字方案)、落地验证(现在这份代码)。以后你做任何技术方案,都要争取走完这三步,而不是方案写完就算完事。"
+
+### 十、单元测试:重试机制、自定义Runnable与容错逻辑的确定性验证
+
+```python
+"""
+test_resilience.py
+
+苍穹平台 · LCEL链式改造技术验证 · 模块十(单元测试:重试/日志/容错)
+
+本文件针对模块九(custom_runnable_and_resilience.py)编写单元测试,
+覆盖以下关键行为:
+1. 指数退避重试装饰器:失败N次后成功的场景,验证实际调用次数与
+   最终返回值;连续失败超过最大重试次数的场景,验证会正确重新抛出
+   原始异常,不会"吞掉"错误信息。
+2. LoggingRunnable(完全自定义的Runnable组件):正常执行时能够透传
+   内部Runnable的返回值;内部Runnable抛出异常时,能够正确包装为
+   StageExecutionError,并在异常信息里带上阶段名称。
+3. run_resilient_three_stage_chain:通过依赖注入(stage_overrides参数)
+   使用完全不依赖真实模型调用的假Runnable,验证"全部成功"与
+   "某一阶段失败后,前面阶段结果被完整保留、后续阶段不再被执行"
+   两种场景下的返回结构是否符合预期。
+
+苍穹平台的测试规范要求:凡是涉及真实大模型调用的逻辑,单元测试阶段
+必须通过依赖注入或mock的方式隔离掉网络调用,保证测试的确定性、速度
+与可重复执行性,不能让CI流水线的稳定性依赖于外部大模型接口的可用性
+与响应速度——这也是老王在评审模块八(test_chain.py)时特别提出的一点
+改进意见:test_chain.py里的测试仍然依赖真实模型调用,今天这份测试,
+是对"如何编写不依赖外部服务的单元测试"的补充示范,两者并不冲突,
+test_chain.py用来做"真实调用链路是否端到端跑通"的验证,test_resilience.py
+用来做"容错逻辑本身是否正确"的验证,二者的验证目标本来就不一样。
+
+编写人:陈铭
+评审人:王振宇
+飞书任务号:CQ-107
+"""
+
+import unittest
+from typing import Any, List, Optional
+from unittest.mock import patch
+
+from langchain_core.runnables import Runnable, RunnableConfig
+
+from custom_runnable_and_resilience import (
+    LoggingRunnable,
+    ResilientChainResult,
+    StageExecutionError,
+    StageOutcome,
+    retry_with_exponential_backoff,
+    run_resilient_three_stage_chain,
+)
+
+
+class FakeRunnable(Runnable):
+    """
+    测试专用的假Runnable:根据构造时传入的行为函数决定invoke的返回值
+    或抛出的异常,不涉及任何真实的网络调用或大模型API,保证测试的
+    确定性与执行速度。
+    """
+
+    def __init__(self, behavior):
+        """behavior 是一个可调用对象,接收invoke的输入,返回输出或抛出异常。"""
+        self.behavior = behavior
+        self.call_count = 0
+
+    def invoke(self, input: Any, config: Optional[RunnableConfig] = None, **kwargs: Any) -> Any:
+        self.call_count += 1
+        return self.behavior(input)
+
+
+class FakeSummary:
+    """模拟DocumentSummary的最小接口,用于测试_serialize_stage_output的分支。"""
+
+    def __init__(self, summary: str, keywords: List[str]):
+        self.summary = summary
+        self.keywords = keywords
+
+    def model_dump(self) -> dict:
+        return {"summary": self.summary, "keywords": self.keywords}
+
+
+class RetryDecoratorTests(unittest.TestCase):
+    """针对 retry_with_exponential_backoff 装饰器的行为验证。"""
+
+    def setUp(self):
+        # 测试过程中不希望真的等待秒级的退避时间,统一patch掉time.sleep,
+        # 让重试逻辑瞬间跑完,同时依然能验证"确实调用了sleep、重试次数是否正确"。
+        self._sleep_patcher = patch(
+            "custom_runnable_and_resilience.time.sleep", return_value=None
+        )
+        self._sleep_patcher.start()
+
+    def tearDown(self):
+        self._sleep_patcher.stop()
+
+    def test_succeeds_after_transient_failures(self):
+        """验证:前两次调用失败,第三次成功,最终应返回成功结果,且共调用3次。"""
+        call_records: List[int] = []
+
+        @retry_with_exponential_backoff(max_attempts=3, base_delay_seconds=0.01)
+        def flaky_function():
+            call_records.append(1)
+            if len(call_records) < 3:
+                raise ConnectionError("模拟瞬时网络异常")
+            return "最终成功"
+
+        result = flaky_function()
+        self.assertEqual(result, "最终成功")
+        self.assertEqual(len(call_records), 3)
+
+    def test_raises_after_exhausting_all_attempts(self):
+        """验证:如果一直失败,重试耗尽后应该重新抛出最后一次的原始异常。"""
+        call_records: List[int] = []
+
+        @retry_with_exponential_backoff(max_attempts=3, base_delay_seconds=0.01)
+        def always_failing_function():
+            call_records.append(1)
+            raise ValueError("模拟永久性错误")
+
+        with self.assertRaises(ValueError):
+            always_failing_function()
+        self.assertEqual(len(call_records), 3, "应当正好尝试了max_attempts次,不多不少")
+
+
+class LoggingRunnableTests(unittest.TestCase):
+    """针对自定义Runnable组件 LoggingRunnable 的行为验证。"""
+
+    def test_passthrough_on_success(self):
+        """验证:内部Runnable正常返回时,LoggingRunnable应原样透传结果。"""
+        inner = FakeRunnable(behavior=lambda data: {"result": "ok", "echo": data})
+        wrapped = LoggingRunnable(inner, stage_name="测试阶段")
+
+        output = wrapped.invoke({"text": "hello"})
+        self.assertEqual(output["result"], "ok")
+        self.assertEqual(output["echo"], {"text": "hello"})
+        self.assertEqual(inner.call_count, 1)
+
+    def test_wraps_exception_with_stage_name(self):
+        """验证:内部Runnable抛异常时,LoggingRunnable应包装为StageExecutionError。"""
+
+        def always_raise(_: Any) -> Any:
+            raise TimeoutError("模拟模型调用超时")
+
+        inner = FakeRunnable(behavior=always_raise)
+        wrapped = LoggingRunnable(inner, stage_name="翻译阶段")
+
+        with self.assertRaises(StageExecutionError) as ctx:
+            wrapped.invoke({"text": "hello"})
+
+        self.assertEqual(ctx.exception.stage_name, "翻译阶段")
+        self.assertIsInstance(ctx.exception.original_exception, TimeoutError)
+        self.assertIn("翻译阶段", str(ctx.exception))
+
+
+class ResilientChainTests(unittest.TestCase):
+    """
+    针对 run_resilient_three_stage_chain 的端到端行为验证,
+    全程通过 stage_overrides 注入假Runnable,不发起任何真实网络请求。
+    """
+
+    def setUp(self):
+        self._sleep_patcher = patch(
+            "custom_runnable_and_resilience.time.sleep", return_value=None
+        )
+        self._sleep_patcher.start()
+
+    def tearDown(self):
+        self._sleep_patcher.stop()
+
+    def test_all_stages_succeed(self):
+        """验证:三个阶段全部注入成功行为时,最终结果应标记为完全成功。"""
+        overrides = {
+            "translation": FakeRunnable(lambda data: "This is fine."),
+            "polishing": FakeRunnable(lambda data: "This is fine, polished."),
+            "summary": FakeRunnable(
+                lambda data: FakeSummary(
+                    summary="A short summary.", keywords=["fine", "polished"]
+                )
+            ),
+        }
+
+        result = run_resilient_three_stage_chain(
+            "这是一段用于测试的示例文本。", stage_overrides=overrides
+        )
+
+        self.assertTrue(result.is_fully_successful)
+        self.assertIsNone(result.failed_stage)
+        self.assertEqual(len(result.stage_outcomes), 3)
+        self.assertTrue(all(outcome.succeeded for outcome in result.stage_outcomes))
+
+        serialized = result.to_dict()
+        summary_stage_output = serialized["stages"][-1]["output"]
+        self.assertEqual(summary_stage_output["summary"], "A short summary.")
+        self.assertEqual(summary_stage_output["keywords"], ["fine", "polished"])
+
+    def test_stops_at_first_failing_stage_and_preserves_previous_results(self):
+        """
+        验证:润色阶段始终失败(重试耗尽)时,
+        1. 翻译阶段的成功结果应被完整保留;
+        2. failed_stage应准确标记为"polishing";
+        3. 摘要阶段不应被执行(避免无意义的调用浪费)。
+        """
+        summary_stage = FakeRunnable(lambda data: FakeSummary("不应该被调用到", []))
+
+        def always_fail_polishing(_: Any) -> Any:
+            raise ConnectionError("模拟场景:润色阶段依赖的模型接口连接超时")
+
+        overrides = {
+            "translation": FakeRunnable(lambda data: "Translated text."),
+            "polishing": FakeRunnable(always_fail_polishing),
+            "summary": summary_stage,
+        }
+
+        result = run_resilient_three_stage_chain(
+            "这是一段用于测试故障注入的示例文本。", stage_overrides=overrides
+        )
+
+        self.assertFalse(result.is_fully_successful)
+        self.assertEqual(result.failed_stage, "polishing")
+
+        translation_outcome = next(
+            o for o in result.stage_outcomes if o.stage_name == "translation"
+        )
+        self.assertTrue(translation_outcome.succeeded)
+        self.assertEqual(translation_outcome.output, "Translated text.")
+
+        polishing_outcome = next(
+            o for o in result.stage_outcomes if o.stage_name == "polishing"
+        )
+        self.assertFalse(polishing_outcome.succeeded)
+        self.assertIn("润色阶段", polishing_outcome.error_message)
+
+        stage_names_executed = [o.stage_name for o in result.stage_outcomes]
+        self.assertNotIn("summary", stage_names_executed, "摘要阶段不应该在润色失败后被执行")
+        self.assertEqual(summary_stage.call_count, 0, "摘要阶段对应的假Runnable不应该被真正调用")
+
+
+class StageOutcomeSerializationTests(unittest.TestCase):
+    """针对 StageOutcome / ResilientChainResult 序列化逻辑的补充验证。"""
+
+    def test_to_dict_handles_plain_string_output(self):
+        """验证:普通字符串类型的阶段输出,应原样保留在序列化结果里。"""
+        result = ResilientChainResult(original_text="示例原文")
+        result.stage_outcomes.append(
+            StageOutcome(stage_name="translation", succeeded=True, output="Sample output.")
+        )
+        serialized = result.to_dict()
+        self.assertEqual(serialized["stages"][0]["output"], "Sample output.")
+        self.assertEqual(serialized["original_text"], "示例原文")
+
+    def test_to_dict_serializes_pydantic_like_output(self):
+        """验证:带model_dump方法的对象(模拟Pydantic实例),应被正确转换为字典。"""
+        result = ResilientChainResult(original_text="示例原文")
+        result.stage_outcomes.append(
+            StageOutcome(
+                stage_name="summary",
+                succeeded=True,
+                output=FakeSummary(summary="摘要内容", keywords=["关键词一", "关键词二"]),
+            )
+        )
+        serialized = result.to_dict()
+        self.assertEqual(
+            serialized["stages"][0]["output"],
+            {"summary": "摘要内容", "keywords": ["关键词一", "关键词二"]},
+        )
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+```
+
+写完这份测试,陈铭在本地跑了一遍`python -m unittest test_resilience.py -v`,九个测试用例全部瞬间通过,没有等待任何一次真实的网络请求。他把这个结果发给老王,补了一句:"这套测试跑完不到一秒。"老王回复:"这才是单元测试该有的样子——快、稳、不依赖外部世界的心情好不好。你今天`test_chain.py`那份测试,虽然也有价值,但它验证的是'真实链路能不能跑通',属于集成测试的范畴,不应该跟这种纯逻辑单元测试混在一起反复跑,以后咱们的CI流水线,这两类测试会分开配置不同的触发频率。"
 
 ---
 
