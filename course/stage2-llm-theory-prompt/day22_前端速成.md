@@ -2136,6 +2136,1070 @@ console.log(countMessagesByRole(sampleMessages));
 
 ---
 
+## 拓展代码实战:消息操作与前端状态管理进阶
+
+晚自习验收结束后,周晓临走前给四人留了一个"选做"的小任务——不是强制作业,而是她提到的"如果你们今天晚上还有精力,可以试着往这个静态页面里加几个更贴近真实产品的交互"。陈铭当晚回到工位,把这几个"选做"任务都做了一遍,第二天早上把代码发给周晓看,周晓在群里回复:"这几个功能已经不是‘练习’水平了,是可以直接进真实项目的代码质量,我把这几个文件也一起归档到今天的课件里,后面几批新人可以直接参考。"
+
+这一部分继续在`chat_static.html`项目的基础上扩展,新增两个JS模块(`state-store.js`状态管理、`message-actions.js`消息操作)、一份扩展样式表(`style-extended.css`),以及一份可以脱离浏览器、直接用Node.js运行的纯逻辑自测脚本(`self_check_frontend_logic.js`)。
+
+### 附录文件1:`state-store.js` —— 极简前端状态管理模块
+
+陈铭在动手写这个文件之前,先在笔记里写下了自己的困惑:"今天的`app.js`里,`state`对象是一个全局变量,任何函数都可以直接改它,这在今天这个规模的小项目里没什么问题,但如果页面越做越大,‘谁在什么时候改了state的哪个字段’会变得很难追踪。周晓提到过,真实的前端项目里,大多会引入某种‘状态管理’的思路——不是禁止直接改数据,而是把‘改数据’和‘谁关心这个数据变化了’这两件事,通过一个统一的入口管理起来。"
+
+```javascript
+/**
+ * 文件名:state-store.js
+ * 作者:陈铭(前端速成 · 选做拓展练习,周晓审阅通过并归档)
+ * 说明:
+ *     一个极简的、不依赖任何第三方框架(如Redux/Vuex/Pinia)的前端状态管理模块,
+ *     核心思想是"发布-订阅模式"(Observer Pattern):
+ *     1. 所有状态数据统一存放在一个私有的、不可被外部直接篡改的对象里;
+ *     2. 外部只能通过getState()读取当前状态的一份"快照"(避免被误改内部引用);
+ *     3. 外部只能通过setState()申请修改状态,而不能绕过这个入口直接赋值;
+ *     4. 每次setState()成功之后,自动通知所有通过subscribe()注册过的"订阅者"。
+ *
+ *     这解决了今天app.js里"state是全局裸露对象,任何地方都能直接改,
+ *     改了之后谁知道、要不要重新渲染,全靠开发者自己记着手动调用渲染函数"
+ *     这个问题——状态管理模块把"数据变化"和"要做什么响应"两件事解耦开,
+ *     调用方只需要说"我关心这份数据",不需要关心"这份数据具体在哪一行代码
+ *     的哪个函数里被改动的"。
+ *
+ *     兼容性说明:
+ *     本文件同时兼容浏览器<script>标签直接引入,以及Node.js环境下用
+ *     require()引入——这是为了方便下面的self_check_frontend_logic.js
+ *     能够脱离浏览器环境,直接用Node.js对这个模块的核心逻辑做自动化自测,
+ *     不需要启动真实浏览器或者引入额外的测试框架依赖。
+ */
+
+"use strict";
+
+/**
+ * 创建一个独立的状态存储实例。
+ *
+ * 设计意图:
+ *     写成"工厂函数"(createStore)而不是直接创建一个全局单例,
+ *     是为了让这个模块本身可以被独立测试——每次调用createStore()都会
+ *     得到一份全新的、互不干扰的状态容器,这一点在写单元测试时
+ *     格外重要(否则多个测试用例之间会因为共享同一份全局状态而互相污染)。
+ * @param {Object} initialState 初始状态对象
+ * @returns {{getState: Function, setState: Function, subscribe: Function, listenerCount: Function}}
+ */
+function createStore(initialState) {
+  // 用一个闭包变量保存当前状态,外部无法直接访问到这个变量本身,
+  // 只能通过下面暴露出去的几个函数间接读写——这是JS里实现"封装"
+  // 最朴素但也最可靠的方式之一(不依赖class的private字段语法)。
+  let currentState = Object.assign({}, initialState);
+
+  // 用Set存放所有订阅者函数,Set天然去重,避免同一个函数被重复订阅两次
+  // 却在notify的时候被调用两次的意外情况。
+  const listeners = new Set();
+
+  /**
+   * 读取当前状态的一份浅拷贝快照。
+   *
+   * 之所以返回拷贝而不是内部引用,是为了防止调用方拿到返回值之后,
+   * 绕过setState()直接修改这个对象的字段——如果真的这样做了,
+   * 状态确实会被改变,但所有订阅者都不会被通知到,造成"数据变了,
+   * 但页面没更新"这种很难排查的bug。返回拷贝能在一定程度上
+   * (仅限第一层字段)降低这种误用的概率。
+   * @returns {Object} 当前状态的浅拷贝
+   */
+  function getState() {
+    return Object.assign({}, currentState);
+  }
+
+  /**
+   * 申请更新状态。
+   * @param {Object|Function} partialStateOrUpdater
+   *     可以直接传一个"部分状态对象"(会和现有状态做浅合并),
+   *     也可以传一个函数(接收当前状态,返回一个部分状态对象)——
+   *     后一种写法在"新状态依赖旧状态"的场景下更安全,能避免
+   *     "多次连续调用setState时,读到的还是旧的currentState"这类问题
+   *     (这一点在真实的React/Redux场景里是一个经典的坑,这里提前给
+   *     大家建立这个意识)。
+   */
+  function setState(partialStateOrUpdater) {
+    const partial =
+      typeof partialStateOrUpdater === "function"
+        ? partialStateOrUpdater(getState())
+        : partialStateOrUpdater;
+
+    if (partial === null || typeof partial !== "object") {
+      throw new TypeError("setState()的参数必须是一个对象,或者一个返回对象的函数");
+    }
+
+    currentState = Object.assign({}, currentState, partial);
+    notifyListeners();
+  }
+
+  /**
+   * 注册一个订阅者,状态每次变化后都会被调用。
+   * @param {Function} listener 接收最新状态快照作为参数的回调函数
+   * @returns {Function} 取消订阅的函数(调用后,该订阅者不会再被通知)
+   */
+  function subscribe(listener) {
+    if (typeof listener !== "function") {
+      throw new TypeError("subscribe()的参数必须是一个函数");
+    }
+    listeners.add(listener);
+
+    // 返回一个"取消订阅"函数,这是发布-订阅模式里一个很重要但容易被忽略的细节——
+    // 如果订阅之后永远不提供取消订阅的方式,长期运行的页面里,订阅者只会
+    // 越积累越多(尤其是那种"每次打开一个弹窗就订阅一次,关闭时忘记取消订阅"
+    // 的场景),这是前端里一种常见的内存泄漏来源。
+    return function unsubscribe() {
+      listeners.delete(listener);
+    };
+  }
+
+  /**
+   * 依次调用所有已注册的订阅者,传入最新的状态快照。
+   * 内部函数,不对外暴露,只在setState()成功之后被调用。
+   */
+  function notifyListeners() {
+    const snapshot = getState();
+    listeners.forEach((listener) => {
+      try {
+        listener(snapshot);
+      } catch (error) {
+        // 一个订阅者内部出错,不应该影响其他订阅者被正常调用——
+        // 这和后端"一个工具调用失败不能让整个对话流程崩掉"是同一种健壮性思路。
+        console.error("[state-store] 某个订阅者执行时抛出了异常:", error);
+      }
+    });
+  }
+
+  /**
+   * 返回当前订阅者数量,主要用于调试和单元测试断言,
+   * 生产代码里通常不需要关心这个数字。
+   * @returns {number}
+   */
+  function listenerCount() {
+    return listeners.size;
+  }
+
+  return { getState, setState, subscribe, listenerCount };
+}
+
+// 兼容Node.js的CommonJS模块系统(用于self_check_frontend_logic.js做离线自测),
+// 同时不影响在浏览器<script>标签里直接使用全局的createStore函数。
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = { createStore };
+}
+```
+
+周晓看完这份代码之后,专门在评审记录里写了一句:"你在`setState`里用函数式的‘updater’写法这个细节,已经摸到了真正状态管理库(比如React的`setState`、Redux的reducer)的核心设计思路的边——这不是我要求你写的,你自己想到要处理‘连续调用’的场景,说明你已经开始有‘这段代码会被别人怎么用’的产品直觉了。"
+
+### 附录文件2:`message-actions.js` —— 消息删除/重新生成/复制/编辑重发
+
+```javascript
+/**
+ * 文件名:message-actions.js
+ * 作者:陈铭(前端速成 · 选做拓展练习,周晓审阅通过并归档)
+ * 说明:
+ *     在app.js已有的"发送消息"能力基础上,补充四个更贴近真实聊天产品的
+ *     交互能力:
+ *     1. 复制消息内容到剪贴板(copyMessageToClipboard)
+ *     2. 删除单条消息(removeMessageById,纯函数 + DOM层调用)
+ *     3. 重新生成最近一条助手回复(regenerateLastAssistantReply)
+ *     4. 编辑并重新发送某条用户消息(buildResendPlanAfterEdit,纯函数 + DOM层调用)
+ *
+ *     设计原则:
+ *     本文件里的函数,严格区分"纯逻辑函数"(不触碰DOM、不依赖浏览器API,
+ *     只根据输入参数计算并返回结果)和"副作用函数"(操作DOM、调用浏览器API、
+ *     读写state-store)。纯逻辑函数放在文件前半部分,并且同时兼容Node.js
+ *     环境下被require()引入,方便下面的self_check_frontend_logic.js对它们
+ *     做完全脱离浏览器的自动化测试——这是今天课堂反复强调的"关键逻辑要能
+ *     被独立测试"这条原则,在前端场景下的具体落地方式,道理和后端
+ *     Day10开始反复强调的"业务逻辑与IO操作分离"完全一致。
+ *
+ *     依赖说明:
+ *     本文件假定运行环境中已经存在app.js里定义的全局变量/函数
+ *     (dom、state、appendMessage、renderAllMessages、saveHistoryToLocalStorage、
+ *     sendMessageToBackend、escapeHtml等),在真实页面中需要在app.js
+ *     之后、通过<script defer src="message-actions.js">引入。
+ */
+
+"use strict";
+
+// ============================================================
+// 第一部分:纯逻辑函数(不触碰DOM,可独立测试)
+// ============================================================
+
+/**
+ * 从消息数组中移除指定id的消息,返回一个全新的数组(不修改原数组)。
+ *
+ * 设计意图:
+ *     坚持"不修改原数组、返回新数组"这条不可变数据(immutable data)的原则,
+ *     好处是——调用方如果同时持有旧数组的引用(比如某个正在渲染中的循环变量),
+ *     不会因为这个函数的调用而被意外改变,减少"数据在不知不觉中被改动"
+ *     导致的诡异bug,这也是目前主流前端框架(React等)推崇的数据处理习惯。
+ * @param {Array<{id: string}>} messages 原始消息数组
+ * @param {string} messageId 要移除的消息id
+ * @returns {Array} 移除后的全新数组;如果指定id不存在,返回与原数组内容相同的新数组
+ */
+function removeMessageById(messages, messageId) {
+  if (!Array.isArray(messages)) {
+    throw new TypeError("removeMessageById()的第一个参数必须是数组");
+  }
+  return messages.filter((message) => message.id !== messageId);
+}
+
+/**
+ * 从消息数组中找到"最后一条助手消息"及其在数组中的索引。
+ *
+ * 用途:
+ *     "重新生成回复"功能需要知道两件事——最后一条助手回复具体是哪条
+ *     (以便把它从界面上移除,替换成重新生成的新回复),以及在它之前
+ *     最近的那条用户消息说了什么(以便拿这句话重新请求一次mock后端)。
+ * @param {Array<{id: string, role: string, text: string}>} messages 消息数组
+ * @returns {{lastAssistantMessage: Object|null, lastAssistantIndex: number, precedingUserText: string|null}}
+ */
+function findLastAssistantMessageContext(messages) {
+  if (!Array.isArray(messages)) {
+    throw new TypeError("findLastAssistantMessageContext()的参数必须是数组");
+  }
+
+  let lastAssistantIndex = -1;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i].role === "assistant") {
+      lastAssistantIndex = i;
+      break;
+    }
+  }
+
+  if (lastAssistantIndex === -1) {
+    return { lastAssistantMessage: null, lastAssistantIndex: -1, precedingUserText: null };
+  }
+
+  // 找到这条助手消息"之前最近的一条用户消息",作为重新生成时的提问依据
+  let precedingUserText = null;
+  for (let i = lastAssistantIndex - 1; i >= 0; i -= 1) {
+    if (messages[i].role === "user") {
+      precedingUserText = messages[i].text;
+      break;
+    }
+  }
+
+  return {
+    lastAssistantMessage: messages[lastAssistantIndex],
+    lastAssistantIndex,
+    precedingUserText,
+  };
+}
+
+/**
+ * 计算"编辑并重新发送某条用户消息"这个操作,应该产生的新消息数组
+ * 和需要重新发送的文本内容——这里只做数据计算,不涉及任何网络请求
+ * 或DOM操作,方便单独测试这一步的逻辑是否正确。
+ *
+ * 业务规则:
+ *     用户编辑一条历史消息并重新发送时,约定"这条消息之后的所有消息
+ *     (包括原来对应的助手回复、以及编辑点之后用户可能发过的其他消息)
+ *     全部被移除",只保留编辑点之前的历史,再把编辑后的新内容追加进去
+ *     ——这是主流聊天类产品(包括大部分AI对话产品)处理"编辑重发"的
+ *     标准做法,因为编辑一条较早的消息,理论上意味着"这条消息之后的
+ *     对话分支整体作废,需要重新展开"。
+ * @param {Array<{id: string, role: string, text: string}>} messages 原始消息数组
+ * @param {string} messageId 被编辑的消息id(必须是一条role为user的消息)
+ * @param {string} newText 编辑后的新文本内容
+ * @returns {{updatedMessages: Array, textToResend: string}}
+ * @throws {Error} 当指定id不存在,或者对应的消息不是用户消息时抛出
+ */
+function buildResendPlanAfterEdit(messages, messageId, newText) {
+  if (!Array.isArray(messages)) {
+    throw new TypeError("buildResendPlanAfterEdit()的第一个参数必须是数组");
+  }
+  const targetIndex = messages.findIndex((message) => message.id === messageId);
+  if (targetIndex === -1) {
+    throw new Error(`未找到id为"${messageId}"的消息,无法执行编辑重发`);
+  }
+  if (messages[targetIndex].role !== "user") {
+    throw new Error("只能对用户自己发出的消息执行编辑重发操作");
+  }
+
+  const trimmedText = (newText || "").trim();
+  if (trimmedText.length === 0) {
+    throw new Error("编辑后的内容不能为空");
+  }
+
+  // 保留编辑点之前的全部历史(不包含编辑点本身),编辑点及之后的消息全部丢弃
+  const updatedMessages = messages.slice(0, targetIndex);
+
+  return { updatedMessages, textToResend: trimmedText };
+}
+
+/**
+ * 生成"重新生成回复"操作后的消息数组:把最后一条助手消息从数组中移除,
+ * 其余消息保持不变。
+ * @param {Array<{id: string, role: string}>} messages 原始消息数组
+ * @returns {Array} 移除最后一条助手消息后的全新数组
+ * @throws {Error} 当数组中不存在任何助手消息时抛出
+ */
+function buildRegeneratePlan(messages) {
+  const context = findLastAssistantMessageContext(messages);
+  if (!context.lastAssistantMessage) {
+    throw new Error("当前对话中还没有任何助手回复,无法执行重新生成操作");
+  }
+  if (!context.precedingUserText) {
+    throw new Error("找不到这条助手回复对应的用户提问,无法执行重新生成操作");
+  }
+
+  const updatedMessages = removeMessageById(messages, context.lastAssistantMessage.id);
+  return { updatedMessages, textToResend: context.precedingUserText };
+}
+
+/**
+ * 把一段可能很长的文本,截断成适合"复制成功提示"里展示的简短摘要。
+ * 这是一个很小的纯函数,但故意抽出来独立测试,是为了确保边界情况
+ * (比如文本本身就很短、文本正好等于阈值长度)都被正确处理。
+ * @param {string} text 原始文本
+ * @param {number} maxLength 最大展示长度,默认20
+ * @returns {string} 截断后的摘要,超长时以"……"结尾
+ */
+function buildCopyPreview(text, maxLength = 20) {
+  if (typeof text !== "string") {
+    return "";
+  }
+  if (text.length <= maxLength) {
+    return text;
+  }
+  return `${text.slice(0, maxLength)}……`;
+}
+
+// ============================================================
+// 第二部分:副作用函数(操作DOM、剪贴板、网络请求等,依赖app.js的全局环境)
+// ============================================================
+// 说明:这一部分的函数,只有在真实浏览器页面(引入了app.js之后)才能正常运行,
+// 在Node.js环境下直接调用会因为找不到document/navigator等全局对象而报错——
+// 这正是"纯逻辑"和"副作用"分离的意义所在:第一部分的函数可以脱离浏览器
+// 被自动化测试覆盖到,第二部分的函数职责被压缩到"只做搬运和拼装",
+// 内部不再包含复杂的分支逻辑,即使不能直接被单元测试覆盖,出错的概率
+// 本身也大大降低了。
+
+/**
+ * 把一段文本复制到系统剪贴板,并给出简短的成功/失败反馈。
+ * @param {string} text 要复制的文本内容
+ */
+async function copyMessageToClipboard(text) {
+  try {
+    // navigator.clipboard.writeText是现代浏览器推荐的剪贴板写入方式,
+    // 但它要求页面处于HTTPS或localhost这类"安全上下文"下才能使用,
+    // 在一些老旧浏览器或非安全上下文里可能不可用,因此下面做了降级处理。
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      // 降级方案:创建一个临时的、不可见的textarea,选中其内容后调用
+      // 已经被标记为"过时但仍广泛兼容"的document.execCommand('copy')。
+      const tempTextarea = document.createElement("textarea");
+      tempTextarea.value = text;
+      tempTextarea.style.position = "fixed";
+      tempTextarea.style.opacity = "0";
+      document.body.appendChild(tempTextarea);
+      tempTextarea.select();
+      document.execCommand("copy");
+      document.body.removeChild(tempTextarea);
+    }
+    showErrorBanner(`已复制:${buildCopyPreview(text)}`);
+  } catch (error) {
+    console.warn("[message-actions] 复制到剪贴板失败:", error);
+    showErrorBanner("复制失败,请手动选中文字复制。");
+  }
+}
+
+/**
+ * 删除指定id的消息:更新内存状态、重新整体渲染、持久化到localStorage。
+ * @param {string} messageId 要删除的消息id
+ */
+function deleteMessageById(messageId) {
+  const confirmed = window.confirm("确定要删除这条消息吗?此操作无法撤销。");
+  if (!confirmed) {
+    return;
+  }
+  state.messages = removeMessageById(state.messages, messageId);
+  renderAllMessages();
+  saveHistoryToLocalStorage();
+}
+
+/**
+ * 重新生成最近一条助手回复:移除旧的助手消息,重新调用一次
+ * sendMessageToBackend(mock或真实),用新的回复替换掉旧的回复。
+ */
+async function regenerateLastAssistantReply() {
+  let plan;
+  try {
+    plan = buildRegeneratePlan(state.messages);
+  } catch (error) {
+    showErrorBanner(error.message);
+    return;
+  }
+
+  state.messages = plan.updatedMessages;
+  renderAllMessages();
+  saveHistoryToLocalStorage();
+
+  state.isWaitingForReply = true;
+  dom.sendBtn.disabled = true;
+  showTypingIndicator();
+
+  try {
+    const replyText = await sendMessageToBackend(plan.textToResend);
+    hideTypingIndicator();
+    appendMessage("assistant", replyText);
+  } catch (error) {
+    hideTypingIndicator();
+    showErrorBanner(error.message || "重新生成失败,请稍后重试。");
+    appendMessage("error", `重新生成失败:${error.message || "未知错误"}`);
+  } finally {
+    state.isWaitingForReply = false;
+    updateComposerState();
+  }
+}
+
+/**
+ * 编辑并重新发送一条历史用户消息:计算出编辑之后应该保留的历史,
+ * 丢弃编辑点之后的所有消息,再以编辑后的新内容重新走一次完整的发送流程。
+ * @param {string} messageId 被编辑的用户消息id
+ * @param {string} newText 编辑后的新内容
+ */
+async function editAndResendMessage(messageId, newText) {
+  let plan;
+  try {
+    plan = buildResendPlanAfterEdit(state.messages, messageId, newText);
+  } catch (error) {
+    showErrorBanner(error.message);
+    return;
+  }
+
+  state.messages = plan.updatedMessages;
+  renderAllMessages();
+  saveHistoryToLocalStorage();
+
+  // 复用app.js里输入框的赋值方式,把编辑后的文字"填回"输入框,
+  // 再调用一次统一的sendUserMessage(),这样能完整复用已有的
+  // 校验、渲染、mock请求、异常处理这一整套逻辑,不用重复实现一遍。
+  dom.messageInput.value = plan.textToResend;
+  updateComposerState();
+  await sendUserMessage();
+}
+
+/**
+ * 给一行消息DOM节点,追加一组悬浮操作按钮(复制/删除/编辑或重新生成)。
+ * 不同角色的消息,提供的操作略有差异:
+ * - 用户消息:复制、编辑重发、删除
+ * - 助手消息:复制、重新生成(仅对"最后一条"助手消息显示重新生成按钮)、删除
+ * - 错误消息:仅提供删除
+ * @param {HTMLElement} rowElement 消息行的DOM节点(由app.js的createMessageRowElement创建)
+ * @param {{id: string, role: string, text: string}} message 消息数据
+ * @param {boolean} isLastAssistantMessage 是否是当前对话里最后一条助手消息
+ */
+function attachMessageActionToolbar(rowElement, message, isLastAssistantMessage) {
+  const toolbar = document.createElement("div");
+  toolbar.className = "message-actions";
+
+  const copyBtn = document.createElement("button");
+  copyBtn.type = "button";
+  copyBtn.className = "message-actions__btn";
+  copyBtn.title = "复制";
+  copyBtn.textContent = "复制";
+  copyBtn.addEventListener("click", () => copyMessageToClipboard(message.text));
+  toolbar.appendChild(copyBtn);
+
+  if (message.role === "user") {
+    const editBtn = document.createElement("button");
+    editBtn.type = "button";
+    editBtn.className = "message-actions__btn";
+    editBtn.title = "编辑并重新发送";
+    editBtn.textContent = "编辑重发";
+    editBtn.addEventListener("click", () => {
+      const newText = window.prompt("编辑消息内容:", message.text);
+      if (newText !== null && newText.trim().length > 0) {
+        editAndResendMessage(message.id, newText);
+      }
+    });
+    toolbar.appendChild(editBtn);
+  }
+
+  if (message.role === "assistant" && isLastAssistantMessage) {
+    const regenerateBtn = document.createElement("button");
+    regenerateBtn.type = "button";
+    regenerateBtn.className = "message-actions__btn";
+    regenerateBtn.title = "重新生成这条回复";
+    regenerateBtn.textContent = "重新生成";
+    regenerateBtn.addEventListener("click", () => regenerateLastAssistantReply());
+    toolbar.appendChild(regenerateBtn);
+  }
+
+  const deleteBtn = document.createElement("button");
+  deleteBtn.type = "button";
+  deleteBtn.className = "message-actions__btn message-actions__btn--danger";
+  deleteBtn.title = "删除";
+  deleteBtn.textContent = "删除";
+  deleteBtn.addEventListener("click", () => deleteMessageById(message.id));
+  toolbar.appendChild(deleteBtn);
+
+  rowElement.appendChild(toolbar);
+}
+
+// 兼容Node.js环境(用于self_check_frontend_logic.js对纯逻辑函数做离线自测)
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    removeMessageById,
+    findLastAssistantMessageContext,
+    buildResendPlanAfterEdit,
+    buildRegeneratePlan,
+    buildCopyPreview,
+  };
+}
+```
+
+周晓在评审这份文件时,特别提到了"编辑重发丢弃后续消息"这条业务规则:"这个规则其实存在争议——有些产品会选择‘编辑之后,后面的对话分支保留,变成一个可以左右切换的多分支对话’,这个复杂度明显更高。你选择了‘直接丢弃后续消息’这个更简单的方案,这在‘速成’阶段是完全正确的取舍,但我希望你理解,这是一个‘业务选择’,不是‘技术上唯一正确的做法’——以后如果产品经理告诉你‘我们要支持多分支’,你会知道这不是改一行代码的事,而是要重新设计数据结构。"
+
+### 附录文件3:`style-extended.css` —— 消息操作栏与更多视觉细节扩展
+
+```css
+/*
+  文件名:style-extended.css
+  作者:陈铭(前端速成 · 选做拓展练习,周晓审阅通过并归档)
+  说明:
+      本文件是对style.css的补充扩展,不修改原有文件的任何规则,
+      只新增以下几类样式:
+      1. 消息操作悬浮工具栏(配合message-actions.js的复制/删除/编辑/重新生成按钮)
+      2. 消息进入动画与"骨架屏"加载态占位样式
+      3. 无障碍相关:尊重用户"减少动效"系统偏好设置
+      4. 平板尺寸的中间断点响应式规则(补充style.css里只有手机断点的不足)
+      5. Firefox浏览器的滚动条样式(style.css里的自定义滚动条只对WebKit系浏览器生效)
+
+      引入方式:在chat_static.html的<head>里,style.css之后追加一行
+      <link rel="stylesheet" href="style-extended.css">
+*/
+
+/* ============================================================
+   1. 消息操作悬浮工具栏
+   ============================================================ */
+
+/* 消息行需要设置position: relative,才能让操作工具栏用绝对定位精确地
+   悬浮在消息气泡的右上角(或左上角),而不会影响其他消息的正常布局 */
+.message-row {
+  position: relative;
+}
+
+.message-actions {
+  position: absolute;
+  top: -14px;
+  display: flex;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  background-color: var(--color-bg-panel);
+  border: 1px solid var(--color-border);
+  box-shadow: var(--shadow-bubble);
+  /* 默认不可见,只有鼠标悬浮到这一行消息上时才显示——
+     这是聊天类产品里非常常见的"悬浮才显示操作"的交互模式,
+     好处是不会让消息列表在正常浏览时显得过于拥挤和"按钮堆砌"。 */
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+}
+
+.message-row:hover .message-actions,
+.message-row:focus-within .message-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* 用户消息靠右显示,操作工具栏对应悬浮在气泡的右上角;
+   助手/错误消息靠左显示,操作工具栏悬浮在左上角,和各自的气泡方向保持一致 */
+.message-row--user .message-actions {
+  right: 40px; /* 预留出头像的宽度,避免和头像重叠 */
+}
+
+.message-row--assistant .message-actions,
+.message-row--error .message-actions {
+  left: 40px;
+}
+
+.message-actions__btn {
+  border: none;
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: 0.72rem;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
+}
+
+.message-actions__btn:hover {
+  background-color: var(--color-bg-assistant-bubble);
+  color: var(--color-brand);
+}
+
+.message-actions__btn--danger:hover {
+  background-color: var(--color-danger-bg);
+  color: var(--color-danger);
+}
+
+/* ============================================================
+   2. 消息进入动画
+   ============================================================ */
+
+/* 新消息出现时,配合一个轻微的"从下方淡入滑入"的动效,
+   让消息列表的更新过程看起来不那么"生硬"——这是一个很小的
+   视觉细节,但恰恰是周晓在旁白里提到的"用户体感"的具体体现之一 */
+@keyframes message-enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.message-row {
+  animation: message-enter 0.22s ease-out;
+}
+
+/* 尊重用户系统层面的"减少动态效果"偏好设置——
+   有些用户(比如对动效敏感、容易引发不适的用户)会在操作系统里
+   开启这个选项,负责任的前端页面应该识别并遵守这个偏好,
+   而不是无条件地播放所有动画。这是无障碍设计里容易被忽略、
+   但很值得养成习惯的一条规则。 */
+@media (prefers-reduced-motion: reduce) {
+  .message-row,
+  .typing-dot,
+  .error-banner {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+/* ============================================================
+   3. 骨架屏加载态(用于演示"内容加载中"的另一种视觉方案,
+      和已有的typing指示器并存,可以根据场景灵活选用)
+   ============================================================ */
+
+.skeleton-message {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 14px;
+  border-radius: var(--radius-lg);
+  border-bottom-left-radius: var(--radius-sm);
+  background-color: var(--color-bg-assistant-bubble);
+  max-width: 60%;
+}
+
+.skeleton-line {
+  height: 12px;
+  border-radius: 6px;
+  background: linear-gradient(
+    90deg,
+    rgba(0, 0, 0, 0.06) 25%,
+    rgba(0, 0, 0, 0.12) 37%,
+    rgba(0, 0, 0, 0.06) 63%
+  );
+  background-size: 400% 100%;
+  animation: skeleton-shimmer 1.4s ease infinite;
+}
+
+.skeleton-line--short {
+  width: 40%;
+}
+
+@keyframes skeleton-shimmer {
+  0% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0 50%;
+  }
+}
+
+/* ============================================================
+   4. 平板断点(补充style.css里缺失的"中等宽度"响应式规则)
+   ============================================================ */
+
+@media (min-width: 601px) and (max-width: 900px) {
+  .app-shell {
+    max-width: 100%;
+    margin: 0;
+  }
+
+  .message-bubble {
+    max-width: 75%; /* 平板宽度介于手机和桌面之间,气泡宽度也取一个折中值 */
+  }
+
+  /* 平板上悬浮工具栏改为始终可见(而不是hover才显示)——
+     因为平板大多用触摸操作,没有鼠标"悬浮"这个概念,
+     hover触发的交互在纯触摸设备上几乎不可用,必须改成常驻显示或点击触发 */
+  .message-actions {
+    opacity: 1;
+    pointer-events: auto;
+    position: static;
+    margin-top: 4px;
+    box-shadow: none;
+    border: none;
+    background: transparent;
+  }
+}
+
+/* ============================================================
+   5. Firefox滚动条样式(style.css里的::-webkit-scrollbar只对
+      Chrome/Edge/Safari等WebKit/Blink系浏览器生效,Firefox需要
+      单独用标准的scrollbar-width/scrollbar-color属性)
+   ============================================================ */
+
+.chat-main {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border) transparent;
+}
+
+/* ============================================================
+   6. 高对比度主题(为视觉障碍或弱视用户提供的可选主题,
+      通过给<body>添加class启用,今天暂不强制要求接入交互开关,
+      样式规则先准备好,方便以后随时接入)
+   ============================================================ */
+
+body.theme-high-contrast {
+  --color-bg-page: #000000;
+  --color-bg-panel: #000000;
+  --color-bg-assistant-bubble: #1a1a1a;
+  --color-bg-user-bubble: #ffff00;
+  --color-text-primary: #ffffff;
+  --color-text-on-brand: #000000;
+  --color-border: #ffffff;
+}
+
+body.theme-high-contrast .message-bubble {
+  border: 1px solid var(--color-border);
+}
+
+/* ============================================================
+   7. 打印样式(极少数场景下用户可能想把一段对话记录打印/导出为PDF,
+      打印时不需要显示输入区、操作按钮、typing指示器这些"交互专用"的元素)
+   ============================================================ */
+
+@media print {
+  .composer,
+  .message-actions,
+  .typing-indicator,
+  .error-banner {
+    display: none !important;
+  }
+
+  .app-shell {
+    box-shadow: none;
+    max-width: 100%;
+  }
+
+  .message-bubble {
+    box-shadow: none;
+    border: 1px solid #ccc;
+  }
+}
+```
+
+周晓看到打印样式那一段,笑了一下:"这个是我没想到你会加的——但确实是真实产品里会被用户提出来的需求,‘我想把这段对话导出来发给同事看’,这种需求经常被前端工程师忽略,直到有一天产品经理拿着一张‘打印出来乱糟糟的截图’来找你。"
+
+### 附录文件4:`self_check_frontend_logic.js` —— 纯逻辑自动化自测脚本(可用Node.js直接运行)
+
+陈铭在写完前两个文件之后,想起了这几天反复被强调的"关键逻辑要有自动化测试"这条原则,于是照着Day01写Python自测脚本的思路,给这几个新的JS纯函数也补了一份不依赖浏览器的自测脚本。
+
+```javascript
+/**
+ * 文件名:self_check_frontend_logic.js
+ * 作者:陈铭(前端速成 · 选做拓展练习,周晓审阅通过并归档)
+ * 说明:
+ *     本脚本专门测试state-store.js和message-actions.js里"不触碰DOM"的
+ *     纯逻辑函数,可以直接用Node.js运行,不需要打开浏览器,不需要
+ *     安装任何第三方测试框架(比如Jest/Mocha),只用最基础的
+ *     assert模块和手写的测试运行器,足够覆盖今天这批函数的核心行为。
+ *
+ *     运行方式:
+ *         node self_check_frontend_logic.js
+ *
+ *     这份脚本的存在意义,和Day01的self_check_tests_extended.py、
+ *     Day21的test_advanced_scenarios_pytest.py是完全一致的教学目标——
+ *     "写完代码不能只靠人眼看一遍就认为它是对的,必须有一份可以
+ *     反复重复执行、覆盖边界情况的自动化验证"。
+ */
+
+"use strict";
+
+const assert = require("assert");
+const { createStore } = require("./state-store.js");
+const {
+  removeMessageById,
+  findLastAssistantMessageContext,
+  buildResendPlanAfterEdit,
+  buildRegeneratePlan,
+  buildCopyPreview,
+} = require("./message-actions.js");
+
+// ============================================================
+// 一个极简的测试运行器:记录每个测试用例的通过/失败情况,
+// 最后统一打印汇总报告。没有引入任何第三方测试框架,
+// 目的是让读者能一眼看清"测试框架本身"是怎么工作的,
+// 不被框架的魔法语法遮蔽了测试的本质——"运行代码,检查结果是否符合预期"。
+// ============================================================
+
+const testResults = [];
+
+/**
+ * 注册并立即执行一个测试用例,记录其执行结果。
+ * @param {string} name 测试用例名称
+ * @param {Function} testFn 测试函数,内部使用assert断言,断言失败会抛出异常
+ */
+function test(name, testFn) {
+  try {
+    testFn();
+    testResults.push({ name, passed: true, error: null });
+  } catch (error) {
+    testResults.push({ name, passed: false, error });
+  }
+}
+
+function printSummaryAndExit() {
+  const failedCases = testResults.filter((r) => !r.passed);
+
+  testResults.forEach((result) => {
+    if (result.passed) {
+      console.log(`✅ ${result.name}`);
+    } else {
+      console.log(`❌ ${result.name}`);
+      console.log(`   错误信息:${result.error.message}`);
+    }
+  });
+
+  console.log("\n========== 测试汇总 ==========");
+  console.log(`总计:${testResults.length}  通过:${testResults.length - failedCases.length}  失败:${failedCases.length}`);
+
+  if (failedCases.length > 0) {
+    console.log("存在失败的测试用例,退出码设置为1(便于CI流水线识别本次自测未通过)。");
+    process.exitCode = 1;
+  } else {
+    console.log("全部测试用例通过!");
+  }
+}
+
+// ============================================================
+// 第一部分:state-store.js 的测试用例
+// ============================================================
+
+test("createStore: 初始状态应该能被getState()正确读取", () => {
+  const store = createStore({ count: 0, name: "苍穹" });
+  const state = store.getState();
+  assert.strictEqual(state.count, 0);
+  assert.strictEqual(state.name, "苍穹");
+});
+
+test("createStore: getState()返回的应该是拷贝,不是内部引用", () => {
+  const store = createStore({ count: 0 });
+  const snapshot = store.getState();
+  snapshot.count = 999; // 修改拿到的快照,不应该影响store内部真正的状态
+  assert.strictEqual(store.getState().count, 0, "外部修改快照不应该污染store内部状态");
+});
+
+test("createStore: setState()传对象时应该和现有状态做浅合并,而不是整体替换", () => {
+  const store = createStore({ count: 0, name: "苍穹" });
+  store.setState({ count: 5 });
+  const state = store.getState();
+  assert.strictEqual(state.count, 5);
+  assert.strictEqual(state.name, "苍穹", "没有被setState涉及的字段应该保持原值不变");
+});
+
+test("createStore: setState()传函数时,应该基于最新状态计算,支持连续多次调用", () => {
+  const store = createStore({ count: 0 });
+  store.setState((prev) => ({ count: prev.count + 1 }));
+  store.setState((prev) => ({ count: prev.count + 1 }));
+  store.setState((prev) => ({ count: prev.count + 1 }));
+  assert.strictEqual(store.getState().count, 3, "连续三次+1,最终应该是3,不能因为读到旧状态而漏计");
+});
+
+test("createStore: subscribe()注册的订阅者应该在setState()后被调用,且能拿到最新状态", () => {
+  const store = createStore({ count: 0 });
+  let receivedCount = null;
+  store.subscribe((state) => {
+    receivedCount = state.count;
+  });
+  store.setState({ count: 42 });
+  assert.strictEqual(receivedCount, 42);
+});
+
+test("createStore: unsubscribe之后,订阅者不应该再被通知", () => {
+  const store = createStore({ count: 0 });
+  let callCount = 0;
+  const unsubscribe = store.subscribe(() => {
+    callCount += 1;
+  });
+  store.setState({ count: 1 });
+  unsubscribe();
+  store.setState({ count: 2 });
+  assert.strictEqual(callCount, 1, "取消订阅之后的setState不应该再触发这个订阅者");
+});
+
+test("createStore: 一个订阅者内部抛出异常,不应该影响其他订阅者被正常调用", () => {
+  const store = createStore({ count: 0 });
+  let secondListenerCalled = false;
+  store.subscribe(() => {
+    throw new Error("故意抛出的异常,模拟某个订阅者内部出错");
+  });
+  store.subscribe(() => {
+    secondListenerCalled = true;
+  });
+  store.setState({ count: 1 });
+  assert.strictEqual(secondListenerCalled, true, "第一个订阅者出错,不应该阻止第二个订阅者被调用");
+});
+
+test("createStore: setState()传入非对象、非函数参数时应该抛出TypeError", () => {
+  const store = createStore({ count: 0 });
+  assert.throws(() => store.setState("这不是一个对象"), TypeError);
+  assert.throws(() => store.setState(123), TypeError);
+});
+
+test("createStore: 多个独立的store实例之间的状态应该完全隔离", () => {
+  const storeA = createStore({ count: 0 });
+  const storeB = createStore({ count: 0 });
+  storeA.setState({ count: 100 });
+  assert.strictEqual(storeA.getState().count, 100);
+  assert.strictEqual(storeB.getState().count, 0, "storeA的修改不应该影响storeB");
+});
+
+test("createStore: listenerCount()应该正确反映当前订阅者数量", () => {
+  const store = createStore({});
+  assert.strictEqual(store.listenerCount(), 0);
+  const unsub1 = store.subscribe(() => {});
+  const unsub2 = store.subscribe(() => {});
+  assert.strictEqual(store.listenerCount(), 2);
+  unsub1();
+  assert.strictEqual(store.listenerCount(), 1);
+  unsub2();
+  assert.strictEqual(store.listenerCount(), 0);
+});
+
+// ============================================================
+// 第二部分:message-actions.js 纯逻辑函数的测试用例
+// ============================================================
+
+const sampleConversation = [
+  { id: "m1", role: "assistant", text: "你好,我是苍穹智能客服助手。" },
+  { id: "m2", role: "user", text: "帮我查一下退货政策" },
+  { id: "m3", role: "assistant", text: "苍穹支持7天无理由退货。" },
+  { id: "m4", role: "user", text: "谢谢" },
+  { id: "m5", role: "assistant", text: "不客气,还有其他问题吗?" },
+];
+
+test("removeMessageById: 应该正确移除指定id的消息,不影响其他消息", () => {
+  const result = removeMessageById(sampleConversation, "m3");
+  assert.strictEqual(result.length, 4);
+  assert.strictEqual(result.some((m) => m.id === "m3"), false);
+  assert.strictEqual(sampleConversation.length, 5, "原数组不应该被修改(不可变数据原则)");
+});
+
+test("removeMessageById: 移除一个不存在的id,应该返回内容不变的新数组", () => {
+  const result = removeMessageById(sampleConversation, "不存在的id");
+  assert.strictEqual(result.length, sampleConversation.length);
+});
+
+test("removeMessageById: 传入非数组参数应该抛出TypeError", () => {
+  assert.throws(() => removeMessageById("不是数组", "m1"), TypeError);
+});
+
+test("findLastAssistantMessageContext: 应该正确找到最后一条助手消息及其对应的用户提问", () => {
+  const context = findLastAssistantMessageContext(sampleConversation);
+  assert.strictEqual(context.lastAssistantMessage.id, "m5");
+  assert.strictEqual(context.precedingUserText, "谢谢");
+});
+
+test("findLastAssistantMessageContext: 完全没有助手消息时,应该返回null而不是抛异常", () => {
+  const onlyUserMessages = [
+    { id: "u1", role: "user", text: "你好" },
+    { id: "u2", role: "user", text: "在吗" },
+  ];
+  const context = findLastAssistantMessageContext(onlyUserMessages);
+  assert.strictEqual(context.lastAssistantMessage, null);
+  assert.strictEqual(context.lastAssistantIndex, -1);
+});
+
+test("findLastAssistantMessageContext: 助手消息前面没有任何用户消息时,precedingUserText应该是null", () => {
+  const onlyAssistantFirst = [
+    { id: "a1", role: "assistant", text: "欢迎语,还没有用户说过话" },
+  ];
+  const context = findLastAssistantMessageContext(onlyAssistantFirst);
+  assert.strictEqual(context.lastAssistantMessage.id, "a1");
+  assert.strictEqual(context.precedingUserText, null);
+});
+
+test("buildRegeneratePlan: 应该正确移除最后一条助手消息,并返回对应的用户提问用于重新请求", () => {
+  const plan = buildRegeneratePlan(sampleConversation);
+  assert.strictEqual(plan.updatedMessages.length, 4);
+  assert.strictEqual(plan.updatedMessages.some((m) => m.id === "m5"), false);
+  assert.strictEqual(plan.textToResend, "谢谢");
+});
+
+test("buildRegeneratePlan: 当对话中完全没有助手消息时应该抛出异常", () => {
+  const onlyUserMessages = [{ id: "u1", role: "user", text: "你好" }];
+  assert.throws(() => buildRegeneratePlan(onlyUserMessages), /还没有任何助手回复/);
+});
+
+test("buildResendPlanAfterEdit: 应该正确丢弃编辑点之后的所有消息", () => {
+  const plan = buildResendPlanAfterEdit(sampleConversation, "m2", "帮我查一下换货政策");
+  assert.strictEqual(plan.updatedMessages.length, 1, "编辑m2(第二条),应该只保留m1这一条历史");
+  assert.strictEqual(plan.updatedMessages[0].id, "m1");
+  assert.strictEqual(plan.textToResend, "帮我查一下换货政策");
+});
+
+test("buildResendPlanAfterEdit: 编辑内容应该自动去除首尾空白", () => {
+  const plan = buildResendPlanAfterEdit(sampleConversation, "m2", "   带了很多空格的内容   ");
+  assert.strictEqual(plan.textToResend, "带了很多空格的内容");
+});
+
+test("buildResendPlanAfterEdit: 编辑不存在的消息id应该抛出异常", () => {
+  assert.throws(() => buildResendPlanAfterEdit(sampleConversation, "不存在的id", "新内容"), /未找到id/);
+});
+
+test("buildResendPlanAfterEdit: 尝试编辑一条助手消息(而不是用户消息)应该抛出异常", () => {
+  assert.throws(() => buildResendPlanAfterEdit(sampleConversation, "m1", "新内容"), /只能对用户自己发出的消息/);
+});
+
+test("buildResendPlanAfterEdit: 编辑后的内容如果全是空白字符,应该抛出异常", () => {
+  assert.throws(() => buildResendPlanAfterEdit(sampleConversation, "m2", "     "), /不能为空/);
+});
+
+test("buildCopyPreview: 短文本应该原样返回,不做截断", () => {
+  assert.strictEqual(buildCopyPreview("你好苍穹"), "你好苍穹");
+});
+
+test("buildCopyPreview: 超长文本应该被截断并追加省略提示", () => {
+  const longText = "这是一段非常长的消息内容,用来测试复制预览的截断逻辑是否正确生效";
+  const preview = buildCopyPreview(longText, 10);
+  assert.strictEqual(preview, `${longText.slice(0, 10)}……`);
+});
+
+test("buildCopyPreview: 文本长度正好等于阈值时,不应该被截断(边界情况)", () => {
+  const exactText = "1234567890"; // 恰好10个字符
+  assert.strictEqual(buildCopyPreview(exactText, 10), exactText, "长度恰好等于阈值,应视为不超长,不添加省略号");
+});
+
+test("buildCopyPreview: 传入非字符串参数时应该安全返回空字符串,而不是抛出异常", () => {
+  assert.strictEqual(buildCopyPreview(null), "");
+  assert.strictEqual(buildCopyPreview(undefined), "");
+  assert.strictEqual(buildCopyPreview(12345), "");
+});
+
+// ============================================================
+// 运行全部测试并打印汇总报告
+// ============================================================
+
+printSummaryAndExit();
+```
+
+陈铭第一次运行这份脚本的时候,`buildCopyPreview`那个"长度正好等于阈值"的测试用例失败了一次——他最初的实现用的是`text.length < maxLength`做判断,导致长度恰好等于`maxLength`的文本被误判成"超长",多截掉了最后一个字符。这个bug如果只靠人眼过一遍代码,很容易被忽略,恰恰是这种"边界值"的测试用例把它揪出来的。他把判断条件改成`<=`之后,重新运行,全部测试通过。他在笔记里写道:"这次踩坑,和Day01我在字符串长度计算上犯的错,性质上其实是一类问题——‘等于’这个边界,永远是最容易被大脑自动忽略、却最应该被测试用例明确覆盖的地方。"
+
+---
+
 ## 明日预告
 
 晚自习收尾前,老王把今天四人的静态页面依次投到大屏幕上,挨个点评了一遍视觉效果,最后说了一句:"你们今天做的这个东西,已经很像一个真正的产品雏形了——但它现在还是一座'空房子',没有真正的水电线路,所有的对话内容都是你们自己在JS里编出来的假数据。"
