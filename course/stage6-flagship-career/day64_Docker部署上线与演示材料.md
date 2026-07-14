@@ -2616,6 +2616,2078 @@ groups:
           description: "主模型提供方出现异常,已自动切换至备用模型提供方,请核实主模型服务状态"
 ```
 
+### 十一、生产镜像 Dockerfile 集合(多阶段构建 + 非root运行 + 健康检查依赖预装)
+
+> 说明:六个案例中提到的"健康检查依赖缺失"踩坑经验已全部体现在下述Dockerfile中——所有需要HTTP健康检查的服务镜像均显式安装`curl`,数据库类服务复用官方镜像自带的检查命令。所有服务均以非root用户运行,符合安全基线要求。
+
+```dockerfile
+# ============================================================
+# Dockerfile - core-api (Python 3.11 + FastAPI)
+# 多阶段构建:builder阶段安装依赖并编译wheel包,runtime阶段仅拷贝
+# 必要产物,最终镜像不包含编译工具链,减小攻击面与体积
+# ============================================================
+
+# -------- 阶段一:依赖构建 --------
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+# 安装编译期依赖(仅在builder阶段存在,不会进入最终镜像)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        libpq-dev \
+        gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+# 预编译为wheel包,加速最终阶段的安装且不需要保留构建工具链
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip wheel --no-cache-dir --wheel-dir /build/wheels -r requirements.txt
+
+# -------- 阶段二:运行时镜像 --------
+FROM python:3.11-slim AS runtime
+
+LABEL maintainer="蓬远科技-核心开发组"
+LABEL project="cangqiong-core-api"
+LABEL version="1.0.0"
+
+# 生产环境健康检查依赖curl,精简镜像默认不带,这里显式安装
+# (对应本篇课堂笔记中"健康检查依赖缺失导致假阳性unhealthy"的踩坑教训)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        tzdata \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+
+# 创建非root运行用户,避免容器进程以root权限运行
+RUN groupadd -r cangqiong && useradd -r -g cangqiong -d /app -s /sbin/nologin cangqiong
+
+WORKDIR /app
+
+COPY --from=builder /build/wheels /wheels
+COPY requirements.txt .
+RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt \
+    && rm -rf /wheels
+
+COPY --chown=cangqiong:cangqiong ./app /app/app
+COPY --chown=cangqiong:cangqiong ./alembic /app/alembic
+COPY --chown=cangqiong:cangqiong ./alembic.ini /app/alembic.ini
+COPY --chown=cangqiong:cangqiong ./manage.py /app/manage.py
+
+# 应用日志与临时文件目录提前创建并授权,避免运行时因权限不足写入失败
+RUN mkdir -p /app/logs /app/tmp \
+    && chown -R cangqiong:cangqiong /app/logs /app/tmp
+
+USER cangqiong
+
+EXPOSE 8080
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    APP_MODULE="app.main:app" \
+    WORKERS=4
+
+HEALTHCHECK --interval=15s --timeout=5s --retries=3 --start-period=40s \
+    CMD curl -f http://127.0.0.1:8080/health/live || exit 1
+
+ENTRYPOINT ["gunicorn"]
+CMD ["app.main:app", "-k", "uvicorn.workers.UvicornWorker", \
+     "--bind", "0.0.0.0:8080", "--workers", "4", \
+     "--timeout", "60", "--graceful-timeout", "30", \
+     "--access-logfile", "-", "--error-logfile", "-"]
+```
+
+```dockerfile
+# ============================================================
+# Dockerfile - agent-orchestrator (Python 3.11)
+# 该服务在内存中维护多Agent会话上下文,资源占用相对较高,
+# 构建时额外安装了性能分析工具以便生产环境按需临时开启profiling
+# ============================================================
+
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip wheel --no-cache-dir --wheel-dir /build/wheels -r requirements.txt
+
+FROM python:3.11-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl tzdata \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+
+RUN groupadd -r cangqiong && useradd -r -g cangqiong -d /app -s /sbin/nologin cangqiong
+
+WORKDIR /app
+COPY --from=builder /build/wheels /wheels
+COPY requirements.txt .
+RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt \
+    && rm -rf /wheels
+
+COPY --chown=cangqiong:cangqiong ./orchestrator /app/orchestrator
+
+RUN mkdir -p /app/logs && chown -R cangqiong:cangqiong /app/logs
+
+USER cangqiong
+
+EXPOSE 8090
+
+HEALTHCHECK --interval=15s --timeout=5s --retries=3 --start-period=40s \
+    CMD curl -f http://127.0.0.1:8090/health/ready || exit 1
+
+ENTRYPOINT ["python", "-m", "orchestrator.main"]
+```
+
+```dockerfile
+# ============================================================
+# Dockerfile - doc-parser(文档解析服务,涉及PDF/Word/Excel多格式解析)
+# 需要额外的系统级依赖(用于解析扫描件OCR和Office文档),这些依赖
+# 体积较大,单独放在一个专用的基础镜像层,方便多个解析相关服务复用
+# ============================================================
+
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential gcc libpoppler-cpp-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip wheel --no-cache-dir --wheel-dir /build/wheels -r requirements.txt
+
+FROM python:3.11-slim AS runtime
+
+# tesseract-ocr 用于扫描件文字识别,libreoffice用于Office文档转换预览
+# 这两个组件体积较大,是doc-parser镜像内存/磁盘占用偏高的主要原因,
+# 因此上午资源配额讨论时给doc-parser的内存上限设置为2048M
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl tzdata tesseract-ocr tesseract-ocr-chi-sim poppler-utils \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+
+RUN groupadd -r cangqiong && useradd -r -g cangqiong -d /app -s /sbin/nologin cangqiong
+
+WORKDIR /app
+COPY --from=builder /build/wheels /wheels
+COPY requirements.txt .
+RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt \
+    && rm -rf /wheels
+
+COPY --chown=cangqiong:cangqiong ./parser /app/parser
+
+RUN mkdir -p /app/tmp_uploads /app/logs \
+    && chown -R cangqiong:cangqiong /app/tmp_uploads /app/logs
+
+USER cangqiong
+
+EXPOSE 8300
+
+HEALTHCHECK --interval=20s --timeout=5s --retries=3 --start-period=30s \
+    CMD curl -f http://127.0.0.1:8300/health/ready || exit 1
+
+ENTRYPOINT ["python", "-m", "parser.server"]
+```
+
+```dockerfile
+# ============================================================
+# Dockerfile - console-web(前端控制台,Node构建 + Nginx静态托管)
+# 采用构建产物与运行时分离的多阶段方案,最终镜像只包含静态资源
+# 和一个极简的Nginx,不含任何Node运行时,显著缩小镜像体积
+# ============================================================
+
+# -------- 阶段一:前端构建 --------
+FROM node:20-alpine AS builder
+
+WORKDIR /build
+COPY package.json package-lock.json ./
+RUN npm ci --prefer-offline --no-audit --progress=false
+
+COPY . .
+# 生产构建,注入生产API地址等环境变量
+ARG VITE_API_BASE_URL=https://cangqiong.pengyuan-intelligence.com/api
+ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
+RUN npm run build
+
+# -------- 阶段二:静态资源托管 --------
+FROM nginx:1.25.4-alpine AS runtime
+
+LABEL project="cangqiong-console-web"
+
+RUN apk add --no-cache curl tzdata \
+    && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+
+COPY --from=builder /build/dist /usr/share/nginx/html
+COPY ./nginx/console-web.conf /etc/nginx/conf.d/default.conf
+
+# Nginx官方镜像默认以root启动master进程再降权到worker,这里进一步
+# 收紧:worker进程运行账号固定为nginx非特权用户(镜像已内置该用户)
+RUN chown -R nginx:nginx /usr/share/nginx/html /var/cache/nginx /var/log/nginx \
+    && sed -i 's/^user nginx;/user nginx;/' /etc/nginx/nginx.conf
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=20s --timeout=5s --retries=3 --start-period=20s \
+    CMD curl -f http://127.0.0.1:3000/ || exit 1
+
+CMD ["nginx", "-g", "daemon off;"]
+```
+
+### 十二、Kubernetes 生产级部署清单(面向验收后扩容路线的预研版本)
+
+> 背景说明:孙昊上午提到"目前规模先用Compose,后续扩容再上K8s",团队在晚间复盘时把这份K8s清单作为技术储备提前整理出来,方便验收通过后进入下一阶段时可以直接复用,而不必从零设计。清单以core-api服务为主线,包含命名空间、资源配额、部署、服务、水平自动扩缩容、Pod中断预算、Ingress等企业级要素。
+
+```yaml
+# ============================================================
+# k8s/00-namespace-and-quota.yaml
+# 命名空间隔离与资源配额(防止单个命名空间无限制占用集群资源)
+# ============================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cangqiong-prod
+  labels:
+    project: cangqiong
+    env: production
+    owner: pengyuan-tech
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: cangqiong-prod-quota
+  namespace: cangqiong-prod
+spec:
+  hard:
+    requests.cpu: "16"
+    requests.memory: 32Gi
+    limits.cpu: "32"
+    limits.memory: 64Gi
+    pods: "60"
+    services: "20"
+    persistentvolumeclaims: "10"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: cangqiong-prod-limitrange
+  namespace: cangqiong-prod
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "500m"
+        memory: 512Mi
+      defaultRequest:
+        cpu: "100m"
+        memory: 128Mi
+      max:
+        cpu: "4"
+        memory: 4Gi
+```
+
+```yaml
+# ============================================================
+# k8s/10-core-api-configmap-secret.yaml
+# 非敏感配置使用ConfigMap,敏感配置使用Secret,两者分离管理
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: core-api-config
+  namespace: cangqiong-prod
+data:
+  APP_ENV: "production"
+  DB_HOST: "postgres-primary.cangqiong-prod.svc.cluster.local"
+  DB_PORT: "5432"
+  DB_NAME: "cangqiong_prod"
+  DB_USER: "cangqiong_app"
+  REDIS_HOST: "redis.cangqiong-prod.svc.cluster.local"
+  REDIS_PORT: "6379"
+  LOG_FORMAT: "json"
+  LOG_LEVEL: "info"
+  LOG_MASK_SENSITIVE: "true"
+  TZ: "Asia/Shanghai"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: core-api-secret
+  namespace: cangqiong-prod
+type: Opaque
+stringData:
+  # 生产环境实际值通过CI/CD流水线在部署时从Vault注入,此处仅为占位说明
+  DB_PASSWORD: "__INJECT_FROM_VAULT__"
+  REDIS_PASSWORD: "__INJECT_FROM_VAULT__"
+  JWT_SIGNING_KEY: "__INJECT_FROM_VAULT__"
+  MODEL_API_KEY: "__INJECT_FROM_VAULT__"
+```
+
+```yaml
+# ============================================================
+# k8s/20-core-api-deployment.yaml
+# 核心API服务的Deployment定义,包含滚动更新策略、探针、资源限制、
+# 反亲和性调度(避免多个副本被集中调度到同一物理节点造成单点风险)
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: core-api
+  namespace: cangqiong-prod
+  labels:
+    app: core-api
+    tier: application
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # 滚动更新时最多同时多出1个新副本,最多允许0个副本不可用,
+      # 即"先加后减"模式,保证更新期间可用副本数不低于原始数量
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: core-api
+  template:
+    metadata:
+      labels:
+        app: core-api
+        tier: application
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: core-api
+                topologyKey: kubernetes.io/hostname
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: core-api
+          image: registry.pengyuan.internal/cangqiong/core-api:1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          envFrom:
+            - configMapRef:
+                name: core-api-config
+            - secretRef:
+                name: core-api-secret
+          resources:
+            requests:
+              cpu: "300m"
+              memory: 384Mi
+            limits:
+              cpu: "1000m"
+              memory: 768Mi
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # 优雅停机:先给应用发送SIGTERM并预留时间完成正在处理的请求,
+          # 避免Pod被直接杀死导致进行中的用户请求收到连接重置
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 10"]
+          volumeMounts:
+            - name: app-logs
+              mountPath: /app/logs
+      volumes:
+        - name: app-logs
+          emptyDir: {}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+```
+
+```yaml
+# ============================================================
+# k8s/21-core-api-service-and-hpa.yaml
+# Service定义(集群内部访问入口) + 水平自动扩缩容(HPA)
+# ============================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: core-api
+  namespace: cangqiong-prod
+  labels:
+    app: core-api
+spec:
+  type: ClusterIP
+  selector:
+    app: core-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: core-api-hpa
+  namespace: cangqiong-prod
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: core-api
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75
+  behavior:
+    scaleDown:
+      # 缩容行为放缓,避免流量短暂下降就立刻缩容,造成后续流量回升时
+      # 又要重新扩容,产生不必要的抖动(即"scale down抖动"问题)
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: core-api-pdb
+  namespace: cangqiong-prod
+spec:
+  # 集群维护(如节点滚动升级)时,最多允许1个副本同时不可用,
+  # 保证任意时刻至少有min(replicas-1, 2)个副本对外提供服务
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: core-api
+```
+
+```yaml
+# ============================================================
+# k8s/22-ingress.yaml
+# 对外流量入口,基于路径的路由分发 + TLS终止 + 限流注解
+# ============================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cangqiong-ingress
+  namespace: cangqiong-prod
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "20m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    # 每个客户端IP限速,防止单一来源的异常流量拖垫整体服务质量
+    nginx.ingress.kubernetes.io/limit-rps: "50"
+spec:
+  tls:
+    - hosts:
+        - cangqiong.pengyuan-intelligence.com
+      secretName: cangqiong-tls-cert
+  rules:
+    - host: cangqiong.pengyuan-intelligence.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: core-api
+                port:
+                  number: 8080
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: console-web
+                port:
+                  number: 3000
+```
+
+### 十三、会话一致性与Redis会话外置改造(应对蓝绿切换时的"系统失忆"问题)
+
+> 背景:周娜在晨会上提出的"切流量瞬间用户会话被分裂到blue/green两个不同版本容器"的问题,团队当天采用了临时方案(Nginx一致性哈希)先顶住上线,同时把"会话完全外置到Redis"列为技术债。以下代码是该技术债在当晚被提前落地的过渡实现,供后续正式替换内存态会话时直接复用。
+
+```nginx
+# nginx/upstream.d/core-api-sticky.conf
+# 临时方案:基于客户端会话Cookie做一致性哈希,保证蓝绿切换过渡期内
+# 同一个会话尽量落在同一个后端,减少上下文分裂的概率(非100%保证,
+# 仅作为Redis会话外置改造完成前的过渡缓解措施)
+
+upstream core_api_upstream_sticky {
+    hash $cookie_cangqiong_session_id consistent;
+    server cangqiong-core-api-blue:8080 max_fails=3 fail_timeout=10s;
+    server cangqiong-core-api-green:8080 max_fails=3 fail_timeout=10s;
+    keepalive 64;
+}
+
+server {
+    listen 80;
+    server_name cangqiong.pengyuan-intelligence.com;
+
+    location /api/ {
+        proxy_pass http://core_api_upstream_sticky/;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+
+        # 如果客户端首次访问还没有会话Cookie,由网关生成一个并回写,
+        # 保证后续同一用户的请求能够被一致性哈希路由到同一后端
+        add_header Set-Cookie "cangqiong_session_id=$request_id; Path=/; HttpOnly" always;
+    }
+}
+```
+
+```python
+# ============================================================
+# session_store.py
+# Agent会话上下文的Redis外置存储实现
+# 目标:让core-api / agent-orchestrator容器本身变成完全无状态,
+# 任意请求落在哪个版本的容器上,都能从Redis读到同一份会话数据,
+# 从根本上解决蓝绿切换过程中的"上下文分裂"问题
+# ============================================================
+
+import json
+import time
+import uuid
+from dataclasses import dataclass, field, asdict
+from typing import Any, Optional
+
+import redis
+
+
+# Redis中会话数据的键名前缀,统一管理便于运维排查和批量清理
+SESSION_KEY_PREFIX = "cangqiong:session:"
+# 会话默认过期时间(30分钟无活动则自动失效,避免内存/存储无限增长)
+DEFAULT_SESSION_TTL_SECONDS = 30 * 60
+# 单个会话上下文允许保留的最大历史轮次,超过后做滑动窗口截断,
+# 防止长对话导致单个会话的存储体积无限膨胀
+MAX_HISTORY_TURNS = 20
+
+
+@dataclass
+class ConversationTurn:
+    """单轮对话记录,包含用户输入、系统回答、涉及的Agent链路信息"""
+    turn_id: str
+    role: str  # "user" 或 "assistant"
+    content: str
+    agent_trace: list = field(default_factory=list)  # 记录本轮涉及的Agent调用链
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class SessionContext:
+    """完整的会话上下文对象,替代原来保存在容器内存里的状态"""
+    session_id: str
+    tenant_scope: str  # legal / hr / scm,租户业务域标识
+    user_id: str
+    history: list = field(default_factory=list)  # List[ConversationTurn]
+    metadata: dict = field(default_factory=dict)  # 存放业务自定义扩展字段
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict:
+        data = asdict(self)
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SessionContext":
+        history = [ConversationTurn(**turn) for turn in data.get("history", [])]
+        return cls(
+            session_id=data["session_id"],
+            tenant_scope=data["tenant_scope"],
+            user_id=data["user_id"],
+            history=history,
+            metadata=data.get("metadata", {}),
+            created_at=data.get("created_at", time.time()),
+            updated_at=data.get("updated_at", time.time()),
+        )
+
+
+class RedisSessionStore:
+    """
+    会话上下文的Redis存储管理器。
+
+    设计要点:
+    1. 所有写操作都会刷新TTL,保证活跃会话不会因为空闲超时被误删;
+    2. 使用Redis的WATCH/事务机制保证"读取-修改-写回"过程中的原子性,
+       避免同一用户高频连续提问时出现并发写覆盖问题;
+    3. 序列化格式统一使用JSON,而不是pickle,避免跨语言/跨版本兼容
+       性问题,也避免pickle反序列化带来的安全隐患。
+    """
+
+    def __init__(self, redis_client: redis.Redis, ttl_seconds: int = DEFAULT_SESSION_TTL_SECONDS):
+        self._redis = redis_client
+        self._ttl = ttl_seconds
+
+    def _key(self, session_id: str) -> str:
+        return f"{SESSION_KEY_PREFIX}{session_id}"
+
+    def create_session(self, tenant_scope: str, user_id: str) -> SessionContext:
+        session_id = str(uuid.uuid4())
+        ctx = SessionContext(session_id=session_id, tenant_scope=tenant_scope, user_id=user_id)
+        self._persist(ctx)
+        return ctx
+
+    def get_session(self, session_id: str) -> Optional[SessionContext]:
+        raw = self._redis.get(self._key(session_id))
+        if raw is None:
+            return None
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            # 数据损坏时不应让整个请求崩溃,而是视为会话不存在,
+            # 由上层业务决定是否重新创建一个新会话
+            return None
+        return SessionContext.from_dict(data)
+
+    def append_turn(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        agent_trace: Optional[list] = None,
+    ) -> SessionContext:
+        """
+        向会话追加一轮对话记录,使用乐观锁(WATCH)保证并发安全。
+        如果检测到并发冲突(并发修改导致版本不一致),会重试有限次数。
+        """
+        key = self._key(session_id)
+        max_retries = 3
+
+        for attempt in range(max_retries):
+            with self._redis.pipeline() as pipe:
+                try:
+                    pipe.watch(key)
+                    raw = pipe.get(key)
+                    if raw is None:
+                        # 会话不存在则视为异常场景,由调用方决定是否重建
+                        pipe.unwatch()
+                        raise SessionNotFoundError(session_id)
+
+                    data = json.loads(raw)
+                    ctx = SessionContext.from_dict(data)
+
+                    turn = ConversationTurn(
+                        turn_id=str(uuid.uuid4()),
+                        role=role,
+                        content=content,
+                        agent_trace=agent_trace or [],
+                    )
+                    ctx.history.append(turn)
+
+                    # 滑动窗口截断,只保留最近MAX_HISTORY_TURNS轮,
+                    # 防止长对话导致单条会话记录无限增长拖慢读写性能
+                    if len(ctx.history) > MAX_HISTORY_TURNS:
+                        ctx.history = ctx.history[-MAX_HISTORY_TURNS:]
+
+                    ctx.updated_at = time.time()
+
+                    pipe.multi()
+                    pipe.set(key, json.dumps(ctx.to_dict(), ensure_ascii=False), ex=self._ttl)
+                    pipe.execute()
+                    return ctx
+                except redis.WatchError:
+                    # 并发冲突,重试
+                    if attempt == max_retries - 1:
+                        raise
+                    continue
+
+        raise RuntimeError("会话更新重试次数耗尽,请检查并发写入是否异常")
+
+    def _persist(self, ctx: SessionContext) -> None:
+        self._redis.set(
+            self._key(ctx.session_id),
+            json.dumps(ctx.to_dict(), ensure_ascii=False),
+            ex=self._ttl,
+        )
+
+    def touch_ttl(self, session_id: str) -> bool:
+        """仅刷新过期时间,不修改内容,用于用户仍在浏览但暂未发言的场景"""
+        return bool(self._redis.expire(self._key(session_id), self._ttl))
+
+    def delete_session(self, session_id: str) -> None:
+        self._redis.delete(self._key(session_id))
+
+    def count_active_sessions(self, tenant_scope: Optional[str] = None) -> int:
+        """
+        统计当前活跃会话数量,用于监控面板展示业务活跃度指标。
+        生产环境数据量较大时应避免使用KEYS命令阻塞Redis,这里采用
+        SCAN游标方式逐批遍历,对生产环境更友好。
+        """
+        count = 0
+        cursor = 0
+        pattern = f"{SESSION_KEY_PREFIX}*"
+        while True:
+            cursor, keys = self._redis.scan(cursor=cursor, match=pattern, count=200)
+            if tenant_scope is None:
+                count += len(keys)
+            else:
+                for key in keys:
+                    raw = self._redis.get(key)
+                    if raw:
+                        try:
+                            data = json.loads(raw)
+                            if data.get("tenant_scope") == tenant_scope:
+                                count += 1
+                        except json.JSONDecodeError:
+                            continue
+            if cursor == 0:
+                break
+        return count
+
+
+class SessionNotFoundError(Exception):
+    def __init__(self, session_id: str):
+        super().__init__(f"会话不存在或已过期: {session_id}")
+        self.session_id = session_id
+
+
+def build_default_session_store() -> RedisSessionStore:
+    """工厂函数:根据环境变量创建生产环境使用的会话存储实例"""
+    import os
+
+    client = redis.Redis(
+        host=os.environ.get("REDIS_HOST", "redis"),
+        port=int(os.environ.get("REDIS_PORT", "6379")),
+        password=os.environ.get("REDIS_PASSWORD"),
+        db=1,  # 会话数据独立使用db1,与缓存(db0)、队列(db2)物理隔离
+        decode_responses=True,
+        socket_connect_timeout=3,
+        socket_timeout=5,
+    )
+    return RedisSessionStore(client)
+
+
+if __name__ == "__main__":
+    # 简单的本地自测入口,验证核心读写与并发场景下的基本行为
+    store = build_default_session_store()
+    session = store.create_session(tenant_scope="legal", user_id="demo-user-001")
+    print(f"新建会话: {session.session_id}")
+
+    store.append_turn(session.session_id, role="user", content="帮我查一下违约条款")
+    store.append_turn(
+        session.session_id,
+        role="assistant",
+        content="已找到相关条款,详情见引用……",
+        agent_trace=["retrieval-agent", "review-agent"],
+    )
+
+    reloaded = store.get_session(session.session_id)
+    print(f"重新读取会话,历史轮次数: {len(reloaded.history)}")
+```
+
+```python
+# ============================================================
+# migrate_inflight_sessions.py
+# 蓝绿切换发布当晚的一次性迁移脚本:
+# 将旧版本(内存态会话)中仍在活跃的会话,提取后写入Redis外置存储,
+# 保证发布过程中正在对话的用户不会因为版本切换而丢失上下文。
+# 该脚本仅在本次改造上线当晚执行一次,后续新版本上线后不再需要,
+# 因为新版本从一开始就直接读写Redis,不存在"内存态"数据需要迁移。
+# ============================================================
+
+import json
+import sys
+import time
+
+import requests
+
+from session_store import build_default_session_store, SessionContext
+
+
+OLD_VERSION_INTERNAL_EXPORT_URL = "http://cangqiong-agent-orchestrator:8090/internal/export-sessions"
+MIGRATION_LOG_PATH = "/data/pengyuan/logs/session_migration.log"
+
+
+def log(message: str) -> None:
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}"
+    print(line)
+    with open(MIGRATION_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+def fetch_inflight_sessions() -> list:
+    """
+    调用旧版本服务内部预留的导出接口,拉取当前所有仍保存在内存中的
+    活跃会话快照。该接口仅对内部网络开放,且只在迁移当晚临时启用。
+    """
+    resp = requests.get(OLD_VERSION_INTERNAL_EXPORT_URL, timeout=10)
+    resp.raise_for_status()
+    payload = resp.json()
+    return payload.get("sessions", [])
+
+
+def migrate_sessions(sessions: list) -> tuple:
+    store = build_default_session_store()
+    success_count = 0
+    failure_count = 0
+
+    for raw_session in sessions:
+        try:
+            ctx = SessionContext.from_dict(raw_session)
+            store._persist(ctx)  # 直接落库,不走append_turn的并发控制逻辑
+            success_count += 1
+            log(f"迁移成功: session_id={ctx.session_id}, tenant={ctx.tenant_scope}, "
+                f"历史轮次={len(ctx.history)}")
+        except Exception as exc:  # noqa: BLE001
+            failure_count += 1
+            log(f"迁移失败: 原始数据片段={json.dumps(raw_session, ensure_ascii=False)[:200]}, "
+                f"错误={exc}")
+
+    return success_count, failure_count
+
+
+def main():
+    log("============ 会话迁移任务开始 ============")
+    try:
+        sessions = fetch_inflight_sessions()
+    except Exception as exc:  # noqa: BLE001
+        log(f"拉取旧版本活跃会话失败,终止迁移: {exc}")
+        sys.exit(1)
+
+    log(f"共发现 {len(sessions)} 个待迁移的活跃会话")
+
+    if not sessions:
+        log("无需迁移,任务结束")
+        return
+
+    success, failure = migrate_sessions(sessions)
+    log(f"迁移完成,成功 {success} 个,失败 {failure} 个")
+
+    if failure > 0:
+        log("存在迁移失败的会话,请人工核实是否需要通知对应用户重新开始对话")
+        sys.exit(2)
+
+    log("============ 会话迁移任务结束 ============")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 十四、日志脱敏中间件(敏感信息掩码,应对法务/人力场景的合规审计要求)
+
+> 背景:陈铭在课堂笔记中提到"调试日志把用户输入原文整个打出来,里面刚好有个身份证号"的真实事故。以下是当晚补齐的统一日志脱敏中间件实现,覆盖身份证号、手机号、银行卡号、邮箱等常见敏感字段格式,在写入日志前统一做掩码处理。
+
+```python
+# ============================================================
+# log_masking_middleware.py
+# 统一日志脱敏中间件与工具函数
+# 覆盖范围:身份证号、手机号、银行卡号、邮箱、薪资/金额类数字
+# (薪资类脱敏可按需开启,默认关闭,因为审计和运营分析场景可能
+#  仍需要看到真实金额,是否脱敏由LOG_MASK_SENSITIVE环境变量控制)
+# ============================================================
+
+import logging
+import re
+import json
+from typing import Any
+
+
+class SensitiveDataMasker:
+    """
+    敏感信息掩码处理器,通过一组预编译的正则表达式识别常见敏感
+    字段格式,并将匹配到的内容替换为掩码字符串,同时保留足够的
+    前后缀信息以便于排查问题时做模糊定位,而不完全丢失可读性。
+    """
+
+    # 中国大陆身份证号:18位,最后一位可能是数字或X/x
+    ID_CARD_PATTERN = re.compile(r"\b(\d{6})\d{8}(\d{3}[\dXx])\b")
+    # 中国大陆手机号:1开头的11位数字
+    PHONE_PATTERN = re.compile(r"\b(1[3-9]\d)\d{4}(\d{4})\b")
+    # 银行卡号:16-19位连续数字(简化匹配,生产环境可结合Luhn校验进一步降低误判)
+    BANK_CARD_PATTERN = re.compile(r"\b(\d{4})\d{8,11}(\d{4})\b")
+    # 邮箱地址
+    EMAIL_PATTERN = re.compile(r"\b([A-Za-z0-9._%+-]{1,3})[A-Za-z0-9._%+-]*(@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
+
+    def __init__(self, mask_salary: bool = False):
+        self._mask_salary = mask_salary
+        # 薪资/金额类字段的启发式识别:在"薪资""工资""金额""违约金"等
+        # 关键词附近出现的数字,视为潜在敏感金额(仅在mask_salary开启时生效)
+        self.salary_context_pattern = re.compile(
+            r"(薪资|工资|月薪|年薪|违约金|合同金额)[:：]?\s*([\d,]+\.?\d*)\s*元?"
+        )
+
+    def mask(self, text: str) -> str:
+        if not text:
+            return text
+
+        text = self.ID_CARD_PATTERN.sub(r"\1********\2", text)
+        text = self.PHONE_PATTERN.sub(r"\1****\2", text)
+        text = self.BANK_CARD_PATTERN.sub(r"\1********\2", text)
+        text = self.EMAIL_PATTERN.sub(r"\1***\2", text)
+
+        if self._mask_salary:
+            text = self.salary_context_pattern.sub(
+                lambda m: f"{m.group(1)}: ****(已脱敏)", text
+            )
+
+        return text
+
+    def mask_dict(self, data: dict) -> dict:
+        """
+        递归处理字典结构中的所有字符串字段,适用于结构化日志场景
+        (比如请求体、响应体以JSON形式记录到日志时的批量脱敏)。
+        """
+        if not isinstance(data, dict):
+            return data
+
+        masked = {}
+        for key, value in data.items():
+            if isinstance(value, str):
+                masked[key] = self.mask(value)
+            elif isinstance(value, dict):
+                masked[key] = self.mask_dict(value)
+            elif isinstance(value, list):
+                masked[key] = [
+                    self.mask_dict(item) if isinstance(item, dict)
+                    else (self.mask(item) if isinstance(item, str) else item)
+                    for item in value
+                ]
+            else:
+                masked[key] = value
+        return masked
+
+
+class MaskingLogFilter(logging.Filter):
+    """
+    标准logging模块的Filter实现,挂载到日志处理器上后,所有经过
+    该处理器输出的日志记录都会自动被脱敏,业务代码无需在每处
+    调用日志的地方手动调用mask(),降低漏改漏配的风险。
+    """
+
+    def __init__(self, masker: SensitiveDataMasker):
+        super().__init__()
+        self._masker = masker
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = self._masker.mask(record.msg)
+
+        if record.args:
+            if isinstance(record.args, dict):
+                record.args = self._masker.mask_dict(record.args)
+            else:
+                record.args = tuple(
+                    self._masker.mask(arg) if isinstance(arg, str) else arg
+                    for arg in record.args
+                )
+        return True
+
+
+class JSONLogFormatter(logging.Formatter):
+    """
+    生产环境统一使用JSON格式输出日志,方便Loki/ELK等日志系统做
+    结构化检索。字段设计参考了孙昊在课堂笔记中提出的"统一格式"要求。
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "module": record.module,
+            "line": record.lineno,
+        }
+        # 附加自定义业务上下文字段(如request_id、tenant_scope等),
+        # 由调用方通过logging.LoggerAdapter或extra参数传入
+        for extra_key in ("request_id", "tenant_scope", "session_id", "user_id"):
+            if hasattr(record, extra_key):
+                payload[extra_key] = getattr(record, extra_key)
+
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+
+        return json.dumps(payload, ensure_ascii=False)
+
+
+def setup_production_logging(mask_salary: bool = False) -> logging.Logger:
+    """
+    生产环境日志初始化入口,统一挂载JSON格式化器与脱敏过滤器。
+    """
+    masker = SensitiveDataMasker(mask_salary=mask_salary)
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(JSONLogFormatter())
+    handler.addFilter(MaskingLogFilter(masker))
+
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.addHandler(handler)
+    root_logger.setLevel(logging.INFO)
+
+    return root_logger
+
+
+class RequestBodyMaskingASGIMiddleware:
+    """
+    ASGI中间件(适配FastAPI/Starlette):在把请求体/响应体写入访问日志
+    之前,先做一层脱敏处理,防止诸如身份证号、手机号这类字段随着
+    调试日志被明文记录下来。仅在DEBUG级别的详细日志开启时生效,
+    生产环境默认info级别不会记录完整请求体,这里是双重防护。
+    """
+
+    def __init__(self, app, masker: SensitiveDataMasker = None):
+        self.app = app
+        self.masker = masker or SensitiveDataMasker()
+        self._logger = logging.getLogger("cangqiong.access")
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        body_chunks = []
+
+        async def receive_wrapper():
+            message = await receive()
+            if message["type"] == "http.request":
+                body_chunks.append(message.get("body", b""))
+            return message
+
+        if self._logger.isEnabledFor(logging.DEBUG):
+            raw_body = b"".join(body_chunks)
+            try:
+                body_text = raw_body.decode("utf-8", errors="ignore")
+                masked_body = self.masker.mask(body_text)
+                self._logger.debug("请求体(已脱敏): %s", masked_body[:2000])
+            except Exception:  # noqa: BLE001
+                pass
+
+        await self.app(scope, receive_wrapper, send)
+
+
+# ---------------------- 单元测试(可直接用pytest运行) ----------------------
+
+def test_mask_id_card():
+    masker = SensitiveDataMasker()
+    text = "身份证号是310101199001011234,请核实"
+    masked = masker.mask(text)
+    assert "199001011234" not in masked
+    assert "310101" in masked  # 前6位地区码保留,便于粗粒度排查
+    assert "1234" not in masked or "234" in masked
+
+
+def test_mask_phone():
+    masker = SensitiveDataMasker()
+    text = "联系电话13812345678"
+    masked = masker.mask(text)
+    assert "12345678" not in masked
+    assert "138" in masked
+
+
+def test_mask_dict_nested():
+    masker = SensitiveDataMasker()
+    data = {
+        "user": {"phone": "13912345678", "note": "无异常"},
+        "items": [{"id_card": "310101199001011234"}],
+    }
+    masked = masker.mask_dict(data)
+    assert "12345678" not in masked["user"]["phone"]
+    assert "199001011234" not in masked["items"][0]["id_card"]
+
+
+def test_salary_masking_optional():
+    masker_off = SensitiveDataMasker(mask_salary=False)
+    masker_on = SensitiveDataMasker(mask_salary=True)
+    text = "本次违约金:16800元"
+    assert "16800" in masker_off.mask(text)
+    assert "16800" not in masker_on.mask(text)
+
+
+if __name__ == "__main__":
+    test_mask_id_card()
+    test_mask_phone()
+    test_mask_dict_nested()
+    test_salary_masking_optional()
+    print("日志脱敏中间件单元测试全部通过")
+```
+
+### 十五、CI/CD流水线配置(GitLab CI,涵盖镜像自检、影子环境冒烟测试、安全扫描)
+
+> 说明:对应流程图中"从最终代码到生产环境部署上线的完整发布流程",本节把该流程图落地为可直接使用的CI配置,并把第八题作业参考答案中提到的"镜像自检提前拦截"机制在流水线层面实现。
+
+```yaml
+# .gitlab-ci.yml
+# ============================================================
+# 苍穹企业级智能体中台 - CI/CD 流水线定义
+# 阶段划分:build -> test -> image-scan -> shadow-deploy ->
+#          shadow-smoke-test -> deploy-production
+# ============================================================
+
+stages:
+  - build
+  - test
+  - image-scan
+  - shadow-deploy
+  - shadow-smoke-test
+  - deploy-production
+
+variables:
+  REGISTRY: registry.pengyuan.internal
+  IMAGE_NAMESPACE: cangqiong
+  DOCKER_BUILDKIT: "1"
+
+.default_rules: &default_rules
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "release"'
+    - if: '$CI_MERGE_REQUEST_ID'
+
+build-core-api-image:
+  stage: build
+  <<: *default_rules
+  image: docker:24.0-cli
+  services:
+    - docker:24.0-dind
+  script:
+    - echo "开始构建 core-api 镜像,commit=${CI_COMMIT_SHORT_SHA}"
+    - docker build -t ${REGISTRY}/${IMAGE_NAMESPACE}/core-api:${CI_COMMIT_SHORT_SHA} -f services/core-api/Dockerfile services/core-api
+    - docker tag ${REGISTRY}/${IMAGE_NAMESPACE}/core-api:${CI_COMMIT_SHORT_SHA} ${REGISTRY}/${IMAGE_NAMESPACE}/core-api:latest-staging
+    - docker push ${REGISTRY}/${IMAGE_NAMESPACE}/core-api:${CI_COMMIT_SHORT_SHA}
+    - docker push ${REGISTRY}/${IMAGE_NAMESPACE}/core-api:latest-staging
+
+unit-and-integration-test:
+  stage: test
+  <<: *default_rules
+  image: python:3.11-slim
+  services:
+    - postgres:15.6-alpine
+    - redis:7.2-alpine
+  variables:
+    POSTGRES_DB: cangqiong_test
+    POSTGRES_USER: test_user
+    POSTGRES_PASSWORD: test_pwd
+    DB_HOST: postgres
+    REDIS_HOST: redis
+  script:
+    - pip install --no-cache-dir -r services/core-api/requirements.txt -r services/core-api/requirements-dev.txt
+    - pytest services/core-api/tests --junitxml=report.xml --cov=services/core-api --cov-report=term-missing
+  artifacts:
+    when: always
+    reports:
+      junit: report.xml
+
+# 镜像自检:验证健康检查命令在全新构建的镜像内确实可以执行成功,
+# 对应本篇课后作业第8题参考答案中"把检查前移到CI流水线"的具体落地
+image-self-check:
+  stage: image-scan
+  <<: *default_rules
+  image: docker:24.0-cli
+  services:
+    - docker:24.0-dind
+  script:
+    - echo "验证 core-api 镜像内健康检查命令是否可执行..."
+    - docker run -d --name self-check-core-api ${REGISTRY}/${IMAGE_NAMESPACE}/core-api:${CI_COMMIT_SHORT_SHA}
+    - sleep 5
+    - |
+      if ! docker exec self-check-core-api curl -f http://127.0.0.1:8080/health/live 2>/dev/null; then
+        echo "错误:健康检查命令在镜像内执行失败,可能是基础镜像缺少curl等依赖"
+        docker logs self-check-core-api
+        docker rm -f self-check-core-api
+        exit 1
+      fi
+    - docker rm -f self-check-core-api
+    - echo "镜像自检通过"
+
+image-vulnerability-scan:
+  stage: image-scan
+  <<: *default_rules
+  image: aquasec/trivy:0.50.1
+  script:
+    - echo "对镜像进行安全漏洞扫描,阻断高危及以上漏洞..."
+    - trivy image --exit-code 1 --severity HIGH,CRITICAL --no-progress
+        ${REGISTRY}/${IMAGE_NAMESPACE}/core-api:${CI_COMMIT_SHORT_SHA}
+  allow_failure: false
+
+deploy-to-shadow-environment:
+  stage: shadow-deploy
+  <<: *default_rules
+  image: docker:24.0-cli
+  services:
+    - docker:24.0-dind
+  environment:
+    name: shadow
+  script:
+    - echo "将本次构建的镜像部署到影子环境..."
+    - export IMAGE_TAG=${CI_COMMIT_SHORT_SHA}
+    - docker compose -f docker-compose.shadow.yml pull
+    - docker compose -f docker-compose.shadow.yml up -d
+    - sleep 30
+
+shadow-full-regression:
+  stage: shadow-smoke-test
+  <<: *default_rules
+  image: python:3.11-slim
+  script:
+    - pip install --no-cache-dir requests pyyaml
+    - echo "在影子环境执行三大业务场景的回归验证..."
+    - python scripts/verify_demo_script.py
+        --script-dir ./demo_scripts
+        --api-base https://shadow.cangqiong.pengyuan-intelligence.com/api
+        --token ${SHADOW_ENV_API_TOKEN}
+        --coverage-threshold 0.5
+  artifacts:
+    when: always
+    paths:
+      - verify_report.json
+
+deploy-to-production:
+  stage: deploy-production
+  <<: *default_rules
+  when: manual  # 生产发布必须人工确认触发,不做全自动化,符合变更管控要求
+  image: docker:24.0-cli
+  environment:
+    name: production
+  script:
+    - echo "触发生产环境滚动发布..."
+    - ssh deploy@prod-host-1 "cd /opt/cangqiong && ./deploy_production.sh"
+  after_script:
+    - echo "发布流程结束,请人工核实企业微信告警群中的部署通知消息"
+```
+
+### 十六、生产服务器初始化脚本(基础环境批量准备)
+
+> 对应需求文档中"基础设施与资源"检查清单第一条,该脚本用于三台全新的生产服务器首次接入项目时,一次性把Docker环境、内核参数、时区、NTP同步等基础项配置到位,避免手动逐台操作导致配置不一致。
+
+```bash
+#!/usr/bin/env bash
+# ============================================================
+# provision_prod_server.sh
+# 生产服务器基础环境初始化脚本
+# 用途:三台8核32G云主机首次接入前统一执行,保证环境一致性
+# 执行方式:以具备sudo权限的账号在目标服务器上运行
+# ============================================================
+
+set -euo pipefail
+
+LOG_FILE="/var/log/cangqiong_provision.log"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | sudo tee -a "$LOG_FILE"
+}
+
+check_root_or_sudo() {
+    if [[ "$(id -u)" -ne 0 ]] && ! sudo -n true 2>/dev/null; then
+        echo "错误:本脚本需要root权限或可用的sudo权限执行"
+        exit 1
+    fi
+}
+
+setup_timezone_and_ntp() {
+    log "配置时区为Asia/Shanghai..."
+    sudo timedatectl set-timezone Asia/Shanghai
+
+    log "安装并启用NTP时间同步服务..."
+    if command -v apt-get &> /dev/null; then
+        sudo apt-get update -y
+        sudo apt-get install -y chrony
+    elif command -v yum &> /dev/null; then
+        sudo yum install -y chrony
+    fi
+    sudo systemctl enable chronyd
+    sudo systemctl restart chronyd
+    sleep 2
+    chronyc tracking | head -n 5 | tee -a "$LOG_FILE"
+}
+
+setup_kernel_params() {
+    log "调整内核参数,满足向量数据库等组件的运行要求..."
+
+    local sysctl_conf="/etc/sysctl.d/99-cangqiong.conf"
+    sudo tee "$sysctl_conf" > /dev/null <<'EOF'
+# 苍穹中台生产环境内核参数调优
+# vm.max_map_count: 向量数据库(Milvus底层依赖)在处理大规模索引时
+# 需要较多的内存映射区域,默认值(通常65530)在高并发场景下容易不足
+vm.max_map_count=262144
+
+# 提高文件描述符相关的系统级限制,应对高并发连接场景
+fs.file-max=1048576
+
+# 网络连接相关优化,应对短连接密集的HTTP请求场景
+net.core.somaxconn=4096
+net.ipv4.tcp_max_syn_backlog=4096
+net.ipv4.tcp_tw_reuse=1
+
+# 适当增大网络缓冲区,改善大文档上传/下载场景下的网络吞吐表现
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+EOF
+
+    sudo sysctl --system
+    log "内核参数配置完成"
+}
+
+setup_resource_limits() {
+    log "调整用户级资源限制(nofile/nproc)..."
+    local limits_conf="/etc/security/limits.d/99-cangqiong.conf"
+    sudo tee "$limits_conf" > /dev/null <<'EOF'
+*    soft    nofile    1048576
+*    hard    nofile    1048576
+*    soft    nproc     65536
+*    hard    nproc     65536
+EOF
+}
+
+install_docker_engine() {
+    if command -v docker &> /dev/null; then
+        log "检测到Docker已安装,版本: $(docker --version),跳过安装步骤"
+        return
+    fi
+
+    log "开始安装Docker Engine..."
+    curl -fsSL https://get.docker.com | sudo sh
+    sudo systemctl enable docker
+    sudo systemctl start docker
+
+    log "配置Docker daemon参数(日志驱动、存储驱动、地址池)..."
+    sudo mkdir -p /etc/docker
+    sudo tee /etc/docker/daemon.json > /dev/null <<'EOF'
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "20m",
+    "max-file": "5"
+  },
+  "storage-driver": "overlay2",
+  "default-address-pools": [
+    { "base": "172.28.0.0/16", "size": 24 }
+  ],
+  "live-restore": true
+}
+EOF
+    sudo systemctl restart docker
+    log "Docker Engine 安装与配置完成,版本: $(docker --version)"
+}
+
+install_docker_compose_plugin() {
+    if docker compose version &> /dev/null; then
+        log "检测到Docker Compose插件已安装,版本: $(docker compose version)"
+        return
+    fi
+
+    log "安装Docker Compose插件..."
+    local compose_version="v2.24.6"
+    local plugin_dir="/usr/local/lib/docker/cli-plugins"
+    sudo mkdir -p "$plugin_dir"
+    sudo curl -SL \
+        "https://github.com/docker/compose/releases/download/${compose_version}/docker-compose-linux-x86_64" \
+        -o "${plugin_dir}/docker-compose"
+    sudo chmod +x "${plugin_dir}/docker-compose"
+    log "Docker Compose 插件安装完成,版本: $(docker compose version)"
+}
+
+create_data_directories() {
+    log "创建数据持久化目录并设置合理权限..."
+    local base_dir="/data/pengyuan"
+    local sub_dirs=("postgres" "postgres-wal" "redis" "minio" "vectordb" "logs" "backups")
+
+    for dir in "${sub_dirs[@]}"; do
+        sudo mkdir -p "${base_dir}/${dir}"
+    done
+
+    # PostgreSQL容器默认使用UID 999运行,提前调整属主避免首次启动时
+    # 出现"data directory has wrong ownership"权限错误
+    sudo chown -R 999:999 "${base_dir}/postgres" "${base_dir}/postgres-wal"
+    log "数据目录创建完成: ${base_dir}"
+}
+
+create_deploy_user() {
+    log "创建专用部署账号 cangqiong-deploy(非root,用于CI/CD流水线登录部署)..."
+    if id "cangqiong-deploy" &> /dev/null; then
+        log "部署账号已存在,跳过创建"
+        return
+    fi
+    sudo useradd -m -s /bin/bash cangqiong-deploy
+    sudo usermod -aG docker cangqiong-deploy
+    log "部署账号创建完成,已加入docker用户组"
+}
+
+verify_provisioning() {
+    log "============ 环境初始化验证 ============"
+    log "时区: $(timedatectl | grep 'Time zone')"
+    log "vm.max_map_count: $(sysctl -n vm.max_map_count)"
+    log "Docker版本: $(docker --version)"
+    log "Docker Compose版本: $(docker compose version)"
+    log "磁盘剩余空间:"
+    df -h /data | tee -a "$LOG_FILE"
+    log "============ 验证完成 ============"
+}
+
+main() {
+    check_root_or_sudo
+    log "========== 生产服务器初始化开始:$(hostname) =========="
+    setup_timezone_and_ntp
+    setup_kernel_params
+    setup_resource_limits
+    install_docker_engine
+    install_docker_compose_plugin
+    create_data_directories
+    create_deploy_user
+    verify_provisioning
+    log "========== 生产服务器初始化完成:$(hostname) =========="
+}
+
+main "$@"
+```
+
+### 十七、验收对照表自动生成工具(需求条目 ⇄ 完成状态 ⇄ 验证方式)
+
+> 对应林悦最看重的"验收对照表"文档,以下工具把需求条目、完成状态、验证方式维护成结构化数据,一键生成Markdown格式的对照表,避免人工整理时出现遗漏或口径不一致。
+
+```python
+# ============================================================
+# generate_acceptance_checklist.py
+# 验收对照表自动生成工具
+# 输入:结构化的需求条目数据(可来自立项文档整理,这里以内嵌
+#      数据结构示例展示,生产环境可改为从Excel/数据库读取)
+# 输出:Markdown格式的验收对照表,可直接嵌入项目交付文档
+# ============================================================
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional
+
+
+class CompletionStatus(str, Enum):
+    DONE = "已完成"
+    PARTIAL = "部分完成"
+    PENDING = "待后续迭代"
+
+
+@dataclass
+class AcceptanceItem:
+    category: str          # 需求分类,如"多租户隔离""检索能力""性能指标"
+    requirement: str        # 需求条目原文(尽量贴近立项文档表述)
+    status: CompletionStatus
+    verification_method: str  # 验证方式说明,尽量指向具体的案例/数据/演示环节
+    remark: Optional[str] = None  # 补充说明,如未完成项的后续计划
+
+
+# 需求条目数据来源:寰宇集团项目立项阶段的需求访谈纪要整理
+ACCEPTANCE_ITEMS = [
+    AcceptanceItem(
+        category="多租户与数据隔离",
+        requirement="法务、人力、供应链三大业务部门的数据必须严格隔离,任一部门无法访问其他部门数据",
+        status=CompletionStatus.DONE,
+        verification_method="现场演示环节可用不同租户身份交叉请求验证;项目文档附有专项越权访问测试报告",
+    ),
+    AcceptanceItem(
+        category="多租户与数据隔离",
+        requirement="敏感字段(身份证号、薪资、合同金额)需在日志、界面展示中做脱敏处理",
+        status=CompletionStatus.DONE,
+        verification_method="项目文档附日志脱敏中间件实现说明及单元测试结果",
+    ),
+    AcceptanceItem(
+        category="检索与问答能力",
+        requirement="支持法务合同条款的精确检索与定位,并标注引用来源",
+        status=CompletionStatus.DONE,
+        verification_method="演示脚本法务场景问题1现场验证",
+    ),
+    AcceptanceItem(
+        category="检索与问答能力",
+        requirement="支持跨文档、跨合同的信息比对与冲突识别",
+        status=CompletionStatus.DONE,
+        verification_method="演示脚本法务场景问题2现场验证",
+    ),
+    AcceptanceItem(
+        category="多Agent协作能力",
+        requirement="支持检索、计算、审核等多个Agent协作完成复合任务",
+        status=CompletionStatus.DONE,
+        verification_method="演示脚本法务场景问题4、供应链场景问题4/5现场验证",
+    ),
+    AcceptanceItem(
+        category="主动预警能力",
+        requirement="系统需具备主动发现异常并推送预警的能力,而非仅限于被动问答",
+        status=CompletionStatus.DONE,
+        verification_method="演示脚本人力场景问题4(绩效异常预警简报)现场展示",
+    ),
+    AcceptanceItem(
+        category="性能指标",
+        requirement="P95响应时间不超过2秒",
+        status=CompletionStatus.DONE,
+        verification_method="性能与成本报告显示优化后P95为1.8秒,压测报告可现场提供原始数据",
+    ),
+    AcceptanceItem(
+        category="性能指标",
+        requirement="系统需支持至少每秒100请求的并发承载能力",
+        status=CompletionStatus.DONE,
+        verification_method="压测报告显示优化后并发承载能力达每秒150请求以上",
+    ),
+    AcceptanceItem(
+        category="部署与运维",
+        requirement="发布更新过程中业务不能出现明显中断",
+        status=CompletionStatus.DONE,
+        verification_method="部署运维文档记录蓝绿滚动更新方案,实测业务中断时间为0",
+    ),
+    AcceptanceItem(
+        category="部署与运维",
+        requirement="需提供完整的监控告警体系,覆盖资源、业务、链路三个层次",
+        status=CompletionStatus.DONE,
+        verification_method="Grafana看板现场演示,并提供告警联调测试记录",
+    ),
+    AcceptanceItem(
+        category="部署与运维",
+        requirement="需具备数据备份与灾难恢复能力,并完成至少一次恢复演练",
+        status=CompletionStatus.DONE,
+        verification_method="项目文档附恢复演练记录,恢复耗时约25分钟,数据一致性校验通过",
+    ),
+    AcceptanceItem(
+        category="模型接入",
+        requirement="需支持公有云模型与私有化部署模型的可插拔切换",
+        status=CompletionStatus.DONE,
+        verification_method="架构文档展示模型路由中心设计,私有化模型接入配置已在compose文件中预留",
+    ),
+    AcceptanceItem(
+        category="会话体验",
+        requirement="多轮对话上下文需在系统升级/发布过程中保持连续,不出现'失忆'现象",
+        status=CompletionStatus.PARTIAL,
+        verification_method="当前采用Nginx一致性哈希作为过渡方案缓解该问题",
+        remark="会话完全外置到Redis的改造已完成代码实现并在当晚完成迁移验证,"
+               "计划在验收通过后的第一个迭代周期完成生产环境正式切换",
+    ),
+    AcceptanceItem(
+        category="成本可控性",
+        requirement="需提供月度运营成本估算,并说明成本随业务量增长的变化趋势",
+        status=CompletionStatus.DONE,
+        verification_method="性能与成本报告附成本换算说明及分业务部门的月度成本区间估算",
+    ),
+]
+
+
+def render_markdown_table(items: list) -> str:
+    lines = [
+        "| 分类 | 需求条目 | 完成状态 | 验证方式 | 备注 |",
+        "|---|---|---|---|---|",
+    ]
+    for item in items:
+        remark = item.remark or "-"
+        lines.append(
+            f"| {item.category} | {item.requirement} | {item.status.value} | "
+            f"{item.verification_method} | {remark} |"
+        )
+    return "\n".join(lines)
+
+
+def render_summary(items: list) -> str:
+    total = len(items)
+    done = sum(1 for i in items if i.status == CompletionStatus.DONE)
+    partial = sum(1 for i in items if i.status == CompletionStatus.PARTIAL)
+    pending = sum(1 for i in items if i.status == CompletionStatus.PENDING)
+
+    return (
+        f"验收条目总数: {total}  |  已完成: {done} ({done/total:.0%})  |  "
+        f"部分完成: {partial} ({partial/total:.0%})  |  待后续迭代: {pending} ({pending/total:.0%})"
+    )
+
+
+def render_by_category(items: list) -> str:
+    """按分类分组统计,方便验收会议上逐个分类过一遍完成情况"""
+    categories = {}
+    for item in items:
+        categories.setdefault(item.category, []).append(item)
+
+    lines = []
+    for category, cat_items in categories.items():
+        done_count = sum(1 for i in cat_items if i.status == CompletionStatus.DONE)
+        lines.append(f"- **{category}**: {done_count}/{len(cat_items)} 已完成")
+    return "\n".join(lines)
+
+
+def main():
+    print("# 寰宇集团项目验收对照表\n")
+    print(render_summary(ACCEPTANCE_ITEMS))
+    print("\n## 分类完成情况概览\n")
+    print(render_by_category(ACCEPTANCE_ITEMS))
+    print("\n## 详细对照表\n")
+    print(render_markdown_table(ACCEPTANCE_ITEMS))
+
+    with open("acceptance_checklist.md", "w", encoding="utf-8") as f:
+        f.write("# 寰宇集团项目验收对照表\n\n")
+        f.write(render_summary(ACCEPTANCE_ITEMS) + "\n\n")
+        f.write("## 分类完成情况概览\n\n")
+        f.write(render_by_category(ACCEPTANCE_ITEMS) + "\n\n")
+        f.write("## 详细对照表\n\n")
+        f.write(render_markdown_table(ACCEPTANCE_ITEMS) + "\n")
+
+    print("\n对照表已输出至 acceptance_checklist.md")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 十八、月度运营成本估算工具(性能与成本报告配套代码)
+
+> 对应性能与成本报告中"面向业务方的成本换算说明",把Token消耗量换算成更直观的"每千次问答平均成本",并结合各业务部门预估问答量给出月度总成本区间。
+
+```python
+# ============================================================
+# monthly_cost_estimator.py
+# 月度运营成本估算工具
+# 用途:把模型调用的Token消耗、检索服务算力消耗等技术指标,
+#      换算成业务方能直接理解的"每千次问答成本"与"月度预算区间"
+# ============================================================
+
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass
+class ModelPricing:
+    """模型调用计价配置(元/千Token),区分输入与输出计价"""
+    provider_name: str
+    input_price_per_1k_tokens: float
+    output_price_per_1k_tokens: float
+
+
+@dataclass
+class UsageProfile:
+    """
+    单次问答的平均资源消耗画像,数据来源于六天冲刺期间的压测统计,
+    不同业务场景由于问题复杂度不同,消耗画像存在差异。
+    """
+    scenario_name: str
+    avg_input_tokens: int
+    avg_output_tokens: int
+    avg_retrieval_calls: int        # 平均每次问答触发的检索调用次数
+    avg_rerank_calls: int           # 平均每次问答触发的重排调用次数
+    multi_agent_ratio: float        # 该场景中触发多Agent协作的问答占比
+
+
+# 六天冲刺压测统计得出的各场景平均消耗画像(节选自压测报告)
+USAGE_PROFILES = {
+    "legal": UsageProfile(
+        scenario_name="法务场景",
+        avg_input_tokens=1800,
+        avg_output_tokens=420,
+        avg_retrieval_calls=2,
+        avg_rerank_calls=1,
+        multi_agent_ratio=0.35,
+    ),
+    "hr": UsageProfile(
+        scenario_name="人力场景",
+        avg_input_tokens=900,
+        avg_output_tokens=280,
+        avg_retrieval_calls=1,
+        avg_rerank_calls=1,
+        multi_agent_ratio=0.20,
+    ),
+    "scm": UsageProfile(
+        scenario_name="供应链场景",
+        avg_input_tokens=2400,
+        avg_output_tokens=650,
+        avg_retrieval_calls=3,
+        avg_rerank_calls=2,
+        multi_agent_ratio=0.55,
+    ),
+}
+
+# 模型路由中心当前配置的主力模型计价(示例价格,实际以供应商最新计价为准)
+PRIMARY_MODEL_PRICING = ModelPricing(
+    provider_name="公有云主模型",
+    input_price_per_1k_tokens=0.004,
+    output_price_per_1k_tokens=0.012,
+)
+
+# 多Agent协作场景下,平均每次协作会额外触发1.8次模型调用(用于中间推理步骤)
+MULTI_AGENT_EXTRA_CALL_FACTOR = 1.8
+
+# 检索与重排的单次调用平均算力成本(经压测折算为等效GPU使用成本,元/次)
+RETRIEVAL_CALL_COST = 0.0008
+RERANK_CALL_COST = 0.0015
+
+
+def estimate_single_question_cost(profile: UsageProfile, pricing: ModelPricing) -> float:
+    """估算单次问答的平均直接成本(模型调用 + 检索 + 重排)"""
+    base_model_cost = (
+        profile.avg_input_tokens / 1000 * pricing.input_price_per_1k_tokens
+        + profile.avg_output_tokens / 1000 * pricing.output_price_per_1k_tokens
+    )
+
+    # 多Agent协作场景下,额外的模型调用按比例折算进入平均成本
+    multi_agent_extra_cost = base_model_cost * profile.multi_agent_ratio * (MULTI_AGENT_EXTRA_CALL_FACTOR - 1)
+
+    retrieval_cost = profile.avg_retrieval_calls * RETRIEVAL_CALL_COST
+    rerank_cost = profile.avg_rerank_calls * RERANK_CALL_COST
+
+    total = base_model_cost + multi_agent_extra_cost + retrieval_cost + rerank_cost
+    return round(total, 6)
+
+
+def estimate_per_thousand_questions(profile: UsageProfile, pricing: ModelPricing) -> float:
+    single_cost = estimate_single_question_cost(profile, pricing)
+    return round(single_cost * 1000, 2)
+
+
+@dataclass
+class DepartmentForecast:
+    department_name: str
+    scenario_key: str
+    estimated_daily_questions_low: int
+    estimated_daily_questions_high: int
+
+
+# 各业务部门基于需求访谈阶段预估的日均问答量区间
+DEPARTMENT_FORECASTS = [
+    DepartmentForecast("法务部", "legal", 80, 150),
+    DepartmentForecast("人力资源部", "hr", 200, 400),
+    DepartmentForecast("供应链管理部", "scm", 60, 120),
+]
+
+
+def estimate_monthly_cost_range(forecast: DepartmentForecast, pricing: ModelPricing) -> tuple:
+    profile = USAGE_PROFILES[forecast.scenario_key]
+    per_question_cost = estimate_single_question_cost(profile, pricing)
+
+    days_per_month = 22  # 按企业工作日估算,而非自然日,更贴近实际业务使用规律
+    low = per_question_cost * forecast.estimated_daily_questions_low * days_per_month
+    high = per_question_cost * forecast.estimated_daily_questions_high * days_per_month
+    return round(low, 2), round(high, 2)
+
+
+def generate_cost_report() -> str:
+    lines = ["# 寰宇集团项目月度运营成本估算报告\n"]
+    lines.append("## 各业务场景每千次问答平均成本\n")
+    lines.append("| 业务场景 | 每千次问答成本(元) |")
+    lines.append("|---|---|")
+
+    for key, profile in USAGE_PROFILES.items():
+        cost_per_1k = estimate_per_thousand_questions(profile, PRIMARY_MODEL_PRICING)
+        lines.append(f"| {profile.scenario_name} | {cost_per_1k} |")
+
+    lines.append("\n## 各部门月度成本区间估算(基于预估日均问答量)\n")
+    lines.append("| 部门 | 预估日均问答量区间 | 月度成本区间(元) |")
+    lines.append("|---|---|---|")
+
+    total_low, total_high = 0.0, 0.0
+    for forecast in DEPARTMENT_FORECASTS:
+        low, high = estimate_monthly_cost_range(forecast, PRIMARY_MODEL_PRICING)
+        total_low += low
+        total_high += high
+        lines.append(
+            f"| {forecast.department_name} | "
+            f"{forecast.estimated_daily_questions_low}-{forecast.estimated_daily_questions_high} | "
+            f"{low} - {high} |"
+        )
+
+    lines.append(f"\n**全部业务部门合计月度成本估算区间:约 {round(total_low, 2)} - {round(total_high, 2)} 元**\n")
+    lines.append(
+        "> 说明:以上估算仅覆盖模型调用与检索/重排的直接算力成本,不包含服务器"
+        "租用、存储、带宽等基础设施固定成本;基础设施成本相对固定,不随问答量"
+        "线性增长,因此业务量增长带来的边际成本增速是相对平缓的,这也是本报告"
+        "希望向客户传达的关键结论之一。\n"
+    )
+
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    report = generate_cost_report()
+    print(report)
+    with open("monthly_cost_report.md", "w", encoding="utf-8") as f:
+        f.write(report)
+```
+
+### 十九、Grafana看板Provisioning配置(三层看板结构落地)
+
+> 对应课堂笔记"系统资源总览 / 业务指标看板 / Agent调用链路耗时分布"三层看板设计,以下为可直接被Grafana自动加载的Provisioning数据源与看板定义片段。
+
+```yaml
+# monitoring/grafana-datasources/datasources.yml
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://cangqiong-prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: "15s"
+
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://cangqiong-loki:3100
+    editable: false
+```
+
+```json
+{
+  "title": "苍穹中台 - 系统资源总览",
+  "uid": "cangqiong-resource-overview",
+  "timezone": "Asia/Shanghai",
+  "refresh": "30s",
+  "panels": [
+    {
+      "title": "各容器CPU使用率",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(container_cpu_usage_seconds_total{name=~\"cangqiong-.*\"}[1m])) by (name)",
+          "legendFormat": "{{name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "value": 0, "color": "green" },
+              { "value": 0.6, "color": "yellow" },
+              { "value": 0.85, "color": "red" }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "各容器内存使用率(相对上限比例)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "container_memory_usage_bytes{name=~\"cangqiong-.*\"} / container_spec_memory_limit_bytes{name=~\"cangqiong-.*\"}",
+          "legendFormat": "{{name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "steps": [
+              { "value": 0, "color": "green" },
+              { "value": 0.6, "color": "yellow" },
+              { "value": 0.85, "color": "red" }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "磁盘剩余空间比例",
+      "type": "gauge",
+      "gridPos": { "x": 0, "y": 8, "w": 8, "h": 6 },
+      "targets": [
+        {
+          "expr": "node_filesystem_avail_bytes{mountpoint=\"/data\"} / node_filesystem_size_bytes{mountpoint=\"/data\"}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1 }
+      }
+    }
+  ]
+}
+```
+
+```json
+{
+  "title": "苍穹中台 - 业务指标看板",
+  "uid": "cangqiong-business-metrics",
+  "timezone": "Asia/Shanghai",
+  "refresh": "30s",
+  "panels": [
+    {
+      "title": "各业务场景QPS",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total{path=~\"/api/(legal|hr|scm)/.*\"}[1m])) by (path)",
+          "legendFormat": "{{path}}"
+        }
+      ]
+    },
+    {
+      "title": "P95 / P99 延迟",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "P95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "P99"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "title": "最近24小时问答总量趋势",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 8, "w": 24, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(increase(business_question_total[1h])) by (tenant_scope)",
+          "legendFormat": "{{tenant_scope}}"
+        }
+      ]
+    }
+  ]
+}
+```
+
+```json
+{
+  "title": "苍穹中台 - Agent调用链路耗时分布",
+  "uid": "cangqiong-agent-trace-latency",
+  "timezone": "Asia/Shanghai",
+  "refresh": "1m",
+  "panels": [
+    {
+      "title": "各环节平均耗时占比(检索/重排/模型调用/多Agent接力)",
+      "type": "piechart",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "avg(agent_pipeline_stage_duration_seconds) by (stage)",
+          "legendFormat": "{{stage}}"
+        }
+      ]
+    },
+    {
+      "title": "单次问答端到端耗时分布直方图",
+      "type": "histogram",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "agent_pipeline_total_duration_seconds_bucket"
+        }
+      ]
+    },
+    {
+      "title": "多Agent协作链路耗时Top10(按具体协作组合)",
+      "type": "table",
+      "gridPos": { "x": 0, "y": 8, "w": 24, "h": 8 },
+      "targets": [
+        {
+          "expr": "topk(10, avg(agent_pipeline_total_duration_seconds) by (agent_combo))"
+        }
+      ]
+    }
+  ]
+}
+```
+
+### 二十、镜像安全扫描本地检查脚本(配合CI流水线的本地复现工具)
+
+> 便于开发人员在提交代码前于本地环境提前复现CI流水线中的镜像扫描与自检步骤,减少"本地通过、CI失败"的往返排查成本。
+
+```bash
+#!/usr/bin/env bash
+# ============================================================
+# local_image_check.sh
+# 本地镜像安全扫描与自检复现脚本
+# 用途:开发人员在推送代码前,本地快速复现CI流水线中image-scan
+#      阶段的检查逻辑,提前发现问题
+# ============================================================
+
+set -euo pipefail
+
+SERVICE_NAME="${1:-core-api}"
+DOCKERFILE_DIR="services/${SERVICE_NAME}"
+IMAGE_TAG="local-check-${SERVICE_NAME}"
+
+if [[ ! -d "$DOCKERFILE_DIR" ]]; then
+    echo "错误: 未找到服务目录 ${DOCKERFILE_DIR}"
+    exit 1
+fi
+
+echo "============ 步骤1: 本地构建镜像 ============"
+docker build -t "$IMAGE_TAG" -f "${DOCKERFILE_DIR}/Dockerfile" "$DOCKERFILE_DIR"
+
+echo "============ 步骤2: 镜像体积检查 ============"
+IMAGE_SIZE_MB=$(docker image inspect "$IMAGE_TAG" --format='{{.Size}}' | awk '{print int($1/1024/1024)}')
+echo "镜像体积: ${IMAGE_SIZE_MB} MB"
+if (( IMAGE_SIZE_MB > 1024 )); then
+    echo "警告: 镜像体积超过1GB,建议检查是否有不必要的依赖或未清理的构建缓存"
+fi
+
+echo "============ 步骤3: 健康检查命令自检 ============"
+CONTAINER_NAME="local-check-container-${SERVICE_NAME}"
+docker rm -f "$CONTAINER_NAME" &> /dev/null || true
+docker run -d --name "$CONTAINER_NAME" "$IMAGE_TAG"
+sleep 5
+
+HEALTHCHECK_CMD=$(docker inspect --format='{{json .Config.Healthcheck.Test}}' "$IMAGE_TAG")
+echo "镜像内配置的健康检查命令: ${HEALTHCHECK_CMD}"
+
+STATUS=$(docker inspect --format='{{.State.Status}}' "$CONTAINER_NAME")
+if [[ "$STATUS" != "running" ]]; then
+    echo "错误: 容器未能正常启动,状态: ${STATUS}"
+    docker logs "$CONTAINER_NAME"
+    docker rm -f "$CONTAINER_NAME"
+    exit 1
+fi
+echo "容器启动状态正常"
+
+echo "============ 步骤4: 非root用户运行检查 ============"
+RUNNING_USER=$(docker exec "$CONTAINER_NAME" whoami 2>/dev/null || echo "unknown")
+echo "容器内运行用户: ${RUNNING_USER}"
+if [[ "$RUNNING_USER" == "root" ]]; then
+    echo "警告: 容器以root用户运行,不符合安全基线要求,请在Dockerfile中显式指定非root USER"
+fi
+
+docker rm -f "$CONTAINER_NAME" &> /dev/null || true
+
+echo "============ 步骤5: Trivy安全扫描(如本地已安装trivy) ============"
+if command -v trivy &> /dev/null; then
+    trivy image --severity HIGH,CRITICAL --exit-code 0 "$IMAGE_TAG"
+else
+    echo "提示: 本地未安装trivy,跳过安全扫描步骤,建议参考CI流水线在本地也安装trivy进行完整复现"
+fi
+
+echo ""
+echo "本地镜像检查全部步骤执行完成: ${SERVICE_NAME}"
+```
+
 ---
 
 ## 今日复盘
