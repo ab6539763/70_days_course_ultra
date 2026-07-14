@@ -2454,6 +2454,1597 @@ echo "压测阶段 [$STAGE] 完成"
 echo "======================================"
 ```
 
+### 7.11 压测日志转换脚本(export_request_log.py)
+
+`run_perf_cycle.sh` 里调用的日志转换脚本,负责把 Locust 原始日志转换成 `cost_monitor.py` 需要的标准 jsonl 格式,同时补充模型档位、缓存命中标记等字段,这些字段在原始 Locust 日志里是没有的,需要从应用层自己打的结构化日志里关联合并。
+
+```python
+"""
+export_request_log.py
+苍穹企业级智能体中台 - 压测请求日志转换脚本
+作用: 把Locust压测过程中记录的原始请求日志,与应用层输出的结构化调用日志
+(包含token消耗、模型档位、缓存命中情况)按请求ID关联合并,生成cost_monitor.py
+所需的标准jsonl格式,供优化前后对比分析使用。
+"""
+
+import argparse
+import json
+import re
+from dataclasses import dataclass, asdict
+from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# 数据结构定义
+# ---------------------------------------------------------------------------
+
+@dataclass
+class NormalizedRequestLog:
+    question: str
+    input_tokens: int
+    output_tokens: int
+    model_tier: str
+    from_cache: bool
+    latency_ms: float
+    request_id: str
+    status_code: int
+
+
+# ---------------------------------------------------------------------------
+# Locust日志解析:提取每条请求的耗时与状态码
+# ---------------------------------------------------------------------------
+
+LOCUST_LOG_PATTERN = re.compile(
+    r'request_id=(?P<request_id>\S+)\s+'
+    r'name=(?P<name>\S+)\s+'
+    r'response_time_ms=(?P<latency_ms>[\d.]+)\s+'
+    r'status_code=(?P<status_code>\d+)'
+)
+
+
+def parse_locust_log(path: str) -> dict:
+    """解析Locust结构化日志(团队约定Locust自定义日志格式携带request_id用于关联),
+    返回以request_id为键的耗时与状态码信息"""
+    parsed = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            match = LOCUST_LOG_PATTERN.search(line)
+            if not match:
+                continue
+            data = match.groupdict()
+            parsed[data["request_id"]] = {
+                "latency_ms": float(data["latency_ms"]),
+                "status_code": int(data["status_code"]),
+                "name": data["name"],
+            }
+    return parsed
+
+
+# ---------------------------------------------------------------------------
+# 应用层结构化日志解析:提取token消耗、模型档位、缓存命中情况
+# ---------------------------------------------------------------------------
+
+def parse_app_log(path: str) -> dict:
+    """应用层每次问答请求都会输出一条结构化JSON日志,记录本次调用的token消耗、
+    使用的模型档位、是否命中缓存等信息,这里按request_id索引方便后续关联"""
+    parsed = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            request_id = record.get("request_id")
+            if not request_id:
+                continue
+            parsed[request_id] = record
+    return parsed
+
+
+# ---------------------------------------------------------------------------
+# 关联合并与导出
+# ---------------------------------------------------------------------------
+
+def merge_logs(locust_data: dict, app_data: dict) -> list:
+    merged = []
+    missing_app_log_count = 0
+    for request_id, locust_info in locust_data.items():
+        app_info = app_data.get(request_id)
+        if app_info is None:
+            # 应用层日志缺失(可能是限流拒绝的请求,根本没进入业务逻辑),
+            # 这类请求不纳入成本统计,但要记数,方便排查两份日志是否严重不对齐
+            missing_app_log_count += 1
+            continue
+        merged.append(NormalizedRequestLog(
+            question=app_info.get("question", ""),
+            input_tokens=app_info.get("input_tokens", 0),
+            output_tokens=app_info.get("output_tokens", 0),
+            model_tier=app_info.get("model_tier", "flagship_model"),
+            from_cache=app_info.get("from_cache", False),
+            latency_ms=locust_info["latency_ms"],
+            request_id=request_id,
+            status_code=locust_info["status_code"],
+        ))
+    if missing_app_log_count > 0:
+        print(f"警告: {missing_app_log_count}条压测请求未找到对应的应用层日志,已跳过统计")
+    return merged
+
+
+def write_jsonl(records: list, output_path: str) -> None:
+    with open(output_path, "w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(asdict(record), ensure_ascii=False) + "\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="压测日志转换为成本监控脚本所需格式")
+    parser.add_argument("--source-log", required=True, help="Locust原始日志路径")
+    parser.add_argument("--app-log", default=None, help="应用层结构化调用日志路径,默认与source-log同目录下的app.log")
+    parser.add_argument("--output", required=True, help="转换后的jsonl输出路径")
+    args = parser.parse_args()
+
+    app_log_path = args.app_log or args.source_log.replace("locust.log", "app.log")
+
+    locust_data = parse_locust_log(args.source_log)
+    app_data = parse_app_log(app_log_path)
+    merged = merge_logs(locust_data, app_data)
+
+    write_jsonl(merged, args.output)
+    print(f"转换完成,共关联{len(merged)}条有效请求记录,已写入{args.output}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 7.12 缓存层与模型路由的单元测试
+
+针对7.6节两级缓存层和7.7节模型分级路由分别补充的独立测试文件,这两个模块在当天下午优化落地后,赵磊要求必须先过单元测试才能合入主分支,不能只靠压测数据"看起来变好了"就直接上线。
+
+```python
+"""
+test_cache_layer.py
+苍穹企业级智能体中台 - 两级缓存层单元测试
+覆盖: 精确匹配缓存的TTL与抖动 / 语义缓存的相似度判定 / 统一缓存门面的命中率统计
+"""
+
+import time
+
+import pytest
+
+from cache_layer import (
+    ExactMatchCache,
+    InMemoryRedis,
+    QACacheFacade,
+    SemanticCache,
+    build_exact_cache_key,
+    normalize_question,
+    simple_hash_embed,
+)
+
+
+@pytest.fixture
+def redis_client():
+    return InMemoryRedis()
+
+
+@pytest.fixture
+def exact_cache(redis_client):
+    return ExactMatchCache(redis_client, base_ttl_seconds=100, fallback_ttl_seconds=10, jitter_seconds=5)
+
+
+@pytest.fixture
+def semantic_cache():
+    return SemanticCache(embed_fn=lambda t: simple_hash_embed(t, dims=32), similarity_threshold=0.92)
+
+
+# ---------------------------------------------------------------------------
+# 归一化与哈希键生成
+# ---------------------------------------------------------------------------
+
+def test_normalize_question_strips_punctuation_and_case():
+    assert normalize_question("报销标准是多少?") == normalize_question("报销标准是多少")
+    assert normalize_question("REPORT") == normalize_question("report")
+
+
+def test_build_exact_cache_key_deterministic():
+    key1 = build_exact_cache_key("报销标准是多少")
+    key2 = build_exact_cache_key("报销标准是多少")
+    assert key1 == key2
+
+
+# ---------------------------------------------------------------------------
+# 精确匹配缓存
+# ---------------------------------------------------------------------------
+
+def test_exact_cache_set_and_get(exact_cache):
+    exact_cache.set("报销标准是多少", {"answer": "交通费按实际发生额报销"})
+    result = exact_cache.get("报销标准是多少")
+    assert result is not None
+    assert result["answer"] == "交通费按实际发生额报销"
+
+
+def test_exact_cache_miss_returns_none(exact_cache):
+    assert exact_cache.get("从来没问过的问题") is None
+
+
+def test_exact_cache_normalized_equivalence_hits_same_entry(exact_cache):
+    exact_cache.set("报销标准是多少?", {"answer": "A"})
+    assert exact_cache.get("报销标准是多少") is not None
+
+
+def test_exact_cache_fallback_ttl_shorter_than_normal(exact_cache, redis_client):
+    exact_cache.set("查不到的问题", {"answer": "未在知识库中找到相关信息"}, is_fallback=True)
+    key = build_exact_cache_key("查不到的问题")
+    # 直接篡改内部存储的过期时间来验证fallback_ttl确实生效(白盒验证手段)
+    value, expire_at = redis_client._data[key]
+    assert expire_at is not None
+    assert expire_at - time.time() <= 10 + 0.5
+
+
+def test_exact_cache_invalidate_by_doc_id(exact_cache):
+    exact_cache.set("审批规则是什么", {"answer": "分级审批规则"})
+    key = build_exact_cache_key("审批规则是什么")
+    index = {key: ["doc_003"]}
+    invalidated = exact_cache.invalidate_by_doc_id("doc_003", index)
+    assert invalidated == 1
+    assert exact_cache.get("审批规则是什么") is None
+
+
+def test_exact_cache_invalidate_unrelated_doc_does_not_affect(exact_cache):
+    exact_cache.set("审批规则是什么", {"answer": "分级审批规则"})
+    key = build_exact_cache_key("审批规则是什么")
+    index = {key: ["doc_999"]}
+    invalidated = exact_cache.invalidate_by_doc_id("doc_003", index)
+    assert invalidated == 0
+    assert exact_cache.get("审批规则是什么") is not None
+
+
+# ---------------------------------------------------------------------------
+# 语义缓存
+# ---------------------------------------------------------------------------
+
+def test_semantic_cache_similar_questions_hit(semantic_cache):
+    semantic_cache.set("报销需要什么材料", {"answer": "发票和审批单"})
+    result = semantic_cache.get("报销需要什么材料")
+    assert result is not None
+    assert result["answer"] == "发票和审批单"
+
+
+def test_semantic_cache_dissimilar_questions_miss(semantic_cache):
+    semantic_cache.set("报销需要什么材料", {"answer": "发票和审批单"})
+    result = semantic_cache.get("今天天气怎么样")
+    assert result is None
+
+
+def test_semantic_cache_empty_cache_returns_none(semantic_cache):
+    assert semantic_cache.get("任意问题") is None
+
+
+def test_semantic_cache_eviction_when_exceeds_max_entries():
+    cache = SemanticCache(embed_fn=lambda t: simple_hash_embed(t, dims=16), max_entries=3)
+    for i in range(5):
+        cache.set(f"问题{i}", {"answer": f"答案{i}"})
+    assert cache.size() == 3
+
+
+# ---------------------------------------------------------------------------
+# 统一缓存门面
+# ---------------------------------------------------------------------------
+
+def test_cache_facade_prefers_exact_over_semantic(exact_cache, semantic_cache):
+    facade = QACacheFacade(exact_cache, semantic_cache)
+    exact_cache.set("报销标准是多少", {"answer": "精确匹配结果"})
+    semantic_cache.set("报销标准是多少", {"answer": "语义匹配结果"})
+
+    result = facade.get("报销标准是多少")
+    assert result["answer"] == "精确匹配结果"
+    assert facade.hit_stats["exact_hit"] == 1
+    assert facade.hit_stats["semantic_hit"] == 0
+
+
+def test_cache_facade_falls_back_to_semantic(exact_cache, semantic_cache):
+    facade = QACacheFacade(exact_cache, semantic_cache)
+    semantic_cache.set("报销需要什么材料", {"answer": "发票和审批单"})
+
+    result = facade.get("报销要提交哪些资料")
+    assert result is not None
+    assert facade.hit_stats["semantic_hit"] == 1
+
+
+def test_cache_facade_hit_rate_calculation(exact_cache, semantic_cache):
+    facade = QACacheFacade(exact_cache, semantic_cache)
+    exact_cache.set("问题A", {"answer": "答案A"})
+
+    facade.get("问题A")  # 命中
+    facade.get("问题B")  # 未命中
+    facade.get("问题C")  # 未命中
+
+    assert facade.hit_rate() == pytest.approx(1 / 3, rel=0.01)
+
+
+def test_cache_facade_set_skips_semantic_for_fallback(exact_cache, semantic_cache):
+    facade = QACacheFacade(exact_cache, semantic_cache)
+    facade.set("查不到的问题", {"answer": "未在知识库中找到相关信息"}, is_fallback=True)
+    assert semantic_cache.size() == 0, "兜底答案不应该进入语义缓存,避免污染相似问题的匹配结果"
+```
+
+```python
+"""
+test_model_router.py
+苍穹企业级智能体中台 - 模型分级路由单元测试
+覆盖: 难度分类器规则判定 / 自我评估置信度计算 / 路由与自动升级机制
+"""
+
+import asyncio
+
+import pytest
+
+from model_router import (
+    DifficultyClassifier,
+    ModelRouter,
+    ModelTier,
+    SelfConfidenceEvaluator,
+)
+
+
+class _FakeClient:
+    def __init__(self, response_text: str):
+        self.response_text = response_text
+        self.call_count = 0
+
+    async def complete(self, prompt: str, max_tokens: int = 500) -> dict:
+        self.call_count += 1
+        return {
+            "text": self.response_text,
+            "input_tokens": len(prompt) // 2,
+            "output_tokens": len(self.response_text) // 2,
+        }
+
+
+@pytest.fixture
+def classifier():
+    return DifficultyClassifier()
+
+
+# ---------------------------------------------------------------------------
+# 难度分类器
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("question", [
+    "XX型号设备重量是多少",
+    "报销标准是多少",
+    "工单怎么提交",
+    "8000元的采购需要谁审批",
+])
+def test_classifier_routes_simple_questions_to_light(classifier, question):
+    tier, confidence = classifier.classify(question)
+    assert tier == ModelTier.LIGHT
+    assert confidence >= 0.85
+
+
+@pytest.mark.parametrize("question", [
+    "为什么这次审批比上次慢这么多",
+    "对比一下两种报销方式的区别",
+    "如果超过预算那么该怎么办",
+]) 
+def test_classifier_routes_complex_questions_to_flagship(classifier, question):
+    tier, confidence = classifier.classify(question)
+    assert tier == ModelTier.FLAGSHIP
+
+
+def test_classifier_many_context_chunks_routes_to_flagship(classifier):
+    tier, _ = classifier.classify("这是一个模糊的问题", context_chunk_count=6)
+    assert tier == ModelTier.FLAGSHIP
+
+
+def test_classifier_ambiguous_question_defaults_to_light_with_low_confidence(classifier):
+    tier, confidence = classifier.classify("随便问一句", context_chunk_count=0)
+    assert tier == ModelTier.LIGHT
+    assert confidence < 0.6
+
+
+# ---------------------------------------------------------------------------
+# 自我评估置信度
+# ---------------------------------------------------------------------------
+
+def test_confidence_evaluator_short_answer_low_confidence():
+    evaluator = SelfConfidenceEvaluator()
+    assert evaluator.evaluate("嗯", "任意上下文") < 0.5
+
+
+def test_confidence_evaluator_uncertain_phrase_medium_confidence():
+    evaluator = SelfConfidenceEvaluator()
+    score = evaluator.evaluate("这个我不确定,可能需要进一步确认", "任意上下文")
+    assert score == 0.5
+
+
+def test_confidence_evaluator_high_overlap_high_confidence():
+    evaluator = SelfConfidenceEvaluator()
+    context = "报销标准是交通费按实际发生额报销住宿费每晚不超过400元"
+    answer = "报销标准是交通费按实际发生额报销"
+    score = evaluator.evaluate(answer, context)
+    assert score > 0.6
+
+
+def test_confidence_evaluator_should_upgrade_below_threshold():
+    evaluator = SelfConfidenceEvaluator(upgrade_threshold=0.6)
+    assert evaluator.should_upgrade(0.5) is True
+    assert evaluator.should_upgrade(0.7) is False
+
+
+# ---------------------------------------------------------------------------
+# 路由与自动升级
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_router_simple_question_uses_light_model_no_upgrade():
+    light = _FakeClient("报销标准是交通费按实际发生额报销")
+    flagship = _FakeClient("旗舰模型答案")
+    router = ModelRouter(light, flagship)
+
+    result = await router.route_and_complete(
+        question="报销标准是多少",
+        prompt="已知信息:报销标准是交通费按实际发生额报销\n\n请回答:报销标准是多少",
+        context_text="报销标准是交通费按实际发生额报销",
+    )
+
+    assert light.call_count == 1
+    assert flagship.call_count == 0
+    assert result["tier_used"] == ModelTier.LIGHT.value
+    assert result["upgraded_from_light"] is False
+
+
+@pytest.mark.asyncio
+async def test_router_complex_question_uses_flagship_directly():
+    light = _FakeClient("轻量模型答案")
+    flagship = _FakeClient("旗舰模型答案")
+    router = ModelRouter(light, flagship)
+
+    result = await router.route_and_complete(
+        question="为什么这次的审批流程比上次慢",
+        prompt="任意prompt",
+        context_text="任意上下文",
+    )
+
+    assert light.call_count == 0
+    assert flagship.call_count == 1
+    assert result["tier_used"] == ModelTier.FLAGSHIP.value
+
+
+@pytest.mark.asyncio
+async def test_router_upgrades_when_light_model_low_confidence():
+    light = _FakeClient("嗯")  # 极短回答,触发低置信度
+    flagship = _FakeClient("完整详细的旗舰模型答案")
+    router = ModelRouter(light, flagship)
+
+    result = await router.route_and_complete(
+        question="随便问一句模糊问题",
+        prompt="任意prompt",
+        context_text="任意上下文",
+    )
+
+    assert light.call_count == 1
+    assert flagship.call_count == 1, "低置信度应该触发自动升级重新调用旗舰模型"
+    assert result["upgraded_from_light"] is True
+    assert router.routing_stats["upgraded"] == 1
+
+
+@pytest.mark.asyncio
+async def test_router_routing_summary_ratios():
+    light = _FakeClient("报销标准是交通费按实际发生额报销")
+    flagship = _FakeClient("旗舰模型答案")
+    router = ModelRouter(light, flagship)
+
+    for _ in range(8):
+        await router.route_and_complete("报销标准是多少", "prompt", "报销标准是交通费按实际发生额报销")
+    for _ in range(2):
+        await router.route_and_complete("为什么审批变慢了", "prompt", "任意上下文")
+
+    summary = router.routing_summary()
+    assert summary["light"] == 8
+    assert summary["flagship"] == 2
+    assert summary["upgraded"] == 0
+    assert summary["light_ratio"] == pytest.approx(0.8, rel=0.01)
+```
+
+### 7.13 Prompt 压缩工具的单元测试
+
+```python
+"""
+test_prompt_compressor.py
+苍穹企业级智能体中台 - Prompt压缩工具单元测试
+覆盖: 检索片段语义去重 / 多轮历史摘要化 / 压缩前后token估算对比统计
+"""
+
+import asyncio
+from dataclasses import dataclass
+
+import pytest
+
+from prompt_compressor import (
+    HistorySummarizer,
+    compress_prompt,
+    dedup_chunks_by_similarity,
+)
+
+
+@dataclass
+class _Msg:
+    role: str
+    content: str
+
+
+@dataclass
+class _Chunk:
+    doc_id: str
+    text: str
+    score: float = 1.0
+
+
+class _FakeSummarizerClient:
+    def __init__(self):
+        self.call_count = 0
+
+    async def complete(self, prompt: str, max_tokens: int = 150) -> dict:
+        self.call_count += 1
+        return {"text": "历史对话摘要:用户询问了采购流程相关问题", "input_tokens": 50, "output_tokens": 20}
+
+
+# ---------------------------------------------------------------------------
+# 检索片段语义去重
+# ---------------------------------------------------------------------------
+
+def test_dedup_removes_highly_similar_chunks():
+    chunks = [
+        _Chunk("doc_001", "报销标准是交通费按实际发生额报销住宿费每晚不超过400元"),
+        _Chunk("doc_001_dup", "报销标准是交通费按实际发生额报销住宿费每晚不超过四百元"),
+        _Chunk("doc_002", "请假流程是提前一天在系统提交申请"),
+    ]
+    result = dedup_chunks_by_similarity(chunks, similarity_threshold=0.6)
+    assert result.removed_count >= 1
+    kept_ids = [c.doc_id for c in result.kept_chunks]
+    assert "doc_002" in kept_ids
+
+
+def test_dedup_keeps_all_when_no_overlap():
+    chunks = [
+        _Chunk("doc_001", "报销标准是交通费按实际发生额报销"),
+        _Chunk("doc_002", "请假流程是提前一天在系统提交申请"),
+        _Chunk("doc_003", "审批规则按金额区间分级"),
+    ]
+    result = dedup_chunks_by_similarity(chunks, similarity_threshold=0.9)
+    assert result.removed_count == 0
+    assert len(result.kept_chunks) == 3
+
+
+def test_dedup_prefers_earlier_ranked_chunk():
+    chunks = [
+        _Chunk("doc_high_rank", "报销标准是交通费按实际发生额报销住宿费每晚不超过400元", score=0.95),
+        _Chunk("doc_low_rank", "报销标准是交通费按实际发生额报销住宿费每晚不超过400元整", score=0.80),
+    ]
+    result = dedup_chunks_by_similarity(chunks, similarity_threshold=0.5)
+    kept_ids = [c.doc_id for c in result.kept_chunks]
+    assert "doc_high_rank" in kept_ids
+    assert "doc_low_rank" not in kept_ids
+
+
+def test_dedup_empty_chunk_list():
+    result = dedup_chunks_by_similarity([])
+    assert result.kept_chunks == []
+    assert result.removed_count == 0
+
+
+# ---------------------------------------------------------------------------
+# 多轮历史摘要化
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_history_summarizer_short_history_no_summarization():
+    client = _FakeSummarizerClient()
+    summarizer = HistorySummarizer(client, keep_recent_turns=3)
+    messages = [_Msg("user", "问题1"), _Msg("assistant", "回答1")]
+
+    result = await summarizer.build_context_history("session_001", messages)
+
+    assert client.call_count == 0, "历史轮次未超过保留阈值,不应触发摘要调用"
+    assert "问题1" in result
+
+
+@pytest.mark.asyncio
+async def test_history_summarizer_long_history_triggers_summarization():
+    client = _FakeSummarizerClient()
+    summarizer = HistorySummarizer(client, keep_recent_turns=2)
+    messages = []
+    for i in range(6):
+        messages.append(_Msg("user", f"问题{i}"))
+        messages.append(_Msg("assistant", f"回答{i}"))
+
+    result = await summarizer.build_context_history("session_002", messages)
+
+    assert client.call_count == 1
+    assert "历史对话摘要" in result
+    assert "问题4" in result or "问题5" in result  # 最近2轮原文应该被保留
+
+
+@pytest.mark.asyncio
+async def test_history_summarizer_caches_repeated_summary_calls():
+    client = _FakeSummarizerClient()
+    summarizer = HistorySummarizer(client, keep_recent_turns=2)
+    messages = []
+    for i in range(6):
+        messages.append(_Msg("user", f"问题{i}"))
+        messages.append(_Msg("assistant", f"回答{i}"))
+
+    await summarizer.build_context_history("session_003", messages)
+    await summarizer.build_context_history("session_003", messages)
+
+    assert client.call_count == 1, "同样的历史片段第二次应该直接命中摘要缓存,不重复调用大模型"
+
+
+# ---------------------------------------------------------------------------
+# 整合压缩效果
+# ---------------------------------------------------------------------------
+
+def test_compress_prompt_reduces_token_estimate():
+    original_system_prompt = "你是一个功能强大的智能助手,你需要尽可能详细地回答用户的问题," \
+                              "你需要保持礼貌和专业,你需要基于给定的资料来回答问题,不能编造信息。"
+    chunks = [
+        _Chunk("doc_001", "报销标准是交通费按实际发生额报销住宿费每晚不超过400元"),
+        _Chunk("doc_001_dup", "报销标准是交通费按实际发生额报销住宿费每晚不超过四百元整"),
+    ]
+    final_prompt, stats = compress_prompt(
+        system_prompt=original_system_prompt,
+        context_chunks=chunks,
+        history_text="用户: 之前问过差旅相关问题\n助手: 已回答",
+        question="报销标准是多少",
+    )
+    assert stats["reduction_ratio"] > 0
+    assert stats["removed_duplicate_chunks"] >= 1
+    assert "报销标准是多少" in final_prompt
+
+
+def test_compress_prompt_no_duplicates_still_reduces_system_prompt():
+    original_system_prompt = "你是一个功能强大的智能助手,你需要尽可能详细地回答用户的问题," \
+                              "你需要保持礼貌和专业,你需要基于给定的资料来回答问题,不能编造信息。"
+    chunks = [_Chunk("doc_001", "请假流程是提前一天在系统提交申请")]
+    _, stats = compress_prompt(
+        system_prompt=original_system_prompt,
+        context_chunks=chunks,
+        history_text="",
+        question="请假需要提前多久",
+    )
+    assert stats["removed_duplicate_chunks"] == 0
+    assert stats["reduction_ratio"] > 0, "即使没有重复片段,精简后的系统提示词也应该带来一定压缩收益"
+```
+
+### 7.14 异步数据库连接池与分组管理
+
+对应优化项二"并发控制"的完整实现,包括同步驱动切换为异步驱动、按操作优先级分组的连接池、以及和限流熔断机制配合工作的资源保护逻辑。
+
+```python
+"""
+db_pool.py
+苍穹企业级智能体中台 - 异步数据库连接池分组管理
+背景: 优化前所有数据库操作共用一个大小为20的同步连接池,在35并发左右迅速耗尽。
+本模块按操作特征分组管理连接池,避免低频重操作(如工单创建的事务写入)
+挤占高频轻操作(如会话历史读取)的连接资源。
+"""
+
+import asyncio
+import time
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
+
+
+class PoolGroup(str, Enum):
+    HIGH_FREQ_LIGHT = "high_freq_light"     # 高频轻量操作: 会话历史读写、缓存查询回源
+    LOW_FREQ_HEAVY = "low_freq_heavy"       # 低频重操作: 工单创建、审批流事务写入
+    BACKGROUND = "background"               # 后台任务: 定期回归压测、评估脚本、报表生成
+
+
+@dataclass
+class PoolConfig:
+    group: PoolGroup
+    max_connections: int
+    acquire_timeout_seconds: float
+
+
+DEFAULT_POOL_CONFIGS = [
+    PoolConfig(group=PoolGroup.HIGH_FREQ_LIGHT, max_connections=40, acquire_timeout_seconds=2.0),
+    PoolConfig(group=PoolGroup.LOW_FREQ_HEAVY, max_connections=15, acquire_timeout_seconds=5.0),
+    PoolConfig(group=PoolGroup.BACKGROUND, max_connections=5, acquire_timeout_seconds=10.0),
+]
+
+
+@dataclass
+class PoolMetrics:
+    acquired_count: int = 0
+    released_count: int = 0
+    timeout_count: int = 0
+    wait_time_ms_total: float = 0.0
+    in_use_peak: int = 0
+
+    @property
+    def avg_wait_time_ms(self) -> float:
+        return round(self.wait_time_ms_total / self.acquired_count, 2) if self.acquired_count else 0.0
+
+
+class ConnectionPoolExhaustedError(Exception):
+    pass
+
+
+class _FakeConnection:
+    """演示用的假连接对象,真实系统中替换为asyncpg/aiomysql等驱动返回的真实连接"""
+
+    def __init__(self, conn_id: str):
+        self.conn_id = conn_id
+        self.opened_at = time.time()
+
+    async def execute(self, query: str, *args) -> dict:
+        await asyncio.sleep(0)  # 模拟异步IO让出控制权
+        return {"query": query, "args": args, "conn_id": self.conn_id}
+
+
+class AsyncConnectionPool:
+    """单个分组的异步连接池,内部用Semaphore限制并发上限,超时未获取到连接则抛出异常
+    交由上层的限流熔断机制统一处理降级响应"""
+
+    def __init__(self, config: PoolConfig):
+        self.config = config
+        self._semaphore = asyncio.Semaphore(config.max_connections)
+        self._connections: list = [
+            _FakeConnection(f"{config.group.value}-{i}") for i in range(config.max_connections)
+        ]
+        self._available: asyncio.Queue = asyncio.Queue()
+        for conn in self._connections:
+            self._available.put_nowait(conn)
+        self.metrics = PoolMetrics()
+        self._in_use_count = 0
+
+    @asynccontextmanager
+    async def acquire(self):
+        wait_start = time.time()
+        try:
+            await asyncio.wait_for(
+                self._semaphore.acquire(), timeout=self.config.acquire_timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            self.metrics.timeout_count += 1
+            raise ConnectionPoolExhaustedError(
+                f"连接池[{self.config.group.value}]在{self.config.acquire_timeout_seconds}秒内未能获取到可用连接"
+            )
+
+        wait_elapsed_ms = (time.time() - wait_start) * 1000
+        self.metrics.wait_time_ms_total += wait_elapsed_ms
+        self.metrics.acquired_count += 1
+
+        conn = await self._available.get()
+        self._in_use_count += 1
+        self.metrics.in_use_peak = max(self.metrics.in_use_peak, self._in_use_count)
+        try:
+            yield conn
+        finally:
+            self._in_use_count -= 1
+            self.metrics.released_count += 1
+            await self._available.put(conn)
+            self._semaphore.release()
+
+    def health_snapshot(self) -> dict:
+        return {
+            "group": self.config.group.value,
+            "max_connections": self.config.max_connections,
+            "in_use_current": self._in_use_count,
+            "in_use_peak": self.metrics.in_use_peak,
+            "timeout_count": self.metrics.timeout_count,
+            "avg_wait_time_ms": self.metrics.avg_wait_time_ms,
+            "utilization_pct": round(self._in_use_count / self.config.max_connections * 100, 1),
+        }
+
+
+class PoolManager:
+    """连接池分组管理器,根据操作类型自动路由到对应分组的连接池"""
+
+    def __init__(self, configs: Optional[list] = None):
+        configs = configs or DEFAULT_POOL_CONFIGS
+        self._pools: dict[PoolGroup, AsyncConnectionPool] = {
+            cfg.group: AsyncConnectionPool(cfg) for cfg in configs
+        }
+
+    def get_pool(self, group: PoolGroup) -> AsyncConnectionPool:
+        if group not in self._pools:
+            raise KeyError(f"未配置分组: {group}")
+        return self._pools[group]
+
+    async def execute(self, group: PoolGroup, query: str, *args) -> dict:
+        pool = self.get_pool(group)
+        async with pool.acquire() as conn:
+            return await conn.execute(query, *args)
+
+    def full_health_report(self) -> list:
+        return [pool.health_snapshot() for pool in self._pools.values()]
+
+
+# ---------------------------------------------------------------------------
+# 高层业务封装:会话历史读写(高频轻量)与工单创建(低频重量,需要"序列号自增"消除竞态)
+# ---------------------------------------------------------------------------
+
+class SessionHistoryRepository:
+    def __init__(self, pool_manager: PoolManager):
+        self.pool_manager = pool_manager
+
+    async def append_message(self, session_id: str, role: str, content: str) -> None:
+        await self.pool_manager.execute(
+            PoolGroup.HIGH_FREQ_LIGHT,
+            "INSERT INTO session_messages (session_id, role, content) VALUES ($1, $2, $3)",
+            session_id, role, content,
+        )
+
+    async def fetch_recent(self, session_id: str, limit: int = 10) -> dict:
+        return await self.pool_manager.execute(
+            PoolGroup.HIGH_FREQ_LIGHT,
+            "SELECT * FROM session_messages WHERE session_id = $1 ORDER BY created_at DESC LIMIT $2",
+            session_id, limit,
+        )
+
+
+class TicketRepository:
+    """工单创建使用数据库序列号自增,从根本上消除7.3节集成测试回归的编号竞态缺陷"""
+
+    def __init__(self, pool_manager: PoolManager):
+        self.pool_manager = pool_manager
+
+    async def create_ticket(self, title: str, amount: float) -> dict:
+        return await self.pool_manager.execute(
+            PoolGroup.LOW_FREQ_HEAVY,
+            "INSERT INTO tickets (ticket_no, title, amount) "
+            "VALUES (nextval('ticket_no_seq'), $1, $2) RETURNING ticket_no",
+            title, amount,
+        )
+
+
+class RegressionJobRepository:
+    """定期回归压测与评估任务专用的低权重后台连接池,避免和线上真实业务流量抢连接资源"""
+
+    def __init__(self, pool_manager: PoolManager):
+        self.pool_manager = pool_manager
+
+    async def write_evaluation_snapshot(self, report: dict) -> None:
+        await self.pool_manager.execute(
+            PoolGroup.BACKGROUND,
+            "INSERT INTO evaluation_snapshots (payload, created_at) VALUES ($1, NOW())",
+            report,
+        )
+```
+
+### 7.15 APM 耗时拆解采集工具
+
+对应6.2.1节压测复盘表格里"各环节耗时占比"的数据来源,这是一个轻量级的埋点采集工具,通过上下文管理器包裹每个环节,自动记录耗时并汇总成占比报表,不依赖具体的APM厂商SDK,方便在没有采购商业APM之前先用这套内部工具跑起来。
+
+```python
+"""
+latency_tracer.py
+苍穹企业级智能体中台 - 轻量级请求耗时拆解采集工具
+用途: 对应6.2.1节的"各环节耗时占比"表格数据来源,通过span上下文管理器
+记录问答链路中每个环节的耗时,汇总成占比报表,辅助定位性能瓶颈。
+"""
+
+import statistics
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+@dataclass
+class Span:
+    name: str
+    start_time: float
+    end_time: Optional[float] = None
+
+    @property
+    def duration_ms(self) -> float:
+        if self.end_time is None:
+            return 0.0
+        return round((self.end_time - self.start_time) * 1000, 2)
+
+
+@dataclass
+class TraceRecord:
+    trace_id: str
+    spans: list = field(default_factory=list)
+
+    @property
+    def total_duration_ms(self) -> float:
+        return round(sum(s.duration_ms for s in self.spans), 2)
+
+    def breakdown(self) -> dict:
+        total = self.total_duration_ms
+        result = {}
+        for span in self.spans:
+            result[span.name] = {
+                "duration_ms": span.duration_ms,
+                "pct": round(span.duration_ms / total * 100, 1) if total > 0 else 0.0,
+            }
+        return result
+
+
+class LatencyTracer:
+    """单次请求生命周期内使用的耗时追踪器,配合`with tracer.span("环节名"):`记录各环节耗时"""
+
+    def __init__(self, trace_id: str):
+        self.record = TraceRecord(trace_id=trace_id)
+
+    @contextmanager
+    def span(self, name: str):
+        span_obj = Span(name=name, start_time=time.time())
+        try:
+            yield span_obj
+        finally:
+            span_obj.end_time = time.time()
+            self.record.spans.append(span_obj)
+
+    def finish(self) -> TraceRecord:
+        return self.record
+
+
+class TraceAggregator:
+    """跨多次请求汇总耗时数据,产出类似6.2.1节表格的平均耗时与占比统计,
+    以及P50/P95/P99分位数,用于压测报告和优化前后对比"""
+
+    def __init__(self):
+        self._traces: list[TraceRecord] = []
+
+    def add(self, trace: TraceRecord) -> None:
+        self._traces.append(trace)
+
+    def average_breakdown(self) -> dict:
+        span_durations: dict[str, list] = {}
+        for trace in self._traces:
+            for span in trace.spans:
+                span_durations.setdefault(span.name, []).append(span.duration_ms)
+
+        total_avg = sum(statistics.mean(v) for v in span_durations.values()) if span_durations else 0.0
+
+        result = {}
+        for name, durations in span_durations.items():
+            avg = statistics.mean(durations)
+            result[name] = {
+                "avg_duration_ms": round(avg, 1),
+                "pct": round(avg / total_avg * 100, 1) if total_avg > 0 else 0.0,
+                "sample_count": len(durations),
+            }
+        return result
+
+    def overall_percentiles(self) -> dict:
+        totals = sorted(t.total_duration_ms for t in self._traces)
+        if not totals:
+            return {"p50": 0.0, "p95": 0.0, "p99": 0.0}
+
+        def percentile(pct: float) -> float:
+            idx = min(int(len(totals) * pct), len(totals) - 1)
+            return round(totals[idx], 1)
+
+        return {"p50": percentile(0.50), "p95": percentile(0.95), "p99": percentile(0.99)}
+
+    def identify_bottleneck(self, threshold_pct: float = 50.0) -> Optional[str]:
+        """找出占比超过阈值的环节,对应课堂笔记中"LLM推理调用占比83.7%"这类结论的自动化产出方式"""
+        breakdown = self.average_breakdown()
+        for name, stats in breakdown.items():
+            if stats["pct"] >= threshold_pct:
+                return name
+        return None
+
+    def to_report(self) -> dict:
+        return {
+            "sample_size": len(self._traces),
+            "breakdown": self.average_breakdown(),
+            "overall_percentiles_ms": self.overall_percentiles(),
+            "bottleneck": self.identify_bottleneck(),
+        }
+
+
+# ---------------------------------------------------------------------------
+# 使用示例: 模拟一次完整的问答链路耗时采集
+# ---------------------------------------------------------------------------
+
+async def simulate_traced_qa_request(tracer: LatencyTracer, vector_store, llm_client, question: str) -> str:
+    with tracer.span("网关鉴权与路由"):
+        pass  # 真实实现里这里会做JWT校验、路由匹配等操作
+
+    with tracer.span("Query改写"):
+        rewritten_question = question.strip()
+
+    with tracer.span("向量检索"):
+        chunks = vector_store.search(rewritten_question, top_k=5)
+
+    with tracer.span("重排序"):
+        chunks = sorted(chunks, key=lambda c: c.score, reverse=True)
+
+    with tracer.span("上下文拼装"):
+        context = "\n".join(c.text for c in chunks)
+
+    with tracer.span("LLM推理调用"):
+        prompt = f"已知信息:\n{context}\n\n请回答:{question}"
+        result = await llm_client.complete(prompt)
+
+    with tracer.span("结果后处理与返回"):
+        answer = result["text"].strip()
+
+    return answer
+```
+
+### 7.16 定期回归压测与评估调度任务
+
+对应6.2.8节讨论的"好的性能优化不是一次性事件,是要变成一套能自己运转的机制"。这份脚本把压测和RAG评估打包成可以被 CI/CD 流水线定时调度的任务,每周自动跑一次完整回归,并和上一周的基线对比,识别"温水煮青蛙"式的缓慢退化趋势。
+
+```python
+"""
+regression_scheduler.py
+苍穹企业级智能体中台 - 定期回归压测与评估调度任务
+用途: 每周由CI/CD流水线自动触发,跑一轮压测(预发布环境)和RAG评估(不触碰生产流量),
+与历史基线对比,识别缓慢退化趋势,产出结构化报告并在超过阈值时触发告警。
+"""
+
+import argparse
+import json
+import statistics
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# 基线快照的数据结构与存取
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MetricSnapshot:
+    run_date: str
+    p95_latency_ms: float
+    concurrency_capacity: int
+    avg_cost_per_request: float
+    cache_hit_rate: float
+    faithfulness: float
+    answer_relevancy: float
+    context_recall: float
+
+
+class SnapshotHistory:
+    """负责读写历史快照文件(jsonl格式,一行一次回归的结果),供趋势分析使用"""
+
+    def __init__(self, history_path: str):
+        self.history_path = Path(history_path)
+
+    def load_all(self) -> list:
+        if not self.history_path.exists():
+            return []
+        snapshots = []
+        with open(self.history_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                raw = json.loads(line)
+                snapshots.append(MetricSnapshot(**raw))
+        return snapshots
+
+    def append(self, snapshot: MetricSnapshot) -> None:
+        self.history_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.history_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(asdict(snapshot), ensure_ascii=False) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# 退化趋势检测
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TrendAlert:
+    metric_name: str
+    current_value: float
+    baseline_avg: float
+    change_pct: float
+    severity: str
+
+
+DEGRADATION_RULES = [
+    # (指标名, 取值方向, 允许的最大恶化百分比, 严重级别)
+    ("p95_latency_ms", "higher_is_worse", 15.0, "warning"),
+    ("p95_latency_ms", "higher_is_worse", 30.0, "critical"),
+    ("concurrency_capacity", "lower_is_worse", 15.0, "warning"),
+    ("avg_cost_per_request", "higher_is_worse", 20.0, "warning"),
+    ("cache_hit_rate", "lower_is_worse", 20.0, "warning"),
+    ("faithfulness", "lower_is_worse", 5.0, "critical"),
+    ("answer_relevancy", "lower_is_worse", 5.0, "warning"),
+    ("context_recall", "lower_is_worse", 8.0, "warning"),
+]
+
+
+def _pct_change(baseline: float, current: float, direction: str) -> float:
+    if baseline == 0:
+        return 0.0
+    raw_change = (current - baseline) / baseline * 100
+    return raw_change if direction == "higher_is_worse" else -raw_change
+
+
+def detect_degradation(history: list, current: MetricSnapshot, lookback_weeks: int = 4) -> list:
+    """把最近N周的历史快照取平均作为基线,和本周结果对比,超过阈值则生成告警。
+    使用滑动平均而不是单纯和上一周对比,是为了避免某一周偶发的噪声数据触发误报。"""
+    if not history:
+        return []
+
+    recent_history = history[-lookback_weeks:]
+    alerts = []
+
+    for metric_name, direction, threshold_pct, severity in DEGRADATION_RULES:
+        baseline_values = [getattr(s, metric_name) for s in recent_history]
+        baseline_avg = statistics.mean(baseline_values)
+        current_value = getattr(current, metric_name)
+
+        change_pct = _pct_change(baseline_avg, current_value, direction)
+        if change_pct > threshold_pct:
+            alerts.append(TrendAlert(
+                metric_name=metric_name,
+                current_value=current_value,
+                baseline_avg=round(baseline_avg, 4),
+                change_pct=round(change_pct, 2),
+                severity=severity,
+            ))
+
+    return alerts
+
+
+# ---------------------------------------------------------------------------
+# 回归任务主流程(伪代码风格的编排,真实调用locust/rag_evaluation的入口留给CI/CD配置)
+# ---------------------------------------------------------------------------
+
+def run_weekly_regression(staging_host: str, history_path: str,
+                           current_metrics: Optional[dict] = None) -> dict:
+    """current_metrics用于本地演示传入模拟数据,真实CI/CD流水线中这部分数据来自
+    调用run_perf_cycle.sh + rag_evaluation.py之后解析出的结构化结果"""
+
+    current_metrics = current_metrics or {
+        "p95_latency_ms": 3100,
+        "concurrency_capacity": 108,
+        "avg_cost_per_request": 0.030,
+        "cache_hit_rate": 0.45,
+        "faithfulness": 0.86,
+        "answer_relevancy": 0.83,
+        "context_recall": 0.78,
+    }
+
+    history_store = SnapshotHistory(history_path)
+    history = history_store.load_all()
+
+    current_snapshot = MetricSnapshot(
+        run_date=datetime.now().strftime("%Y-%m-%d"),
+        **current_metrics,
+    )
+
+    alerts = detect_degradation(history, current_snapshot)
+    history_store.append(current_snapshot)
+
+    return {
+        "run_date": current_snapshot.run_date,
+        "staging_host": staging_host,
+        "current_snapshot": asdict(current_snapshot),
+        "alerts": [asdict(a) for a in alerts],
+        "has_critical_alert": any(a.severity == "critical" for a in alerts),
+        "history_sample_count": len(history),
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="每周定期回归压测与评估调度任务")
+    parser.add_argument("--staging-host", default="https://cangqiong-staging.pengyuan.internal")
+    parser.add_argument("--history-path", default="./regression_history/weekly_snapshots.jsonl")
+    parser.add_argument("--output", default="./regression_history/latest_report.json")
+    args = parser.parse_args()
+
+    report = run_weekly_regression(args.staging_host, args.history_path)
+
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+    if report["has_critical_alert"]:
+        print("检测到严重级别的退化告警,请立即查看报告:", args.output)
+        raise SystemExit(1)  # 非零退出码,CI/CD流水线据此判断是否需要阻断或标红本次任务
+    elif report["alerts"]:
+        print(f"检测到{len(report['alerts'])}条警告级别的退化趋势,建议排查,但不阻断流水线")
+    else:
+        print("本周回归结果正常,未发现明显退化趋势")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+对应上面调度任务的 CI/CD 流水线配置片段(以类GitLab CI语法为例,团队实际使用的流水线工具与此类似):
+
+```yaml
+# .ci/weekly_regression.yml
+# 苍穹企业级智能体中台 - 每周定期回归压测与评估流水线配置
+# 说明: 只在预发布环境跑,不对生产环境施压;评估脚本涉及大模型调用的部分做频次控制
+
+weekly_regression_job:
+  stage: scheduled-regression
+  image: python:3.11-slim
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $REGRESSION_SCHEDULE == "weekly"'
+  variables:
+    STAGING_HOST: "https://cangqiong-staging.pengyuan.internal"
+  before_script:
+    - pip install -r requirements-test.txt
+  script:
+    - ./run_perf_cycle.sh after
+    - python rag_evaluation.py --dataset golden_qa_150.jsonl --report rag_report_weekly.json
+    - python regression_scheduler.py --staging-host "$STAGING_HOST" --history-path ./regression_history/weekly_snapshots.jsonl --output ./regression_history/latest_report.json
+  artifacts:
+    when: always
+    paths:
+      - regression_history/latest_report.json
+      - perf_logs/comparison_report_0063.json
+      - rag_report_weekly.json
+    expire_in: 90 days
+  allow_failure: false  # 出现critical级别告警时任务失败,需要人工确认后才能继续后续流水线
+```
+
+### 7.17 监控告警规则接入
+
+对应6.2.8节陈铭提出的想法:"把今天定的验收线做成一套自动化的监控告警规则,接到现有的APM系统里"。这份代码定义了告警规则的判定逻辑和推送渠道适配层,和7.16节的定期回归任务是两套不同的机制——本模块面向的是线上生产环境的实时/近实时监控,7.16面向的是预发布环境的主动式定期回归,两者互补但不能混用。
+
+```python
+"""
+alerting_rules.py
+苍穹企业级智能体中台 - 生产环境监控告警规则
+用途: 把测试计划中定义的验收标准转换为可持续监控的告警规则,
+接入现有APM系统的指标流,一旦线上真实流量下指标连续超过阈值就自动推送告警。
+"""
+
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable, Optional
+
+
+class AlertLevel(str, Enum):
+    INFO = "info"
+    WARNING = "warning"
+    CRITICAL = "critical"
+
+
+@dataclass
+class AlertRule:
+    name: str
+    metric_key: str
+    threshold: float
+    comparator: str  # "gt" 表示超过阈值触发, "lt" 表示低于阈值触发
+    level: AlertLevel
+    consecutive_windows_required: int = 3  # 连续多少个采样窗口超阈值才真正触发,避免单次抖动误报
+    description: str = ""
+
+
+# 验收标准转换而来的告警规则清单,直接对应测试计划文档2.4节和2.5节的表格
+PRODUCTION_ALERT_RULES = [
+    AlertRule(
+        name="P95响应延迟超过验收线",
+        metric_key="p95_latency_seconds",
+        threshold=6.0,
+        comparator="gt",
+        level=AlertLevel.CRITICAL,
+        consecutive_windows_required=3,
+        description="客户验收标准P95≤6秒,连续3个窗口超标视为线上退化",
+    ),
+    AlertRule(
+        name="P95响应延迟超过内部目标",
+        metric_key="p95_latency_seconds",
+        threshold=4.0,
+        comparator="gt",
+        level=AlertLevel.WARNING,
+        consecutive_windows_required=5,
+        description="内部目标P95≤4秒,超标提示需要关注但暂不算严重",
+    ),
+    AlertRule(
+        name="错误率超标",
+        metric_key="error_rate_pct",
+        threshold=1.0,
+        comparator="gt",
+        level=AlertLevel.CRITICAL,
+        consecutive_windows_required=2,
+        description="客户验收标准错误率≤1%",
+    ),
+    AlertRule(
+        name="单次问答成本超标",
+        metric_key="avg_cost_per_request_yuan",
+        threshold=0.03,
+        comparator="gt",
+        level=AlertLevel.WARNING,
+        consecutive_windows_required=6,
+        description="目标单次成本≤0.03元,连续6个窗口(约每小时1次采样)超标才触发,避免短时间流量波动误报",
+    ),
+    AlertRule(
+        name="Faithfulness质量分下滑",
+        metric_key="faithfulness_score",
+        threshold=0.85,
+        comparator="lt",
+        level=AlertLevel.CRITICAL,
+        consecutive_windows_required=2,
+        description="达标线0.85,质量类指标一旦下滑要比性能类指标更快响应",
+    ),
+    AlertRule(
+        name="Answer Relevancy质量分下滑",
+        metric_key="answer_relevancy_score",
+        threshold=0.80,
+        comparator="lt",
+        level=AlertLevel.WARNING,
+        consecutive_windows_required=3,
+    ),
+    AlertRule(
+        name="缓存命中率异常走低",
+        metric_key="cache_hit_rate_pct",
+        threshold=20.0,
+        comparator="lt",
+        level=AlertLevel.WARNING,
+        consecutive_windows_required=4,
+        description="正常水位在40%以上,大幅走低可能意味着TTL配置被误改或知识库频繁更新导致缓存频繁失效",
+    ),
+]
+
+
+@dataclass
+class _RuleState:
+    consecutive_breach_count: int = 0
+    last_fired_at: Optional[float] = None
+    fire_cooldown_seconds: float = 1800.0  # 同一条规则30分钟内不重复告警,避免刷屏
+
+
+@dataclass
+class Alert:
+    rule_name: str
+    level: AlertLevel
+    metric_key: str
+    current_value: float
+    threshold: float
+    description: str
+    fired_at: float = field(default_factory=time.time)
+
+
+class AlertEngine:
+    """告警引擎: 接收周期性采集到的指标快照,按规则判定是否触发告警,
+    内置连续窗口计数和冷却期机制,避免单次抖动或短时间重复告警"""
+
+    def __init__(self, rules: Optional[list] = None):
+        self.rules = rules or PRODUCTION_ALERT_RULES
+        self._states: dict[str, _RuleState] = {rule.name: _RuleState() for rule in self.rules}
+
+    @staticmethod
+    def _is_breach(value: float, threshold: float, comparator: str) -> bool:
+        return value > threshold if comparator == "gt" else value < threshold
+
+    def evaluate(self, metrics_snapshot: dict) -> list:
+        fired_alerts = []
+        now = time.time()
+
+        for rule in self.rules:
+            if rule.metric_key not in metrics_snapshot:
+                continue
+            value = metrics_snapshot[rule.metric_key]
+            state = self._states[rule.name]
+
+            if self._is_breach(value, rule.threshold, rule.comparator):
+                state.consecutive_breach_count += 1
+            else:
+                state.consecutive_breach_count = 0
+                continue
+
+            reached_required_windows = state.consecutive_breach_count >= rule.consecutive_windows_required
+            past_cooldown = state.last_fired_at is None or (now - state.last_fired_at) > state.fire_cooldown_seconds
+
+            if reached_required_windows and past_cooldown:
+                fired_alerts.append(Alert(
+                    rule_name=rule.name,
+                    level=rule.level,
+                    metric_key=rule.metric_key,
+                    current_value=value,
+                    threshold=rule.threshold,
+                    description=rule.description,
+                    fired_at=now,
+                ))
+                state.last_fired_at = now
+
+        return fired_alerts
+
+
+# ---------------------------------------------------------------------------
+# 推送渠道适配层: 团队内部使用企业IM机器人推送,同时保留日志兜底渠道
+# ---------------------------------------------------------------------------
+
+class NotificationChannel:
+    def send(self, alert: Alert) -> None:
+        raise NotImplementedError
+
+
+class IMBotChannel(NotificationChannel):
+    """企业IM机器人推送渠道,真实实现调用IM平台的webhook接口"""
+
+    def __init__(self, webhook_sender: Callable[[str], None]):
+        self.webhook_sender = webhook_sender
+
+    def send(self, alert: Alert) -> None:
+        level_emoji = {"info": "ℹ️", "warning": "⚠️", "critical": "🚨"}
+        text = (
+            f"{level_emoji.get(alert.level.value, '')} [{alert.level.value.upper()}] {alert.rule_name}\n"
+            f"当前值: {alert.current_value}, 阈值: {alert.threshold}\n"
+            f"说明: {alert.description}"
+        )
+        self.webhook_sender(text)
+
+
+class LogFallbackChannel(NotificationChannel):
+    """兜底日志渠道,即使IM推送失败,也保证告警不会完全丢失,可供事后审计排查"""
+
+    def __init__(self):
+        self.records: list = []
+
+    def send(self, alert: Alert) -> None:
+        self.records.append(alert)
+
+
+class AlertDispatcher:
+    def __init__(self, channels: list):
+        self.channels = channels
+
+    def dispatch(self, alerts: list) -> None:
+        for alert in alerts:
+            for channel in self.channels:
+                try:
+                    channel.send(alert)
+                except Exception as exc:  # noqa: BLE001 - 告警推送失败不能影响主流程,记录后继续
+                    print(f"告警推送渠道{channel.__class__.__name__}发送失败: {exc}")
+```
+
+### 7.18 月度客户健康度报告生成器
+
+对应6.2.8节孙雯提出的想法:"每个月给寰宇集团那边同步一次简版的健康度报告"。这份脚本把内部监控和回归任务产出的原始数据,转换成一份面向客户、语言更友好的月度健康度摘要,呼应7.16节"作业参考答案第7题"里提到的"专业严谨、让客户容易理解"两个诉求。
+
+```python
+"""
+health_report_generator.py
+苍穹企业级智能体中台 - 月度客户健康度报告生成器
+用途: 把regression_scheduler.py产出的历史快照和alerting_rules.py记录的告警事件,
+转换为一份面向客户的月度健康度摘要,语言风格更友好,弱化技术术语,突出趋势和结论。
+"""
+
+import json
+import statistics
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional
+
+
+@dataclass
+class MonthlyHealthReport:
+    report_month: str
+    avg_p95_latency_seconds: float
+    avg_error_rate_pct: float
+    avg_cost_per_request_yuan: float
+    avg_faithfulness: float
+    avg_answer_relevancy: float
+    total_alerts_fired: int
+    critical_alerts_fired: int
+    overall_conclusion: str
+    highlights: list = field(default_factory=list)
+    watch_items: list = field(default_factory=list)
+
+
+def _mean_or_zero(values: list) -> float:
+    return round(statistics.mean(values), 4) if values else 0.0
+
+
+def build_monthly_report(weekly_snapshots: list, monthly_alerts: list, report_month: Optional[str] = None) -> MonthlyHealthReport:
+    """weekly_snapshots是regression_scheduler.py产出的MetricSnapshot转成的dict列表(取当月的4-5条),
+    monthly_alerts是alerting_rules.py中AlertEngine在当月触发的Alert记录列表"""
+
+    report_month = report_month or datetime.now().strftime("%Y-%m")
+
+    p95_values = [s["p95_latency_ms"] / 1000 for s in weekly_snapshots]
+    cost_values = [s["avg_cost_per_request"] for s in weekly_snapshots]
+    faithfulness_values = [s["faithfulness"] for s in weekly_snapshots]
+    relevancy_values = [s["answer_relevancy"] for s in weekly_snapshots]
+
+    critical_count = sum(1 for a in monthly_alerts if a.get("level") == "critical")
+
+    highlights = []
+    watch_items = []
+
+    if p95_values and max(p95_values) <= 4.0:
+        highlights.append(f"本月响应速度稳定,P95延迟最高{max(p95_values):.1f}秒,持续优于内部4秒目标")
+    elif p95_values:
+        watch_items.append(f"本月P95延迟出现波动,最高达到{max(p95_values):.1f}秒,建议关注")
+
+    if faithfulness_values and min(faithfulness_values) >= 0.85:
+        highlights.append(f"问答忠实度稳定保持在{min(faithfulness_values):.2f}以上,答案质量可靠")
+    elif faithfulness_values:
+        watch_items.append(f"本月忠实度指标出现低于0.85的情况(最低{min(faithfulness_values):.2f}),已安排排查")
+
+    if critical_count == 0:
+        highlights.append("本月未出现严重级别的系统告警,系统运行平稳")
+    else:
+        watch_items.append(f"本月触发{critical_count}次严重级别告警,已逐一处理,详情见附录")
+
+    if cost_values:
+        avg_cost = statistics.mean(cost_values)
+        if avg_cost <= 0.03:
+            highlights.append(f"单次问答平均成本约{avg_cost:.3f}元,持续保持在目标范围内")
+
+    if not watch_items:
+        conclusion = "本月系统整体运行平稳,各项核心指标均达到或优于约定标准,无需客户方特别关注的问题。"
+    elif critical_count > 0:
+        conclusion = "本月系统整体可用,但出现过需要重点关注的问题,已完成处理,详见下方关注事项说明。"
+    else:
+        conclusion = "本月系统整体运行平稳,存在少量指标波动,均在可控范围内,已记录并将持续观察。"
+
+    return MonthlyHealthReport(
+        report_month=report_month,
+        avg_p95_latency_seconds=_mean_or_zero(p95_values),
+        avg_error_rate_pct=0.0,  # 演示中省略,真实实现从weekly_snapshots补充的error_rate字段计算
+        avg_cost_per_request_yuan=_mean_or_zero(cost_values),
+        avg_faithfulness=_mean_or_zero(faithfulness_values),
+        avg_answer_relevancy=_mean_or_zero(relevancy_values),
+        total_alerts_fired=len(monthly_alerts),
+        critical_alerts_fired=critical_count,
+        overall_conclusion=conclusion,
+        highlights=highlights,
+        watch_items=watch_items,
+    )
+
+
+def render_as_customer_facing_text(report: MonthlyHealthReport) -> str:
+    """渲染成客户能直接阅读的文本格式,避免直接甩一份JSON数据给业务方"""
+    lines = [
+        f"《苍穹企业级智能体中台 · {report.report_month} 月度健康度报告》",
+        "",
+        f"总体结论: {report.overall_conclusion}",
+        "",
+        "本月关键指标:",
+        f"  - 平均P95响应延迟: {report.avg_p95_latency_seconds:.2f} 秒",
+        f"  - 平均单次问答成本: {report.avg_cost_per_request_yuan:.3f} 元",
+        f"  - 平均答案忠实度: {report.avg_faithfulness:.2f}",
+        f"  - 平均答案相关性: {report.avg_answer_relevancy:.2f}",
+        "",
+        "本月亮点:",
+    ]
+    lines.extend(f"  · {item}" for item in report.highlights) if report.highlights else lines.append("  (本月无特别亮点记录)")
+    lines.append("")
+    lines.append("需要关注的事项:")
+    if report.watch_items:
+        lines.extend(f"  · {item}" for item in report.watch_items)
+    else:
+        lines.append("  (本月无需要客户方特别关注的事项)")
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    demo_snapshots = [
+        {"p95_latency_ms": 3100, "avg_cost_per_request": 0.029, "faithfulness": 0.87, "answer_relevancy": 0.84},
+        {"p95_latency_ms": 3350, "avg_cost_per_request": 0.031, "faithfulness": 0.86, "answer_relevancy": 0.83},
+        {"p95_latency_ms": 2980, "avg_cost_per_request": 0.028, "faithfulness": 0.88, "answer_relevancy": 0.85},
+        {"p95_latency_ms": 3200, "avg_cost_per_request": 0.030, "faithfulness": 0.87, "answer_relevancy": 0.84},
+    ]
+    demo_alerts = []
+    report = build_monthly_report(demo_snapshots, demo_alerts, report_month="2026-07")
+    print(render_as_customer_facing_text(report))
+```
+
 ---
 
 ## 八、今日复盘
