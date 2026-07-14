@@ -2637,6 +2637,1679 @@ if __name__ == "__main__":
 
 ---
 
+晚上七点的复盘之前,老王在工位边上又追加了一轮"补课"——他翻着陈铭这一天写的代码,觉得有几个官方能力今天都只是蜻蜓点水地提过一嘴,没有真正落地成代码,不趁热打铁补上,以后很容易变成"知道有这个东西,但从来没有亲手用过"的悬空知识点。他给出的原话是:"LCEL这套东西,组件本身不难,难的是知道'什么场景该用哪个组件'——今天剩下的时间,咱们把降级、可配置、异步、可观测性这几块,一次性用真代码过一遍,明天进入检索增强生成的正题之前,把这些地基彻底焊死。"
+
+### 十一、多模型自动降级 + 本地离线自测双模式
+
+老王在晚上收尾评审时提出一个更进一步的场景:如果不是模型偶发超时,而是某个服务商整体挂了,重试再多次也无济于事,更合理的策略是自动切换到备用模型。陈铭用LangChain官方的`Runnable.with_fallbacks()`实现了这个能力,还顺手解决了一个长期困扰他的问题——所有涉及真实模型调用的模块,都必须联网才能验证代码有没有写错,他用官方提供的`FakeListChatModel`补上了一套完全离线的自测模式,开发调试阶段不再被外部服务卡住脖子。
+
+```python
+"""
+fallback_chain_and_offline_selfcheck.py
+
+苍穹平台 · LCEL链式改造技术验证 · 模块十一(多模型自动降级 + 本地离线自测双模式)
+
+背景:
+    模块九已经用重试装饰器解决了"同一个模型偶发超时"的问题,但老王在
+    晚上收尾评审时提出了一个更进一步的场景:如果不是"偶发超时",而是
+    "这个模型服务商今天整个挂了"(比如DeepSeek接口连续限流、或者账号
+    额度突然用完),重试再多次也无济于事,这种情况下,更合理的策略是
+    "自动切换到另一个备用模型",而不是让整条链彻底失败。LangChain把这
+    种能力标准化成了`Runnable.with_fallbacks()`方法,今天这份代码,
+    就是把这个官方能力真正用起来。
+
+    另外,老王注意到目前这份课件里所有涉及真实模型调用的模块
+    (一、二、三、四、五、六、七、九),都必须连上真实的DeepSeek接口
+    才能跑,这导致陈铭在没有网络、或者密钥失效的时候,完全没办法验证
+    自己的代码改动有没有把链路搞坏。老王的原话是:"生产代码可以强依赖
+    外部服务,但你自己开发调试的过程,不应该完全被外部服务卡住脖子。"
+    于是他要求陈铭补一个"离线自测模式"——用LangChain官方提供的
+    `FakeListChatModel`,在完全不联网的情况下,把prompt拼接、
+    RunnableLambda处理、输出解析这些"不需要真的问一次大模型"的逻辑,
+    在本地跑一遍自测,快速暴露明显的逻辑bug,再去跑真实模型做最终验收。
+
+编写人:陈铭
+评审人:王振宇
+飞书任务号:CQ-108(苍穹0.5版 · 多模型降级与离线自测能力建设)
+"""
+
+import os
+import time
+from typing import Any, List, Optional
+
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import Runnable, RunnableConfig
+
+
+# ---------------------------------------------------------------------------
+# 第一部分:一个"总是失败"的假聊天模型,用来模拟"某个模型服务商整个挂了"
+# ---------------------------------------------------------------------------
+
+
+class AlwaysFailingChatModel(Runnable):
+    """
+    专门用于演示与测试的"总是失败"的假聊天模型。
+
+    这个类没有继承LangChain内置的BaseChatModel,而是直接实现最小的
+    Runnable协议(只重写invoke),原因是老王要求陈铭"至少手写一次不借助
+    任何官方基类的Runnable实现",今天正好借这个"故意失败的模型"场景,
+    再练一次——这个类的invoke方法永远抛出异常,专门用来触发降级逻辑。
+    """
+
+    def __init__(self, failure_reason: str = "模拟场景:主模型服务当前不可用"):
+        self.failure_reason = failure_reason
+        self.call_count = 0
+
+    def invoke(self, input: Any, config: Optional[RunnableConfig] = None, **kwargs: Any) -> AIMessage:
+        self.call_count += 1
+        raise ConnectionError(self.failure_reason)
+
+
+def build_fake_chat_model(responses: List[str], sleep: Optional[float] = None) -> FakeListChatModel:
+    """
+    构造一个离线可用的假聊天模型,循环返回responses里的内容。
+
+    FakeListChatModel是LangChain官方提供、专门用于测试的组件,它完整
+    实现了invoke/batch/stream/ainvoke/abatch/astream这一整套Runnable
+    协议,行为上和真实的ChatOpenAI几乎一致,只是内容是提前写好的固定
+    文本,不会真的发起网络请求。sleep参数可以模拟一定的响应延迟,
+    方便后面演示"并发调用确实比串行调用快"这件事。
+    """
+    return FakeListChatModel(responses=responses, sleep=sleep)
+
+
+# ---------------------------------------------------------------------------
+# 第二部分:主模型 + 备用模型,用with_fallbacks()组合出自动降级链
+# ---------------------------------------------------------------------------
+
+
+def build_translation_chain_with_fallback(
+    primary_model: Runnable,
+    fallback_model: Runnable,
+) -> Runnable:
+    """
+    构建一条"主模型失败时自动切换到备用模型"的翻译链。
+
+    Runnable.with_fallbacks()接收一个"备用Runnable列表",当主体在
+    invoke过程中抛出异常时,会依次尝试列表里的每一个备用Runnable,
+    直到某一个成功,或者全部都失败(全部失败时,会重新抛出最后一个
+    备用方案抛出的异常)。
+
+    这里特意把fallback包在prompt|model|parser的"model"这一节点上,
+    而不是包在整条链外层,原因是:如果包在整条链外层,一旦切换到备用
+    模型,prompt还需要重新格式化一次(虽然结果一样,但语义上不够精确);
+    只包在model这一节点,能让fallback的粒度更细——只有"模型调用"这一步
+    出问题时才切换,prompt格式化、输出解析这些其他步骤完全不受影响。
+    """
+    resilient_model = primary_model.with_fallbacks([fallback_model])
+
+    prompt = ChatPromptTemplate.from_template(
+        "把下面这句话翻译成英文,只输出翻译结果,不要任何多余的解释:\n{text}"
+    )
+    parser = StrOutputParser()
+    return prompt | resilient_model | parser
+
+
+def demo_fallback_triggers_on_primary_failure() -> None:
+    """
+    演示一:主模型总是失败,备用模型正常返回,验证链条最终能够拿到
+    备用模型的结果,而不是让整条链直接崩溃。
+    """
+    print("\n===== 演示一:主模型失败,自动降级到备用模型 =====")
+
+    primary = AlwaysFailingChatModel(failure_reason="模拟场景:DeepSeek接口当前限流")
+    fallback = build_fake_chat_model(responses=["This is the fallback translation result."])
+
+    chain = build_translation_chain_with_fallback(primary, fallback)
+    result = chain.invoke({"text": "这是一句测试用的句子。"})
+
+    print(f"主模型调用次数:{primary.call_count}(应该是1,说明确实尝试过主模型)")
+    print(f"最终返回结果(来自备用模型):{result}")
+
+    assert primary.call_count == 1, "主模型应该被尝试调用过一次,才能触发降级逻辑"
+    assert result == "This is the fallback translation result.", "最终结果应该来自备用模型"
+    print("验证通过:主模型失败后,链条自动降级到备用模型,并成功返回结果。")
+
+
+def demo_fallback_exhausted_reraises_first_error() -> None:
+    """
+    演示二:主模型和备用模型都失败,验证最终会重新抛出异常,而不是
+    悄悄返回一个None或者空字符串——"明确地失败"比"悄悄地返回错误数据"
+    在工程上永远是更安全的选择。
+
+    这里有一个容易被想反的细节,陈铭当初也猜错了一次:`with_fallbacks()`
+    在"所有候选都失败"时,重新抛出的是**第一个**候选(也就是主模型)
+    产生的异常,而不是最后一个备用方案的异常——源码里明确维护了
+    `first_error`这个变量,循环结束后统一raise它。这么设计是有道理的:
+    主模型的失败原因,通常才是"业务上最值得被关注、最应该出现在报警
+    信息里"的那一个,备用方案本身失败,更多时候只是"雪上加霜"的次要信息。
+    """
+    print("\n===== 演示二:主模型与备用模型均失败,应重新抛出主模型的原始异常 =====")
+
+    primary = AlwaysFailingChatModel(failure_reason="模拟场景:主服务商接口超时")
+    fallback = AlwaysFailingChatModel(failure_reason="模拟场景:备用服务商额度已耗尽")
+
+    chain = build_translation_chain_with_fallback(primary, fallback)
+
+    try:
+        chain.invoke({"text": "这是一句测试用的句子。"})
+        assert False, "主模型和备用模型都失败时,理应抛出异常,这一行不该被执行到"
+    except ConnectionError as error:
+        print(f"链条正确抛出了异常:{error}")
+        assert "主服务商接口超时" in str(error), "抛出的应该是第一个失败的候选(也就是主模型)的原始异常信息"
+
+    assert primary.call_count == 1, "主模型应该被尝试调用过一次"
+    assert fallback.call_count == 1, "备用模型也应该被尝试调用过一次"
+    print("验证通过:主模型和备用模型都失败时,链条正确抛出了主模型最初失败的那个原始异常。")
+
+
+def demo_fallback_with_multiple_candidates() -> None:
+    """
+    演示三:一主两备,前两个都失败,第三个(第二个备用)成功,
+    验证with_fallbacks()支持依次尝试多个备用方案,而不是只能配一个。
+    """
+    print("\n===== 演示三:一主两备,依次尝试直到成功 =====")
+
+    primary = AlwaysFailingChatModel(failure_reason="模拟场景:主服务商DeepSeek不可用")
+    fallback_one = AlwaysFailingChatModel(failure_reason="模拟场景:备用服务商A同样不可用")
+    fallback_two = build_fake_chat_model(responses=["Result from the second fallback provider."])
+
+    resilient_model = primary.with_fallbacks([fallback_one, fallback_two])
+    prompt = ChatPromptTemplate.from_template("翻译:{text}")
+    parser = StrOutputParser()
+    chain = prompt | resilient_model | parser
+
+    result = chain.invoke({"text": "多级降级测试"})
+    print(f"最终结果(应来自第二个备用方案):{result}")
+
+    assert primary.call_count == 1
+    assert fallback_one.call_count == 1
+    assert result == "Result from the second fallback provider."
+    print("验证通过:with_fallbacks()支持配置多个备用方案,会依次尝试直到某一个成功。")
+
+
+# ---------------------------------------------------------------------------
+# 第三部分:离线自测模式——用FakeListChatModel验证"不涉及真实模型能力"的逻辑
+# ---------------------------------------------------------------------------
+
+
+def build_offline_testable_summary_chain(fake_responses: List[str]) -> Runnable:
+    """
+    构建一条完全离线可运行的"清洗 -> 生成摘要"链,用于本地快速自测。
+
+    这条链的结构,与模块六里真实的摘要阶段几乎一样,唯一的区别是模型
+    换成了FakeListChatModel。这样陈铭在本地开发阶段,可以先用这条离线
+    链验证prompt模板有没有写错占位符、RunnableLambda清洗逻辑有没有bug、
+    输出解析逻辑对不对,确认这些"纯逻辑"部分没问题之后,再切换成真实
+    模型做最终验收,能大幅减少反复调用真实大模型接口(既费钱又费时间)
+    的次数。
+    """
+    from langchain_core.runnables import RunnableLambda
+
+    def normalize_whitespace(payload: dict) -> dict:
+        """清洗输入文本里的多余空白,这一步纯粹是字符串处理,不涉及模型能力。"""
+        text = payload.get("text", "")
+        return {"text": " ".join(text.split())}
+
+    cleaner = RunnableLambda(normalize_whitespace)
+    prompt = ChatPromptTemplate.from_template("请为以下内容生成一句话摘要:\n{text}")
+    fake_model = build_fake_chat_model(responses=fake_responses)
+    parser = StrOutputParser()
+
+    return cleaner | prompt | fake_model | parser
+
+
+def run_offline_selfcheck_suite() -> None:
+    """
+    模拟陈铭在没有网络、或者密钥暂时失效的情况下,如何用离线自测链快速
+    验证自己当天写的组合逻辑没有明显bug。这个函数本身不发起任何网络请求。
+    """
+    print("\n===== 演示四:离线自测模式(不依赖真实网络与API密钥) =====")
+
+    chain = build_offline_testable_summary_chain(
+        fake_responses=["这是关于苍穹平台LCEL能力建设的一句话摘要。"]
+    )
+
+    messy_input = {"text": "苍穹   平台     今天    重点     打磨   了    容错   与   降级   能力。"}
+    result = chain.invoke(messy_input)
+    print(f"离线自测结果:{result}")
+
+    assert result == "这是关于苍穹平台LCEL能力建设的一句话摘要。"
+    print("验证通过:即使完全离线,清洗+prompt拼接+输出解析这套组合逻辑依然可以被快速验证。")
+
+    # 用batch模式验证离线链条对多条输入的处理能力
+    batch_inputs = [
+        {"text": "第一条待摘要的示例文本。"},
+        {"text": "第二条待摘要的示例文本,内容稍微长一点。"},
+        {"text": "第三条。"},
+    ]
+
+    multi_response_chain = build_offline_testable_summary_chain(
+        fake_responses=["摘要A", "摘要B", "摘要C"]
+    )
+    batch_results = multi_response_chain.batch(batch_inputs)
+    print(f"batch离线自测结果:{batch_results}")
+    assert batch_results == ["摘要A", "摘要B", "摘要C"], "FakeListChatModel应该按顺序循环返回预设的响应内容"
+    print("验证通过:离线自测链同样支持batch批量调用,行为与真实链路完全一致。")
+
+
+# ---------------------------------------------------------------------------
+# 第四部分:根据环境变量,自动选择"真实模型"或"离线假模型"的工厂函数
+# ---------------------------------------------------------------------------
+
+
+def resolve_chat_model_for_current_environment(
+    real_model_factory,
+    fake_responses: List[str],
+) -> Runnable:
+    """
+    根据环境变量CQ_OFFLINE_MODE,自动决定当前应该使用真实模型还是假模型。
+
+    这是老王要求补充的一个"开发体验优化"——陈铭以后不需要每次在
+    "真实模型"和"离线假模型"之间手动改代码切换,只需要在本地开发时
+    设置一个环境变量`CQ_OFFLINE_MODE=1`,同一份代码在CI流水线、本地
+    离线开发、真实联调三种场景下都能直接复用,不用维护两份平行的代码。
+    """
+    offline_mode = os.getenv("CQ_OFFLINE_MODE", "0") == "1"
+    if offline_mode:
+        return build_fake_chat_model(responses=fake_responses)
+    return real_model_factory()
+
+
+def demo_environment_aware_model_selection() -> None:
+    """演示环境变量驱动的模型选择逻辑,分别模拟"离线开发"和"真实环境"两种取值。"""
+    print("\n===== 演示五:环境变量驱动的模型自动选择 =====")
+
+    def real_model_factory_stub():
+        # 真实环境下这里应该返回一个 ChatOpenAI 实例,今天演示里用一个
+        # "会抛异常"的占位符代替,专门用来证明"离线模式下这个工厂函数
+        # 根本不会被调用",避免真实环境下的代码在离线演示里被误触发。
+        raise RuntimeError("真实模型工厂函数被意外调用了,这在离线模式下不应该发生")
+
+    os.environ["CQ_OFFLINE_MODE"] = "1"
+    model = resolve_chat_model_for_current_environment(
+        real_model_factory_stub, fake_responses=["离线模式返回的固定结果"]
+    )
+    assert isinstance(model, FakeListChatModel), "CQ_OFFLINE_MODE=1时,应该返回假模型实例"
+    print("离线模式下(CQ_OFFLINE_MODE=1):正确返回了FakeListChatModel,未触发真实模型工厂函数。")
+
+    os.environ["CQ_OFFLINE_MODE"] = "0"
+    try:
+        resolve_chat_model_for_current_environment(
+            real_model_factory_stub, fake_responses=["不会用到这个"]
+        )
+        assert False, "非离线模式下应该调用真实模型工厂函数并抛出RuntimeError,这一行不该被执行到"
+    except RuntimeError as error:
+        print(f"非离线模式下(CQ_OFFLINE_MODE=0):正确尝试调用了真实模型工厂函数,捕获到预期异常:{error}")
+    finally:
+        os.environ.pop("CQ_OFFLINE_MODE", None)
+
+
+def run_all_demos() -> None:
+    """依次运行本文件中的全部演示。"""
+    demo_fallback_triggers_on_primary_failure()
+    demo_fallback_exhausted_reraises_first_error()
+    demo_fallback_with_multiple_candidates()
+    run_offline_selfcheck_suite()
+    demo_environment_aware_model_selection()
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+
+### 十二、运行时可配置字段:configurable_fields / configurable_alternatives
+
+海纳制造集团的产品经理提出一个需求:普通用户默认用速度快、成本低的模型档位,VIP客户可以切换到能力更强的档位。如果每种场景各写一套chain构建代码,代码会迅速膨胀成一堆重复的链条。陈铭用`configurable_fields`和`configurable_alternatives`解决了这个问题——只构建一条链,把需要按场景切换的参数或组件标记成可配置项,调用时通过`config`动态指定具体取值,还封装了一层"按用户等级自动选择档位"的业务规则函数。
+
+```python
+"""
+configurable_runtime_model_switch.py
+
+苍穹平台 · LCEL链式改造技术验证 · 模块十二(运行时可配置字段:configurable_fields / configurable_alternatives)
+
+背景:
+    模块十一解决了"模型服务挂了自动切换"的问题,但老王在评审时又抛出了
+    另一个更贴近产品需求的场景:海纳制造集团的产品经理希望后台能提供一个
+    "模型档位切换"的开关——普通用户默认用速度快、成本低的模型档位,
+    VIP客户或者对准确度要求更高的场景,可以切换到能力更强(但更贵、更慢)
+    的模型档位;温度参数(temperature)也希望能按场景动态调整,创意型
+    任务温度调高一些,严谨的结构化提取任务温度调到接近0。
+
+    如果按照"每种场景各写一套chain构建代码"的思路来实现,代码会迅速
+    膨胀成一堆几乎相同、只有一两个参数不同的重复链条。LangChain提供了
+    `configurable_fields`和`configurable_alternatives`这两个能力,
+    专门用来解决这个问题:先构建出**一条**链,把其中"可能需要按场景切换"
+    的参数或组件,标记成"可配置项",调用的时候通过`config`参数动态指定
+    具体取值,而不需要重新构建一条新链。
+
+编写人:陈铭
+评审人:王振宇
+飞书任务号:CQ-109(苍穹0.5版 · 运行时模型档位与参数动态配置)
+"""
+
+from typing import Any, Dict
+
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import ConfigurableField, Runnable
+
+
+# ---------------------------------------------------------------------------
+# 第一部分:用configurable_fields让"温度参数"在运行时可调
+# ---------------------------------------------------------------------------
+
+
+def build_temperature_configurable_model() -> Runnable:
+    """
+    构造一个"温度参数可在运行时动态调整"的假模型。
+
+    真实生产代码里,这里应该是:
+        ChatOpenAI(model=..., temperature=0.3).configurable_fields(
+            temperature=ConfigurableField(id="temperature", name="生成温度")
+        )
+    今天演示用FakeListChatModel替代,是为了让整份代码在没有真实API密钥
+    的情况下也能完整跑通并被单元测试覆盖,底层原理与真实模型完全一致
+    ——configurable_fields操作的是Runnable对象本身的属性,不关心这个
+    属性最终是不是真的会影响一次大模型调用的行为。
+
+    这里用"responses"这个字段做配置演示(FakeListChatModel没有真正的
+    temperature参数),但暴露给调用方的config id依然叫"temperature",
+    这是故意设计的一个小心思——目的是让demo函数在调用形式上,与真实
+    生产代码保持完全一致的使用体验,只是内部实现细节不同。
+    """
+    base_model = FakeListChatModel(responses=["这是默认档位(如同temperature=0.3)的生成结果。"])
+    return base_model.configurable_fields(
+        responses=ConfigurableField(
+            id="temperature_profile",
+            name="生成温度档位",
+            description="不同温度档位对应的示例返回内容,真实场景下这里应该是真正的temperature数值",
+        )
+    )
+
+
+def demo_runtime_temperature_switch() -> None:
+    """演示同一个模型对象,在不同调用时使用不同的"温度档位",而不需要重新构建模型实例。"""
+    print("\n===== 演示一:同一个模型对象,运行时切换温度档位 =====")
+
+    model = build_temperature_configurable_model()
+    prompt = ChatPromptTemplate.from_template("请为以下产品写一句宣传语:{product}")
+    chain = prompt | model | StrOutputParser()
+
+    default_result = chain.invoke({"product": "苍穹智能体中台"})
+    print(f"未指定配置时(默认档位):{default_result}")
+
+    creative_result = chain.invoke(
+        {"product": "苍穹智能体中台"},
+        config={"configurable": {"temperature_profile": ["这是创意档位(如同temperature=0.9)的生成结果,风格更大胆。"]}},
+    )
+    print(f"指定创意档位后:{creative_result}")
+
+    precise_result = chain.invoke(
+        {"product": "苍穹智能体中台"},
+        config={"configurable": {"temperature_profile": ["这是严谨档位(如同temperature=0.0)的生成结果,风格更保守。"]}},
+    )
+    print(f"指定严谨档位后:{precise_result}")
+
+    assert "默认档位" in default_result
+    assert "创意档位" in creative_result
+    assert "严谨档位" in precise_result
+    print("验证通过:通过config参数,同一个模型对象在不同调用中确实表现出了不同的'温度档位'。")
+
+
+# ---------------------------------------------------------------------------
+# 第二部分:用configurable_alternatives实现"模型档位"整体切换
+# ---------------------------------------------------------------------------
+
+
+def build_tiered_model_chain() -> Runnable:
+    """
+    构造一个支持"档位整体切换"的模型链:默认是标准档(fast_tier),
+    可以通过config切换到能力更强的旗舰档(flagship_tier)。
+
+    与第一部分"只调整一个参数"不同,configurable_alternatives针对的是
+    "整个组件替换"的场景——不只是温度不同,可能连模型型号本身都不同
+    (比如标准档用一个轻量模型,旗舰档换成参数量更大的模型),两者调用
+    接口完全一致,但内部实现可以是两个完全独立的对象。
+    """
+    fast_tier_model = FakeListChatModel(responses=["【标准档】这是响应速度更快、成本更低的结果。"])
+    flagship_tier_model = FakeListChatModel(responses=["【旗舰档】这是准确度更高、响应稍慢的结果。"])
+
+    configurable_model = fast_tier_model.configurable_alternatives(
+        ConfigurableField(id="model_tier", name="模型档位"),
+        default_key="fast_tier",
+        flagship_tier=flagship_tier_model,
+    )
+
+    prompt = ChatPromptTemplate.from_template("请回答用户的问题:{question}")
+    return prompt | configurable_model | StrOutputParser()
+
+
+def demo_runtime_model_tier_switch() -> None:
+    """演示通过config参数,在'标准档'和'旗舰档'两个完全不同的模型实例之间切换。"""
+    print("\n===== 演示二:同一条链,运行时切换模型档位(标准档 / 旗舰档) =====")
+
+    chain = build_tiered_model_chain()
+
+    default_result = chain.invoke({"question": "苍穹平台今天新增了哪些能力?"})
+    print(f"未指定档位时(默认标准档):{default_result}")
+
+    flagship_result = chain.invoke(
+        {"question": "苍穹平台今天新增了哪些能力?"},
+        config={"configurable": {"model_tier": "flagship_tier"}},
+    )
+    print(f"指定model_tier=flagship_tier后:{flagship_result}")
+
+    assert "标准档" in default_result
+    assert "旗舰档" in flagship_result
+    print("验证通过:configurable_alternatives能够在运行时把请求路由到完全不同的模型实例上。")
+
+
+# ---------------------------------------------------------------------------
+# 第三部分:结合业务场景——按用户等级自动决定档位,封装成一个业务函数
+# ---------------------------------------------------------------------------
+
+
+VIP_TIER_LEVELS = {"gold", "platinum"}
+
+
+def resolve_model_tier_for_user(user_level: str) -> str:
+    """
+    根据用户等级,决定应该使用的模型档位标识。
+
+    这个函数本身与LangChain没有任何关系,是纯业务规则,单独抽出来的
+    好处是:业务规则的变化(比如以后新增一个"银牌"等级享受折扣档位),
+    只需要改这一个函数,不需要动任何LCEL链的构建代码——这也是"业务
+    规则"和"链路结构"应该保持解耦的一个具体体现。
+    """
+    if user_level in VIP_TIER_LEVELS:
+        return "flagship_tier"
+    return "fast_tier"
+
+
+def answer_user_question(chain: Runnable, question: str, user_level: str) -> str:
+    """
+    对外暴露的业务入口:根据用户等级自动选择模型档位,调用方不需要
+    关心configurable_alternatives的具体实现细节。
+    """
+    tier = resolve_model_tier_for_user(user_level)
+    return chain.invoke({"question": question}, config={"configurable": {"model_tier": tier}})
+
+
+def demo_business_level_driven_tier_selection() -> None:
+    """演示"按用户等级自动选择模型档位"这一层业务封装的正确性。"""
+    print("\n===== 演示三:按用户等级自动选择模型档位(业务封装) =====")
+
+    chain = build_tiered_model_chain()
+
+    normal_user_result = answer_user_question(chain, "怎么导出待办事项报表?", user_level="normal")
+    gold_user_result = answer_user_question(chain, "怎么导出待办事项报表?", user_level="gold")
+    platinum_user_result = answer_user_question(chain, "怎么导出待办事项报表?", user_level="platinum")
+
+    print(f"普通用户(normal):{normal_user_result}")
+    print(f"黄金用户(gold):{gold_user_result}")
+    print(f"白金用户(platinum):{platinum_user_result}")
+
+    assert "标准档" in normal_user_result, "普通用户应该被路由到标准档"
+    assert "旗舰档" in gold_user_result, "黄金用户应该被路由到旗舰档"
+    assert "旗舰档" in platinum_user_result, "白金用户应该被路由到旗舰档"
+    print("验证通过:普通用户被路由到标准档,黄金/白金用户被路由到旗舰档,与业务规则一致。")
+
+
+# ---------------------------------------------------------------------------
+# 第四部分:同时配置多个可配置项(模型档位 + 输出语言前缀)
+# ---------------------------------------------------------------------------
+
+
+def build_multi_configurable_chain():
+    """
+    构造一条带有两层可配置能力的链:模型档位(model_tier,通过
+    configurable_alternatives实现)与输入前缀处理(通过普通的
+    RunnableLambda + config的"configurable"字段手动读取实现)。
+
+    这里特意展示两种不同的"可配置"实现方式的边界:
+    configurable_fields/configurable_alternatives只能作用于
+    Runnable/Pydantic模型上真正声明过的字段,不是任意函数都能直接
+    套用;如果只是想让一个普通的RunnableLambda函数,根据每次调用
+    传入的config做出不同行为,更朴素也更通用的做法,是直接在函数体内
+    读取RunnableConfig里的configurable字典,今天这里就用这种写法演示。
+    """
+    from langchain_core.runnables import RunnableConfig, RunnableLambda
+
+    def add_language_prefix(payload: Dict[str, Any], config: RunnableConfig) -> Dict[str, Any]:
+        configurable = (config or {}).get("configurable", {})
+        prefix = configurable.get("language_prefix", "[中文默认前缀]")
+        return {"question": f"{prefix} {payload['question']}"}
+
+    fast_tier_model = FakeListChatModel(responses=["【标准档】的回答内容。"])
+    flagship_tier_model = FakeListChatModel(responses=["【旗舰档】的回答内容。"])
+    configurable_model = fast_tier_model.configurable_alternatives(
+        ConfigurableField(id="model_tier"),
+        default_key="fast_tier",
+        flagship_tier=flagship_tier_model,
+    )
+
+    prompt = ChatPromptTemplate.from_template("{question}")
+    full_chain = RunnableLambda(add_language_prefix) | prompt | configurable_model | StrOutputParser()
+    return full_chain, RunnableLambda(add_language_prefix)
+
+
+def demo_combining_multiple_configurable_dimensions() -> None:
+    """
+    演示:同一次调用里,可以在config的configurable字典中同时指定
+    "模型档位"(交给configurable_alternatives处理)和"语言前缀"
+    (交给自定义RunnableLambda手动读取config处理)两个互相独立的维度,
+    二者可以自由组合、互不干扰。
+
+    由于FakeListChatModel返回的是提前写好的固定文本(不会真的读取
+    prompt里拼进去的语言前缀内容),这里分两步验证:
+    1. 直接调用prefixer本身,验证"语言前缀"这个维度确实按config生效;
+    2. 调用组合好的完整链条,验证"模型档位"这个维度确实按config生效。
+    两者结合起来,就完整验证了"两个可配置维度可以在同一次调用里自由组合"。
+    """
+    print("\n===== 演示四:多个可配置维度可以自由组合 =====")
+
+    full_chain, prefixer = build_multi_configurable_chain()
+
+    prefixed_default = prefixer.invoke({"question": "苍穹平台的多语言支持进展如何?"})
+    prefixed_english = prefixer.invoke(
+        {"question": "苍穹平台的多语言支持进展如何?"},
+        config={"configurable": {"language_prefix": "[English]"}},
+    )
+    print(f"未指定language_prefix时:{prefixed_default}")
+    print(f"指定language_prefix=[English]时:{prefixed_english}")
+    assert prefixed_default["question"].startswith("[中文默认前缀]")
+    assert prefixed_english["question"].startswith("[English]")
+
+    result_default_tier = full_chain.invoke({"question": "苍穹平台的多语言支持进展如何?"})
+    result_flagship_tier = full_chain.invoke(
+        {"question": "苍穹平台的多语言支持进展如何?"},
+        config={"configurable": {"model_tier": "flagship_tier", "language_prefix": "[English]"}},
+    )
+    print(f"默认档位结果:{result_default_tier}")
+    print(f"旗舰档位结果(同时指定了language_prefix):{result_flagship_tier}")
+
+    assert "标准档" in result_default_tier
+    assert "旗舰档" in result_flagship_tier
+    print("验证通过:model_tier(通过configurable_alternatives)与language_prefix")
+    print("(通过手动读取config)这两个独立维度,在同一次调用里被正确、互不干扰地组合生效。")
+
+
+def run_all_demos() -> None:
+    """依次运行本文件中的全部演示。"""
+    demo_runtime_temperature_switch()
+    demo_runtime_model_tier_switch()
+    demo_business_level_driven_tier_selection()
+    demo_combining_multiple_configurable_dimensions()
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+
+### 十三、异步调用:ainvoke/abatch/astream与并发性能对比
+
+苍穹平台的FastAPI服务本身跑在异步事件循环上,如果在异步接口里调用同步的`chain.invoke()`会阻塞整个事件循环。陈铭把LCEL链条上的异步方法`ainvoke`、`abatch`、`astream`真正用了一遍,还亲手验证了一个容易被误解的陷阱——用了async/await不代表就是并发,只有用`asyncio.gather`真正同时发起多个请求才算数;此外还用`asyncio.Semaphore`演示了限制并发上限、避免瞬间请求过多压垮下游服务的做法。
+
+```python
+"""
+async_chain_and_concurrency.py
+
+苍穹平台 · LCEL链式改造技术验证 · 模块十三(异步调用:ainvoke/abatch/astream与并发性能对比)
+
+背景:
+    模块一已经对比过`invoke`(同步单条)与`batch`(同步批量,内部有一定
+    并发调度)之间的性能差异,但苍穹平台真实的FastAPI服务本身就是跑在
+    异步事件循环上的(Day22-24已经搭好了异步接口),如果在异步接口里
+    调用同步的`chain.invoke()`,会阻塞整个事件循环,导致同一个进程里
+    其他正在处理的请求全部被卡住——这是异步Web服务里一个非常容易被
+    忽略、但后果很严重的性能陷阱。LCEL链条上的每一个Runnable,都同时
+    提供了异步版本的方法:`ainvoke`、`abatch`、`astream`,今天要做的,
+    是把这三个异步方法真正用起来,并且用`asyncio.gather`亲手验证一次
+    "并发发起多个请求"相比"依次await每一个请求"能带来多大的耗时收益。
+
+编写人:陈铭
+评审人:王振宇
+飞书任务号:CQ-110(苍穹0.5版 · 异步调用能力验证与并发耗时基准测试)
+"""
+
+import asyncio
+import time
+from typing import Any, List, Optional
+
+from langchain_core.messages import AIMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import Runnable, RunnableConfig
+
+
+class SimulatedLatencyChatModel(Runnable):
+    """
+    专门用于耗时对比演示的假聊天模型:同步invoke里用time.sleep模拟网络
+    延迟,异步ainvoke里用asyncio.sleep模拟同样的延迟。
+
+    这里之所以没有直接用官方的FakeListChatModel,是因为实测发现它的
+    sleep参数只在_stream/_astream(流式)里生效,invoke/ainvoke(非流式)
+    的调用路径根本不会等待这个延迟——这是陈铭今天调试耗时对比实验时,
+    真实踩到的一个"想当然"的坑:看到某个类有sleep参数,不代表这个参数
+    在所有调用路径上都生效,具体行为一定要翻源码或者跑一次实验确认,
+    不能只凭参数名字猜测。今天为了让"非流式调用"的耗时对比实验也能
+    正确模拟延迟,干脆手写一个更简单直接的假模型,只服务于这一个目的。
+    """
+
+    def __init__(self, latency_seconds: float, response_text: str):
+        self.latency_seconds = latency_seconds
+        self.response_text = response_text
+        self.call_count = 0
+
+    def invoke(self, input: Any, config: Optional[RunnableConfig] = None, **kwargs: Any) -> AIMessage:
+        self.call_count += 1
+        time.sleep(self.latency_seconds)
+        return AIMessage(content=self.response_text)
+
+    async def ainvoke(self, input: Any, config: Optional[RunnableConfig] = None, **kwargs: Any) -> AIMessage:
+        self.call_count += 1
+        await asyncio.sleep(self.latency_seconds)
+        return AIMessage(content=self.response_text)
+
+
+# ---------------------------------------------------------------------------
+# 第一部分:构建一条带有模拟网络延迟的异步链
+# ---------------------------------------------------------------------------
+
+
+def build_chain_with_simulated_latency(latency_seconds: float, response_text: str) -> Runnable:
+    """
+    构建一条prompt | model | parser的三段链,model用SimulatedLatencyChatModel
+    模拟,固定延迟代替真实网络请求的耗时波动,方便在单元测试和课堂演示里
+    得到稳定、可复现的耗时对比结果,而不必依赖真实网络环境当天的状况
+    (网络环境的好坏,不应该影响我们对"异步并发是否真的有效"这件事本身
+    的验证结论)。
+    """
+    model = SimulatedLatencyChatModel(latency_seconds=latency_seconds, response_text=response_text)
+    prompt = ChatPromptTemplate.from_template("请处理以下内容:{text}")
+    return prompt | model | StrOutputParser()
+
+
+# ---------------------------------------------------------------------------
+# 第二部分:同步串行 vs 异步并发,耗时对比
+# ---------------------------------------------------------------------------
+
+
+def run_sync_sequential(chain: Runnable, inputs: List[dict]) -> List[str]:
+    """同步方式,依次调用invoke处理每一条输入,作为耗时对比的基准。"""
+    return [chain.invoke(item) for item in inputs]
+
+
+async def run_async_sequential(chain: Runnable, inputs: List[dict]) -> List[str]:
+    """
+    异步方式,但依然是"依次await"——这是一个容易被误解的陷阱写法,
+    很多刚接触异步编程的人会觉得"只要用了async/await就等于并发了",
+    但如果每一次await都乖乖等前一个完全结束才发起下一个,本质上还是
+    串行执行,耗时不会比同步版本快多少,今天特意把这种"伪并发"写法
+    也实现一遍,用真实的耗时数据把这个误解戳破。
+    """
+    results = []
+    for item in inputs:
+        result = await chain.ainvoke(item)
+        results.append(result)
+    return results
+
+
+async def run_async_concurrent(chain: Runnable, inputs: List[dict]) -> List[str]:
+    """
+    异步方式,用asyncio.gather真正做到"同时发起多个请求,一起等待它们
+    完成",这才是异步编程真正发挥并发优势的写法。
+    """
+    tasks = [chain.ainvoke(item) for item in inputs]
+    return await asyncio.gather(*tasks)
+
+
+async def run_abatch_concurrent(chain: Runnable, inputs: List[dict]) -> List[str]:
+    """
+    使用LangChain内置的abatch方法——它本质上也是对多个ainvoke调用做了
+    并发编排,通常是生产代码里最推荐的写法,因为不需要自己手写
+    asyncio.gather,还能享受LangChain内部对并发度、错误处理等细节的
+    统一封装(比如可以通过config里的max_concurrency参数限制并发上限,
+    避免瞬间打出过多并发请求把下游服务打垮)。
+    """
+    return await chain.abatch(inputs)
+
+
+def demo_async_concurrency_benefit() -> None:
+    """
+    核心演示:构造5条"每条耗时0.2秒"的模拟请求,分别用四种方式处理,
+    对比总耗时,验证"真正的并发"确实比"串行"和"伪并发"快得多。
+    """
+    print("\n===== 演示一:同步串行 vs 异步伪并发 vs 异步真并发,耗时对比 =====")
+
+    latency_per_call = 0.2
+    inputs = [{"text": f"任务{i}"} for i in range(5)]
+    chain = build_chain_with_simulated_latency(latency_per_call, "已处理完成。")
+
+    start = time.perf_counter()
+    sync_results = run_sync_sequential(chain, inputs)
+    sync_elapsed = time.perf_counter() - start
+    print(f"[同步串行invoke] 耗时:{sync_elapsed:.2f}秒,结果数量:{len(sync_results)}")
+
+    start = time.perf_counter()
+    async_seq_results = asyncio.run(run_async_sequential(chain, inputs))
+    async_seq_elapsed = time.perf_counter() - start
+    print(f"[异步但依然串行await] 耗时:{async_seq_elapsed:.2f}秒,结果数量:{len(async_seq_results)}")
+
+    start = time.perf_counter()
+    async_concurrent_results = asyncio.run(run_async_concurrent(chain, inputs))
+    async_concurrent_elapsed = time.perf_counter() - start
+    print(f"[asyncio.gather真并发] 耗时:{async_concurrent_elapsed:.2f}秒,结果数量:{len(async_concurrent_results)}")
+
+    start = time.perf_counter()
+    abatch_results = asyncio.run(run_abatch_concurrent(chain, inputs))
+    abatch_elapsed = time.perf_counter() - start
+    print(f"[abatch内置并发] 耗时:{abatch_elapsed:.2f}秒,结果数量:{len(abatch_results)}")
+
+    expected_sequential_lower_bound = latency_per_call * len(inputs) * 0.9
+    assert sync_elapsed >= expected_sequential_lower_bound, "同步串行的总耗时理应接近'单次延迟 x 请求数量'"
+    assert async_seq_elapsed >= expected_sequential_lower_bound, "伪并发(依次await)的总耗时同样接近串行耗时,不会明显更快"
+
+    concurrency_upper_bound = latency_per_call * 2.5
+    assert async_concurrent_elapsed < concurrency_upper_bound, \
+        f"真并发的总耗时应该明显小于串行耗时,接近单次延迟而不是多次延迟的总和,实际为{async_concurrent_elapsed:.2f}秒"
+    assert abatch_elapsed < concurrency_upper_bound, \
+        f"abatch的总耗时也应该明显小于串行耗时,实际为{abatch_elapsed:.2f}秒"
+
+    assert sync_results == async_seq_results == async_concurrent_results == abatch_results, \
+        "四种调用方式最终得到的结果内容应该完全一致,只是耗时不同"
+
+    print("\n验证通过:四种方式最终结果完全一致,但'asyncio.gather真并发'和'abatch'的总耗时")
+    print(f"明显小于串行方式的{sync_elapsed:.2f}秒,证明了'真正的并发'确实能显著缩短总处理时间——")
+    print("这正是苍穹平台FastAPI异步接口层,应该优先使用ainvoke/abatch/astream的核心原因。")
+
+
+# ---------------------------------------------------------------------------
+# 第三部分:astream的异步流式调用,与同步stream的行为对比
+# ---------------------------------------------------------------------------
+
+
+async def collect_astream_chunks(chain: Runnable, payload: dict) -> List[str]:
+    """异步收集astream产出的所有增量文本块,返回一个列表方便后续断言。"""
+    chunks = []
+    async for chunk in chain.astream(payload):
+        chunks.append(chunk)
+    return chunks
+
+
+def demo_async_stream() -> None:
+    """
+    演示astream异步流式调用,验证它产出的内容拼接起来与完整结果一致。
+
+    注意:这里改用官方的FakeListChatModel,而不是上面自己手写的
+    SimulatedLatencyChatModel——因为后者只实现了invoke/ainvoke这两个
+    "最小协议",没有重写_stream/_astream,所以走的是Runnable基类提供的
+    默认流式实现(本质上是"调一次ainvoke,把整段结果当成唯一一个分块
+    直接yield出去"),并不会真的把内容拆成多个小块。而FakeListChatModel
+    官方实现里,_stream/_astream是逐字符拆分并yield的,更适合用来演示
+    "真正的流式输出是什么样子"。这也从另一个角度印证了模块九学到的道理
+    ——Runnable协议只保证"最小实现能跑通",具体的流式体验好不好,
+    要看子类有没有针对性地重写stream/astream。
+    """
+    print("\n===== 演示二:astream异步流式调用 =====")
+
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+
+    full_response = "苍穹平台异步流式响应演示文本。"
+    prompt = ChatPromptTemplate.from_template("请处理以下内容:{text}")
+    model = FakeListChatModel(responses=[full_response])
+    chain = prompt | model | StrOutputParser()
+
+    chunks = asyncio.run(collect_astream_chunks(chain, {"text": "任意输入"}))
+    reconstructed = "".join(chunks)
+
+    print(f"astream产出的分块数量:{len(chunks)}")
+    print(f"拼接还原后的完整内容:{reconstructed}")
+
+    assert reconstructed == full_response, "astream产出的所有分块拼接起来,应该与完整响应内容完全一致"
+    assert len(chunks) > 1, "既然是流式输出,理应产出多个分块,而不是一次性给出整个字符串"
+    print("验证通过:astream确实以多个小分块的形式,逐步产出与完整响应内容一致的文本。")
+
+
+# ---------------------------------------------------------------------------
+# 第四部分:限制并发上限(max_concurrency),避免瞬间请求过多压垮下游
+# ---------------------------------------------------------------------------
+
+
+def demo_max_concurrency_limit() -> None:
+    """
+    演示abatch的max_concurrency参数——限制同一时刻最多有多少个请求
+    真正在"飞行中"(in-flight),这是生产环境里非常重要的一项保护措施:
+    如果不加限制,一次性对下游模型接口发起几百个并发请求,很容易触发
+    服务商的限流策略,甚至把自己内部的连接池、线程池资源耗尽。
+    """
+    print("\n===== 演示三:abatch的max_concurrency并发上限控制 =====")
+
+    max_in_flight = 0
+    current_in_flight = 0
+    lock = asyncio.Lock()
+
+    async def tracked_call(item: dict) -> str:
+        nonlocal max_in_flight, current_in_flight
+        async with lock:
+            current_in_flight += 1
+            max_in_flight = max(max_in_flight, current_in_flight)
+        await asyncio.sleep(0.05)
+        async with lock:
+            current_in_flight -= 1
+        return f"已处理:{item['text']}"
+
+    async def run_with_manual_semaphore(inputs: List[dict], limit: int) -> List[str]:
+        semaphore = asyncio.Semaphore(limit)
+
+        async def bounded_call(item: dict) -> str:
+            async with semaphore:
+                return await tracked_call(item)
+
+        return await asyncio.gather(*(bounded_call(item) for item in inputs))
+
+    inputs = [{"text": f"任务{i}"} for i in range(10)]
+
+    results = asyncio.run(run_with_manual_semaphore(inputs, limit=3))
+    print(f"处理了{len(results)}条任务,过程中观测到的最大同时在飞请求数:{max_in_flight}")
+
+    assert len(results) == 10, "全部10条任务都应该被处理完"
+    assert max_in_flight <= 3, f"设置了并发上限为3,实际观测到的最大同时在飞请求数不应超过3,实际为{max_in_flight}"
+    print("验证通过:通过asyncio.Semaphore限制并发上限后,同一时刻的最大在飞请求数确实被控制住了,")
+    print("这与LangChain的abatch(..., config={'max_concurrency': N})参数所提供的能力,原理是完全一致的。")
+
+
+def run_all_demos() -> None:
+    """依次运行本文件中的全部演示。"""
+    demo_async_concurrency_benefit()
+    demo_async_stream()
+    demo_max_concurrency_limit()
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+
+### 十四、自定义回调处理器:调用链路可观测性建设
+
+早上老王那句"报错信息只会告诉你链执行失败,不会告诉你哪一步输入出了问题"的质问,一直是贯穿全天的主线。陈铭在收尾前补上了这条线最关键的一块拼图——继承`BaseCallbackHandler`实现了一个能统计每个组件调用次数、耗时、成功或失败的回调处理器,证明了"可观测性可以作为一个随时插拔的独立组件挂载到链条上,而不需要侵入业务逻辑本身"。
+
+```python
+"""
+custom_callback_observability.py
+
+苍穹平台 · LCEL链式改造技术验证 · 模块十四(自定义回调处理器:调用链路可观测性建设)
+
+背景:
+    今天早上老王那句"报错信息只会告诉你链执行失败,不会告诉你哪一步
+    输入出了问题"的质问,一直是贯穿全天的主线。前面几个模块分别从
+    "重试""降级""异步并发"几个角度提升了链条的健壮性,但老王要求
+    在收尾之前,再补上"可观测性"这条线上最关键的一块拼图——LangChain
+    的回调(Callback)机制。
+
+    LCEL链条上的每一个组件,在执行invoke/batch/stream的过程中,都会
+    在关键节点(开始、结束、出错、模型开始生成、模型产出一个新token等)
+    自动触发一系列回调事件。只要实现一个继承自`BaseCallbackHandler`的
+    自定义处理器,把关心的事件方法重写一遍,就能在完全不修改链条本身
+    结构的前提下,"旁路"式地采集耗时、调用次数、每一步的输入输出等
+    信息——这正是"横切关注点"(cross-cutting concern)的一个典型例子:
+    可观测性不应该侵入业务逻辑本身,而应该像本模块一样,作为一个可以
+    随时插拔的独立组件挂载上去。
+
+编写人:陈铭
+评审人:王振宇
+飞书任务号:CQ-111(苍穹0.5版 · LCEL链路可观测性:自定义回调处理器)
+"""
+
+import time
+from typing import Any, Dict, List, Optional
+from uuid import UUID
+
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import Runnable
+
+
+# ---------------------------------------------------------------------------
+# 第一部分:自定义回调处理器——统计每一个组件的调用次数与耗时
+# ---------------------------------------------------------------------------
+
+
+class StageTimingRecord:
+    """
+    记录单次"链上组件执行"的时间信息,用普通类(不是LCEL的一部分)
+    表示一条观测记录,字段设计上尽量贴近真实生产环境里日志平台需要
+    采集的字段:组件名称、开始时间、结束时间、耗时、是否成功。
+    """
+
+    def __init__(self, run_id: UUID, component_name: str, started_at: float):
+        self.run_id = run_id
+        self.component_name = component_name
+        self.started_at = started_at
+        self.ended_at: Optional[float] = None
+        self.succeeded: Optional[bool] = None
+        self.error_message: Optional[str] = None
+
+    @property
+    def duration_seconds(self) -> Optional[float]:
+        if self.ended_at is None:
+            return None
+        return self.ended_at - self.started_at
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "component_name": self.component_name,
+            "duration_seconds": round(self.duration_seconds, 4) if self.duration_seconds is not None else None,
+            "succeeded": self.succeeded,
+            "error_message": self.error_message,
+        }
+
+
+class TimingAndCallCountCallbackHandler(BaseCallbackHandler):
+    """
+    自定义回调处理器:记录链条上每一个被触发的组件(chain/llm)的
+    调用次数与耗时,并在链条整体结束后,可以导出一份完整的调用明细。
+
+    苍穹平台约定:任何需要采集"跨越多个组件的调用链路信息"的监控需求,
+    优先考虑通过CallbackHandler实现,而不是在每个组件内部手动埋点——
+    手动埋点意味着以后新增一个组件,就要记得再手动加一遍监控代码,
+    容易遗漏;而回调机制是LangChain框架级别提供的能力,只要组件遵循
+    Runnable协议,新增的组件天然就会被现有的回调处理器覆盖到,不需要
+    额外改动。
+    """
+
+    def __init__(self):
+        self.records: List[StageTimingRecord] = []
+        self._active_records: Dict[UUID, StageTimingRecord] = {}
+        self.llm_call_count = 0
+        self.chain_call_count = 0
+
+    def on_chain_start(
+        self, serialized: Dict[str, Any], inputs: Dict[str, Any], *, run_id: UUID, **kwargs: Any
+    ) -> None:
+        self.chain_call_count += 1
+        component_name = (serialized or {}).get("name") or (serialized or {}).get("id", ["未知组件"])[-1]
+        record = StageTimingRecord(run_id=run_id, component_name=str(component_name), started_at=time.perf_counter())
+        self._active_records[run_id] = record
+        self.records.append(record)
+
+    def on_chain_end(self, outputs: Dict[str, Any], *, run_id: UUID, **kwargs: Any) -> None:
+        record = self._active_records.get(run_id)
+        if record is not None:
+            record.ended_at = time.perf_counter()
+            record.succeeded = True
+
+    def on_chain_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
+        record = self._active_records.get(run_id)
+        if record is not None:
+            record.ended_at = time.perf_counter()
+            record.succeeded = False
+            record.error_message = str(error)
+
+    def on_llm_start(
+        self, serialized: Dict[str, Any], prompts: List[str], *, run_id: UUID, **kwargs: Any
+    ) -> None:
+        self.llm_call_count += 1
+        record = StageTimingRecord(run_id=run_id, component_name="LLM调用", started_at=time.perf_counter())
+        self._active_records[run_id] = record
+        self.records.append(record)
+
+    def on_llm_end(self, response: Any, *, run_id: UUID, **kwargs: Any) -> None:
+        record = self._active_records.get(run_id)
+        if record is not None:
+            record.ended_at = time.perf_counter()
+            record.succeeded = True
+
+    def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
+        record = self._active_records.get(run_id)
+        if record is not None:
+            record.ended_at = time.perf_counter()
+            record.succeeded = False
+            record.error_message = str(error)
+
+    def export_summary(self) -> Dict[str, Any]:
+        """把采集到的全部记录,汇总成一份适合打印或者上报监控平台的摘要。"""
+        return {
+            "chain_call_count": self.chain_call_count,
+            "llm_call_count": self.llm_call_count,
+            "total_records": len(self.records),
+            "failed_records": sum(1 for r in self.records if r.succeeded is False),
+            "records": [r.to_dict() for r in self.records],
+        }
+
+
+# ---------------------------------------------------------------------------
+# 第二部分:把自定义回调处理器挂载到一条真实链条上
+# ---------------------------------------------------------------------------
+
+
+def build_demo_chain(response_text: str) -> Runnable:
+    """构建一条最简单的prompt | model | parser链,用于演示回调采集效果。"""
+    prompt = ChatPromptTemplate.from_template("请总结以下内容:{text}")
+    model = FakeListChatModel(responses=[response_text])
+    return prompt | model | StrOutputParser()
+
+
+def demo_callback_captures_successful_run() -> None:
+    """演示一次成功的链条调用,验证回调处理器能正确统计到LLM调用次数与耗时。"""
+    print("\n===== 演示一:回调处理器采集一次成功调用的信息 =====")
+
+    handler = TimingAndCallCountCallbackHandler()
+    chain = build_demo_chain("这是一份关于苍穹平台可观测性建设的摘要。")
+
+    result = chain.invoke({"text": "较长的原始输入文本……"}, config={"callbacks": [handler]})
+    print(f"链条返回结果:{result}")
+
+    summary = handler.export_summary()
+    print(f"回调采集到的摘要信息:{summary}")
+
+    assert summary["llm_call_count"] == 1, "一次链条调用应该只触发一次LLM调用"
+    assert summary["failed_records"] == 0, "本次调用全程成功,不应该有任何失败记录"
+    assert all(record["duration_seconds"] is not None for record in summary["records"]), \
+        "每一条记录都应该有明确的耗时统计,不应该出现None"
+    print("验证通过:自定义回调处理器正确统计了本次调用涉及的每一个组件的执行情况。")
+
+
+def demo_callback_captures_failure() -> None:
+    """演示模型调用失败时,回调处理器能正确记录失败信息,而不是静默丢失。"""
+    print("\n===== 演示二:回调处理器采集一次失败调用的信息 =====")
+
+    from langchain_core.messages import AIMessage
+    from langchain_core.runnables import RunnableConfig
+
+    class AlwaysFailingModel(Runnable):
+        def invoke(self, input: Any, config: Optional[RunnableConfig] = None, **kwargs: Any) -> AIMessage:
+            raise TimeoutError("模拟场景:模型接口响应超时")
+
+    handler = TimingAndCallCountCallbackHandler()
+    prompt = ChatPromptTemplate.from_template("请总结以下内容:{text}")
+    chain = prompt | AlwaysFailingModel() | StrOutputParser()
+
+    try:
+        chain.invoke({"text": "任意输入"}, config={"callbacks": [handler]})
+        assert False, "模型调用理应失败并向上抛出异常,这一行不该被执行到"
+    except TimeoutError:
+        pass
+
+    summary = handler.export_summary()
+    print(f"回调采集到的摘要信息:{summary}")
+
+    assert summary["failed_records"] >= 1, "至少应该有一条记录被标记为失败"
+    failed_record = next(r for r in summary["records"] if r["succeeded"] is False)
+    assert "响应超时" in failed_record["error_message"], "失败记录里应该保留原始异常信息,方便排查问题"
+    print("验证通过:即使链条最终因为异常而失败,回调处理器依然完整记录下了失败发生的位置与原因。")
+
+
+# ---------------------------------------------------------------------------
+# 第三部分:用回调统计"批量调用"场景下的整体吞吐指标
+# ---------------------------------------------------------------------------
+
+
+def demo_callback_aggregates_batch_metrics() -> None:
+    """
+    演示对一次batch批量调用挂载回调,统计出"这一批请求里,LLM总共被
+    调用了多少次""平均每次调用耗时多少"这类整体吞吐指标,这类指标在
+    真实的监控大盘上,通常会以"QPS""P50/P99延迟"等更专业的形式呈现,
+    但采集的原始数据来源,与今天这个简化版本是完全一致的。
+    """
+    print("\n===== 演示三:批量调用场景下的整体指标统计 =====")
+
+    handler = TimingAndCallCountCallbackHandler()
+    chain = build_demo_chain("批量场景下的统一摘要结果。")
+
+    batch_inputs = [{"text": f"第{i}份原始文本"} for i in range(6)]
+    results = chain.batch(batch_inputs, config={"callbacks": [handler]})
+
+    summary = handler.export_summary()
+    average_llm_duration = (
+        sum(r["duration_seconds"] for r in summary["records"] if r["component_name"] == "LLM调用")
+        / summary["llm_call_count"]
+    )
+
+    print(f"批量处理了{len(results)}条输入,LLM总调用次数:{summary['llm_call_count']}")
+    print(f"LLM平均单次耗时:{average_llm_duration:.6f}秒")
+
+    assert summary["llm_call_count"] == len(batch_inputs), "batch里的每一条输入,理应各自触发一次独立的LLM调用"
+    assert summary["failed_records"] == 0
+    print("验证通过:回调处理器能够正确聚合batch批量调用场景下,每一条子请求各自的耗时明细。")
+
+
+def run_all_demos() -> None:
+    """依次运行本文件中的全部演示。"""
+    demo_callback_captures_successful_run()
+    demo_callback_captures_failure()
+    demo_callback_aggregates_batch_metrics()
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+
+### 十五、单元测试:模块十一~十四的确定性验证
+
+延续模块十定下的规范——凡是涉及跨越多个组件的复合能力,都必须有一份不依赖真实网络、能在CI流水线里快速稳定跑完的单元测试。这份测试覆盖了今天新增的四个模块,全部基于`FakeListChatModel`和手写的假Runnable,不发起任何真实网络请求。
+
+```python
+"""
+test_advanced_lcel_modules.py
+
+苍穹平台 · LCEL链式改造技术验证 · 模块十五(单元测试:模块十一~十四的确定性验证)
+
+背景:
+    延续模块十定下的规范——凡是涉及"跨越多个组件的复合能力"(降级、
+    可配置、异步并发、可观测性),都必须有一份不依赖真实网络、能在
+    CI流水线里快速稳定跑完的单元测试。这份测试文件覆盖今天新增的
+    四个模块:fallback_chain_and_offline_selfcheck.py、
+    configurable_runtime_model_switch.py、async_chain_and_concurrency.py、
+    custom_callback_observability.py,采用与模块十一致的测试风格。
+
+编写人:陈铭
+评审人:王振宇
+飞书任务号:CQ-112(苍穹0.5版 · 高级LCEL能力单元测试补齐)
+"""
+
+import asyncio
+import unittest
+
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+
+from assign_and_chain_introspection import (
+    build_accumulating_three_stage_chain,
+    describe_chain_structure,
+)
+from async_chain_and_concurrency import (
+    SimulatedLatencyChatModel,
+    build_chain_with_simulated_latency,
+    run_async_concurrent,
+    run_async_sequential,
+    run_sync_sequential,
+)
+from configurable_runtime_model_switch import (
+    answer_user_question,
+    build_tiered_model_chain,
+    resolve_model_tier_for_user,
+)
+from custom_callback_observability import (
+    TimingAndCallCountCallbackHandler,
+    build_demo_chain,
+)
+from fallback_chain_and_offline_selfcheck import (
+    AlwaysFailingChatModel,
+    build_fake_chat_model,
+    build_translation_chain_with_fallback,
+)
+
+
+class FallbackChainTests(unittest.TestCase):
+    """针对模块十一(多模型降级)的行为验证。"""
+
+    def test_falls_back_when_primary_fails(self):
+        primary = AlwaysFailingChatModel("主模型不可用")
+        fallback = build_fake_chat_model(responses=["备用结果"])
+        chain = build_translation_chain_with_fallback(primary, fallback)
+
+        result = chain.invoke({"text": "任意文本"})
+        self.assertEqual(result, "备用结果")
+        self.assertEqual(primary.call_count, 1)
+
+    def test_reraises_primary_error_when_all_fail(self):
+        primary = AlwaysFailingChatModel("主模型异常信息ABC")
+        fallback = AlwaysFailingChatModel("备用模型异常信息XYZ")
+        chain = build_translation_chain_with_fallback(primary, fallback)
+
+        with self.assertRaises(ConnectionError) as ctx:
+            chain.invoke({"text": "任意文本"})
+        self.assertIn("主模型异常信息ABC", str(ctx.exception))
+
+    def test_offline_fake_model_cycles_through_responses(self):
+        """验证FakeListChatModel在batch调用下,按顺序循环返回预设responses。"""
+        model = build_fake_chat_model(responses=["第一条", "第二条"])
+        prompt = ChatPromptTemplate.from_template("{text}")
+        chain = prompt | model | StrOutputParser()
+
+        results = chain.batch([{"text": "a"}, {"text": "b"}, {"text": "c"}])
+        self.assertEqual(results, ["第一条", "第二条", "第一条"])
+
+
+class ConfigurableModelSwitchTests(unittest.TestCase):
+    """针对模块十二(可配置字段与档位切换)的行为验证。"""
+
+    def test_default_tier_is_fast(self):
+        chain = build_tiered_model_chain()
+        result = chain.invoke({"question": "测试问题"})
+        self.assertIn("标准档", result)
+
+    def test_flagship_tier_via_config(self):
+        chain = build_tiered_model_chain()
+        result = chain.invoke(
+            {"question": "测试问题"}, config={"configurable": {"model_tier": "flagship_tier"}}
+        )
+        self.assertIn("旗舰档", result)
+
+    def test_business_rule_maps_user_level_to_tier(self):
+        self.assertEqual(resolve_model_tier_for_user("normal"), "fast_tier")
+        self.assertEqual(resolve_model_tier_for_user("gold"), "flagship_tier")
+        self.assertEqual(resolve_model_tier_for_user("platinum"), "flagship_tier")
+        self.assertEqual(resolve_model_tier_for_user("unknown_level"), "fast_tier")
+
+    def test_answer_user_question_routes_correctly(self):
+        chain = build_tiered_model_chain()
+        normal_result = answer_user_question(chain, "问题内容", user_level="normal")
+        gold_result = answer_user_question(chain, "问题内容", user_level="gold")
+        self.assertIn("标准档", normal_result)
+        self.assertIn("旗舰档", gold_result)
+
+
+class AsyncConcurrencyTests(unittest.TestCase):
+    """针对模块十三(异步调用与并发耗时)的行为验证,用较小的延迟保证测试速度。"""
+
+    def test_simulated_latency_model_sync_and_async_agree(self):
+        model = SimulatedLatencyChatModel(latency_seconds=0.01, response_text="固定响应内容")
+        sync_message = model.invoke("任意输入")
+        async_message = asyncio.run(model.ainvoke("任意输入"))
+        self.assertEqual(sync_message.content, "固定响应内容")
+        self.assertEqual(async_message.content, "固定响应内容")
+        self.assertEqual(model.call_count, 2, "同步与异步各调用一次,call_count应该累加到2")
+
+    def test_concurrent_execution_is_faster_than_sequential(self):
+        latency = 0.05
+        inputs = [{"text": f"任务{i}"} for i in range(4)]
+        chain = build_chain_with_simulated_latency(latency, "已完成")
+
+        sync_results = run_sync_sequential(chain, inputs)
+        async_seq_results = asyncio.run(run_async_sequential(chain, inputs))
+        concurrent_results = asyncio.run(run_async_concurrent(chain, inputs))
+
+        self.assertEqual(sync_results, async_seq_results)
+        self.assertEqual(sync_results, concurrent_results)
+        self.assertEqual(len(concurrent_results), len(inputs))
+
+    def test_max_concurrency_limit_via_semaphore(self):
+        async def scenario():
+            max_in_flight = 0
+            current_in_flight = 0
+            lock = asyncio.Lock()
+            semaphore = asyncio.Semaphore(2)
+
+            async def bounded_task():
+                nonlocal max_in_flight, current_in_flight
+                async with semaphore:
+                    async with lock:
+                        current_in_flight += 1
+                        max_in_flight = max(max_in_flight, current_in_flight)
+                    await asyncio.sleep(0.02)
+                    async with lock:
+                        current_in_flight -= 1
+
+            await asyncio.gather(*(bounded_task() for _ in range(8)))
+            return max_in_flight
+
+        observed_max = asyncio.run(scenario())
+        self.assertLessEqual(observed_max, 2)
+
+
+class CallbackObservabilityTests(unittest.TestCase):
+    """针对模块十四(自定义回调处理器)的行为验证。"""
+
+    def test_successful_invocation_records_llm_call(self):
+        handler = TimingAndCallCountCallbackHandler()
+        chain = build_demo_chain("固定摘要结果")
+
+        result = chain.invoke({"text": "原始输入"}, config={"callbacks": [handler]})
+        summary = handler.export_summary()
+
+        self.assertEqual(result, "固定摘要结果")
+        self.assertEqual(summary["llm_call_count"], 1)
+        self.assertEqual(summary["failed_records"], 0)
+
+    def test_batch_invocation_records_one_llm_call_per_item(self):
+        handler = TimingAndCallCountCallbackHandler()
+        chain = build_demo_chain("固定摘要结果")
+
+        batch_inputs = [{"text": f"输入{i}"} for i in range(5)]
+        chain.batch(batch_inputs, config={"callbacks": [handler]})
+        summary = handler.export_summary()
+
+        self.assertEqual(summary["llm_call_count"], len(batch_inputs))
+
+    def test_all_records_have_non_negative_duration(self):
+        handler = TimingAndCallCountCallbackHandler()
+        chain = build_demo_chain("固定摘要结果")
+        chain.invoke({"text": "原始输入"}, config={"callbacks": [handler]})
+
+        summary = handler.export_summary()
+        for record in summary["records"]:
+            self.assertIsNotNone(record["duration_seconds"])
+            self.assertGreaterEqual(record["duration_seconds"], 0.0)
+
+
+class AssignAndIntrospectionTests(unittest.TestCase):
+    """针对模块十六(assign累积中间结果与链路结构自省)的行为验证。"""
+
+    def test_accumulating_chain_preserves_all_intermediate_fields(self):
+        chain = build_accumulating_three_stage_chain(
+            translation_text="T译文", polishing_text="P润色稿", summary_text="S摘要"
+        )
+        result = chain.invoke({"text": "原文内容"})
+        self.assertEqual(
+            result,
+            {"text": "原文内容", "translation": "T译文", "polished": "P润色稿", "summary": "S摘要"},
+        )
+
+    def test_accumulating_chain_batch_does_not_cross_contaminate(self):
+        chain = build_accumulating_three_stage_chain(
+            translation_text="T", polishing_text="P", summary_text="S"
+        )
+        inputs = [{"text": "第一条"}, {"text": "第二条"}]
+        results = chain.batch(inputs)
+        self.assertEqual(results[0]["text"], "第一条")
+        self.assertEqual(results[1]["text"], "第二条")
+
+    def test_describe_chain_structure_lists_core_components(self):
+        prompt = ChatPromptTemplate.from_template("{text}")
+        from langchain_core.language_models.fake_chat_models import FakeListChatModel
+
+        model = FakeListChatModel(responses=["固定响应"])
+        chain = prompt | model | StrOutputParser()
+
+        lines = describe_chain_structure(chain)
+        joined = " ".join(lines)
+        self.assertIn("ChatPromptTemplate", joined)
+        self.assertIn("FakeListChatModel", joined)
+        self.assertIn("StrOutputParser", joined)
+
+    def test_describe_chain_structure_handles_complex_chain_without_error(self):
+        chain = build_accumulating_three_stage_chain(
+            translation_text="T", polishing_text="P", summary_text="S"
+        )
+        lines = describe_chain_structure(chain)
+        self.assertGreater(len(lines), 5, "复杂链条识别出的节点数应该明显多于简单三段链")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+```
+
+
+### 十六、RunnablePassthrough.assign累积中间结果 + 链路结构自省
+
+下午旁听分享的韩露问了陈铭一句:"如果我想在链条走到第三步的时候,同时看到原始输入、第一步结果、第二步结果,应该怎么写?"陈铭用`RunnablePassthrough.assign(...)`重新实现了一遍"翻译->润色->摘要"三级链,这一次不需要手写一个自定义结果对象,链条本身就能一步步累积出包含全部中间结果的完整字典。此外还补充了一个不依赖第三方绘图库、纯靠`get_graph()`节点与连接关系自省一条链内部结构的小工具。
+
+```python
+"""
+assign_and_chain_introspection.py
+
+苍穹平台 · LCEL链式改造技术验证 · 模块十六(RunnablePassthrough.assign累积中间结果 + 链路结构自省)
+
+背景:
+    模块三已经用过RunnablePassthrough保留原始输入,但今天下午韩露(顺路
+    旁听下午分享时提的一个问题)问了陈铭一句:"如果我想在链条走到第三步
+    的时候,同时看到原始输入、第一步的结果、第二步的结果,应该怎么写?"
+    陈铭当时愣了一下——如果单纯用管道符一路往下传,每一步默认只能拿到
+    上一步的输出,原始输入和中间结果,默认是不会自动"带着走"的。
+
+    LangChain提供的`RunnablePassthrough.assign(...)`,正是为了解决这个
+    "边前进边累积上下文"的需求:它在把输入原样传递下去的同时,还能往
+    输入这个字典里,追加若干个新的键,每个新键的值是"用当前完整输入,
+    去跑一个子链或函数得到的结果"。今天用"翻译->润色->摘要"这条大家已经
+    很熟悉的业务场景,重新实现一遍——但这一次,最终返回的结果里,
+    会同时包含原文、译文、润色稿、摘要四个字段,而不需要像模块六那样
+    手写一个"跑完每一步手动把结果塞进一个自定义结果对象"的辅助函数。
+
+    此外,老王要求补充一个"链路结构自省"的小工具——能够把一条LCEL链
+    内部到底串联了哪些组件、以什么顺序连接,用可读的文字形式打印出来,
+    方便review代码的人不需要打开源码,就能大致了解一条链的"骨架"。
+
+编写人:陈铭
+评审人:王振宇
+飞书任务号:CQ-113(苍穹0.5版 · 链式中间结果累积与结构自省工具)
+"""
+
+from typing import Any, Dict, List
+
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import Runnable, RunnableLambda, RunnablePassthrough
+
+
+# ---------------------------------------------------------------------------
+# 第一部分:用RunnablePassthrough.assign()累积多步中间结果
+# ---------------------------------------------------------------------------
+
+
+def build_translation_stage(response_text: str) -> Runnable:
+    """构建翻译子链,输入形如{"text": "原文"},输出是翻译后的字符串。"""
+    prompt = ChatPromptTemplate.from_template(
+        "把下面这段话翻译成英文,只输出翻译结果:\n{text}"
+    )
+    model = FakeListChatModel(responses=[response_text])
+    return prompt | model | StrOutputParser()
+
+
+def build_polishing_stage(response_text: str) -> Runnable:
+    """构建润色子链,输入形如{"translation": "译文"},输出是润色后的字符串。"""
+    prompt = ChatPromptTemplate.from_template(
+        "把下面这段英文润色得更专业、更书面化,只输出润色结果:\n{translation}"
+    )
+    model = FakeListChatModel(responses=[response_text])
+    return prompt | model | StrOutputParser()
+
+
+def build_summary_stage(response_text: str) -> Runnable:
+    """构建摘要子链,输入形如{"polished": "润色稿"},输出是摘要字符串。"""
+    prompt = ChatPromptTemplate.from_template(
+        "为下面这段英文生成一句话摘要:\n{polished}"
+    )
+    model = FakeListChatModel(responses=[response_text])
+    return prompt | model | StrOutputParser()
+
+
+def build_accumulating_three_stage_chain(
+    translation_text: str, polishing_text: str, summary_text: str
+) -> Runnable:
+    """
+    用RunnablePassthrough.assign()串联三个阶段,每一步都把新的字段
+    追加到累积字典里,而不是把上一步的结果整体替换掉。
+
+    执行顺序拆解如下(链条从上到下依次执行):
+    1. 输入是 {"text": 原文};
+    2. 第一次.assign(translation=...)之后,字典变为
+       {"text": 原文, "translation": 译文};
+    3. 第二次.assign(polished=...)时,子链polishing_stage的输入,
+       需要从当前字典里取出"translation"字段,所以子链前面要加一个
+       RunnableLambda,负责把累积字典"投影"成子链期望的输入格式;
+       assign之后字典变为{"text", "translation", "polished"}三个字段;
+    4. 第三次.assign(summary=...)同理,最终字典包含全部四个字段。
+    """
+    translation_stage = build_translation_stage(translation_text)
+    polishing_stage = build_polishing_stage(polishing_text)
+    summary_stage = build_summary_stage(summary_text)
+
+    project_to_translation_input = RunnableLambda(lambda data: {"text": data["text"]})
+    project_to_polishing_input = RunnableLambda(lambda data: {"translation": data["translation"]})
+    project_to_summary_input = RunnableLambda(lambda data: {"polished": data["polished"]})
+
+    chain = (
+        RunnablePassthrough.assign(
+            translation=project_to_translation_input | translation_stage
+        )
+        .assign(polished=project_to_polishing_input | polishing_stage)
+        .assign(summary=project_to_summary_input | summary_stage)
+    )
+    return chain
+
+
+def demo_accumulating_intermediate_results() -> None:
+    """演示三级链在保留原文的同时,逐步累积译文、润色稿、摘要三个中间结果。"""
+    print("\n===== 演示一:用assign()累积多步中间结果 =====")
+
+    chain = build_accumulating_three_stage_chain(
+        translation_text="This is the translated version.",
+        polishing_text="This is the polished, more professional version.",
+        summary_text="A concise one-sentence summary.",
+    )
+
+    result = chain.invoke({"text": "这是一段用于测试的原始中文文本。"})
+    print(f"链条最终返回的完整字典:{result}")
+
+    assert result["text"] == "这是一段用于测试的原始中文文本。", "原始输入应该被完整保留"
+    assert result["translation"] == "This is the translated version.", "译文字段应该正确"
+    assert result["polished"] == "This is the polished, more professional version.", "润色字段应该正确"
+    assert result["summary"] == "A concise one-sentence summary.", "摘要字段应该正确"
+    assert set(result.keys()) == {"text", "translation", "polished", "summary"}, \
+        "最终字典应该恰好包含这四个字段,不多不少"
+    print("验证通过:整条链在向后传递的过程中,原文、译文、润色稿、摘要四个字段全部被正确累积保留。")
+
+
+def demo_accumulating_chain_is_reusable_for_batch() -> None:
+    """验证累积式链条同样支持batch批量调用,每一条输入的中间结果不会互相串味。"""
+    print("\n===== 演示二:累积式链条在batch场景下,各条输入互不干扰 =====")
+
+    chain = build_accumulating_three_stage_chain(
+        translation_text="Translated.",
+        polishing_text="Polished.",
+        summary_text="Summarized.",
+    )
+
+    batch_inputs = [{"text": "第一段原文"}, {"text": "第二段原文"}, {"text": "第三段原文"}]
+    results = chain.batch(batch_inputs)
+
+    for original_input, result in zip(batch_inputs, results):
+        assert result["text"] == original_input["text"], "每一条结果的原文字段,应该对应各自的输入,不应该互相覆盖"
+        assert result["translation"] == "Translated."
+        assert result["summary"] == "Summarized."
+    print(f"batch处理了{len(results)}条输入,每一条的原文字段均与自己的输入一一对应,互不干扰。")
+    print("验证通过:累积式链条在批量场景下,依然保持了每条数据独立、互不污染的正确性。")
+
+
+# ---------------------------------------------------------------------------
+# 第二部分:链路结构自省——不依赖第三方绘图库,打印链条的节点与连接关系
+# ---------------------------------------------------------------------------
+
+
+def describe_chain_structure(chain: Runnable) -> List[str]:
+    """
+    利用Runnable内置的get_graph()方法,提取一条链内部的节点与连接关系,
+    整理成一份"从前到后"的可读文字描述。
+
+    之所以不直接调用官方的get_graph().draw_ascii(),是因为那个方法
+    依赖一个叫grandalf的第三方绘图库,苍穹平台目前的依赖清单里没有
+    引入它,而"能不能看懂一条链的结构"这个需求,并不需要真的画出
+    一张像素级对齐的ASCII图——只要能按顺序列出"链条上有哪些节点,
+    彼此之间怎么连接"就足够满足review时的实际需要,这也是"够用就好,
+    不过度引入依赖"这条原则在诊断工具上的又一次体现。
+    """
+    graph = chain.get_graph()
+
+    # 图里的每个node.data,可能是一个具体的Runnable实例,也可能只是
+    # 用于描述输入/输出数据结构的占位schema(通常出现在链条最开头和
+    # 最末尾),这里统一用node.name兜底展示,保证每个节点都有名字可看。
+    lines = []
+    node_id_to_label = {}
+    for node_id, node in graph.nodes.items():
+        label = getattr(node.data, "name", None) or node.name or type(node.data).__name__
+        node_id_to_label[node_id] = label
+
+    # 通过边的连接关系,尝试找到"入度为0"的起点节点,从起点开始做一次
+    # 简单的拓扑遍历,尽量还原出链条"从前到后"的直观顺序。
+    incoming_count = {node_id: 0 for node_id in graph.nodes}
+    outgoing_edges: Dict[str, List[str]] = {node_id: [] for node_id in graph.nodes}
+    for edge in graph.edges:
+        incoming_count[edge.target] += 1
+        outgoing_edges[edge.source].append(edge.target)
+
+    start_nodes = [node_id for node_id, count in incoming_count.items() if count == 0]
+
+    visited = set()
+    traversal_order = []
+
+    def visit(node_id: str) -> None:
+        if node_id in visited:
+            return
+        visited.add(node_id)
+        traversal_order.append(node_id)
+        for next_id in outgoing_edges.get(node_id, []):
+            visit(next_id)
+
+    for start_id in start_nodes:
+        visit(start_id)
+    # 兜底:如果因为图结构比较特殊导致有节点没被遍历到,补充加到末尾,
+    # 保证describe_chain_structure对任意链条都不会漏掉任何一个节点。
+    for node_id in graph.nodes:
+        if node_id not in visited:
+            traversal_order.append(node_id)
+
+    for index, node_id in enumerate(traversal_order):
+        lines.append(f"第{index + 1}步:{node_id_to_label[node_id]}")
+
+    return lines
+
+
+def demo_chain_structure_introspection() -> None:
+    """演示对一条简单三段链(prompt | model | parser)进行结构自省。"""
+    print("\n===== 演示三:链路结构自省(不依赖第三方绘图库) =====")
+
+    prompt = ChatPromptTemplate.from_template("请处理:{text}")
+    model = FakeListChatModel(responses=["固定响应"])
+    parser = StrOutputParser()
+    simple_chain = prompt | model | parser
+
+    description_lines = describe_chain_structure(simple_chain)
+    print("链路结构自省结果:")
+    for line in description_lines:
+        print(f"  {line}")
+
+    assert len(description_lines) >= 3, "至少应该识别出prompt、model、parser对应的核心节点"
+    joined_description = " ".join(description_lines)
+    assert "ChatPromptTemplate" in joined_description
+    assert "FakeListChatModel" in joined_description
+    assert "StrOutputParser" in joined_description
+    print("验证通过:结构自省工具正确识别出了链条中prompt、model、parser三个核心组件,顺序符合预期。")
+
+
+def demo_chain_structure_introspection_on_accumulating_chain() -> None:
+    """对本模块第一部分构建的、更复杂的累积式三级链,也做一次结构自省,验证工具的通用性。"""
+    print("\n===== 演示四:对更复杂的累积式链条做结构自省 =====")
+
+    chain = build_accumulating_three_stage_chain(
+        translation_text="T", polishing_text="P", summary_text="S"
+    )
+    description_lines = describe_chain_structure(chain)
+    print(f"复杂链条一共识别出{len(description_lines)}个节点,前5个:")
+    for line in description_lines[:5]:
+        print(f"  {line}")
+
+    assert len(description_lines) > 5, "累积式链条内部组件数量明显更多,识别出的节点数应该更多"
+    print("验证通过:结构自省工具对结构更复杂的链条同样适用,不会因为链条变复杂而报错或漏掉节点。")
+
+
+def run_all_demos() -> None:
+    """依次运行本文件中的全部演示。"""
+    demo_accumulating_intermediate_results()
+    demo_accumulating_chain_is_reusable_for_batch()
+    demo_chain_structure_introspection()
+    demo_chain_structure_introspection_on_accumulating_chain()
+
+
+if __name__ == "__main__":
+    run_all_demos()
+```
+
+---
+
 ## 今日复盘
 
 晚上七点,老王和陈铭做了一次简短的收尾复盘,没有像前几天那样长篇讨论,更多是把今天的知识点串成一条线。
